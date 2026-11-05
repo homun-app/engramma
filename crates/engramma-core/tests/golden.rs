@@ -18,6 +18,10 @@ struct GoldenQuery {
     id: u32,
     #[serde(default)]
     category: String,
+    /// `text` (default) runs in this text+graph test; `hybrid` questions need
+    /// the semantic search and live in engramma-embed's golden tests.
+    #[serde(default)]
+    mode: String,
     q: String,
     #[serde(default)]
     expect: Vec<String>,
@@ -140,6 +144,9 @@ fn golden_queries() {
 
     let mut failures: Vec<String> = Vec::new();
     for gq in &queries {
+        if gq.mode == "hybrid" {
+            continue; // semantic territory: engramma-embed's golden tests
+        }
         let mut q = Query::text(&gq.q).k(gq.k.unwrap_or(5)).graph_hops(2);
         q.lang = Some(Lang::It);
         if let Some(a) = &gq.as_of {
@@ -279,6 +286,50 @@ fn golden_story_invariants() {
     assert_eq!(now_active[0], "1");
     // and the verify still passes after confirm
     assert!(cell.verify().unwrap(/* test-only */).ok());
+}
+
+/// The paraphrase questions (§5) must share **no root** with the note they
+/// expect, after the normalisation of `text.rs`: what they test is the
+/// meaning branch, not lexical overlap.
+#[test]
+fn paraphrase_questions_share_no_roots_with_their_notes() {
+    let (_d, cell) = golden_cell();
+    let raw = std::fs::read_to_string(golden_dir().join("queries.json")).unwrap(/* t */);
+    let queries: Vec<GoldenQuery> = serde_json::from_str(&raw).unwrap(/* test-only */);
+    let paraphrases: Vec<&GoldenQuery> = queries
+        .iter()
+        .filter(|q| q.category == "parafrasi")
+        .collect();
+    assert!(paraphrases.len() >= 15, "want 15 paraphrases");
+    for gq in paraphrases {
+        let q_terms: std::collections::BTreeSet<String> =
+            engramma_core::text::query_terms(&gq.q, Some(Lang::It))
+                .into_iter()
+                .collect();
+        assert!(!q_terms.is_empty(), "`{}` has no usable terms", gq.q);
+        for wanted in &gq.expect {
+            // the note whose title contains `wanted` (how expect works)
+            let note_norm = cell
+                .debug_column(&format!(
+                    "SELECT body_norm FROM notes WHERE lower(title) LIKE '%{}%' LIMIT 1",
+                    wanted.to_lowercase().replace('\'', "''")
+                ))
+                .unwrap(/* test-only */);
+            let found = note_norm.first().cloned().unwrap_or_default();
+            assert!(!found.is_empty(), "`{}`: no note matches `{wanted}`", gq.q);
+            let shared: Vec<String> = found
+                .split(' ')
+                .filter(|stem| q_terms.contains(*stem))
+                .map(String::from)
+                .collect();
+            assert!(
+                shared.is_empty(),
+                "`{}` shares stems {shared:?} with the note `{wanted}` \
+                 (body_norm: {found})",
+                gq.q
+            );
+        }
+    }
 }
 
 /// Small helper to rebuild a ULID from the golden ids.

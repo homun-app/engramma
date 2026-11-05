@@ -637,6 +637,7 @@ name = "engramma-bench"
 version = "0.1.0-dev"
 dependencies = [
  "engramma-core",
+ "engramma-embed",
  "serde_json",
  "tempfile",
  "time",
@@ -650,6 +651,7 @@ dependencies = [
  "anyhow",
  "clap",
  "engramma-core",
+ "engramma-embed",
  "engramma-mcp",
  "serde_json",
  "tempfile",
@@ -688,6 +690,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "time",
  "tokenizers",
  "tract-onnx",
  "ureq",
@@ -699,6 +702,7 @@ version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "engramma-core",
+ "engramma-embed",
  "rmcp",
  "schemars",
  "serde",

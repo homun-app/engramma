@@ -92,14 +92,21 @@ pub fn note_json(n: &Note) -> serde_json::Value {
     n.to_json()
 }
 
-/// Hit JSON: `{score, explain{matched_terms, bm25_rank, via, confidence,
+/// Hit JSON: `{score, raw_score, explain{matched_terms, bm25_rank,
+/// semantic_rank, cosine, fused_score, lists, winning_chunk, via, confidence,
 /// valid_from, valid_to, source}, note}`.
 pub fn hit_json(h: &Hit) -> serde_json::Value {
     serde_json::json!({
         "score": h.score,
+        "raw_score": h.raw_score,
         "explain": {
             "matched_terms": h.explain.matched_terms,
             "bm25_rank": h.explain.bm25_rank,
+            "semantic_rank": h.explain.semantic_rank,
+            "cosine": h.explain.cosine,
+            "fused_score": h.explain.fused_score,
+            "lists": h.explain.lists,
+            "winning_chunk": h.explain.winning_chunk,
             "via": h.explain.via,
             "confidence": h.explain.confidence.as_str(),
             "valid_from": h.explain.valid_from,
@@ -119,7 +126,13 @@ pub fn hit_human(h: &Hit, index: usize) -> String {
         h.note.display_title(),
         engramma_core::id::id8(&h.note.id),
     );
-    out.push_str(&format!("\n   score {:.4}", h.score));
+    out.push_str(&format!(
+        "\n   punteggio {:.4} (grezzo {:.4})",
+        h.score, h.raw_score
+    ));
+    if !h.explain.lists.is_empty() {
+        out.push_str(&format!("\n   liste: {}", h.explain.lists.join(", ")));
+    }
     if !h.explain.matched_terms.is_empty() {
         out.push_str(&format!(
             "\n   termini: {}",
@@ -128,6 +141,15 @@ pub fn hit_human(h: &Hit, index: usize) -> String {
     }
     if let Some(r) = h.explain.bm25_rank {
         out.push_str(&format!("\n   rango BM25: {r}"));
+    }
+    if let Some(r) = h.explain.semantic_rank {
+        out.push_str(&format!("\n   rango semantico: {r}"));
+    }
+    if let Some(c) = h.explain.cosine {
+        out.push_str(&format!("\n   coseno: {c:.4}"));
+    }
+    if let Some(chunk) = h.explain.winning_chunk {
+        out.push_str(&format!("\n   blocco vincente: {chunk}"));
     }
     if let Some(via) = &h.explain.via {
         out.push_str(&format!("\n   via: {via}"));

@@ -283,7 +283,10 @@ pub enum Fusion {
 
 impl Default for Fusion {
     fn default() -> Self {
-        Fusion::Rrf { k: 60 }
+        // Measured on the golden vault (REPORT §v0.2): the convex combination
+        // with α = 0.7 beats RRF on paraphrases (0.867 vs 0.733 recall@5 with
+        // the 311M; 0.800 vs 0.733 with the 97M) at equal factual recall.
+        Fusion::Convex { alpha: 0.7 }
     }
 }
 
@@ -294,6 +297,9 @@ pub struct Semantic {
     /// or its `building` model during a switch — searches always serve
     /// `ready`).
     pub embedder: std::sync::Arc<dyn crate::embed::Embedder>,
+    /// Which candidate lists contribute (`Hybrid` by default; `Vector`
+    /// skips the text list, `Text` is served by the v0.1 path).
+    pub mode: Mode,
     /// Text+vector combination.
     pub fusion: Fusion,
     /// Abstention: a result that arrives only from the vector branch needs
@@ -302,14 +308,23 @@ pub struct Semantic {
 }
 
 impl Semantic {
-    /// Defaults: RRF k=60 and tau = 0.30 (tuned on the golden vault, REPORT).
+    /// Defaults: hybrid, RRF k=60 and tau = 0.30 (tuned on the golden vault,
+    /// REPORT).
     #[must_use]
     pub fn new(embedder: std::sync::Arc<dyn crate::embed::Embedder>) -> Self {
         Self {
             embedder,
+            mode: Mode::Hybrid,
             fusion: Fusion::default(),
             tau: 0.30,
         }
+    }
+
+    /// Set the mode.
+    #[must_use]
+    pub fn with_mode(mut self, mode: Mode) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// Set the fusion.
@@ -1138,8 +1153,12 @@ fn semantic_pipeline(
     let dim = ensure_index(inner)?;
     let conn = &inner.conn;
 
-    // --- text list (BM25, as in v0.1)
-    let terms = text::query_terms(&q.text, q.lang);
+    // --- text list (BM25, as in v0.1; skipped in vector mode)
+    let terms = if sem.mode == Mode::Vector {
+        Vec::new()
+    } else {
+        text::query_terms(&q.text, q.lang)
+    };
     let mut text_hits: Vec<(String, f64)> = Vec::new();
     if !terms.is_empty() {
         let match_expr = terms
@@ -1180,8 +1199,19 @@ fn semantic_pipeline(
         _ => Vec::new(),
     };
 
-    // --- fusion over the filtered lists
-    let fused = fuse(&text_list, &vec_list, &sem.fusion);
+    // --- fusion over the filtered lists, then scaled to [0, 1] like the
+    // bm25_norm of the text path: RRF scores are rank reciprocals (~1/61)
+    // and the graph floor (0.05) is calibrated for normalised seeds —
+    // without this, random graph neighbours would outrank real matches.
+    let fused_raw = fuse(&text_list, &vec_list, &sem.fusion);
+    let fused_max = fused_raw
+        .values()
+        .fold(0.0_f64, |a, v| a.max(*v))
+        .max(f64::EPSILON);
+    let fused: BTreeMap<String, f64> = fused_raw
+        .into_iter()
+        .map(|(id, v)| (id, v / fused_max))
+        .collect();
     let bm25_rank_of: HashMap<&str, usize> = text_list
         .iter()
         .map(|(id, _, rank, _)| (id.as_str(), *rank))
@@ -1191,6 +1221,20 @@ fn semantic_pipeline(
         .map(|(id, _, _, n)| (id.clone(), n))
         .collect();
     let vec_of: HashMap<&str, &VecCand> = vec_list.iter().map(|v| (v.id.as_str(), v)).collect();
+
+    // --- abstention FIRST (§4): a vector-only candidate below tau leaves
+    // before it can seed the graph walk — otherwise its neighbours would
+    // resurface through the expansion and the threshold would mean nothing.
+    // Text matches are never abstained away.
+    let fused: BTreeMap<String, f64> = fused
+        .into_iter()
+        .filter(|(id, _)| {
+            note_of_text.contains_key(id)
+                || vec_of
+                    .get(id.as_str())
+                    .is_some_and(|v| (v.cosine as f32) >= sem.tau)
+        })
+        .collect();
 
     // --- graph expansion from the fused seeds
     let mut seeds: Vec<(String, f64)> = fused.iter().map(|(id, s)| (id.clone(), *s)).collect();
@@ -1246,13 +1290,13 @@ fn semantic_pipeline(
         if from_vec {
             lists.push("vector");
         }
-        // abstention (§4): a vector-only result must clear tau
-        if !from_text && cosine.is_none_or(|c| (c as f32) < sem.tau) {
-            continue;
-        }
-        let raw = fused_score
-            * q.weights.confidence(note.confidence)
-            * recency_of(now, note, q.weights.recency_half_life_days);
+        // (abstention already happened above, before the graph walk; in
+        // vector mode the text list is empty so everything went through it)
+        // Reliability and graph, without the v0.1 recency factor: cosine
+        // differences are hundredths, and a 180-day half-life (tuned for the
+        // wide score gaps of BM25) shuffled them — measured, REPORT §v0.2.
+        // Text-only searches keep the full v0.1 formula.
+        let raw = fused_score * q.weights.confidence(note.confidence);
         hits.push(Hit {
             note: (*note).clone(),
             raw_score: raw,
@@ -1292,10 +1336,7 @@ fn semantic_pipeline(
             continue;
         }
         let w_graph = q.weights.hop_decay.powi(i32::from(hops) + 1);
-        let raw = GRAPH_FLOOR.max(seed)
-            * q.weights.confidence(note.confidence)
-            * recency_of(now, &note, q.weights.recency_half_life_days)
-            * w_graph;
+        let raw = GRAPH_FLOOR.max(seed) * q.weights.confidence(note.confidence) * w_graph;
         hits.push(Hit {
             note,
             raw_score: raw,

@@ -15,12 +15,13 @@ pub mod text;
 pub mod vector;
 
 pub use cell::{Cell, NotePatch, VerifyReport};
+pub use cell::{EmbedPendingReport, ModelCoverage, ModelRow, ModelState};
 pub use embed::{Embedder, TextKind};
 pub use error::{CellError, EmbedError, FormatError, PortError, SearchError};
 pub use format::{Confidence, Lang, Note, NoteType, ParseMode, Status, Validity};
 pub use hlc::{Hlc, HlcClock};
 pub use port::{export, import_cell, import_obsidian};
-pub use search::{Explain, Filters, Hit, Query, Weights};
+pub use search::{Explain, Filters, Fusion, Hit, Mode, Query, SearchOutcome, Semantic, Weights};
 pub use vector::{FlatI8, IndexHit, IndexRow, VectorIndex};
 
 #[cfg(test)]

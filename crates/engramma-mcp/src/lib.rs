@@ -20,14 +20,18 @@ use rmcp::{ErrorData as McpError, ServerHandler, serve_server};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use engramma_core::Cell;
 use engramma_core::format::Status;
-use engramma_core::search::{Hit, Query};
+use engramma_core::search::{Hit, Query, Semantic};
+use engramma_core::{Cell, ModelState};
 
 /// An open, exposed cell.
 pub struct MemoryServer {
     tool_router: ToolRouter<Self>,
     cells: HashMap<String, Cell>,
+    /// The embedder from `<root>/config.json`, when one is configured: the
+    /// vector branch joins automatically, cell by cell, wherever the cell's
+    /// ready model matches. Without it every search is text+graph (v0.1).
+    embedder: Option<std::sync::Arc<dyn engramma_core::embed::Embedder>>,
 }
 
 /// Error conversion into MCP errors.
@@ -57,10 +61,36 @@ impl MemoryServer {
             let cell = Cell::open(&path).map_err(|e| anyhow::anyhow!("cell {name}: {e}"))?;
             cells.insert(name.clone(), cell);
         }
+        // The embedder is optional: a root without config.json serves the
+        // same text+graph search as v0.1.
+        let embedder = match engramma_embed::config::load_embedder(root) {
+            Ok(e) => e,
+            Err(e) => {
+                // a broken configuration must not take the server down
+                eprintln!("engramma-mcp: embedder config: {e}");
+                None
+            }
+        };
         Ok(Self {
             tool_router: Self::tool_router(),
             cells,
+            embedder,
         })
+    }
+
+    /// The semantic context for `cell`, when its ready model matches the
+    /// configured embedder.
+    fn semantic_for(&self, cell: &Cell) -> Option<Semantic> {
+        let embedder = self.embedder.as_ref()?;
+        let ready = cell
+            .models()
+            .ok()?
+            .into_iter()
+            .find(|m| m.state == ModelState::Ready)?;
+        if ready.model != embedder.model_id() {
+            return None;
+        }
+        Some(Semantic::new(std::sync::Arc::clone(embedder)))
     }
 
     fn names(&self) -> Vec<String> {
@@ -105,9 +135,15 @@ impl MemoryServer {
 fn hit_json(h: &Hit) -> serde_json::Value {
     serde_json::json!({
         "score": h.score,
+        "raw_score": h.raw_score,
         "explain": {
             "matched_terms": h.explain.matched_terms,
             "bm25_rank": h.explain.bm25_rank,
+            "semantic_rank": h.explain.semantic_rank,
+            "cosine": h.explain.cosine,
+            "fused_score": h.explain.fused_score,
+            "lists": h.explain.lists,
+            "winning_chunk": h.explain.winning_chunk,
             "via": h.explain.via,
             "confidence": h.explain.confidence.as_str(),
             "valid_from": h.explain.valid_from,
@@ -208,13 +244,15 @@ impl MemoryServer {
     /// Search a person's or a group's memory. Returns the most relevant notes
     /// about the query: each result carries the note text, where it came from
     /// (`source`), when it was true (`valid_from`/`valid_to`) and why it
-    /// matched (`explain`: terms, graph path). Facts that changed over time
-    /// are linked by `supersedes`: for "what is true now" rely on notes whose
-    /// `valid_to` is empty; use `as_of` for questions about the past ("where
-    /// did they live in August?"). Quarantined notes — unconfirmed content
-    /// from third parties — never appear in these results: the memory engine
-    /// hides them until a human confirms them, so do not treat their absence
-    /// as a denial.
+    /// matched (`explain`: terms, semantic rank and cosine when the meaning
+    /// branch is active, graph path). Paraphrases work: ask with different
+    /// words than the note uses. Facts that changed over time are linked by
+    /// `supersedes`: for "what is true now" rely on notes whose `valid_to` is
+    /// empty; use `as_of` for questions about the past ("where did they live
+    /// in August?"). Quarantined notes — unconfirmed content from third
+    /// parties — never appear in these results: the memory engine hides them
+    /// until a human confirms them, so do not treat their absence as a
+    /// denial.
     async fn memory_search(
         &self,
         params: Parameters<SearchParams>,
@@ -230,9 +268,18 @@ impl MemoryServer {
                 .map_err(|e| McpError::invalid_params(format!("as_of: {e}"), None))?;
             q.filters.as_of = Some(v.start());
         }
-        let hits = cell.search(&q).map_err(err)?;
+        // The vector branch joins automatically when the cell has a ready
+        // model matching the configured embedder; otherwise this is the
+        // text+graph search of v0.1.
+        let (hits, mode) = match self.semantic_for(cell) {
+            Some(sem) => {
+                let outcome = cell.search_semantic(&q, &sem).map_err(err)?;
+                (outcome.hits, "hybrid")
+            }
+            None => (cell.search(&q).map_err(err)?, "text"),
+        };
         let arr: Vec<serde_json::Value> = hits.iter().map(hit_json).collect();
-        tool_ok(&serde_json::json!({ "query": p.query, "hits": arr }))
+        tool_ok(&serde_json::json!({ "query": p.query, "mode": mode, "hits": arr }))
     }
 
     #[tool(name = "memory_get")]

@@ -3,6 +3,7 @@
 //! external OpenAI-compatible HTTP endpoints. See `docs/DESIGN.md` § 7.
 
 pub mod builtin;
+pub mod config;
 pub mod http;
 pub mod ollama;
 pub mod pull;

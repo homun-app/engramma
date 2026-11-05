@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+engramma-embed.workspace = true
 engramma-core.workspace = true
 rmcp.workspace = true
 tokio.workspace = true

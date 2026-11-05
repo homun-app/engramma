@@ -54,6 +54,9 @@ enum Command {
     Add {
         /// File with the body markdown ("-" = stdin)
         file: String,
+        /// Skip the embedding pass at the end (notes stay pending)
+        #[arg(long)]
+        no_embed: bool,
         /// Provenance (required)
         #[arg(long)]
         source: String,
@@ -107,6 +110,15 @@ enum Command {
     Search {
         /// Query text
         text: String,
+        /// text | vector | hybrid (default: hybrid when an embedder is ready)
+        #[arg(long)]
+        mode: Option<String>,
+        /// Fusion for hybrid search: rrf | convex-0.3 | convex-0.5 | convex-0.7
+        #[arg(long)]
+        fusion: Option<String>,
+        /// Abstention threshold for vector-only results (default 0.30)
+        #[arg(long)]
+        tau: Option<f32>,
         #[arg(long, default_value = "10")]
         k: usize,
         /// Graph expansion 0-2
@@ -169,9 +181,23 @@ enum Command {
         /// Import a plain Obsidian vault
         #[arg(long)]
         obsidian: bool,
+        /// Skip the embedding pass at the end (notes stay pending)
+        #[arg(long)]
+        no_embed: bool,
     },
     /// Export the cell as an Engramma folder
     Export { dir: PathBuf },
+    /// Manage embedding models (list, pull, use)
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+    /// Embed pending notes with the configured embedder
+    Embed {
+        /// Re-embed every living note, even fresh ones
+        #[arg(long)]
+        all: bool,
+    },
     /// Verify the log (hash chain + replay)
     Verify,
     /// Start the MCP server (stdio, read-only)
@@ -180,6 +206,16 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         cells: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ModelAction {
+    /// List the known models and their state in this cell
+    List,
+    /// Download a model (pinned revision, sha256-verified)
+    Pull { id: String },
+    /// Set the cell's embedding model (blue/green: builds while the old one serves)
+    Use { id: String },
 }
 
 #[derive(Subcommand)]
@@ -342,6 +378,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Cell { action } => run_cell(cli, action),
         Command::Add {
             file,
+            no_embed,
             source,
             confidence,
             r#type,
@@ -372,10 +409,23 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 confidence,
             );
             cell.put_note(&note, "cli")?;
+            let embedded = if *no_embed {
+                None
+            } else {
+                embed_after_write(cli, &cell)?
+            };
             if cli.json {
-                print_json(&serde_json::json!({ "id": note.id.to_string() }));
+                let mut v = serde_json::json!({ "id": note.id.to_string() });
+                if let Some((done, remaining)) = embedded {
+                    v["embedded"] = done.into();
+                    v["pending"] = remaining.into();
+                }
+                print_json(&v);
             } else {
                 println!("aggiunta: {}", note.id);
+                if let Some((done, remaining)) = embedded {
+                    println!("incorporate: {done} (in attesa: {remaining})");
+                }
             }
             Ok(())
         }
@@ -505,6 +555,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Search {
             text,
+            mode,
+            fusion,
+            tau,
             k,
             hops,
             as_of,
@@ -528,10 +581,69 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             if let Some(l) = lang {
                 q.lang = Some(Lang::parse(l).map_err(|e| CliError::usage(e.to_string()))?);
             }
-            let hits = cell.search(&q)?;
+            // Semantic side: the configured embedder decides what "hybrid"
+            // (the default) can do.
+            let embedder = load_embedder_or_warn(cli)?;
+            let ready_model = cell.models().ok().and_then(|ms| {
+                ms.into_iter()
+                    .find(|m| m.state == engramma_core::ModelState::Ready)
+            });
+            let hybrid_ready = embedder.as_ref().is_some_and(|e| {
+                ready_model
+                    .as_ref()
+                    .is_some_and(|m| e.model_id() == m.model)
+            });
+            let chosen = match mode.as_deref() {
+                Some("text") => "text",
+                Some("vector") | Some("hybrid") if hybrid_ready => {
+                    mode.as_deref().unwrap_or("hybrid")
+                }
+                Some("vector") | Some("hybrid") => {
+                    return Err(CliError::usage(
+                        "no ready embedding model for this cell: run `engramma model use <id>` \
+                         and `engramma embed`, or search with --mode text",
+                    ));
+                }
+                Some(other) => {
+                    return Err(CliError::usage(format!(
+                        "unknown --mode `{other}` (text, vector, hybrid)"
+                    )));
+                }
+                None if hybrid_ready => "hybrid",
+                None => "text",
+            };
+            let outcome = if chosen == "text" {
+                let hits = cell.search(&q)?;
+                engramma_core::search::SearchOutcome {
+                    hits,
+                    embed_ms: 0.0,
+                    search_ms: 0.0,
+                }
+            } else {
+                let e = embedder
+                    .as_ref()
+                    .unwrap_or_else(|| unreachable!("hybrid_ready implies an embedder"));
+                let mut sem = engramma_core::search::Semantic::new(std::sync::Arc::clone(e))
+                    .with_tau(tau.unwrap_or(0.30));
+                if let Some(f) = fusion.as_deref() {
+                    sem = sem.with_fusion(parse_fusion(f)?);
+                }
+                if chosen == "vector" {
+                    cell.search_semantic(&q, &sem.with_mode(engramma_core::search::Mode::Vector))?
+                } else {
+                    cell.search_semantic(&q, &sem)?
+                }
+            };
+            let hits = outcome.hits;
             if cli.json {
                 let arr: Vec<serde_json::Value> = hits.iter().map(hit_json).collect();
-                print_json(&serde_json::json!({ "query": text, "hits": arr }));
+                print_json(&serde_json::json!({
+                    "query": text,
+                    "mode": chosen,
+                    "embed_ms": outcome.embed_ms,
+                    "search_ms": outcome.search_ms,
+                    "hits": arr,
+                }));
             } else {
                 for (i, h) in hits.iter().enumerate() {
                     if i > 0 {
@@ -714,21 +826,38 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             report_ok(cli, "ripristinata", &id.to_string());
             Ok(())
         }
-        Command::Import { dir, obsidian } => {
+        Command::Import {
+            dir,
+            obsidian,
+            no_embed,
+        } => {
             let cell = open_cell(cli)?;
             let summary = if *obsidian {
                 import_obsidian(&cell, dir, "cli")?
             } else {
                 import_cell(&cell, dir, "cli")?
             };
+            let embedded = if *no_embed {
+                None
+            } else {
+                embed_after_write(cli, &cell)?
+            };
             if cli.json {
-                print_json(&serde_json::json!({
+                let mut v = serde_json::json!({
                     "imported": summary.imported,
                     "skipped": summary.skipped,
                     "errors": summary.errors,
                     "warnings": summary.warnings,
-                }));
+                });
+                if let Some((done, remaining)) = embedded {
+                    v["embedded"] = done.into();
+                    v["pending"] = remaining.into();
+                }
+                print_json(&v);
             } else {
+                if let Some((done, remaining)) = embedded {
+                    println!("incorporate: {done} (in attesa: {remaining})");
+                }
                 println!("importate: {}", summary.imported);
                 println!("saltate: {}", summary.skipped.len());
                 for s in &summary.skipped {
@@ -757,6 +886,46 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 println!("esportate: {} note in {}", s.written, dir.display());
                 if !s.errors.is_empty() {
                     println!("errori: {}", s.errors.len());
+                }
+            }
+            Ok(())
+        }
+        Command::Model { action } => run_model(cli, action),
+        Command::Embed { all } => {
+            let cell = open_cell(cli)?;
+            let Some(embedder) = load_embedder_or_warn(cli)? else {
+                return Err(CliError::usage(
+                    "no embedder configured: write <root>/config.json with \
+                     {\"embedder\": {\"kind\": \"builtin\", \"model\": \"granite-embedding-97m-multilingual-r2\"}}",
+                ));
+            };
+            let mut done_total = 0_usize;
+            let mut promoted = None;
+            loop {
+                let report = if *all && done_total == 0 {
+                    // one force pass, then normal passes settle the count
+                    cell.embed_all(embedder.as_ref(), 512)?
+                } else {
+                    cell.embed_pending(embedder.as_ref(), 512)?
+                };
+                done_total += report.done;
+                if report.promoted.is_some() {
+                    promoted = report.promoted.clone();
+                }
+                if report.remaining == 0 || report.done == 0 {
+                    break;
+                }
+            }
+            if cli.json {
+                let mut v = serde_json::json!({ "embedded": done_total, "pending": 0 });
+                if let Some(p) = promoted {
+                    v["promoted"] = p.into();
+                }
+                print_json(&v);
+            } else {
+                println!("incorporate: {done_total} note");
+                if let Some(p) = promoted {
+                    println!("modello pronto: {p}");
                 }
             }
             Ok(())
@@ -866,4 +1035,218 @@ fn tempfile_in_engramma_tmp() -> Result<PathBuf, CliError> {
         engramma_core::id::new_ulid().map_err(CliError::from)?
     );
     Ok(dir.join(name))
+}
+
+// ---------------------------------------------------------------------------
+// embedding: CLI plumbing (models, embed passes, search helpers)
+// ---------------------------------------------------------------------------
+
+/// The configured embedder, or None with a stderr note when configuration is
+/// missing/broken. A cell without an embedder keeps the v0.1 search.
+fn load_embedder_or_warn(
+    cli: &Cli,
+) -> Result<Option<std::sync::Arc<dyn engramma_core::embed::Embedder>>, CliError> {
+    match engramma_embed::config::load_embedder(&root(cli)) {
+        Ok(Some(e)) => Ok(Some(e)),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            eprintln!("engramma: embedder configurato ma non utilizzabile: {e}");
+            Ok(None)
+        }
+    }
+}
+
+/// After a write command (add/import): embed what the cell is holding, when
+/// an embedder is configured and matches the cell's target model. Returns
+/// `(done, remaining)` or None when nothing ran.
+fn embed_after_write(cli: &Cli, cell: &Cell) -> Result<Option<(usize, usize)>, CliError> {
+    let Some(embedder) = load_embedder_or_warn(cli)? else {
+        return Ok(None);
+    };
+    // Wrong model (or no target yet): leave the notes pending, silently —
+    // `engramma embed` will say what to do.
+    let target_ok = cell
+        .models()
+        .ok()
+        .and_then(|ms| {
+            ms.into_iter()
+                .find(|m| m.state != engramma_core::ModelState::Retired)
+        })
+        .is_some_and(|m| m.model == embedder.model_id());
+    if !target_ok {
+        return Ok(None);
+    }
+    let report = cell
+        .embed_pending(embedder.as_ref(), 512)
+        .map_err(CliError::from)?;
+    Ok(Some((report.done, report.remaining)))
+}
+
+/// `engramma model list|pull|use`.
+fn run_model(cli: &Cli, action: &ModelAction) -> Result<(), CliError> {
+    let model_root = engramma_embed::spec::model_root();
+    match action {
+        ModelAction::List => {
+            // builtin specs + user folders, with the cell's state when known
+            let mut specs = engramma_embed::spec::ModelSpec::builtin_models();
+            // user folders (e.g. EmbeddingGemma, licence Gemma: never bundled)
+            if let Ok(entries) = std::fs::read_dir(&model_root) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if specs.iter().any(|s| s.id == name) {
+                        continue;
+                    }
+                    let dir = entry.path();
+                    let candidates = [
+                        dir.join("manifest.json"),
+                        dir.join(
+                            std::fs::read_dir(&dir)
+                                .ok()
+                                .and_then(|mut it| {
+                                    it.next()
+                                        .and_then(|e| e.ok())
+                                        .map(|e| e.path().join("manifest.json"))
+                                })
+                                .unwrap_or_else(|| dir.join("manifest.json")),
+                        ),
+                    ];
+                    if candidates.iter().any(|p| p.is_file()) {
+                        match engramma_embed::spec::resolve(&model_root, &name) {
+                            Ok((spec, _)) => specs.push(spec),
+                            Err(e) => eprintln!("engramma: {name}: {e}"),
+                        }
+                    }
+                }
+            }
+            let states = open_cell(cli)
+                .ok()
+                .and_then(|cell| cell.models().ok())
+                .unwrap_or_default();
+            let mut lines: Vec<serde_json::Value> = Vec::new();
+            for spec in &specs {
+                let present = spec
+                    .files
+                    .iter()
+                    .all(|f| spec.file_path(&model_root, f).is_file());
+                let state = states
+                    .iter()
+                    .find(|m| m.model == spec.model_id())
+                    .map(|m| m.state.as_str().to_string());
+                lines.push(serde_json::json!({
+                    "id": spec.id,
+                    "model_id": spec.model_id(),
+                    "dim": spec.dim,
+                    "max_tokens": spec.max_tokens,
+                    "bytes": spec.files.iter().map(|f| f.bytes).sum::<u64>(),
+                    "downloaded": present,
+                    "state": state,
+                }));
+            }
+            if cli.json {
+                print_json(
+                    &serde_json::json!({ "model_root": model_root.display().to_string(), "models": lines }),
+                );
+            } else {
+                println!("modelli in {}", model_root.display());
+                for l in &lines {
+                    let state = l["state"]
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "—".into());
+                    println!(
+                        "{}  {} dim, {} MB, {}, stato: {}",
+                        l["id"].as_str().unwrap_or("?"),
+                        l["dim"],
+                        l["bytes"].as_u64().unwrap_or(0) / 1_000_000,
+                        if l["downloaded"].as_bool().unwrap_or(false) {
+                            "scaricato"
+                        } else {
+                            "da scaricare"
+                        },
+                        state,
+                    );
+                }
+            }
+            Ok(())
+        }
+        ModelAction::Pull { id } => {
+            // Only the pinned builtin specs are downloadable.
+            let spec = engramma_embed::spec::ModelSpec::builtin_models()
+                .into_iter()
+                .find(|s| s.id == *id || s.model_id().starts_with(&format!("{id}@")))
+                .ok_or_else(|| {
+                    CliError::usage(format!(
+                        "`{id}` is not a downloadable model (see `engramma model list`)"
+                    ))
+                })?;
+            let report = engramma_embed::pull::pull(
+                &model_root,
+                &spec,
+                None,
+                std::time::Duration::from_secs(600),
+            )
+            .map_err(|e| CliError::internal(e.to_string()))?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "pulled": spec.model_id(),
+                    "downloaded": report.downloaded,
+                    "skipped": report.skipped,
+                }));
+            } else {
+                println!("scaricato: {} in {}", spec.model_id(), model_root.display());
+            }
+            Ok(())
+        }
+        ModelAction::Use { id } => {
+            let (spec, _dir) = engramma_embed::spec::resolve(&model_root, id)
+                .map_err(|e| CliError::usage(e.to_string()))?;
+            let cell = open_cell(cli)?;
+            cell.add_model(&spec.model_id(), spec.dim)?;
+            // The configuration follows the choice: <root>/config.json now
+            // embeds with this model (remote embedders are configured by
+            // writing the file by hand, see docs/cli.md).
+            let cfg_path = root(cli).join("config.json");
+            let cfg = engramma_embed::config::EmbedderConfig {
+                kind: "builtin".into(),
+                model: spec.id.clone(),
+                url: None,
+                token_env: None,
+                dim: None,
+                max_tokens: None,
+            };
+            std::fs::write(
+                &cfg_path,
+                serde_json::to_string_pretty(&serde_json::json!({ "embedder": cfg }))
+                    .unwrap_or_default(),
+            )?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "model": spec.model_id(),
+                    "state": "building",
+                    "config": cfg_path.display().to_string(),
+                }));
+            } else {
+                println!(
+                    "modello {} in costruzione (config in {}): `engramma embed` lo riempie, \
+                     la ricerca continua con il modello attuale",
+                    spec.model_id(),
+                    cfg_path.display()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Parse `--fusion rrf|convex-0.3|convex-0.5|convex-0.7`.
+fn parse_fusion(s: &str) -> Result<engramma_core::search::Fusion, CliError> {
+    match s {
+        "rrf" => Ok(engramma_core::search::Fusion::Rrf { k: 60 }),
+        "convex-0.3" | "convex-0,3" => Ok(engramma_core::search::Fusion::Convex { alpha: 0.3 }),
+        "convex-0.5" | "convex-0,5" => Ok(engramma_core::search::Fusion::Convex { alpha: 0.5 }),
+        "convex-0.7" | "convex-0,7" => Ok(engramma_core::search::Fusion::Convex { alpha: 0.7 }),
+        other => Err(CliError::usage(format!(
+            "unknown --fusion `{other}` (rrf, convex-0.3, convex-0.5, convex-0.7)"
+        ))),
+    }
 }

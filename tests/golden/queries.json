@@ -282,5 +282,186 @@
     "q": "backend",
     "as_of": "2026-10-15",
     "expect_empty": true
+  },
+  {
+    "id": 37,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "in che città si è trasferita la coppia?",
+    "expect": [
+      "Fabio abita a Milano",
+      "Il trasloco da Roma",
+      "Giulia abita a Milano"
+    ]
+  },
+  {
+    "id": 38,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "quale bevanda ama senza nessun dolcificante?",
+    "expect": [
+      "amaro"
+    ]
+  },
+  {
+    "id": 39,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "che cosa cresce all'aperto dell'appartamento?",
+    "expect": [
+      "piante del terrazzino"
+    ]
+  },
+  {
+    "id": 40,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "quante sedute di ginnastica a settimana e in quali momenti?",
+    "expect": [
+      "palestra la mattina"
+    ]
+  },
+  {
+    "id": 41,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "dove mangiano fuori nel weekend?",
+    "expect": [
+      "sabato da Lucrezia"
+    ]
+  },
+  {
+    "id": 42,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "quali cibi la donna digerisce male?",
+    "expect": [
+      "lattosio"
+    ]
+  },
+  {
+    "id": 43,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "quale professione esercita la compagna?",
+    "expect": [
+      "architetta"
+    ]
+  },
+  {
+    "id": 44,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "che gita culinaria hanno fatto e da chi sono stati ospitati?",
+    "expect": [
+      "Viaggio a Torino"
+    ]
+  },
+  {
+    "id": 45,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "che materia spiegava il professore ai ragazzi?",
+    "expect": [
+      "matematica"
+    ]
+  },
+  {
+    "id": 46,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "quante camere ha l'immobile dove vivono ora?",
+    "expect": [
+      "casa di via Vigevano"
+    ]
+  },
+  {
+    "id": 47,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "qual era il motivo del cambiamento di residenza?",
+    "expect": [
+      "Perché il trasloco"
+    ]
+  },
+  {
+    "id": 48,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "che rivestimenti sono stati scelti per il locale igienico?",
+    "expect": [
+      "piano del bagno"
+    ]
+  },
+  {
+    "id": 49,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "quale strumento pratica lei dalla fanciullezza?",
+    "expect": [
+      "pianoforte"
+    ]
+  },
+  {
+    "id": 50,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "come ha salutato i vecchi compagni di team?",
+    "expect": [
+      "addio ai colleghi"
+    ]
+  },
+  {
+    "id": 51,
+    "category": "parafrasi",
+    "mode": "hybrid",
+    "q": "quando comincia la sua giornata e in quale giorno resta a domicilio?",
+    "expect": [
+      "L'orario di Fabio"
+    ]
+  },
+  {
+    "id": 52,
+    "category": "inglese",
+    "mode": "hybrid",
+    "q": "Which city do the two partners live in now?",
+    "expect": [
+      "Fabio abita a Milano",
+      "Milano"
+    ]
+  },
+  {
+    "id": 53,
+    "category": "inglese",
+    "mode": "hybrid",
+    "q": "Where do they usually have dinner on Saturday night?",
+    "expect": [
+      "sabato da Lucrezia"
+    ]
+  },
+  {
+    "id": 54,
+    "category": "inglese",
+    "mode": "hybrid",
+    "q": "What instrument does the woman of the house play?",
+    "expect": [
+      "pianoforte"
+    ]
+  },
+  {
+    "id": 55,
+    "category": "astensione semantica",
+    "mode": "hybrid",
+    "q": "che auto guida Giulia?",
+    "expect": [],
+    "expect_empty": true
+  },
+  {
+    "id": 56,
+    "category": "astensione semantica",
+    "mode": "hybrid",
+    "q": "quando si sono sposati Fabio e Giulia?",
+    "expect": [],
+    "expect_empty": true
   }
 ]
