@@ -321,14 +321,28 @@ impl Cell {
         Ok(())
     }
 
-    /// Run a read-only query returning one TEXT column per row. Meant for
-    /// tests and tooling that need to compare states.
+    /// Run a **read-only** query returning one TEXT column per row. Meant for
+    /// tests and tooling that need to compare states; not part of the public
+    /// contract (statements that are not read-only are refused).
     ///
     /// # Errors
-    /// [`CellError::Db`] when the query is not a single-column SELECT.
+    /// [`CellError::Invalid`] when the statement is not read-only or does not
+    /// return exactly one column; [`CellError::Db`] on SQL failure.
+    #[doc(hidden)]
     pub fn debug_column(&self, sql: &str) -> Result<Vec<String>, CellError> {
         let inner = self.lock()?;
         let mut stmt = inner.conn.prepare(sql)?;
+        if !stmt.readonly() {
+            return Err(CellError::Invalid(format!(
+                "debug_column is read-only: `{sql}` is not"
+            )));
+        }
+        if stmt.column_count() != 1 {
+            return Err(CellError::Invalid(format!(
+                "debug_column wants exactly one column: `{sql}` returns {}",
+                stmt.column_count()
+            )));
+        }
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .flatten()
@@ -1438,6 +1452,31 @@ mod tests {
             vec!["alfa beta gamma".to_string()],
             "tags_text must be sorted and space-joined"
         );
+    }
+
+    #[test]
+    fn debug_column_refuses_writes() {
+        let (_d, cell) = test_cell();
+        cell.put_note(&note(1, "x"), "t")
+            .unwrap(/* test-only */);
+        assert!(
+            cell.debug_column("SELECT id FROM notes WHERE status != 'deleted'")
+                .is_ok()
+        );
+        assert!(cell.debug_column("DELETE FROM notes").is_err());
+        assert!(
+            cell.debug_column("INSERT INTO meta (key, value) VALUES ('k', 'v')")
+                .is_err()
+        );
+        // and nothing ran behind the refusal
+        let n = cell
+            .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes")
+            .unwrap(/* test-only */);
+        assert_eq!(n, vec!["1".to_string()]);
+        let k = cell
+            .debug_column("SELECT value FROM meta WHERE key = 'k'")
+            .unwrap(/* test-only */);
+        assert!(k.is_empty());
     }
 
     #[test]
