@@ -22,6 +22,12 @@ allow = [
 # Unused allowances are fine (they document the policy); the current tree
 # happens not to need ISC, MPL-2.0 or Unicode-DFS-2016.
 confidence-threshold = 0.93
+# Mozilla's CA root bundle (data, not code) under a permissive data licence,
+# pulled by ureq for TLS to external embedding endpoints (v0.2). Allowed for
+# this crate only.
+exceptions = [
+  { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
 
 [bans]
 # Duplicated versions are tolerated (the resolver already minimises them);
