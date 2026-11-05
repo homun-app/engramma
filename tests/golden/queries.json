@@ -268,5 +268,19 @@
     "expect_not": [
       "vegetariano"
     ]
+  },
+  {
+    "id": 35,
+    "category": "astensione",
+    "q": "vegetariano",
+    "as_of": "2026-10-15",
+    "expect_empty": true
+  },
+  {
+    "id": 36,
+    "category": "astensione",
+    "q": "backend",
+    "as_of": "2026-10-15",
+    "expect_empty": true
   }
 ]
