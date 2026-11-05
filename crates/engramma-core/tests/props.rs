@@ -165,7 +165,7 @@ proptest! {
     fn replay_equals_state(seed in any::<u64>()) {
         let dir = tempfile::tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* test-only */);
-        run_random_ops(&cell, seed, 12);
+        run_random_ops(&cell, seed, ops_count(seed));
         let report = cell.verify().unwrap(/* test-only */);
         prop_assert!(report.ok(), "verify failed: {:?}", report.mismatch);
     }
@@ -175,7 +175,7 @@ proptest! {
     fn export_import_equality(seed in any::<u64>()) {
         let dir = tempfile::tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* test-only */);
-        run_random_ops(&cell, seed, 10);
+        run_random_ops(&cell, seed, ops_count(seed));
         // close open-ended state: delete nothing, just export
         let out = dir.path().join("exp");
         export(&cell, &out).unwrap(/* test-only */);
@@ -248,9 +248,16 @@ proptest! {
     }
 }
 
-/// A deterministic pseudo-random op sequence (xorshift), enough to exercise
-/// every op kind.
-fn run_random_ops(cell: &Cell, seed: u64, n: u16) {
+/// How many ops a property case runs: 40–60, mixed by seed.
+fn ops_count(seed: u64) -> u16 {
+    u16::try_from(40 + (seed % 21)).unwrap_or(40)
+}
+
+/// A deterministic pseudo-random op sequence (xorshift). The target note is
+/// drawn at random among the known ones — pinning it to `notes.first()` let
+/// one delete silence almost every later op — and every OpKind gets a chance
+/// to fire. Returns how many ops of each kind **succeeded**.
+fn run_random_ops(cell: &Cell, seed: u64, n: u16) -> std::collections::HashMap<OpKind, usize> {
     let mut s = seed | 1;
     let mut next = move || {
         s ^= s << 13;
@@ -259,63 +266,67 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) {
         s
     };
     let mut notes: Vec<Ulid> = Vec::new();
-    let mut version_targets: Vec<(Ulid, i64)> = Vec::new();
+    let mut quarantined: Vec<Ulid> = Vec::new(); // non-external, via set_status
+    let mut counts: std::collections::HashMap<OpKind, usize> = std::collections::HashMap::new();
+    let draw = |pool: &[Ulid], rnd: u64| -> Option<Ulid> {
+        if pool.is_empty() {
+            None
+        } else {
+            pool.get((rnd % pool.len() as u64) as usize).copied()
+        }
+    };
     for i in 0..n {
-        let note = any_note_of(next(), i);
-        let choice = next() % 10;
-        let known = notes.clone();
+        let choice = next() % 11;
+        let fresh = any_note_of(next(), i);
         match choice {
-            0..=3 => {
-                if cell.put_note(&note, "prop").is_ok() {
-                    notes.push(note.id);
+            0..=2 => {
+                if cell.put_note(&fresh, "prop").is_ok() {
+                    notes.push(fresh.id);
+                    *counts.entry(OpKind::PutNote).or_insert(0) += 1;
                 }
             }
-            4 => {
-                if let Some(id) = known.first() {
+            3 => {
+                if let Some(id) = draw(&notes, next()) {
                     let patch = NotePatch {
                         body: Some(format!("corpo {}", next() % 100)),
                         ..Default::default()
                     };
-                    if cell.patch_note(id, &patch, "prop").is_ok() {
-                        version_targets.push((
-                            *id,
-                            cell.history(id).map(|h| h.len() as i64).unwrap_or(1).max(1),
-                        ));
+                    if cell.patch_note(&id, &patch, "prop").is_ok() {
+                        *counts.entry(OpKind::PatchNote).or_insert(0) += 1;
+                    }
+                }
+            }
+            4 => {
+                if let Some(id) = draw(&notes, next()) {
+                    let mut new = any_note_of(next(), i + 1000);
+                    new.supersedes = vec![id];
+                    if cell.supersede(&id, &new, None, "prop").is_ok() {
+                        notes.push(new.id);
+                        *counts.entry(OpKind::Supersede).or_insert(0) += 1;
                     }
                 }
             }
             5 => {
-                if let Some(id) = known.first() {
-                    let mut new = any_note_of(next(), i + 1000);
-                    new.supersedes = vec![*id];
-                    if cell.supersede(id, &new, None, "prop").is_ok() {
-                        notes.push(new.id);
-                    }
+                if let Some(id) = draw(&notes, next())
+                    && cell.delete_note(&id, "prop").is_ok()
+                {
+                    *counts.entry(OpKind::DeleteNote).or_insert(0) += 1;
                 }
             }
             6 => {
-                if let Some(id) = known.first() {
-                    let _ = cell.delete_note(id, "prop");
-                }
-            }
-            7 => {
-                if let Some(_id) = known.first() {
-                    let mut ext = any_note_of(next(), i + 2000);
-                    ext.confidence = Confidence::External;
-                    ext.status = Status::Quarantined;
-                    ext.source = "import:web".into();
-                    if cell.put_note(&ext, "prop").is_ok() {
-                        let _ = cell.confirm(&ext.id, "prop");
+                let mut ext = any_note_of(next(), i + 2000);
+                ext.confidence = Confidence::External;
+                ext.status = Status::Quarantined;
+                ext.source = "import:web".into();
+                if cell.put_note(&ext, "prop").is_ok() {
+                    *counts.entry(OpKind::PutNote).or_insert(0) += 1;
+                    if cell.confirm(&ext.id, "prop").is_ok() {
                         notes.push(ext.id);
+                        *counts.entry(OpKind::Confirm).or_insert(0) += 1;
                     }
                 }
             }
-            8 => {
-                if let Some((id, _)) = version_targets.first() {
-                    let _ = cell.restore(id, 1, "prop");
-                }
-            }
-            _ => {
+            7 => {
                 let edge = engramma_core::cell::EdgeInput {
                     src: "Alfa".into(),
                     rel: "rel_x".into(),
@@ -326,15 +337,81 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) {
                     confidence: Confidence::Stated,
                 };
                 if let Ok(edge_id) = cell.link(&edge, "prop") {
-                    let _ = cell.unlink(&edge_id, "prop");
+                    *counts.entry(OpKind::Link).or_insert(0) += 1;
+                    if cell.unlink(&edge_id, "prop").is_ok() {
+                        *counts.entry(OpKind::Unlink).or_insert(0) += 1;
+                    }
+                }
+            }
+            8 => {
+                // restore a version that exists, on a random note
+                if let Some(id) = draw(&notes, next())
+                    && let Ok(history) = cell.history(&id)
+                    && !history.is_empty()
+                {
+                    let v = history[(next() as usize) % history.len()].version;
+                    if cell.restore(&id, v, "prop").is_ok() {
+                        *counts.entry(OpKind::Restore).or_insert(0) += 1;
+                    }
+                }
+            }
+            9 => {
+                // quarantine a random non-external note (never via put)
+                if let Some(id) = draw(&notes, next()) {
+                    let is_external = cell
+                        .get(&id)
+                        .map(|n| n.confidence == Confidence::External)
+                        .unwrap_or(true);
+                    let already = quarantined.contains(&id);
+                    if !is_external
+                        && !already
+                        && cell.set_status(&id, Status::Quarantined, "prop").is_ok()
+                    {
+                        quarantined.push(id);
+                        *counts.entry(OpKind::SetStatus).or_insert(0) += 1;
+                    }
+                }
+            }
+            _ => {
+                // release a quarantined (non-external) note back to active
+                if let Some(id) = quarantined.pop() {
+                    let restored = cell.set_status(&id, Status::Active, "prop").is_ok();
+                    if restored {
+                        *counts.entry(OpKind::SetStatus).or_insert(0) += 1;
+                    }
                 }
             }
         }
     }
-    // every op kind that fired leaves a trace in the log
-    let ops = cell.ops().unwrap(/* test-only */);
-    let kinds: Vec<OpKind> = ops.iter().map(|o| o.kind).collect();
-    let _ = kinds;
+    counts
+}
+
+#[test]
+fn random_ops_cover_every_kind() {
+    // 256 seeds; count the SUCCEEDED ops per kind: each must fire at least
+    // 20 times, so no branch of the generator silently rots.
+    let mut totals = std::collections::HashMap::<OpKind, usize>::new();
+    for seed in 0..256u64 {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* t */);
+        // the cell's own creation is the init op
+        *totals.entry(OpKind::Init).or_insert(0) += 1;
+        for (kind, n) in run_random_ops(&cell, seed, ops_count(seed)) {
+            *totals.entry(kind).or_insert(0) += n;
+        }
+    }
+    let mut missing = Vec::new();
+    for kind in OpKind::ALL {
+        let got = totals.get(&kind).copied().unwrap_or(0);
+        if got < 20 {
+            missing.push(format!("{kind:?}: {got}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "op kinds under 20 successes over 256 seeds: {}",
+        missing.join(", ")
+    );
 }
 
 fn any_note_of(seed: u64, i: u16) -> Note {

@@ -1252,6 +1252,114 @@ mod tests {
         );
     }
 
+    /// Rebuild a full state from an op slice, in memory.
+    fn rebuild_state(ops: &[Op]) -> Result<Connection, CellError> {
+        let mut conn = Connection::open_in_memory()?;
+        configure(&conn)?;
+        let tx = conn.transaction()?;
+        schema::migrate(&tx)?;
+        for op in ops {
+            ops::apply(&tx, op)?;
+        }
+        tx.commit()?;
+        Ok(conn)
+    }
+
+    /// A compact op mix for the replay tests (put/patch/supersede/delete and
+    /// manual edges), targets drawn at random.
+    fn replay_mix(cell: &Cell, seed: u64, n: u16) {
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut notes: Vec<Ulid> = Vec::new();
+        let draw = |pool: &[Ulid], rnd: u64| -> Option<Ulid> {
+            if pool.is_empty() {
+                None
+            } else {
+                pool.get((rnd % pool.len() as u64) as usize).copied()
+            }
+        };
+        for i in 0..n {
+            let n1 = note(i + 1, "corpo [[Milano]]");
+            let n2 = note(i + 500, "sostituto [[Roma]]");
+            match next() % 5 {
+                0 | 1 => {
+                    if cell.put_note(&n1, "t").is_ok() {
+                        notes.push(n1.id);
+                    }
+                }
+                2 => {
+                    if let Some(id) = draw(&notes, next()) {
+                        let patch = NotePatch {
+                            body: Some(format!("nuovo {}", next() % 50)),
+                            ..Default::default()
+                        };
+                        let _ = cell.patch_note(&id, &patch, "t");
+                    }
+                }
+                3 => {
+                    if let Some(id) = draw(&notes, next()) {
+                        let _ = cell.delete_note(&id, "t");
+                    }
+                }
+                _ => {
+                    if let Some(id) = draw(&notes, next())
+                        && cell.supersede(&id, &n2, None, "t").is_ok()
+                    {
+                        notes.push(n2.id);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_replay_matches_full_replay() {
+        // The replication shape (§9): a replica holds ops[..k], receives
+        // changes_since(k) and ends in exactly the same state as a full
+        // replay — for random k and the boundaries.
+        for seed in 1..=6u64 {
+            let dir = tempfile::tempdir().unwrap(/* test-only */);
+            let path = dir.path().join(format!("inc-{seed}.sqlite"));
+            let cell = Cell::create(&path, "inc", "t").unwrap(/* test-only */);
+            replay_mix(&cell, seed, 36);
+            let all = cell.ops().unwrap(/* test-only */);
+            assert!(!all.is_empty());
+            let full = rebuild_state(&all).unwrap(/* test-only */);
+            {
+                let inner = cell.lock().unwrap(/* test-only */);
+                let diff = compare_states(&inner.conn, &full).unwrap(/* t */);
+                assert!(
+                    diff.is_none(),
+                    "full replay diverged (seed {seed}): {diff:?}"
+                );
+            }
+            // one random k per seed plus the boundaries
+            let s = (seed * 2) | 1;
+            let random_k = ((s * 2_654_435_761) as usize) % (all.len() + 1);
+            let mut ks = vec![0, all.len() / 2, all.len().saturating_sub(1), all.len()];
+            ks.push(random_k);
+            ks.sort_unstable();
+            ks.dedup();
+            for k in ks {
+                let k = k.min(all.len());
+                let tail = cell.changes_since(k as i64).unwrap(/* test-only */);
+                let mut combined = all[..k].to_vec();
+                combined.extend(tail);
+                let inc = rebuild_state(&combined).unwrap(/* test-only */);
+                let diff = compare_states(&full, &inc).unwrap(/* test-only */);
+                assert!(
+                    diff.is_none(),
+                    "incremental replay from k={k} diverged (seed {seed}): {diff:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn tampering_the_kind_column_breaks_verify() {
         let (_d, cell) = test_cell();

@@ -18,7 +18,7 @@ use crate::format::{Note, Status, Validity};
 use crate::text;
 
 /// Operation kinds (one row in `ops` each).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpKind {
     /// Cell creation: writes `cell_id` and `name` into `meta`.
     Init,
@@ -43,6 +43,20 @@ pub enum OpKind {
 }
 
 impl OpKind {
+    /// Every kind, in declaration order (tests count coverage).
+    pub const ALL: [OpKind; 10] = [
+        OpKind::Init,
+        OpKind::PutNote,
+        OpKind::PatchNote,
+        OpKind::SetStatus,
+        OpKind::Supersede,
+        OpKind::DeleteNote,
+        OpKind::Restore,
+        OpKind::Link,
+        OpKind::Unlink,
+        OpKind::Confirm,
+    ];
+
     /// Wire name.
     pub fn as_str(&self) -> &'static str {
         match self {
