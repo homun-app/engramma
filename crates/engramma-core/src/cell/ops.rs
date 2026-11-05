@@ -489,6 +489,13 @@ fn write_note(
             "an `external` note can only be `quarantined` (only `confirm` promotes it)".into(),
         ));
     }
+    // Manual edges that cite this note follow its status in the same
+    // operation (deterministic, replayed like the rest): a quarantined or
+    // deleted note must not keep its manual edges visible.
+    tx.execute(
+        "UPDATE edges SET status = ?2 WHERE note_id = ?1 AND id NOT LIKE 'd%'",
+        rusqlite::params![note.id.to_string(), note.status.as_str()],
+    )?;
     let lang = note
         .lang
         .or_else(|| text::detect_lang(&format!("{}\n{}", note.display_title(), note.body)));
@@ -994,20 +1001,33 @@ fn apply_link(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
             ensure_entity(tx, endpoint)?;
         }
     }
+    // A manual edge is born with the status of the note it cites (when it
+    // cites one): visibility must be coherent from the first moment, not only
+    // after the note's next write.
+    let cited = e.get("note_id").and_then(Value::as_str);
+    let status = match cited {
+        Some(note_id) => tx
+            .query_row("SELECT status FROM notes WHERE id = ?1", [note_id], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap_or_else(|_| "active".to_string()),
+        None => "active".to_string(),
+    };
     tx.execute(
         "INSERT INTO edges (id, src, rel, dst, note_id, valid_from, valid_to, confidence, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active')",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             id,
             src,
             rel,
             dst,
-            e.get("note_id").and_then(Value::as_str),
+            cited,
             e.get("valid_from").and_then(Value::as_str),
             e.get("valid_to").and_then(Value::as_str),
             e.get("confidence")
                 .and_then(Value::as_str)
                 .unwrap_or("stated"),
+            status,
         ],
     )?;
     Ok(())

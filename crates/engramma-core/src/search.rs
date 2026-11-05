@@ -1377,6 +1377,55 @@ mod tests {
     }
 
     #[test]
+    fn manual_edge_with_note_follows_its_lifecycle() {
+        // v0.1.1 leftover: a manual edge that cites a note must follow that
+        // note through quarantine/confirm/delete, in the same operation, and
+        // the replay must reproduce it.
+        let (_d, cell) = setup();
+        let cited = note(9, "Nota citata", "un fatto su [[Milano]].", NoteType::Fact);
+        cell.put_note(&cited, "t").unwrap(/* test-only */);
+        cell.link(
+            &crate::cell::EdgeInput {
+                src: "Fabio".into(),
+                rel: "friend_of".into(),
+                dst: "Monza".into(),
+                note_id: Some(cited.id),
+                valid_from: None,
+                valid_to: None,
+                confidence: Confidence::Stated,
+            },
+            "t",
+        )
+        .unwrap(/* test-only */);
+        let edge_vis = |cell: &Cell, flag: bool| -> bool {
+            cell.neighbors("Fabio", 1, &[], flag)
+                .unwrap(/* test-only */)
+                .iter()
+                .any(|n| n.rel == "friend_of")
+        };
+        assert!(edge_vis(&cell, false), "fresh manual edge is visible");
+        // quarantine the cited note: the edge disappears
+        cell.set_status(&cited.id, Status::Quarantined, "t")
+            .unwrap(/* test-only */);
+        assert!(
+            !edge_vis(&cell, false),
+            "the manual edge must hide with its note"
+        );
+        assert!(edge_vis(&cell, true), "include_quarantined still shows it");
+        // confirm brings it back
+        cell.confirm(&cited.id, "t").unwrap(/* test-only */);
+        assert!(edge_vis(&cell, false), "confirm restores the edge");
+        // a later delete hides it again
+        cell.delete_note(&cited.id, "t").unwrap(/* test-only */);
+        assert!(
+            !edge_vis(&cell, true),
+            "a deleted note's manual edge never comes back"
+        );
+        // and the replay reproduces the whole story
+        assert!(cell.verify().unwrap(/* test-only */).ok());
+    }
+
+    #[test]
     fn hostile_names_travel_as_parameters() {
         let (_d, cell) = setup();
         // an entity with an apostrophe and a relation that closes the quoted
