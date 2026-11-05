@@ -113,9 +113,10 @@ link.
    explicit.
 2. Then `x-*` keys in their original order.
 3. Lists are flow: `[a, b]` after a tag name or a comma+space; empty list `[]`.
-4. Strings are emitted bare when they contain none of `:#{}[],&*?|<>=!%@\`"'` or
-   leading/trailing space, are non-empty, and do not parse as a bool, null or
-   number; otherwise single-quoted with `''` escaping.
+4. Strings are emitted bare when they contain no `": "` sequence, no trailing
+   `:`, no `" #"` sequence, no leading `#` or whitespace, none of
+   `{}[],&*?|<>=!%@\`"'` (and no tab/newline), are non-empty, and do not parse
+   as a bool, null or number; otherwise single-quoted with `''` escaping.
 5. `x-*` values are emitted in flow style; maps `{k: v, k2: v2}` (insertion
    order), nested values by the same rules; null as `null`.
 6. `valid_*` serialise as written (date stays a date); `*_at` as

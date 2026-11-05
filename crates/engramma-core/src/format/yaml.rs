@@ -149,22 +149,28 @@ impl YamlValue {
     }
 }
 
-/// Does a plain scalar need single quotes to survive a round trip?
+/// Does a plain scalar need single quotes to survive a round trip? Follows the
+/// YAML plain-scalar rules that matter here: no `": "` or trailing `:`, no
+/// `" #"` or leading `#`, none of the flow/reserved indicators, and nothing
+/// that would read back as a bool, null or number.
 fn needs_quoting(s: &str) -> bool {
     if s.is_empty()
         || s.starts_with(' ')
         || s.ends_with(' ')
+        || s.contains(": ")
+        || s.ends_with(':')
+        || s.contains(" #")
+        || s.starts_with('#')
         || s.chars().any(|c| {
             matches!(
                 c,
-                ':' | '#' | '{' | '}' | '[' | ']' | ',' | '&' | '*' | '?' | '|' | '-' | '<'
-                    | '>' | '=' | '!' | '%' | '@' | '`' | '"' | '\'' | '\n' | '\t'
+                '{' | '}' | '[' | ']' | ',' | '&' | '*' | '?' | '|' | '<' | '>' | '=' | '!'
+                    | '%' | '@' | '`' | '"' | '\'' | '\n' | '\t'
             )
         })
     {
         return true;
     }
-    // A bare scalar must not be read back as bool, null or a number.
     let lower = s.to_ascii_lowercase();
     matches!(
         lower.as_str(),

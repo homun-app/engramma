@@ -486,7 +486,7 @@ impl Note {
         let line = |out: &mut String, k: &str, v: String| {
             let _ = writeln!(out, "{k}: {v}");
         };
-        line(&mut out, "id", self.id.to_string());
+        line(&mut out, "id", YamlValue::emit_scalar(&self.id.to_string()));
         line(&mut out, "type", self.note_type.as_str().to_string());
         if let Some(t) = &self.title {
             line(&mut out, "title", YamlValue::emit_scalar(t));
@@ -504,10 +504,10 @@ impl Note {
         line(&mut out, "confidence", self.confidence.as_str().to_string());
         line(&mut out, "status", self.status.as_str().to_string());
         if let Some(v) = &self.valid_from {
-            line(&mut out, "valid_from", v.to_db_string());
+            line(&mut out, "valid_from", YamlValue::emit_scalar(&v.to_db_string()));
         }
         if let Some(v) = &self.valid_to {
-            line(&mut out, "valid_to", v.to_db_string());
+            line(&mut out, "valid_to", YamlValue::emit_scalar(&v.to_db_string()));
         }
         if !self.supersedes.is_empty() {
             line(
@@ -516,8 +516,8 @@ impl Note {
                 emit_list(&self.supersedes.iter().map(|u| u.to_string()).collect::<Vec<_>>()),
             );
         }
-        line(&mut out, "created_at", self.created_at.to_db_string());
-        line(&mut out, "updated_at", self.updated_at.to_db_string());
+        line(&mut out, "created_at", YamlValue::emit_scalar(&self.created_at.to_db_string()));
+        line(&mut out, "updated_at", YamlValue::emit_scalar(&self.updated_at.to_db_string()));
         for (k, v) in &self.extensions {
             line(&mut out, k, v.emit_flow());
         }
