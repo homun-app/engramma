@@ -153,8 +153,24 @@ Il trait `CellStore` isola SQL, FTS e vettori: un'implementazione SQLite oggi, T
 - La stessa normalizzazione si applica alla domanda.
 
 ### 6.2 Significato (v0.2)
-- Vettori in `sqlite-vec`, oggi a ricerca esatta: va bene dentro una cella fino a qualche centinaio di migliaia di note. Lo stato di un indice approssimato in sqlite-vec va **verificato in v0.2**. Se manca, una cella oltre una certa soglia usa `usearch` (HNSW) solo lei.
-- Si calcola un vettore per nota, più uno per blocco se la nota è lunga.
+> **Rivisto il 2026-11-05, misurando:** in v0.2 niente `sqlite-vec`.
+> - **Stato di sqlite-vec:** la versione stabile (0.1.9) fa solo ricerca esatta. DiskANN e IVF esistono soltanto nelle `0.1.10-alpha`.
+> - **Misure su 100 000 vettori da 384 dimensioni:**
+>
+>   | metodo | p50 |
+>   |---|---|
+>   | sqlite-vec, float esatto | 28 ms |
+>   | sqlite-vec, bit | 14 ms |
+>   | Rust, int8 top-200 + ricalcolo f32 | 0,7 ms |
+> - **Costo d'integrazione:** sqlite-vec richiederebbe un `unsafe` per registrare l'estensione.
+- **I vettori sono dati derivati:**
+  - stanno in una tabella `note_vectors` della cella (f32, con modello e hash del testo);
+  - non entrano nel registro, nel rigioco né nell'export: si ricalcolano dalle note. Così il determinismo del § 4.3 non dipende dalla virgola mobile delle piattaforme.
+- **Indice dietro il trait `VectorIndex`:**
+  - v0.2: `FlatI8`, una scansione esatta su int8 in memoria più il ricalcolo in f32 dei primi candidati, costruita pigramente alla prima ricerca;
+  - in seguito, per celle oltre il milione di note, un HNSW (`usearch`) o DiskANN di sqlite-vec quando sarà stabile.
+- **Unità di indicizzazione:** un vettore per nota, oppure per blocco di paragrafi se la nota supera `max_tokens`. Il punteggio della nota è il massimo dei suoi blocchi.
+- **Filtri:** i candidati vettoriali passano dagli stessi filtri di quelli testuali (quarantena compresa) **prima** della fusione e dell'allargamento nel grafo.
 
 ### 6.3 La domanda
 
@@ -185,14 +201,18 @@ query {
 
 ## 7. Embedding
 
-- Il trait `Embedder` ha tre implementazioni:
-  - **incorporato** (ONNX Runtime via `ort`), quello predefinito;
-  - **Ollama**;
-  - **HTTP esterno**, per il server.
-- **Il modello predefinito si decide misurando, in v0.2**, sul benchmark italiano (§ 11). Candidati verificati oggi:
-  - **IBM Granite Embedding 97M Multilingual R2**: Apache 2.0, aprile 2026, piccolo;
-  - **EmbeddingGemma 308M**: il più forte sotto i 500M secondo Google, ma con **licenza Gemma, non open source**: si può supportare, non includere di serie.
-- Ogni vettore porta il modello e la dimensione. Se si cambia modello, un lavoro in background ricalcola tutto, e la ricerca per significato si spegne finché non ha finito.
+- Il trait `Embedder` sta nel nucleo (senza I/O) e ha tre implementazioni in `engramma-embed`:
+  - **incorporato**, quello predefinito: ONNX via **tract**, in puro Rust. *Deciso il 2026-11-05:* dà gli stessi vettori di ONNX Runtime (cos 1,000000 su Granite R2), senza librerie native da distribuire, quindi anche su mobile e WASM. `ort` è più veloce (~2×), ma è ancora in rc e scarica binari: in futuro sarà al più un backend facoltativo. candle è scartato, perché il suo ModernBERT ha l'attivazione fissa (gelu) e Granite R2 usa `silu`;
+  - **Ollama** (`/api/embed`);
+  - **HTTP compatibile OpenAI** (`/v1/embeddings`), per il server.
+- **Il modello predefinito si decide misurando, in v0.2**, sul benchmark italiano (§ 11). Candidati verificati il 2026-11-05:
+  - **IBM Granite Embedding Multilingual R2**, Apache 2.0, ModernBERT, italiano tra le lingue di addestramento, nessun prefisso:
+    - 97M: 384 dimensioni, MTEB Multilingual Retrieval 60,3;
+    - 311M: 768 dimensioni con Matryoshka, 65,2.
+  - **EmbeddingGemma 308M** (62,5), con **licenza Gemma, non open source**: supportato come cartella fornita dall'utente, non incluso né scaricato di serie.
+  - I modelli si scaricano con `engramma model pull`, con revisione e sha256 fissati.
+- **Cambio di modello «blu/verde».** Ogni vettore porta il modello e l'hash del testo. Il modello nuovo si costruisce (`building`) mentre il vecchio (`ready`) continua a servire la ricerca; lo scambio è atomico a copertura completa. La ricerca per significato non si spegne mai. *Rivisto il 2026-11-05:* prima si spegneva durante il ricalcolo.
+- **Le scritture non calcolano embedding:** le note nuove restano in attesa, e `embed_pending` le elabora a lotti. L'inserimento resta veloce.
 
 ## 8. Come si usa
 
@@ -298,7 +318,7 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 | Versione | Contenuto | Dipende da |
 |---|---|---|
 | **v0.1** | Formato e parser; cella SQLite; registro con HLC e hash; versioni e lapidi; FTS con radici italiano/inglese; entità, relazioni e tag; validità e quarantena; ricerca testo + grafo + tempo con spiegazioni; import/export della cartella; CLI; MCP stdio in sola lettura; benchmark e test di proprietà | — |
-| v0.2 | Embedder (ONNX incorporato, Ollama); `sqlite-vec`; ricerca mista RRF; scelta misurata del modello; ricalcolo al cambio di modello | v0.1 |
+| v0.2 | Embedder (ONNX incorporato via tract, Ollama, HTTP); vettori derivati con indice `FlatI8`; ricerca mista (RRF o convessa, scelta misurando); scelta misurata del modello; cambio di modello blu/verde | v0.1 |
 | v0.3 | Vista markdown bidirezionale con controllo dei file (Obsidian); candidati al consolidamento; `purge`; compattazione del registro | v0.2 |
 | v0.4 | Collegamento Node (napi-rs); **integrazione in Homun**: migrazione, strumenti, `search_history`, sezione Memoria, quarantena dai turni contaminati, audit MCP con ambiti | v0.3 |
 | v0.5 | Identità, abbinamento, sincronizzazione cifrata del registro tra pari, permessi per cella, conflitti | v0.4 |
@@ -355,7 +375,7 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 1. ~~Il nome~~ → **Engramma** (deciso 2026-11-05; il pacchetto npm sarà `@engramma/core`).
 2. **Campi in inglese** nel formato: adottati per la v0.1 (raccomandazione; l'utente può rivederla).
 3. **Dove vive:** repository privato finché non c'è la v0.1, poi pubblico su GitHub?
-4. **Il modello di embedding predefinito:** si decide in v0.2 misurando.
+4. **Il modello di embedding predefinito:** si decide in v0.2 misurando Granite R2 97M contro 311M. Runtime (tract) e indice (`FlatI8`, niente sqlite-vec per ora) sono decisi il 2026-11-05.
 5. **SQLCipher sì o no** per la cifratura della cella (v0.5).
 6. **Il rapporto con Homun:** il motore resta un progetto separato, con le sue versioni. Homun fissa una versione precisa.
 
@@ -369,3 +389,4 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 - A2A e i suoi limiti di sicurezza: https://arxiv.org/pdf/2609.10871 · https://arxiv.org/pdf/2606.31498
 - EmbeddingGemma: https://developers.googleblog.com/en/introducing-embeddinggemma/ · Granite Embedding R2 (ONNX, terza parte): https://huggingface.co/Hisham480/multilingual-r2-ONNX
 - Memoria portabile: https://github.com/MacPaw/portable-memory · https://portable-ai-memory.org/spec/v1.0/
+- (2026-11-05, v0.2) Rilasci di sqlite-vec (0.1.9 stabile, DiskANN/IVF solo in 0.1.10-alpha): https://github.com/asg017/sqlite-vec/releases · Granite Embedding Multilingual R2: https://huggingface.co/blog/ibm-granite/granite-embedding-multilingual-r2 · Fusione convessa contro RRF (ACM TOIS 2023): https://dl.acm.org/doi/10.1145/3596512 · Le misure di tract, sqlite-vec e scansione int8 sono nostre (prototipi nel commit 90a106e e nel prompt v0.2).
