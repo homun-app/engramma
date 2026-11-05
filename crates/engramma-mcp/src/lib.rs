@@ -21,6 +21,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use engramma_core::Cell;
+use engramma_core::format::Status;
 use engramma_core::search::{Hit, Query};
 
 /// An open, exposed cell.
@@ -213,7 +214,9 @@ impl MemoryServer {
     #[tool(name = "memory_get")]
     /// Read one note in full by id (or a unique id prefix), including its
     /// exact body, source, confidence and validity. Use it when a search
-    /// result is promising but truncated.
+    /// result is promising but truncated. Quarantined and deleted notes
+    /// answer exactly like missing ones: the server gives no oracle on
+    /// content waiting for human confirmation.
     async fn memory_get(&self, params: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
         let cell = self.cell(&p.cell)?;
@@ -221,6 +224,14 @@ impl MemoryServer {
         let note = cell
             .get(&id)
             .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        if matches!(note.status, Status::Quarantined | Status::Deleted) {
+            // Same error as a nonexistent note: no way to tell a hidden note
+            // from an absent one through this server.
+            return Err(McpError::invalid_params(
+                format!("note {id} not found"),
+                None,
+            ));
+        }
         tool_ok(&serde_json::json!({
             "note": {
                 "id": note.id.to_string(),
@@ -251,7 +262,7 @@ impl MemoryServer {
         let Parameters(p) = params;
         let cell = self.cell(&p.cell)?;
         let ns = cell
-            .neighbors(&p.entity, p.depth.unwrap_or(1).min(3), &[])
+            .neighbors(&p.entity, p.depth.unwrap_or(1).min(3), &[], false)
             .map_err(err)?;
         let arr: Vec<serde_json::Value> = ns
             .iter()
@@ -276,7 +287,9 @@ impl MemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
         let cell = self.cell(&p.cell)?;
-        let tags = cell.tags(p.prefix.as_deref().unwrap_or("")).map_err(err)?;
+        let tags = cell
+            .tags(p.prefix.as_deref().unwrap_or(""), false)
+            .map_err(err)?;
         let arr: Vec<serde_json::Value> = tags
             .iter()
             .map(|t| serde_json::json!({"name": t.name, "parent": t.parent, "note_count": t.note_count}))
@@ -295,7 +308,7 @@ impl MemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
         let cell = self.cell(&p.cell)?;
-        let tl = cell.timeline(&p.entity).map_err(err)?;
+        let tl = cell.timeline(&p.entity, false).map_err(err)?;
         let arr: Vec<serde_json::Value> = tl.iter().map(hit_json).collect();
         tool_ok(&serde_json::json!({ "entity": p.entity, "notes": arr }))
     }

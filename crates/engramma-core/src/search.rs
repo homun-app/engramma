@@ -264,124 +264,109 @@ impl Cell {
         }
         drop(stmt);
 
-        // 2. RRF fusion over the single ranked list (the function exists and
-        // is tested for v0.2; with one list the rerank below uses bm25_norm).
-        let _rrf = rrf_fuse(&[text_hits.iter().map(|(id, _)| id.clone()).collect()], 60);
+        // 2. Filters come BEFORE the graph expansion: only candidates that
+        // pass them (status, quarantine, superseded, `as_of`) can seed the
+        // walk — a quarantined note must not guide the search (§5).
+        let mut text_candidates: Vec<(String, f64, usize, Note)> = Vec::new();
+        for (rank, (id, bm25)) in text_hits.iter().enumerate() {
+            let Ok(note) = read_note_by_id(conn, id) else {
+                continue;
+            };
+            if !passes_filters(&note, &q.filters, now) {
+                continue;
+            }
+            text_candidates.push((id.clone(), *bm25, rank + 1, note));
+        }
 
-        // Normalised seed scores for the graph expansion (§6.3.3: the added
+        // 3. Normalised seed scores for the graph expansion (§6.3.3: the added
         // notes keep a weight that decays per hop from the seed they came
-        // from).
-        let max_bm25 = text_hits
+        // from). RRF fusion over the single ranked list arrives with the
+        // semantic list in v0.2; the rerank below uses bm25_norm.
+        let max_bm25 = text_candidates
             .iter()
-            .map(|(_, b)| *b)
+            .map(|(_, b, _, _)| *b)
             .fold(0.0_f64, f64::max)
             .max(f64::EPSILON);
-        let seeds: Vec<(String, f64)> = text_hits
+        let seeds: Vec<(String, f64)> = text_candidates
             .iter()
             .take(10)
-            .map(|(id, b)| (id.clone(), *b / max_bm25))
+            .map(|(id, b, _, _)| (id.clone(), *b / max_bm25))
             .collect();
 
-        // 3. Graph expansion from the top text hits.
+        // 4. Graph expansion from the surviving candidates. Edges declared by
+        // quarantined or deleted notes are out unless asked for.
         let as_of = q.filters.as_of;
         let mut extra: BTreeMap<String, (u8, String, f64)> = BTreeMap::new(); // (hops, path, seed score)
-        if q.graph_hops > 0 && !text_hits.is_empty() {
+        if q.graph_hops > 0 && !text_candidates.is_empty() {
             expand_graph(
                 conn,
                 &seeds,
                 q.graph_hops,
                 as_of,
+                q.filters.include_quarantined,
                 &text_hits.iter().map(|(i, _)| i.clone()).collect(),
                 &mut extra,
             )?;
         }
 
-        // 4. Collect note rows for all candidates and apply filters.
-        // (note id, BM25 rank, graph info (hops, path, seed score))
-        let mut candidates: Vec<Candidate> = Vec::new();
-
-        for (rank, (id, _)) in text_hits.iter().enumerate() {
-            candidates.push((id.clone(), Some(rank + 1), None));
+        // 5. Rerank (§13.4): bm25_norm × coverage × confidence × recency ×
+        // graph. Graph-discovered notes keep a decaying share of the seed's
+        // score (with a floor for pure multi-hop answers); the coverage factor
+        // halves notes that share none of the query terms, so pure graph
+        // neighbours support — never replace — real text matches.
+        // body_norm already holds the stemmed title+body (computed at write
+        // time): reuse it instead of re-stemming per candidate.
+        let mut hits: Vec<Hit> = Vec::new();
+        for (id, bm25, rank, note) in text_candidates {
+            let (matched, coverage) = coverage_of(conn, &id, &note, &terms);
+            let raw = (bm25 / max_bm25)
+                * coverage
+                * q.weights.confidence(note.confidence)
+                * recency_of(now, &note, q.weights.recency_half_life_days);
+            hits.push(Hit {
+                explain: Explain {
+                    matched_terms: matched,
+                    bm25_rank: Some(rank),
+                    via: None,
+                    confidence: note.confidence,
+                    valid_from: note.valid_from.as_ref().map(|v| v.to_db_string()),
+                    valid_to: note.valid_to.as_ref().map(|v| v.to_db_string()),
+                    source: note.source.clone(),
+                },
+                note,
+                score: raw,
+            });
         }
         // Cap the expansion: the nearest graph notes only.
         let mut extras: Vec<(String, (u8, String, f64))> = extra.into_iter().take(40).collect();
         extras.sort_by_key(|(_, (hops, _, _))| *hops);
-        for (id, (hops, path, seed)) in &extras {
-            candidates.push((id.clone(), None, Some((*hops, path.clone(), *seed))));
-        }
-        let mut hits: Vec<Hit> = Vec::new();
-        for (id, bm25_rank, graph) in candidates {
+        for (id, (hops, path, seed)) in extras {
             let Ok(note) = read_note_by_id(conn, &id) else {
                 continue;
             };
             if !passes_filters(&note, &q.filters, now) {
                 continue;
             }
-            // Raw score: RRF base (graph notes continue the ranking after the
-            // text list), normalised once at the end over all candidates.
-            // §13.4 rerank: bm25_norm × confidence × recency × graph. With a
-            // single candidate list (v0.1) the base is the normalised BM25
-            // score — RRF (computed for the fusion) arrives with the semantic
-            // list in v0.2. Graph-discovered notes keep a decaying share of
-            // the seed's score (with a floor for pure multi-hop answers).
-            // §13.4 rerank: bm25_norm × coverage × confidence × recency ×
-            // graph. With a single candidate list (v0.1) the base is the
-            // normalised BM25 score — RRF (computed for the fusion) arrives
-            // with the semantic list in v0.2. Graph-discovered notes keep a
-            // decaying share of the seed's score (with a floor for pure
-            // multi-hop answers); the coverage factor halves notes that share
-            // none of the query terms, so pure graph neighbours support —
-            // never replace — real text matches.
-            // body_norm already holds the stemmed title+body (computed at
-            // write time): reuse it instead of re-stemming per candidate.
-            let norm: String = conn
-                .query_row("SELECT body_norm FROM notes WHERE id = ?1", [&id], |r| {
-                    r.get(0)
-                })
-                .unwrap_or_default();
-            let words: BTreeSet<&str> = norm.split(' ').filter(|w| !w.is_empty()).collect();
-            let tag_words = note_tag_string(conn, &id);
-            let matched: Vec<String> = terms
-                .iter()
-                .filter(|t| {
-                    words.contains(t.as_str()) || tag_words.split(' ').any(|w| w == t.as_str())
-                })
-                .cloned()
-                .collect();
-            let coverage = if terms.is_empty() {
-                1.0
-            } else {
-                0.5 + 0.5 * (matched.len() as f64 / terms.len() as f64)
-            };
-            let base = match &graph {
-                None => text_hits
-                    .iter()
-                    .find(|(i, _)| i == &id)
-                    .map(|(_, b)| b / max_bm25)
-                    .unwrap_or(0.0),
-                Some((_, _, seed_norm)) => GRAPH_FLOOR.max(*seed_norm),
-            };
-            let w_graph = match &graph {
-                None => 1.0,
-                // one extra decay step: no text match is one hop less evidence
-                Some((hops, _, _)) => q.weights.hop_decay.powi(i32::from(*hops) + 1),
-            };
-            let age_days = (now - note.updated_at.get()).whole_seconds() as f64 / 86_400.0;
-            let recency = 0.5_f64.powf(age_days / q.weights.recency_half_life_days.max(1.0));
-            let raw = base * coverage * q.weights.confidence(note.confidence) * recency * w_graph;
-            let explain = Explain {
-                matched_terms: matched,
-                bm25_rank,
-                via: graph.map(|(_, p, _)| p),
-                confidence: note.confidence,
-                valid_from: note.valid_from.as_ref().map(|v| v.to_db_string()),
-                valid_to: note.valid_to.as_ref().map(|v| v.to_db_string()),
-                source: note.source.clone(),
-            };
+            let (matched, coverage) = coverage_of(conn, &id, &note, &terms);
+            // one extra decay step: no text match is one hop less evidence
+            let w_graph = q.weights.hop_decay.powi(i32::from(hops) + 1);
+            let raw = GRAPH_FLOOR.max(seed)
+                * coverage
+                * q.weights.confidence(note.confidence)
+                * recency_of(now, &note, q.weights.recency_half_life_days)
+                * w_graph;
             hits.push(Hit {
+                explain: Explain {
+                    matched_terms: matched,
+                    bm25_rank: None,
+                    via: Some(path),
+                    confidence: note.confidence,
+                    valid_from: note.valid_from.as_ref().map(|v| v.to_db_string()),
+                    valid_to: note.valid_to.as_ref().map(|v| v.to_db_string()),
+                    source: note.source.clone(),
+                },
                 note,
                 score: raw,
-                explain,
             });
         }
         let max_raw = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
@@ -403,7 +388,9 @@ impl Cell {
     }
 
     /// Neighbours of an entity (or `note:<id>`), BFS up to `depth`, optionally
-    /// restricted to some relations. Returns the edges, nearest first.
+    /// restricted to some relations. Edges declared by quarantined or deleted
+    /// notes are excluded unless `include_quarantined`; manual edges (no
+    /// declaring note) always stay. Returns the edges, nearest first.
     ///
     /// # Errors
     /// [`SearchError`] on SQL failures.
@@ -412,12 +399,13 @@ impl Cell {
         start: &str,
         depth: u8,
         rels: &[&str],
+        include_quarantined: bool,
     ) -> Result<Vec<Neighbor>, SearchError> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
-        let edges = load_edges(&inner.conn, rels)?;
+        let edges = load_edges(&inner.conn, rels, include_quarantined)?;
         let mut out: Vec<Neighbor> = Vec::new();
         let mut seen_entities: BTreeSet<String> = BTreeSet::from([start.to_string()]);
         let mut frontier: Vec<String> = vec![start.to_string()];
@@ -427,10 +415,7 @@ impl Cell {
                 if !frontier.contains(&e.src) && !frontier.contains(&e.dst) {
                     continue;
                 }
-                let (other, direction) = if e.src
-                    == *frontier.iter().find(|s| **s == e.src).unwrap_or(&e.dst)
-                    && frontier.contains(&e.src)
-                {
+                let (other, direction) = if frontier.contains(&e.src) {
                     (e.dst.clone(), "->")
                 } else {
                     (e.src.clone(), "<-")
@@ -462,16 +447,22 @@ impl Cell {
         Ok(out)
     }
 
-    /// Shortest path between two entities, depth ≤ 4.
+    /// Shortest path between two entities, depth ≤ 4. Edges declared by
+    /// quarantined or deleted notes are excluded unless `include_quarantined`.
     ///
     /// # Errors
     /// [`SearchError`] on SQL failures.
-    pub fn path(&self, a: &str, b: &str) -> Result<Option<Vec<PathStep>>, SearchError> {
+    pub fn path(
+        &self,
+        a: &str,
+        b: &str,
+        include_quarantined: bool,
+    ) -> Result<Option<Vec<PathStep>>, SearchError> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
-        let edges = load_edges(&inner.conn, &[])?;
+        let edges = load_edges(&inner.conn, &[], include_quarantined)?;
         // BFS with parent tracking.
         let mut parents: HashMap<String, (String, String)> = HashMap::new(); // node -> (from, rel)
         let mut queue: Vec<String> = vec![a.to_string()];
@@ -519,22 +510,34 @@ impl Cell {
         Ok(Some(steps))
     }
 
-    /// Tags with note counts; a prefix includes its children.
+    /// Tags with note counts; a prefix includes its children. Notes in
+    /// quarantine (unless `include_quarantined`) and tombstones never count.
     ///
     /// # Errors
     /// [`SearchError`] on SQL failures.
-    pub fn tags(&self, prefix: &str) -> Result<Vec<TagInfo>, SearchError> {
+    pub fn tags(
+        &self,
+        prefix: &str,
+        include_quarantined: bool,
+    ) -> Result<Vec<TagInfo>, SearchError> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
         let like = format!("{prefix}%");
-        let mut stmt = inner.conn.prepare(
-            "SELECT t.name, t.parent, COUNT(nt.note_id)
+        let visible = if include_quarantined {
+            "n.id IS NULL OR n.status != 'deleted'"
+        } else {
+            "n.id IS NULL OR n.status NOT IN ('quarantined', 'deleted')"
+        };
+        let sql = format!(
+            "SELECT t.name, t.parent, COUNT(CASE WHEN {visible} THEN 1 END)
              FROM tags t LEFT JOIN note_tags nt ON nt.tag = t.name
+             LEFT JOIN notes n ON n.id = nt.note_id
              WHERE t.name = ?1 OR t.name LIKE ?2
-             GROUP BY t.name, t.parent ORDER BY t.name",
-        )?;
+             GROUP BY t.name, t.parent ORDER BY t.name"
+        );
+        let mut stmt = inner.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params![prefix, like], |r| {
             Ok(TagInfo {
                 name: r.get(0)?,
@@ -576,25 +579,35 @@ impl Cell {
         Ok(out)
     }
 
-    /// Notes about an entity ordered by validity (its timeline).
+    /// Notes about an entity ordered by validity (its timeline). Edges
+    /// declared by quarantined or deleted notes are excluded unless
+    /// `include_quarantined`; tombstoned notes never appear.
     ///
     /// # Errors
     /// [`SearchError`] on SQL failures.
-    pub fn timeline(&self, entity: &str) -> Result<Vec<Hit>, SearchError> {
+    pub fn timeline(
+        &self,
+        entity: &str,
+        include_quarantined: bool,
+    ) -> Result<Vec<Hit>, SearchError> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
-        // notes declaring an edge on the entity, or the entity's own note.
-        let mut stmt = inner.conn.prepare(
+        // notes declaring an edge on the entity, or the entity's own note
+        let sql = format!(
             "SELECT DISTINCT n.id FROM notes n
              WHERE n.id = (SELECT note_id FROM entities WHERE name = ?1 COLLATE NOCASE)
-                OR n.id IN (SELECT note_id FROM edges
-                            WHERE note_id IS NOT NULL
-                              AND (src = ?1 OR dst = ?1
-                                   OR src IN (SELECT 'note:' || note_id FROM entities WHERE name = ?1 COLLATE NOCASE)))
+                OR n.id IN (SELECT e.note_id FROM edges e
+                            LEFT JOIN notes dn ON dn.id = e.note_id
+                            WHERE e.note_id IS NOT NULL
+                              AND (e.src = ?1 OR e.dst = ?1
+                                   OR e.src IN (SELECT 'note:' || note_id FROM entities WHERE name = ?1 COLLATE NOCASE))
+                              AND {})
              ORDER BY n.valid_from IS NULL, n.valid_from, n.id",
-        )?;
+            edge_visible("e", "dn", include_quarantined)
+        );
+        let mut stmt = inner.conn.prepare(&sql)?;
         let rows = stmt.query_map([entity], |r| r.get::<_, String>(0))?;
         let mut ids = Vec::new();
         for row in rows {
@@ -606,7 +619,12 @@ impl Cell {
             if let Ok(note) = read_note_by_id(&inner.conn, &id) {
                 // like search: tombstones never, quarantine not by default;
                 // superseded notes stay — the timeline is the change history
-                if matches!(note.status, Status::Deleted | Status::Quarantined) {
+                let hidden = if include_quarantined {
+                    note.status == Status::Deleted
+                } else {
+                    matches!(note.status, Status::Deleted | Status::Quarantined)
+                };
+                if hidden {
                     continue;
                 }
                 out.push(Hit {
@@ -792,15 +810,33 @@ fn passes_filters(note: &Note, f: &Filters, now: OffsetDateTime) -> bool {
     true
 }
 
-fn load_edges(conn: &rusqlite::Connection, rels: &[&str]) -> Result<Vec<EdgeRow>, SearchError> {
-    load_edges_where(conn, "1=1", rels)
+fn load_edges(
+    conn: &rusqlite::Connection,
+    rels: &[&str],
+    include_quarantined: bool,
+) -> Result<Vec<EdgeRow>, SearchError> {
+    load_edges_where(conn, "1=1", rels, include_quarantined, None)
 }
 
-/// Load edges filtered by an SQL condition (over `src`/`dst`/`rel` columns).
+/// SQL fragment: edges declared by a note the default view hides (quarantined
+/// or deleted). Manual edges (`link`, no declaring note) always stay. `en` is
+/// the alias of the LEFT JOIN over `notes`.
+fn edge_visible(edge: &str, en: &str, include_quarantined: bool) -> String {
+    if include_quarantined {
+        format!("({edge}.note_id IS NULL OR {en}.status != 'deleted')")
+    } else {
+        format!("({edge}.note_id IS NULL OR {en}.status NOT IN ('quarantined', 'deleted'))")
+    }
+}
+
+/// Load edges filtered by an SQL condition (over `e.src`/`e.dst` columns) and
+/// by declaring-note visibility.
 fn load_edges_where(
     conn: &rusqlite::Connection,
     filter: &str,
     rels: &[&str],
+    include_quarantined: bool,
+    limit: Option<u64>,
 ) -> Result<Vec<EdgeRow>, SearchError> {
     let rel_clause = if rels.is_empty() {
         String::new()
@@ -810,10 +846,17 @@ fn load_edges_where(
             .map(|r| format!("'{}'", r.replace('\'', "''")))
             .collect::<Vec<_>>()
             .join(",");
-        format!(" AND rel IN ({placeholders})")
+        format!(" AND e.rel IN ({placeholders})")
     };
+    let limit_clause = limit
+        .map(|l| format!(" ORDER BY e.id LIMIT {l}"))
+        .unwrap_or_default();
     let sql = format!(
-        "SELECT src, rel, dst, note_id, valid_from, valid_to FROM edges WHERE {filter}{rel_clause}"
+        "SELECT e.src, e.rel, e.dst, e.note_id, e.valid_from, e.valid_to
+         FROM edges e LEFT JOIN notes n ON n.id = e.note_id
+         WHERE ({filter}){rel_clause} AND {}
+         {limit_clause}",
+        edge_visible("e", "n", include_quarantined)
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
@@ -833,24 +876,55 @@ fn load_edges_where(
     Ok(out)
 }
 
-/// Graph expansion (§6.3.3): from the seed notes, walk the entity graph
-/// (edges valid at `as_of`) up to `max_hops` note-hops; collect newly
-/// discovered notes with the path that led to them and the seed score they
-/// inherit (decaying per hop in the rerank).
+/// Query terms found in the note (stems of `body_norm` or tags) and the
+/// coverage factor: 1.0 when every term matches, 0.5 when none does.
+fn coverage_of(
+    conn: &rusqlite::Connection,
+    id: &str,
+    _note: &Note,
+    terms: &[String],
+) -> (Vec<String>, f64) {
+    let norm: String = conn
+        .query_row("SELECT body_norm FROM notes WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap_or_default();
+    let words: BTreeSet<&str> = norm.split(' ').filter(|w| !w.is_empty()).collect();
+    let tag_words = note_tag_string(conn, id);
+    let matched: Vec<String> = terms
+        .iter()
+        .filter(|t| words.contains(t.as_str()) || tag_words.split(' ').any(|w| w == t.as_str()))
+        .cloned()
+        .collect();
+    let coverage = if terms.is_empty() {
+        1.0
+    } else {
+        0.5 + 0.5 * (matched.len() as f64 / terms.len() as f64)
+    };
+    (matched, coverage)
+}
+
+/// Recency weight: exponential decay with the configured half-life (days).
+fn recency_of(now: OffsetDateTime, note: &Note, half_life_days: f64) -> f64 {
+    let age_days = (now - note.updated_at.get()).whole_seconds() as f64 / 86_400.0;
+    0.5_f64.powf(age_days / half_life_days.max(1.0))
+}
+
+/// Graph expansion (§6.3.3): from the seed notes (already filtered by the
+/// query), walk the entity graph (edges valid at `as_of`) up to `max_hops`
+/// note-hops; collect newly discovered notes with the path that led to them
+/// and the seed score they inherit (decaying per hop in the rerank).
 ///
 /// Seeds come from the notes' own bodies (links, relations, subject), so the
 /// walk only needs edges adjacent to the frontier — the indexed `src`/`dst`
 /// columns — never the whole edge table.
-/// A search candidate: a note id, where it came from in the BM25 list, and
-/// the graph discovery (hops, path, inherited seed score) when applicable.
-type Candidate = (String, Option<usize>, Option<(u8, String, f64)>);
-
 #[allow(clippy::too_many_arguments)]
 fn expand_graph(
     conn: &rusqlite::Connection,
     seeds: &[(String, f64)],
     max_hops: u8,
     as_of: Option<OffsetDateTime>,
+    include_quarantined: bool,
     exclude: &BTreeSet<String>,
     extra: &mut BTreeMap<String, (u8, String, f64)>,
 ) -> Result<(), SearchError> {
@@ -896,8 +970,10 @@ fn expand_graph(
         // hundreds of notes) would otherwise drag its whole neighbourhood in.
         let edges = load_edges_where(
             conn,
-            &format!("src IN ({listed}) OR dst IN ({listed}) ORDER BY id LIMIT 400"),
+            &format!("e.src IN ({listed}) OR e.dst IN ({listed})"),
             &[],
+            include_quarantined,
+            Some(400),
         )?;
         let mut next: BTreeSet<String> = BTreeSet::new();
         for e in &edges {
@@ -1155,14 +1231,15 @@ mod tests {
         q.filters.tags = vec!["casa".into()];
         let hits = cell.search_with_now(&q, now()).unwrap(/* test-only */);
         assert!(hits.iter().any(|h| h.note.id == n.id));
-        let tags = cell.tags("casa").unwrap(/* test-only */);
+        let tags = cell.tags("casa", false).unwrap(/* test-only */);
         assert!(tags.iter().any(|t| t.name == "casa/milano/trasloco"));
     }
 
     #[test]
     fn neighbors_and_path() {
         let (_d, cell) = setup();
-        let ns = cell.neighbors("Fabio", 2, &[]).unwrap(/* test-only */);
+        let ns = cell.neighbors("Fabio", 2, &[], false)
+            .unwrap(/* test-only */);
         assert!(
             ns.iter()
                 .any(|n| n.entity == "Giulia" && n.rel == "partner_of")
@@ -1171,12 +1248,101 @@ mod tests {
             ns.iter()
                 .any(|n| n.entity == "Studio Rossi" && n.rel == "works_at")
         );
-        let p = cell.path("Fabio", "Studio Rossi").unwrap(/* test-only */);
+        let p = cell
+            .path("Fabio", "Studio Rossi", false)
+            .unwrap(/* test-only */);
         let steps = p.expect("path exists");
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].rel, "partner_of");
         assert_eq!(steps[1].to, "Studio Rossi");
-        assert!(cell.path("Fabano", "Studio Rossi").unwrap(/* test-only */).is_none());
+        assert!(
+            cell
+            .path("Fabano", "Studio Rossi", false)
+            .unwrap(/* test-only */)
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn quarantined_note_does_not_seed_the_graph() {
+        let (_d, cell) = setup();
+        // "notizia" matches only the quarantined web note: no result may come
+        // out of it, not even graph-discovered neighbours of the poisoned note
+        let hits = cell
+            .search_with_now(&Query::text("notizia").k(10), now())
+            .unwrap(/* test-only */);
+        assert!(hits.is_empty(), "quarantine leaked: {hits:?}");
+    }
+
+    #[test]
+    fn quarantined_edges_do_not_guide_the_walk() {
+        let (_d, cell) = setup();
+        // Zoro is reachable from Fabio ONLY through the relation the
+        // quarantined note declares, and note 7 only through Zoro
+        let mut gossip = note(
+            6,
+            "Fabio",
+            "Voci di corridoio.\n\n## Relations\n- loves:: [[Zoro]]\n",
+            NoteType::Preference,
+        );
+        gossip.confidence = Confidence::External;
+        gossip.status = Status::Quarantined;
+        gossip.source = "import:web".into();
+        cell.put_note(&gossip, "t").unwrap(/* test-only */);
+        let zoro = note(
+            7,
+            "Zoro sta a Torino",
+            "Zoro abita a [[Torino]].",
+            NoteType::Fact,
+        );
+        cell.put_note(&zoro, "t").unwrap(/* test-only */);
+        let hits = cell
+            .search_with_now(&Query::text("Fabio").k(10).graph_hops(2), now())
+            .unwrap(/* test-only */);
+        assert!(
+            hits.iter().all(|h| h.note.id != zoro.id),
+            "walk crossed a quarantined edge: {hits:?}"
+        );
+        // with the flag the quarantined note is a first-class citizen again
+        let mut q = Query::text("Fabio").k(10).graph_hops(2);
+        q.filters.include_quarantined = true;
+        let hits2 = cell.search_with_now(&q, now()).unwrap(/* test-only */);
+        assert!(
+            hits2.iter().any(|h| h.note.id == zoro.id),
+            "include_quarantined should traverse it: {hits2:?}"
+        );
+    }
+
+    #[test]
+    fn neighbors_and_path_skip_quarantined_edges() {
+        let (_d, cell) = setup();
+        let web = format!("01{:024}", 5);
+        // the mention edge `note:5 -> Fabio` is declared by a quarantined note
+        let ns = cell
+            .neighbors("Fabio", 1, &[], false)
+            .unwrap(/* test-only */);
+        assert!(
+            ns.iter()
+                .all(|n| n.note_id.as_deref() != Some(web.as_str())),
+            "quarantined edge in neighbors: {ns:?}"
+        );
+        // Torino hangs off the graph only through that note
+        assert!(cell
+            .path("Fabio", "Torino", false)
+            .unwrap(/* test-only */)
+            .is_none());
+        // the flag brings them back
+        let ns2 = cell
+            .neighbors("Fabio", 1, &[], true)
+            .unwrap(/* test-only */);
+        assert!(
+            ns2.iter()
+                .any(|n| n.note_id.as_deref() == Some(web.as_str()))
+        );
+        assert!(cell
+            .path("Fabio", "Torino", true)
+            .unwrap(/* test-only */)
+            .is_some());
     }
 
     #[test]
@@ -1185,7 +1351,7 @@ mod tests {
         let es = cell.entities("Giul").unwrap(/* test-only */);
         assert_eq!(es.len(), 1);
         assert_eq!(es[0].name, "Giulia");
-        let tl = cell.timeline("Fabio").unwrap(/* test-only */);
+        let tl = cell.timeline("Fabio", false).unwrap(/* test-only */);
         assert!(tl.len() >= 2);
         // ordered by valid_from: Roma (2020) before Milano (2026)
         let titles: Vec<&str> = tl.iter().map(|h| h.note.display_title()).collect();

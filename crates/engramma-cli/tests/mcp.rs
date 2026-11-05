@@ -59,13 +59,12 @@ impl Mcp {
     }
 }
 
-fn make_cell(dir: &std::path::Path, name: &str, body: &str) -> Note {
-    let cell = Cell::create(&dir.join(format!("{name}.sqlite")), name, "test").unwrap(/* t */);
+fn plain_note(title: &str, body: &str) -> Note {
     let t = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(/* t */);
-    let note = Note {
+    Note {
         id: engramma_core::id::new_ulid().unwrap(/* t */),
         note_type: NoteType::Person,
-        title: Some(name.to_string()),
+        title: Some(title.to_string()),
         body: body.to_string(),
         tags: vec![],
         scope: None,
@@ -79,7 +78,12 @@ fn make_cell(dir: &std::path::Path, name: &str, body: &str) -> Note {
         created_at: At(t),
         updated_at: At(t),
         extensions: vec![],
-    };
+    }
+}
+
+fn make_cell(dir: &std::path::Path, name: &str, body: &str) -> Note {
+    let cell = Cell::create(&dir.join(format!("{name}.sqlite")), name, "test").unwrap(/* t */);
+    let note = plain_note(name, body);
     cell.put_note(&note, "test").unwrap(/* t */);
     note
 }
@@ -111,6 +115,19 @@ fn mcp_stdio_roundtrip_and_isolation() {
         "famiglia",
         "Fabio ha traslocato a [[Milano]] con [[Giulia]].",
     );
+    // a quarantined web rumour about Fabio: invisible to the whole server
+    let rumour = {
+        let cell = Cell::open(&cells.join("famiglia.sqlite")).unwrap(/* t */);
+        let mut n = plain_note(
+            "voce dal web",
+            "Si dice che [[Fabio]] sia campione di crossfit.",
+        );
+        n.confidence = Confidence::External;
+        n.status = Status::Quarantined;
+        n.source = "import:web".into();
+        cell.put_note(&n, "test").unwrap(/* t */);
+        n
+    };
     // a second cell that is NOT exposed
     make_cell(&cells, "segreta", "Nota riservata su [[Torino]].");
 
@@ -196,25 +213,96 @@ fn mcp_stdio_roundtrip_and_isolation() {
         "{res}"
     );
 
-    // memory_get by prefix
+    // memory_get by id (full id: two notes created in the same millisecond
+    // share the time prefix — see the short-id note in REPORT v0.1.1)
     let call = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 5,
         "method": "tools/call",
         "params": {
             "name": "memory_get",
-            "arguments": {"cell": "famiglia", "id": note.id.to_string()[..8]}
+            "arguments": {"cell": "famiglia", "id": note.id.to_string()}
         }
     });
     mcp.send(&call.to_string());
     let res = mcp.read_response(5);
     assert!(
         res["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap(/* t */)
-        .contains("Milano"),
+            .as_str()
+            .unwrap(/* t */)
+            .contains("Milano"),
         "{res}"
     );
+
+    // quarantine: the rumour neither seeds the search nor appears as a
+    // neighbour of Fabio
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": {
+            "name": "memory_search",
+            "arguments": {"cell": "famiglia", "query": "campione crossfit"}
+        }
+    });
+    mcp.send(&call.to_string());
+    let res = mcp.read_response(6);
+    let text = res["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap(/* t */);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap(/* t */);
+    assert!(
+        parsed["hits"].as_array().is_some_and(|h| h.is_empty()),
+        "quarantine leaked through MCP search: {parsed}"
+    );
+
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "memory_neighbors",
+            "arguments": {"cell": "famiglia", "entity": "Fabio", "depth": 1}
+        }
+    });
+    mcp.send(&call.to_string());
+    let res = mcp.read_response(7);
+    let text = res["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap(/* t */);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap(/* t */);
+    assert!(
+        !text.contains(&rumour.id.to_string()),
+        "quarantined edge in neighbors: {parsed}"
+    );
+
+    // memory_get on the quarantined note answers exactly like a missing note
+    for (id_req, id) in [
+        (8, rumour.id.to_string()),
+        (9, "01AAAAAAAAAAAAAAAAAAAAAAAA".to_string()),
+    ] {
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id_req,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_get",
+                "arguments": {"cell": "famiglia", "id": id}
+            }
+        });
+        mcp.send(&call.to_string());
+        let res = mcp.read_response(id_req);
+        let msg = res["error"]["message"]
+            .as_str()
+            .or(res["result"]["isError"]
+                .as_bool()
+                .and_then(|_| res["result"]["content"][0]["text"].as_str()))
+            .unwrap_or_default();
+        assert!(
+            res.get("error").is_some() && msg.contains("not found"),
+            "quarantined/missing note must be an indistinguishable error: {res}"
+        );
+    }
 
     drop(mcp);
 }

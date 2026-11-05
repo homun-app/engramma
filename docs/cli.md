@@ -28,7 +28,9 @@ An `external` note is created `quarantined`.
 JSON: `{"id": "<ulid>"}`.
 
 ### `get ID`
-Human: the canonical note file. JSON: the complete note object:
+Human: the canonical note file (quarantined and deleted notes get a
+`⚠ stato: …` warning line first — the CLI may show them, the MCP server may
+not). JSON: the complete note object:
 `{id, type, title, body, tags, lang, source, confidence, status, valid_from,
 valid_to, supersedes, created_at, updated_at, x}`.
 
@@ -73,19 +75,22 @@ Human output prints score, matched terms, BM25 rank, graph path, validity and
 source for each hit. Quarantined and tombstoned notes never appear; superseded
 notes appear only for `--as_of` questions they answer.
 
-### `neighbors ENTITY [--depth N] [--rel R ...]`
+### `neighbors ENTITY [--depth N] [--rel R ...] [--include-quarantined]`
+Edges declared by quarantined or deleted notes are excluded (manual `link`
+edges always stay); `--include-quarantined` brings the quarantined ones back.
 JSON: `{entity, neighbors: [{depth, entity, rel, direction, note_id,
 valid_from, valid_to}]}`.
 
-### `path A B`
-Shortest graph path (≤ 4 steps). JSON: `{from, to, steps: [{from, rel, to}]}`
-or `steps: null`.
+### `path A B [--include-quarantined]`
+Shortest graph path (≤ 4 steps), same edge visibility rules as `neighbors`.
+JSON: `{from, to, steps: [{from, rel, to}]}` or `steps: null`.
 
-### `tags [PREFIX]` / `entities [PREFIX]`
-A tag prefix includes its children. JSON: `{tags: [{name, parent,
+### `tags [PREFIX] [--include-quarantined]` / `entities [PREFIX]`
+A tag prefix includes its children; quarantined and deleted notes do not count
+unless `--include-quarantined` (deleted never). JSON: `{tags: [{name, parent,
 note_count}]}` / `{entities: [{name, id, note_id}]}`.
 
-### `timeline ENTITY`
+### `timeline ENTITY [--include-quarantined]`
 Notes about an entity ordered by validity (oldest first), with each note's
 explain fields.
 

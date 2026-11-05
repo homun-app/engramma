@@ -131,15 +131,34 @@ enum Command {
         depth: u8,
         #[arg(long = "rel")]
         rels: Vec<String>,
+        /// Include edges declared by quarantined notes
+        #[arg(long)]
+        include_quarantined: bool,
     },
     /// Shortest path between two entities
-    Path { a: String, b: String },
+    Path {
+        a: String,
+        b: String,
+        /// Include edges declared by quarantined notes
+        #[arg(long)]
+        include_quarantined: bool,
+    },
     /// Tags (with children)
-    Tags { prefix: Option<String> },
+    Tags {
+        prefix: Option<String>,
+        /// Count quarantined notes too
+        #[arg(long)]
+        include_quarantined: bool,
+    },
     /// Entities by prefix
     Entities { prefix: Option<String> },
     /// Notes about an entity ordered by validity
-    Timeline { entity: String },
+    Timeline {
+        entity: String,
+        /// Include edges declared by quarantined notes
+        #[arg(long)]
+        include_quarantined: bool,
+    },
     /// Versions of a note
     History { id: String },
     /// Restore a version
@@ -367,6 +386,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             if cli.json {
                 print_json(&note_json(&note));
             } else {
+                if matches!(note.status, Status::Quarantined | Status::Deleted) {
+                    println!("⚠ stato: {}", note.status.as_str());
+                }
                 println!(
                     "{}",
                     note.serialize()
@@ -527,10 +549,11 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             entity,
             depth,
             rels,
+            include_quarantined,
         } => {
             let cell = open_cell(cli)?;
             let rel_refs: Vec<&str> = rels.iter().map(String::as_str).collect();
-            let ns = cell.neighbors(entity, *depth, &rel_refs)?;
+            let ns = cell.neighbors(entity, *depth, &rel_refs, *include_quarantined)?;
             if cli.json {
                 let arr: Vec<serde_json::Value> = ns
                     .iter()
@@ -563,9 +586,13 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Command::Path { a, b } => {
+        Command::Path {
+            a,
+            b,
+            include_quarantined,
+        } => {
             let cell = open_cell(cli)?;
-            match cell.path(a, b)? {
+            match cell.path(a, b, *include_quarantined)? {
                 Some(steps) => {
                     if cli.json {
                         let arr: Vec<serde_json::Value> = steps
@@ -591,9 +618,12 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Command::Tags { prefix } => {
+        Command::Tags {
+            prefix,
+            include_quarantined,
+        } => {
             let cell = open_cell(cli)?;
-            let tags = cell.tags(prefix.as_deref().unwrap_or(""))?;
+            let tags = cell.tags(prefix.as_deref().unwrap_or(""), *include_quarantined)?;
             if cli.json {
                 let arr: Vec<serde_json::Value> = tags
                     .iter()
@@ -627,9 +657,12 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Command::Timeline { entity } => {
+        Command::Timeline {
+            entity,
+            include_quarantined,
+        } => {
             let cell = open_cell(cli)?;
-            let tl = cell.timeline(entity)?;
+            let tl = cell.timeline(entity, *include_quarantined)?;
             if cli.json {
                 let arr: Vec<serde_json::Value> = tl.iter().map(hit_json).collect();
                 print_json(&serde_json::json!({ "entity": entity, "notes": arr }));

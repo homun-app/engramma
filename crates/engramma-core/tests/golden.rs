@@ -112,6 +112,29 @@ fn golden_queries() {
     let queries: Vec<GoldenQuery> = serde_json::from_str(&raw).unwrap(/* test-only */);
     assert!(queries.len() >= 25, "want at least 25 golden questions");
 
+    // Quarantined and deleted notes must never surface — not as results, and
+    // not as a hop of a graph path (`via` renders short note ids).
+    let all_ids = cell.debug_column("SELECT id FROM notes").unwrap(/* t */);
+    let hidden: std::collections::BTreeSet<String> = cell
+        .debug_column("SELECT id FROM notes WHERE status IN ('quarantined', 'deleted')")
+        .unwrap(/* t */)
+        .into_iter()
+        .collect();
+    // `(nota <id8>)` fragments resolve to one note only: when that note is
+    // hidden, the path crossed quarantined ground.
+    let via_crosses_hidden = |via: &str| -> bool {
+        via.split("(nota ")
+            .skip(1)
+            .filter_map(|rest| rest.split(')').next())
+            .any(|frag| {
+                let matches: Vec<&String> = all_ids
+                    .iter()
+                    .filter(|id| id.starts_with(frag) || id.ends_with(frag))
+                    .collect();
+                matches.len() == 1 && hidden.contains(matches[0].as_str())
+            })
+    };
+
     let mut failures: Vec<String> = Vec::new();
     for gq in &queries {
         let mut q = Query::text(&gq.q).k(5).graph_hops(2);
@@ -122,6 +145,16 @@ fn golden_queries() {
         }
         let hits = cell.search_with_now(&q, golden_now()).unwrap(/* test-only */);
         let titles = titles(&hits);
+        for h in &hits {
+            if let Some(via) = &h.explain.via
+                && via_crosses_hidden(via)
+            {
+                failures.push(format!(
+                    "[{}] `{}` has a path through a quarantined note: {via}",
+                    gq.category, gq.q
+                ));
+            }
+        }
         if gq.expect_empty {
             if !hits.is_empty() {
                 failures.push(format!(
@@ -192,14 +225,20 @@ fn golden_story_invariants() {
 
     // multi-hop graph: the direct Fabio→Studio Rossi path is `works_at`;
     // the partner path Fabio→Giulia is one step.
-    let path = cell.path("Fabio", "Studio Rossi").unwrap(/* test-only */);
+    let path = cell
+        .path("Fabio", "Studio Rossi", false)
+        .unwrap(/* test-only */);
     let steps = path.expect("path Fabio→Studio Rossi exists");
     assert!(steps.len() <= 4);
     assert_eq!(steps.last().unwrap(/* test-only */).to, "Studio Rossi");
-    let partner = cell.path("Fabio", "Giulia").unwrap(/* test-only */);
+    let partner = cell
+        .path("Fabio", "Giulia", false)
+        .unwrap(/* test-only */);
     assert!(partner.is_some_and(|p| p.len() == 1 && p[0].rel == "partner_of"));
     // and the two-hop answer exists: Giulia -works_at-> Studio Rossi
-    let via_giulia = cell.path("Giulia", "Studio Rossi").unwrap(/* test-only */);
+    let via_giulia = cell
+        .path("Giulia", "Studio Rossi", false)
+        .unwrap(/* test-only */);
     assert!(via_giulia.is_some_and(|p| p.len() == 1 && p[0].rel == "works_at"));
     // no external note ever reaches active without confirm
     let active_external = cell

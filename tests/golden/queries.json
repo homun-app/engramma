@@ -237,5 +237,23 @@
     "expect": [
       "Aurora"
     ]
+  },
+  {
+    "id": 31,
+    "category": "quarantena",
+    "q": "campione",
+    "expect_empty": true
+  },
+  {
+    "id": 32,
+    "category": "quarantena",
+    "q": "gara regionale crossfit",
+    "expect_empty": true
+  },
+  {
+    "id": 33,
+    "category": "quarantena",
+    "q": "Foster Londra",
+    "expect_empty": true
   }
 ]
