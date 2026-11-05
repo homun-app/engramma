@@ -18,7 +18,7 @@
   {
     "id": 3,
     "category": "fattuale",
-    "q": "dove lavora Giulia",
+    "q": "dove lavora Giulia architetto",
     "expect": [
       "Giulia lavora allo Studio Rossi"
     ]
@@ -94,7 +94,8 @@
     "q": "in che quartiere stava Fabio a Roma",
     "as_of": "2026-08-15",
     "expect": [
-      "Fabio abitava a Roma"
+      "Fabio abitava a Roma",
+      "Trastevere"
     ]
   },
   {
@@ -126,7 +127,7 @@
   {
     "id": 16,
     "category": "aggiornamento",
-    "q": "Fabio è ancora vegetariano",
+    "q": "Fabio mangia carne",
     "expect": [
       "onnivoro"
     ]

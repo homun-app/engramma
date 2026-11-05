@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 engramma-core.workspace = true
-engramma-mcp = { path = "../engramma-mcp" }
+engramma-mcp = { path = "../engramma-mcp", version = "0.1.0-dev" }
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true

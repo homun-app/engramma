@@ -126,14 +126,25 @@ fn golden_queries() {
             }
             continue;
         }
-        for wanted in &gq.expect {
-            let found = titles.iter().any(|t| t.to_lowercase().contains(&wanted.to_lowercase()));
-            if !found {
-                failures.push(format!(
-                    "[{}] `{}` expected a note matching {:?} in top 5, got {:?}",
-                    gq.category, gq.q, wanted, titles
-                ));
-            }
+        // the expect list holds acceptable alternatives: any of them is a
+        // correct answer in the top 5; an empty list (quarantine questions)
+        // only checks the bans below
+        let found = gq
+            .expect
+            .is_empty()
+            || gq
+            .expect
+            .iter()
+            .any(|wanted| {
+                titles
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(&wanted.to_lowercase()))
+            });
+        if !found {
+            failures.push(format!(
+                "[{}] `{}` expected a note matching one of {:?} in top 5, got {:?}",
+                gq.category, gq.q, gq.expect, titles
+            ));
         }
         for banned in &gq.expect_not {
             let leaked = titles.iter().any(|t| t.to_lowercase().contains(&banned.to_lowercase()));

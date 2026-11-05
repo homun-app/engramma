@@ -280,6 +280,18 @@ impl Cell {
         &self.path
     }
 
+    /// Checkpoint the WAL (bulk loads leave a large -wal behind).
+    ///
+    /// # Errors
+    /// [] on SQL failure.
+    pub fn checkpoint(&self) -> Result<(), CellError> {
+        let inner = self.lock()?;
+        inner
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
     /// Run a read-only query returning one TEXT column per row. Meant for
     /// tests and tooling that need to compare states.
     ///

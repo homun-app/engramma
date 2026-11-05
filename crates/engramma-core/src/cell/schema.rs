@@ -9,11 +9,11 @@
 //! `integrity-check`, which we never run — see REPORT).
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 1] = [r#"
+pub const MIGRATIONS: [&str; 2] = [r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
                         scope TEXT, source TEXT, confidence TEXT, status TEXT,
@@ -39,6 +39,12 @@ CREATE INDEX idx_edges_rel ON edges(rel);
 CREATE INDEX idx_notes_status_valid ON notes(status, valid_to);
 CREATE INDEX idx_notes_type ON notes(type);
 CREATE INDEX idx_note_tags_tag ON note_tags(tag);
+"#,
+r#"
+-- v2: reindexing a note deletes its derived edges by note id; without this
+-- index every write scans the whole edge table (measured: the 100k-note
+-- benchmark collapsed to ~190 notes/s).
+CREATE INDEX idx_edges_note ON edges(note_id);
 "#];
 
 /// Apply pending migrations inside `tx` and update `meta.schema_version`.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/engramma-core", "crates/engramma-cli", "crates/engramma-mcp"]
+members = ["crates/engramma-core", "crates/engramma-cli", "crates/engramma-mcp", "bench"]
 
 [workspace.package]
 version = "0.1.0-dev"
@@ -10,7 +10,7 @@ rust-version = "1.95"
 repository = "https://github.com/homun-app/engramma"
 
 [workspace.dependencies]
-engramma-core = { path = "crates/engramma-core" }
+engramma-core = { path = "crates/engramma-core", version = "0.1.0-dev" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 saphyr = "0.3"
 serde = { version = "1", features = ["derive"] }

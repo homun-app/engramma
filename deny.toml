@@ -1,0 +1,39 @@
+# cargo-deny configuration. Advisory checks need the network and are skipped
+# in this project's offline CI (`cargo deny check licenses bans` only).
+
+[advisories]
+version = 2
+yanked = "warn"
+
+[licenses]
+version = 2
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+]
+# Unused allowances are fine (they document the policy); the current tree
+# happens not to need ISC, MPL-2.0 or Unicode-DFS-2016.
+confidence-threshold = 0.93
+
+[bans]
+# Duplicated versions are tolerated (the resolver already minimises them);
+# outright duplicates of security-sensitive crates would be flagged here.
+multiple-versions = "allow"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

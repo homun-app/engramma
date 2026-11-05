@@ -232,6 +232,19 @@ impl Cell {
             .map(|t| format!("\"{}\"", t.replace('"', "")))
             .collect::<Vec<_>>()
             .join(" OR ");
+        // A phrase for adjacent stem pairs ("bianca bianchi" collapses to one
+        // stem; the phrase still rewards the notes where the two words are
+        // next to each other, i.e. the actual namesake).
+        let phrase = terms
+            .iter()
+            .map(|t| t.replace('"', ""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let match_expr = if terms.len() >= 2 {
+            format!("{match_expr} OR \"{phrase}\"")
+        } else {
+            match_expr
+        };
         // Column weights: the title says what a note is about; the body is
         // longer and noisier; tags are short but precise.
         let mut stmt = conn.prepare(
@@ -251,33 +264,52 @@ impl Cell {
         }
         drop(stmt);
 
-        // 2. RRF fusion over the (single) ranked list.
-        let ids: Vec<String> = text_hits.iter().map(|(id, _)| id.clone()).collect();
-        let rrf = rrf_fuse(&[ids], 60);
+        // 2. RRF fusion over the single ranked list (the function exists and
+        // is tested for v0.2; with one list the rerank below uses bm25_norm).
+        let _rrf = rrf_fuse(
+            &[text_hits.iter().map(|(id, _)| id.clone()).collect()],
+            60,
+        );
+
+        // Normalised seed scores for the graph expansion (§6.3.3: the added
+        // notes keep a weight that decays per hop from the seed they came
+        // from).
+        let max_bm25 = text_hits
+            .iter()
+            .map(|(_, b)| *b)
+            .fold(0.0_f64, f64::max)
+            .max(f64::EPSILON);
+        let seeds: Vec<(String, f64)> = text_hits
+            .iter()
+            .take(10)
+            .map(|(id, b)| (id.clone(), *b / max_bm25))
+            .collect();
 
         // 3. Graph expansion from the top text hits.
         let as_of = q.filters.as_of;
-        let mut extra: BTreeMap<String, (u8, String)> = BTreeMap::new(); // note_id -> (hops, path)
+        let mut extra: BTreeMap<String, (u8, String, f64)> = BTreeMap::new(); // (hops, path, seed score)
         if q.graph_hops > 0 && !text_hits.is_empty() {
-            let seeds: Vec<String> = text_hits
-                .iter()
-                .take(10)
-                .map(|(id, _)| id.clone())
-                .collect();
-            expand_graph(conn, &seeds, q.graph_hops, as_of, &text_hits.iter().map(|(i, _)| i.clone()).collect(), &mut extra)?;
+            expand_graph(
+                conn,
+                &seeds,
+                q.graph_hops,
+                as_of,
+                &text_hits.iter().map(|(i, _)| i.clone()).collect(),
+                &mut extra,
+            )?;
         }
 
         // 4. Collect note rows for all candidates and apply filters.
-        let mut candidates: Vec<(String, Option<usize>, Option<(u8, String)>)> = Vec::new();
-        let text_ids: BTreeSet<String> = text_hits.iter().map(|(i, _)| i.clone()).collect();
+        let mut candidates: Vec<(String, Option<usize>, Option<(u8, String, f64)>)> = Vec::new();
+
         for (rank, (id, _)) in text_hits.iter().enumerate() {
             candidates.push((id.clone(), Some(rank + 1), None));
         }
         // Cap the expansion: the nearest graph notes only.
-        let mut extras: Vec<(String, (u8, String))> = extra.into_iter().take(40).collect();
-        extras.sort_by_key(|(_, (hops, _))| *hops);
-        for (id, (hops, path)) in &extras {
-            candidates.push((id.clone(), None, Some((*hops, path.clone()))));
+        let mut extras: Vec<(String, (u8, String, f64))> = extra.into_iter().take(40).collect();
+        extras.sort_by_key(|(_, (hops, _, _))| *hops);
+        for (id, (hops, path, seed)) in &extras {
+            candidates.push((id.clone(), None, Some((*hops, path.clone(), *seed))));
         }
         let mut hits: Vec<Hit> = Vec::new();
         for (id, bm25_rank, graph) in candidates {
@@ -292,34 +324,25 @@ impl Cell {
             // §13.4 rerank: bm25_norm × confidence × recency × graph. With a
             // single candidate list (v0.1) the base is the normalised BM25
             // score — RRF (computed for the fusion) arrives with the semantic
-            // list in v0.2. Graph-discovered notes get a small floor so pure
-            // multi-hop answers survive the rerank.
-            let max_bm25 = text_hits
-                .iter()
-                .map(|(_, b)| *b)
-                .fold(0.0_f64, f64::max)
-                .max(f64::EPSILON);
-            let base = match &graph {
-                None => text_hits
-                    .iter()
-                    .find(|(i, _)| i == &id)
-                    .map(|(_, b)| b / max_bm25)
-                    .unwrap_or(0.0),
-                Some((_, _)) => GRAPH_FLOOR,
-            };
-            let w_graph = match &graph {
-                None => 1.0,
-                Some((hops, _)) => q.weights.hop_decay.powi(i32::from(*hops)),
-            };
-            let age_days = (now - note.updated_at.get()).whole_seconds() as f64 / 86_400.0;
-            let recency = 0.5_f64.powf(age_days / q.weights.recency_half_life_days.max(1.0));
-            let raw = base * q.weights.confidence(note.confidence) * recency * w_graph;
-            // matched terms: which query terms occur as words in the
-            // normalised index text.
-            let norm = text::normalize(
-                &format!("{}\n{}", note.display_title(), note.body),
-                note.lang,
-            );
+            // list in v0.2. Graph-discovered notes keep a decaying share of
+            // the seed's score (with a floor for pure multi-hop answers).
+            // §13.4 rerank: bm25_norm × coverage × confidence × recency ×
+            // graph. With a single candidate list (v0.1) the base is the
+            // normalised BM25 score — RRF (computed for the fusion) arrives
+            // with the semantic list in v0.2. Graph-discovered notes keep a
+            // decaying share of the seed's score (with a floor for pure
+            // multi-hop answers); the coverage factor halves notes that share
+            // none of the query terms, so pure graph neighbours support —
+            // never replace — real text matches.
+            // body_norm already holds the stemmed title+body (computed at
+            // write time): reuse it instead of re-stemming per candidate.
+            let norm: String = conn
+                .query_row(
+                    "SELECT body_norm FROM notes WHERE id = ?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
             let words: BTreeSet<&str> = norm.split(' ').filter(|w| !w.is_empty()).collect();
             let tag_words = note_tag_string(conn, &id);
             let matched: Vec<String> = terms
@@ -330,10 +353,31 @@ impl Cell {
                 })
                 .cloned()
                 .collect();
+            let coverage = if terms.is_empty() {
+                1.0
+            } else {
+                0.5 + 0.5 * (matched.len() as f64 / terms.len() as f64)
+            };
+            let base = match &graph {
+                None => text_hits
+                    .iter()
+                    .find(|(i, _)| i == &id)
+                    .map(|(_, b)| b / max_bm25)
+                    .unwrap_or(0.0),
+                Some((_, _, seed_norm)) => GRAPH_FLOOR.max(*seed_norm),
+            };
+            let w_graph = match &graph {
+                None => 1.0,
+                // one extra decay step: no text match is one hop less evidence
+                Some((hops, _, _)) => q.weights.hop_decay.powi(i32::from(*hops) + 1),
+            };
+            let age_days = (now - note.updated_at.get()).whole_seconds() as f64 / 86_400.0;
+            let recency = 0.5_f64.powf(age_days / q.weights.recency_half_life_days.max(1.0));
+            let raw = base * coverage * q.weights.confidence(note.confidence) * recency * w_graph;
             let explain = Explain {
                 matched_terms: matched,
                 bm25_rank,
-                via: graph.map(|(_, p)| p),
+                via: graph.map(|(_, p, _)| p),
                 confidence: note.confidence,
                 valid_from: note.valid_from.as_ref().map(|v| v.to_db_string()),
                 valid_to: note.valid_to.as_ref().map(|v| v.to_db_string()),
@@ -737,21 +781,28 @@ fn passes_filters(note: &Note, f: &Filters, now: OffsetDateTime) -> bool {
 }
 
 fn load_edges(conn: &rusqlite::Connection, rels: &[&str]) -> Result<Vec<EdgeRow>, SearchError> {
-    let (sql, params): (String, Vec<String>) = if rels.is_empty() {
-        (
-            "SELECT src, rel, dst, note_id, valid_from, valid_to FROM edges".into(),
-            vec![],
-        )
+    load_edges_where(conn, "1=1", rels)
+}
+
+/// Load edges filtered by an SQL condition (over `src`/`dst`/`rel` columns).
+fn load_edges_where(
+    conn: &rusqlite::Connection,
+    filter: &str,
+    rels: &[&str],
+) -> Result<Vec<EdgeRow>, SearchError> {
+    let rel_clause = if rels.is_empty() {
+        String::new()
     } else {
-        let placeholders = rels.iter().map(|r| format!("'{}'", r.replace('\'', "''"))).collect::<Vec<_>>().join(",");
-        (
-            format!(
-                "SELECT src, rel, dst, note_id, valid_from, valid_to FROM edges WHERE rel IN ({placeholders})"
-            ),
-            vec![],
-        )
+        let placeholders = rels
+            .iter()
+            .map(|r| format!("'{}'", r.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(" AND rel IN ({placeholders})")
     };
-    let _ = params;
+    let sql = format!(
+        "SELECT src, rel, dst, note_id, valid_from, valid_to FROM edges WHERE {filter}{rel_clause}"
+    );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
         Ok(EdgeRow {
@@ -770,104 +821,100 @@ fn load_edges(conn: &rusqlite::Connection, rels: &[&str]) -> Result<Vec<EdgeRow>
     Ok(out)
 }
 
-/// Stable rank for graph-discovered notes (their order in the capped list).
-fn extra_head_rank(extras: &[(String, (u8, String))], id: &str) -> usize {
-    extras.iter().position(|(k, _)| k == id).unwrap_or(extras.len())
-}
-
 /// Graph expansion (§6.3.3): from the seed notes, walk the entity graph
 /// (edges valid at `as_of`) up to `max_hops` note-hops; collect newly
-/// discovered notes with the path that led to them.
+/// discovered notes with the path that led to them and the seed score they
+/// inherit (decaying per hop in the rerank).
+///
+/// Seeds come from the notes' own bodies (links, relations, subject), so the
+/// walk only needs edges adjacent to the frontier — the indexed `src`/`dst`
+/// columns — never the whole edge table.
+#[allow(clippy::too_many_arguments)]
 fn expand_graph(
     conn: &rusqlite::Connection,
-    seeds: &[String],
+    seeds: &[(String, f64)],
     max_hops: u8,
     as_of: Option<OffsetDateTime>,
     exclude: &BTreeSet<String>,
-    extra: &mut BTreeMap<String, (u8, String)>,
+    extra: &mut BTreeMap<String, (u8, String, f64)>,
 ) -> Result<(), SearchError> {
-    let edges = load_edges(conn, &[])?;
-    // entity -> (note declaring an edge on it, from the seed note)
-    let mut entity_paths: BTreeMap<String, String> = BTreeMap::new(); // entity -> "path so far"
-    let mut hop_notes: BTreeMap<String, (u8, String)> = BTreeMap::new();
-    let mut frontier_entities: BTreeSet<String> = BTreeSet::new();
-
-    // Seed: entities connected to the seed notes.
-    for seed in seeds {
-        for e in &edges {
-            let declares = e.note_id.as_deref() == Some(seed.as_str());
-            let is_subject = e.src != format!("note:{seed}") && e.note_id.as_deref() == Some(seed.as_str());
-            if declares {
-                if is_subject && !e.src.starts_with("note:") {
-                    let path = format!("[[{}]]", e.src);
-                    entity_paths.insert(e.src.clone(), path);
-                    frontier_entities.insert(e.src.clone());
-                }
-                if !e.dst.starts_with("note:") {
-                    let label = if is_subject && !e.src.starts_with("note:") {
-                        format!("")
-                    } else {
-                        String::new()
-                    };
-                    let _ = label;
-                    let path = format!("[[{}]]", e.dst);
-                    entity_paths.entry(e.dst.clone()).or_insert(path);
-                    frontier_entities.insert(e.dst.clone());
-                }
+    // entity -> (path, inherited seed score)
+    let mut entities: BTreeMap<String, (String, f64)> = BTreeMap::new();
+    for (seed_id, score) in seeds {
+        let Ok(note) = read_note_by_id(conn, seed_id) else {
+            continue;
+        };
+        let Ok(analysis) = crate::format::body::analyze(&note.body) else {
+            continue;
+        };
+        let mut names: Vec<String> = analysis.links.clone();
+        for r in &analysis.relations {
+            if !names.contains(&r.dst) {
+                names.push(r.dst.clone());
             }
         }
-        // the note itself may be an entity's note (person notes)
-        let subject: Option<String> = conn
-            .query_row(
-                "SELECT name FROM entities WHERE note_id = ?1",
-                [seed],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(name) = subject {
-            let path = format!("[[{}]]", name);
-            entity_paths.entry(name.clone()).or_insert(path);
-            frontier_entities.insert(name);
+        if let Some(subject) = note.subject_entity() {
+            if !names.contains(&subject) {
+                names.push(subject);
+            }
+        }
+        for name in &names {
+            entities
+                .entry(name.clone())
+                .or_insert_with(|| (format!("[[{name}]]"), *score));
         }
     }
 
-    let mut hops = 0_u8;
-    while hops < max_hops && !frontier_entities.is_empty() {
-        hops += 1;
-        let mut next_frontier: BTreeSet<String> = BTreeSet::new();
+    // BFS over entity adjacency, one edge query per level.
+    let mut frontier: Vec<String> = entities.keys().cloned().collect();
+    for hop in 1..=max_hops {
+        if frontier.is_empty() {
+            break;
+        }
+        let listed = frontier
+            .iter()
+            .map(|n| format!("'{}'", n.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        // Bounded, deterministic walk: a hub entity (a city mentioned by
+        // hundreds of notes) would otherwise drag its whole neighbourhood in.
+        let edges = load_edges_where(
+            conn,
+            &format!("src IN ({listed}) OR dst IN ({listed}) ORDER BY id LIMIT 400"),
+            &[],
+        )?;
+        let mut next: BTreeSet<String> = BTreeSet::new();
         for e in &edges {
             if !valid_at(&e.valid_from, &e.valid_to, as_of) {
                 continue;
             }
-            let (from_entity, to_entity) = if !e.src.starts_with("note:") {
-                (Some(e.src.clone()), e.dst.clone())
+            // Which endpoint is in the frontier, and what lies on the other side?
+            let (from, to) = if frontier.contains(&e.src) && !e.src.starts_with("note:") {
+                (e.src.clone(), e.dst.clone())
+            } else if frontier.contains(&e.dst) && !e.dst.starts_with("note:") {
+                (e.dst.clone(), e.src.clone())
             } else {
-                (None, e.dst.clone())
-            };
-            let Some(fe) = &from_entity else { continue };
-            if !frontier_entities.contains(fe) {
                 continue;
+            };
+            let note_like = to.starts_with("note:");
+            let (base, score) = entities.get(&from).cloned().unwrap_or_default();
+            let dest = if note_like {
+                format!("(nota {})", to.get(5..).map(|id| &id[..8.min(id.len())]).unwrap_or("?"))
+            } else {
+                format!("[[{to}]]")
+            };
+            let path = format!("{base} -{}-> {dest}", e.rel);
+            if !note_like {
+                entities.entry(to.clone()).or_insert((path.clone(), score));
+                next.insert(to.clone());
             }
-            // hop to the destination entity
-            if !to_entity.starts_with("note:") {
-                let base = entity_paths.get(fe).cloned().unwrap_or_default();
-                let path = format!("{base} -{}-> [[{}]]", e.rel, to_entity);
-                entity_paths.entry(to_entity.clone()).or_insert(path);
-                next_frontier.insert(to_entity.clone());
-            }
-            // the edge's declaring note is discovered at this hop
             if let Some(nid) = &e.note_id {
-                if !exclude.contains(nid) && !hop_notes.contains_key(nid) && nid != fe {
-                    let base = entity_paths.get(fe).cloned().unwrap_or_default();
-                    let path = format!("{base} -{}-> [[{}]]", e.rel, to_entity);
-                    hop_notes.insert(nid.clone(), (hops, path));
+                if !exclude.contains(nid) && !extra.contains_key(nid) && *nid != from {
+                    extra.insert(nid.clone(), (hop, path, score));
                 }
             }
         }
-        frontier_entities = next_frontier;
-    }
-    for (id, v) in hop_notes {
-        extra.insert(id, v);
+        frontier = next.into_iter().collect();
     }
     Ok(())
 }

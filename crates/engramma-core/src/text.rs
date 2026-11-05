@@ -88,7 +88,12 @@ const STOPWORDS: &[&str] = &[
     "di", "a", "al", "allo", "alla", "ai", "agli", "alle", "da", "dal", "dallo", "dalla", "dai",
     "dagli", "dalle", "in", "nel", "nello", "nella", "nei", "negli", "nelle", "con", "su", "sul",
     "sullo", "sulla", "sui", "sugli", "sulle", "per", "tra", "fra", "del", "dello", "della",
-    "dei", "degli", "delle", "era", "sono", "stato", "stata", "stati", "state", "essere",
+    "dei", "degli", "delle", "era", "erano", "ero", "sono", "stato", "stata", "stati",
+    "state", "essere", "fa", "fanno", "fatto", "ha", "hai", "hanno", "ho", "sia", "va",
+    "vanno", "questo", "questa", "questi", "queste", "quello", "quella", "quelli",
+    "quelle", "cui", "ne", "ci", "vi", "mi", "ti", "se", "anche", "solo", "molto", "poco",
+    "piu", "meno", "ogni", "tutti", "tutto", "tutta", "tutte", "alcuni", "alcuno",
+    "nessuno", "altro", "altra", "altri", "altre", "senza", "verso", "cio",
     "adesso", "ancora", "prima", "dopo", "sempre", "mai", "poi", "gia", "qui", "la",
     // inglese
     "the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "by", "is", "are", "was",

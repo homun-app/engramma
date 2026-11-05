@@ -357,6 +357,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "engramma-bench"
+version = "0.1.0-dev"
+dependencies = [
+ "engramma-core",
+ "serde_json",
+ "tempfile",
+ "time",
+ "ulid",
+]
+
+[[package]]
 name = "engramma-cli"
 version = "0.1.0-dev"
 dependencies = [
