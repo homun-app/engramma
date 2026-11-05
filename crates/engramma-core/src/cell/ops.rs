@@ -165,36 +165,41 @@ pub fn make_op(
     })
 }
 
+/// The raw fields of a stored `ops` row (one per column).
+#[allow(missing_docs)]
+pub struct OpRow<'a> {
+    pub seq: i64,
+    pub op_id: &'a str,
+    pub hlc: &'a str,
+    pub actor: &'a str,
+    pub kind: &'a str,
+    pub note_id: Option<&'a str>,
+    pub payload_json: &'a str,
+    pub prev_hash: &'a str,
+    pub hash: &'a str,
+}
+
 /// Rebuild an [`Op`] from a stored `ops` row.
 ///
 /// # Errors
 /// [`CellError::Invalid`] on malformed rows.
-pub fn op_from_row(
-    seq: i64,
-    op_id: &str,
-    hlc: &str,
-    actor: &str,
-    kind: &str,
-    note_id: Option<&str>,
-    payload_json: &str,
-    prev_hash: &str,
-    hash: &str,
-) -> Result<Op, CellError> {
+pub fn op_from_row(r: OpRow<'_>) -> Result<Op, CellError> {
     Ok(Op {
-        seq,
-        op_id: Ulid::from_string(op_id)
-            .map_err(|_| CellError::Invalid(format!("bad op_id `{op_id}`")))?,
-        hlc: crate::hlc::Hlc::parse(hlc)?,
-        actor: actor.to_string(),
-        kind: OpKind::parse(kind)?,
-        note_id: note_id
-            .map(|s| Ulid::from_string(s))
+        seq: r.seq,
+        op_id: Ulid::from_string(r.op_id)
+            .map_err(|_| CellError::Invalid(format!("bad op_id `{}`", r.op_id)))?,
+        hlc: crate::hlc::Hlc::parse(r.hlc)?,
+        actor: r.actor.to_string(),
+        kind: OpKind::parse(r.kind)?,
+        note_id: r
+            .note_id
+            .map(Ulid::from_string)
             .transpose()
-            .map_err(|_| CellError::Invalid(format!("bad note_id in op {op_id}")))?,
-        payload: serde_json::from_str(payload_json)
-            .map_err(|e| CellError::Invalid(format!("bad payload in op {op_id}: {e}")))?,
-        prev_hash: prev_hash.to_string(),
-        hash: hash.to_string(),
+            .map_err(|_| CellError::Invalid(format!("bad note_id in op {}", r.op_id)))?,
+        payload: serde_json::from_str(r.payload_json)
+            .map_err(|e| CellError::Invalid(format!("bad payload in op {}: {e}", r.op_id)))?,
+        prev_hash: r.prev_hash.to_string(),
+        hash: r.hash.to_string(),
     })
 }
 
@@ -275,8 +280,7 @@ fn apply_init(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
 }
 
 /// Full column set of `notes` (everything but computed FTS columns).
-const NOTE_COLS: &str =
-    "id, type, title, body, frontmatter_json, scope, source, confidence, status, \
+const NOTE_COLS: &str = "id, type, title, body, frontmatter_json, scope, source, confidence, status, \
      valid_from, valid_to, created_at, updated_at, version, body_norm";
 
 /// Header-only canonical JSON for `frontmatter_json` (the body lives in the
@@ -327,9 +331,7 @@ fn read_note(tx: &Transaction<'_>, id: &Ulid) -> Result<Option<NoteRow>, CellErr
     let body_norm: String = row.get(15).unwrap_or_default();
     let mut tags: Vec<String> = Vec::new();
     {
-        let mut stmt = tx.prepare(
-            "SELECT tag FROM note_tags WHERE note_id = ?1 ORDER BY tag",
-        )?;
+        let mut stmt = tx.prepare("SELECT tag FROM note_tags WHERE note_id = ?1 ORDER BY tag")?;
         let rows = stmt.query_map([id.to_string()], |r| r.get::<_, String>(0))?;
         for t in rows {
             tags.push(t?);
@@ -389,7 +391,12 @@ fn snapshot(tx: &Transaction<'_>, id: &Ulid, version: i64, op_id: &Ulid) -> Resu
     tx.execute(
         "INSERT OR REPLACE INTO note_versions (note_id, version, op_id, snapshot_json)
          VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![id.to_string(), version, op_id.to_string(), row.note.to_json().to_string()],
+        rusqlite::params![
+            id.to_string(),
+            version,
+            op_id.to_string(),
+            row.note.to_json().to_string()
+        ],
     )?;
     Ok(())
 }
@@ -471,11 +478,8 @@ fn write_note(
                 body_norm,
             ],
         )?;
-        let rowid: i64 = tx.query_row(
-            "SELECT rowid FROM notes WHERE id = ?1",
-            [&id],
-            |r| r.get(0),
-        )?;
+        let rowid: i64 =
+            tx.query_row("SELECT rowid FROM notes WHERE id = ?1", [&id], |r| r.get(0))?;
         Ok((rowid, 1))
     }
 }
@@ -524,7 +528,11 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
                 prefix.push('/');
             }
             prefix.push_str(seg);
-            let parent = if i == 0 { None } else { Some(segments[..i].join("/")) };
+            let parent = if i == 0 {
+                None
+            } else {
+                Some(segments[..i].join("/"))
+            };
             tx.execute(
                 "INSERT INTO tags (name, parent) VALUES (?1, ?2)
                  ON CONFLICT(name) DO NOTHING",
@@ -554,10 +562,10 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
             names.push(r.dst.clone());
         }
     }
-    if let Some(subject) = row.note.subject_entity() {
-        if !names.contains(&subject) {
-            names.push(subject.clone());
-        }
+    if let Some(subject) = row.note.subject_entity()
+        && !names.contains(&subject)
+    {
+        names.push(subject.clone());
     }
     for name in &names {
         ensure_entity(tx, name)?;
@@ -598,11 +606,10 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
             .as_ref()
             .map(|v| v.to_db_string())
             .or_else(|| vf.clone());
-        let rvt = r
-            .to
-            .as_ref()
-            .map(|v| v.to_db_string())
-            .or_else(|| vt.clone());
+        let rvt =
+            r.to.as_ref()
+                .map(|v| v.to_db_string())
+                .or_else(|| vt.clone());
         tx.execute(
             "INSERT INTO edges (id, src, rel, dst, note_id, valid_from, valid_to, confidence, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -718,35 +725,34 @@ fn apply_patch(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     if let Some(v) = set.get("valid_from") {
         note.valid_from = v
             .as_str()
-            .map(|s| Validity::parse(s))
+            .map(Validity::parse)
             .transpose()
             .map_err(|e| CellError::Invalid(format!("bad `valid_from`: {e}")))?;
     }
     if let Some(v) = set.get("valid_to") {
         note.valid_to = v
             .as_str()
-            .map(|s| Validity::parse(s))
+            .map(Validity::parse)
             .transpose()
             .map_err(|e| CellError::Invalid(format!("bad `valid_to`: {e}")))?;
     }
     if let Some(v) = set.get("x") {
-        note.extensions = v
-            .as_array()
-            .ok_or_else(|| CellError::Invalid("`x` must be an array of pairs".into()))?
-            .iter()
-            .map(|pair| {
-                let arr = pair
-                    .as_array()
-                    .filter(|a| a.len() == 2)
-                    .ok_or_else(|| CellError::Invalid("`x` must be [key, value] pairs".into()))?;
-                let k = arr[0]
-                    .as_str()
-                    .ok_or_else(|| CellError::Invalid("`x` keys must be strings".into()))?;
-                let val = crate::format::yaml::YamlValue::from_json(&arr[1])
-                    .map_err(|e| CellError::Invalid(format!("bad `x` value: {e}")))?;
-                Ok((k.to_string(), val))
-            })
-            .collect::<Result<Vec<_>, CellError>>()?;
+        note.extensions =
+            v.as_array()
+                .ok_or_else(|| CellError::Invalid("`x` must be an array of pairs".into()))?
+                .iter()
+                .map(|pair| {
+                    let arr = pair.as_array().filter(|a| a.len() == 2).ok_or_else(|| {
+                        CellError::Invalid("`x` must be [key, value] pairs".into())
+                    })?;
+                    let k = arr[0]
+                        .as_str()
+                        .ok_or_else(|| CellError::Invalid("`x` keys must be strings".into()))?;
+                    let val = crate::format::yaml::YamlValue::from_json(&arr[1])
+                        .map_err(|e| CellError::Invalid(format!("bad `x` value: {e}")))?;
+                    Ok((k.to_string(), val))
+                })
+                .collect::<Result<Vec<_>, CellError>>()?;
     }
     note.updated_at = crate::format::At::parse(&payload_str(op, "updated_at")?)
         .map_err(|e| CellError::Invalid(format!("bad `updated_at`: {e}")))?;
@@ -897,11 +903,10 @@ fn apply_link(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     // Entity endpoints are created implicitly; note endpoints must exist.
     for endpoint in [&src, &dst] {
         if let Some(note_id) = endpoint.strip_prefix("note:") {
-            let n: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM notes WHERE id = ?1",
-                [note_id],
-                |r| r.get(0),
-            )?;
+            let n: i64 =
+                tx.query_row("SELECT COUNT(*) FROM notes WHERE id = ?1", [note_id], |r| {
+                    r.get(0)
+                })?;
             if n == 0 {
                 return Err(CellError::NoteNotFound(note_id.to_string()));
             }
@@ -920,7 +925,9 @@ fn apply_link(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
             e.get("note_id").and_then(Value::as_str),
             e.get("valid_from").and_then(Value::as_str),
             e.get("valid_to").and_then(Value::as_str),
-            e.get("confidence").and_then(Value::as_str).unwrap_or("stated"),
+            e.get("confidence")
+                .and_then(Value::as_str)
+                .unwrap_or("stated"),
         ],
     )?;
     Ok(())
@@ -968,17 +975,17 @@ pub fn read_ops(conn: &Connection) -> Result<Vec<Op>, CellError> {
     )?;
     let ops = stmt
         .query_map([], |r| {
-            Ok(op_from_row(
-                r.get(0)?,
-                &r.get::<_, String>(1)?,
-                &r.get::<_, String>(2)?,
-                &r.get::<_, String>(3)?,
-                &r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?.as_deref(),
-                &r.get::<_, String>(6)?,
-                &r.get::<_, String>(7)?,
-                &r.get::<_, String>(8)?,
-            ))
+            Ok(op_from_row(OpRow {
+                seq: r.get(0)?,
+                op_id: &r.get::<_, String>(1)?,
+                hlc: &r.get::<_, String>(2)?,
+                actor: &r.get::<_, String>(3)?,
+                kind: &r.get::<_, String>(4)?,
+                note_id: r.get::<_, Option<String>>(5)?.as_deref(),
+                payload_json: &r.get::<_, String>(6)?,
+                prev_hash: &r.get::<_, String>(7)?,
+                hash: &r.get::<_, String>(8)?,
+            }))
         })?
         .collect::<Result<Result<Vec<_>, _>, _>>()??;
     Ok(ops)

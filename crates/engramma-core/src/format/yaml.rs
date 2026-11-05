@@ -82,14 +82,12 @@ impl YamlValue {
                 }
             }
             serde_json::Value::String(s) => YamlValue::Str(s.clone()),
-            serde_json::Value::Array(items) => {
-                YamlValue::Seq(
-                    items
-                        .iter()
-                        .map(Self::from_json)
-                        .collect::<FormatResult<Vec<_>>>()?,
-                )
-            }
+            serde_json::Value::Array(items) => YamlValue::Seq(
+                items
+                    .iter()
+                    .map(Self::from_json)
+                    .collect::<FormatResult<Vec<_>>>()?,
+            ),
             serde_json::Value::Object(m) => {
                 let mut entries = Vec::with_capacity(m.len());
                 for (k, val) in m {
@@ -178,16 +176,29 @@ fn escape_double(s: &str) -> String {
 /// `" #"` or leading `#`, none of the flow/reserved indicators, and nothing
 /// that would read back as a bool, null or number.
 fn needs_quoting(s: &str) -> bool {
-    let starts_with_indicator = s
-        .chars()
-        .next()
-        .is_some_and(|c| {
-            matches!(
-                c,
-                '\'' | '"' | '!' | '&' | '*' | ',' | '>' | '?' | '|' | '%' | '@' | '`' | '#'
-                    | '[' | ']' | '{' | '}' | '-' | ':'
-            )
-        });
+    let starts_with_indicator = s.chars().next().is_some_and(|c| {
+        matches!(
+            c,
+            '\'' | '"'
+                | '!'
+                | '&'
+                | '*'
+                | ','
+                | '>'
+                | '?'
+                | '|'
+                | '%'
+                | '@'
+                | '`'
+                | '#'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '-'
+                | ':'
+        )
+    });
     if s.is_empty()
         || starts_with_indicator
         || s.starts_with(' ')
@@ -199,8 +210,23 @@ fn needs_quoting(s: &str) -> bool {
         || s.chars().any(|c| {
             matches!(
                 c,
-                '{' | '}' | '[' | ']' | ',' | '&' | '*' | '?' | '|' | '<' | '>' | '=' | '!'
-                    | '%' | '@' | '`' | '\n' | '\t'
+                '{' | '}'
+                    | '['
+                    | ']'
+                    | ','
+                    | '&'
+                    | '*'
+                    | '?'
+                    | '|'
+                    | '<'
+                    | '>'
+                    | '='
+                    | '!'
+                    | '%'
+                    | '@'
+                    | '`'
+                    | '\n'
+                    | '\t'
             )
         })
     {
@@ -209,9 +235,7 @@ fn needs_quoting(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     // YAML core-schema numbers (and the 1.1 octal legacy: `0755`) must be
     // quoted, or they would read back as integers.
-    let yaml_number = s.parse::<i64>().is_ok()
-        || s.parse::<f64>().is_ok()
-        || regex_number_like(s);
+    let yaml_number = s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() || regex_number_like(s);
     matches!(
         lower.as_str(),
         "true" | "false" | "null" | "~" | "yes" | "no" | "on" | "off"
@@ -298,7 +322,9 @@ fn convert(y: YamlOwned) -> FormatResult<YamlValue> {
             return Err(FormatError::UnsupportedYaml("tags are not accepted".into()));
         }
         YamlOwned::Alias(_) => {
-            return Err(FormatError::UnsupportedYaml("aliases are not accepted".into()));
+            return Err(FormatError::UnsupportedYaml(
+                "aliases are not accepted".into(),
+            ));
         }
         YamlOwned::BadValue => {
             return Err(FormatError::Yaml("incoherent scalar value".into()));

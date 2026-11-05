@@ -280,7 +280,9 @@ impl Validity {
             return Ok(Validity(d, None));
         }
         let dt = OffsetDateTime::parse(s, &Rfc3339).map_err(|e| {
-            bad(format!("`{s}` is neither a date nor an RFC 3339 UTC datetime: {e}"))
+            bad(format!(
+                "`{s}` is neither a date nor an RFC 3339 UTC datetime: {e}"
+            ))
         })?;
         if dt.offset() != UtcOffset::UTC {
             return Err(bad(format!("`{s}`: only UTC datetimes are allowed")));
@@ -288,7 +290,10 @@ impl Validity {
         if dt.nanosecond() != 0 {
             return Err(bad(format!("`{s}`: sub-second precision is not allowed")));
         }
-        Ok(Validity(dt.date(), Some((dt.hour(), dt.minute(), dt.second()))))
+        Ok(Validity(
+            dt.date(),
+            Some((dt.hour(), dt.minute(), dt.second())),
+        ))
     }
 
     /// Wire/DB form: a date stays a date, a datetime keeps `Z`.
@@ -325,9 +330,7 @@ impl Validity {
                 .assume_utc(),
             Some((h, m, s)) => self
                 .0
-                .with_time(
-                    time::Time::from_hms(h, m, s).unwrap_or(time::Time::MIDNIGHT),
-                )
+                .with_time(time::Time::from_hms(h, m, s).unwrap_or(time::Time::MIDNIGHT))
                 .assume_utc(),
         }
     }
@@ -504,20 +507,42 @@ impl Note {
         line(&mut out, "confidence", self.confidence.as_str().to_string());
         line(&mut out, "status", self.status.as_str().to_string());
         if let Some(v) = &self.valid_from {
-            line(&mut out, "valid_from", YamlValue::emit_scalar(&v.to_db_string()));
+            line(
+                &mut out,
+                "valid_from",
+                YamlValue::emit_scalar(&v.to_db_string()),
+            );
         }
         if let Some(v) = &self.valid_to {
-            line(&mut out, "valid_to", YamlValue::emit_scalar(&v.to_db_string()));
+            line(
+                &mut out,
+                "valid_to",
+                YamlValue::emit_scalar(&v.to_db_string()),
+            );
         }
         if !self.supersedes.is_empty() {
             line(
                 &mut out,
                 "supersedes",
-                emit_list(&self.supersedes.iter().map(|u| u.to_string()).collect::<Vec<_>>()),
+                emit_list(
+                    &self
+                        .supersedes
+                        .iter()
+                        .map(|u| u.to_string())
+                        .collect::<Vec<_>>(),
+                ),
             );
         }
-        line(&mut out, "created_at", YamlValue::emit_scalar(&self.created_at.to_db_string()));
-        line(&mut out, "updated_at", YamlValue::emit_scalar(&self.updated_at.to_db_string()));
+        line(
+            &mut out,
+            "created_at",
+            YamlValue::emit_scalar(&self.created_at.to_db_string()),
+        );
+        line(
+            &mut out,
+            "updated_at",
+            YamlValue::emit_scalar(&self.updated_at.to_db_string()),
+        );
         for (k, v) in &self.extensions {
             line(&mut out, k, v.emit_flow());
         }
@@ -557,7 +582,10 @@ impl Note {
         m.insert(
             "supersedes".into(),
             serde_json::Value::Array(
-                self.supersedes.iter().map(|u| u.to_string().into()).collect(),
+                self.supersedes
+                    .iter()
+                    .map(|u| u.to_string().into())
+                    .collect(),
             ),
         );
         m.insert("created_at".into(), self.created_at.to_db_string().into());
@@ -568,10 +596,12 @@ impl Note {
             let x = serde_json::Value::Array(
                 self.extensions
                     .iter()
-                    .map(|(k, v)| serde_json::Value::Array(vec![
-                        serde_json::Value::String(k.clone()),
-                        v.to_json(),
-                    ]))
+                    .map(|(k, v)| {
+                        serde_json::Value::Array(vec![
+                            serde_json::Value::String(k.clone()),
+                            v.to_json(),
+                        ])
+                    })
                     .collect(),
             );
             m.insert("x".into(), x);
@@ -585,14 +615,15 @@ impl Note {
     /// # Errors
     /// [`FormatError`] when the payload does not follow the model.
     pub fn from_json(v: &serde_json::Value) -> FormatResult<Self> {
-        let obj = v.as_object().ok_or_else(|| bad_field("note", "expected a JSON object"))?;
+        let obj = v
+            .as_object()
+            .ok_or_else(|| bad_field("note", "expected a JSON object"))?;
         let get_str = |k: &str| -> FormatResult<&str> {
-            obj.get(k).and_then(serde_json::Value::as_str).ok_or_else(|| {
-                bad_field("note", format!("missing string field `{k}`"))
-            })
+            obj.get(k)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| bad_field("note", format!("missing string field `{k}`")))
         };
-        let id = Ulid::from_string(get_str("id")?)
-            .map_err(|_| bad_field("id", "not a ULID"))?;
+        let id = Ulid::from_string(get_str("id")?).map_err(|_| bad_field("id", "not a ULID"))?;
         let note_type = NoteType::parse(get_str("type")?)?;
         let title = obj
             .get("title")
@@ -622,7 +653,8 @@ impl Note {
         let supersedes = string_array(obj.get("supersedes"), "supersedes")?
             .into_iter()
             .map(|s| {
-                Ulid::from_string(&s).map_err(|_| bad_field("supersedes", format!("`{s}` is not a ULID")))
+                Ulid::from_string(&s)
+                    .map_err(|_| bad_field("supersedes", format!("`{s}` is not a ULID")))
             })
             .collect::<FormatResult<Vec<_>>>()?;
         let created_at = At::parse(get_str("created_at")?)?;
@@ -630,13 +662,15 @@ impl Note {
         let mut extensions = Vec::new();
         if let Some(pairs) = obj.get("x").and_then(serde_json::Value::as_array) {
             for pair in pairs {
-                let arr = pair.as_array().ok_or_else(|| {
-                    bad_field("x", "expected an array of [key, value] pairs")
-                })?;
+                let arr = pair
+                    .as_array()
+                    .ok_or_else(|| bad_field("x", "expected an array of [key, value] pairs"))?;
                 if arr.len() != 2 {
                     return Err(bad_field("x", "expected an array of [key, value] pairs"));
                 }
-                let k = arr[0].as_str().ok_or_else(|| bad_field("x", "keys must be strings"))?;
+                let k = arr[0]
+                    .as_str()
+                    .ok_or_else(|| bad_field("x", "keys must be strings"))?;
                 extensions.push((k.to_string(), YamlValue::from_json(&arr[1])?));
             }
         }
@@ -665,7 +699,9 @@ fn string_array(v: Option<&serde_json::Value>, field: &'static str) -> FormatRes
     let Some(v) = v else {
         return Ok(Vec::new());
     };
-    let arr = v.as_array().ok_or_else(|| bad_field(field, "expected a list"))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| bad_field(field, "expected a list"))?;
     arr.iter()
         .map(|item| {
             item.as_str()
@@ -715,21 +751,29 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
     for (k, v) in entries {
         match k.as_str() {
             "id" => {
-                let s = v.as_str().ok_or_else(|| bad_field("id", "expected a string"))?;
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| bad_field("id", "expected a string"))?;
                 let u = Ulid::from_string(s)
                     .map_err(|_| bad_field("id", format!("`{s}` is not a ULID")))?;
                 if u.to_string() != s {
-                    return Err(bad_field("id", format!("`{s}` is not canonical (uppercase)")));
+                    return Err(bad_field(
+                        "id",
+                        format!("`{s}` is not canonical (uppercase)"),
+                    ));
                 }
                 id = Some(u);
             }
             "type" => {
                 note_type = Some(NoteType::parse(
-                    v.as_str().ok_or_else(|| bad_field("type", "expected a string"))?,
+                    v.as_str()
+                        .ok_or_else(|| bad_field("type", "expected a string"))?,
                 )?)
             }
             "title" => {
-                let s = v.as_str().ok_or_else(|| bad_field("title", "expected a string"))?;
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| bad_field("title", "expected a string"))?;
                 if s.contains(['\n', '\r']) {
                     return Err(bad_field("title", "must be a single line"));
                 }
@@ -741,7 +785,9 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
                 };
                 let mut list = Vec::with_capacity(items.len());
                 for item in items {
-                    let s = item.as_str().ok_or_else(|| bad_field("tags", "expected strings"))?;
+                    let s = item
+                        .as_str()
+                        .ok_or_else(|| bad_field("tags", "expected strings"))?;
                     validate_tag_name(s)?;
                     list.push(s.to_string());
                 }
@@ -756,7 +802,8 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
             }
             "lang" => {
                 lang = Some(Lang::parse(
-                    v.as_str().ok_or_else(|| bad_field("lang", "expected a string"))?,
+                    v.as_str()
+                        .ok_or_else(|| bad_field("lang", "expected a string"))?,
                 )?)
             }
             "source" => {
@@ -767,10 +814,10 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
                 )
             }
             "confidence" => {
-                confidence = Some(Confidence::parse(
-                    v.as_str()
-                        .ok_or_else(|| bad_field("confidence", "expected a string"))?,
-                )?)
+                confidence =
+                    Some(Confidence::parse(v.as_str().ok_or_else(|| {
+                        bad_field("confidence", "expected a string")
+                    })?)?)
             }
             "status" => {
                 status = Some(Status::parse(
@@ -779,16 +826,16 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
                 )?)
             }
             "valid_from" => {
-                valid_from = Some(Validity::parse(
-                    v.as_str()
-                        .ok_or_else(|| bad_field("valid_from", "expected a date or datetime"))?,
-                )?)
+                valid_from =
+                    Some(Validity::parse(v.as_str().ok_or_else(|| {
+                        bad_field("valid_from", "expected a date or datetime")
+                    })?)?)
             }
             "valid_to" => {
-                valid_to = Some(Validity::parse(
-                    v.as_str()
-                        .ok_or_else(|| bad_field("valid_to", "expected a date or datetime"))?,
-                )?)
+                valid_to =
+                    Some(Validity::parse(v.as_str().ok_or_else(|| {
+                        bad_field("valid_to", "expected a date or datetime")
+                    })?)?)
             }
             "supersedes" => {
                 let YamlValue::Seq(items) = &v else {
@@ -799,22 +846,24 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
                     let s = item
                         .as_str()
                         .ok_or_else(|| bad_field("supersedes", "expected strings"))?;
-                    list.push(Ulid::from_string(s)
-                        .map_err(|_| bad_field("supersedes", format!("`{s}` is not a ULID")))?);
+                    list.push(
+                        Ulid::from_string(s)
+                            .map_err(|_| bad_field("supersedes", format!("`{s}` is not a ULID")))?,
+                    );
                 }
                 supersedes = Some(list);
             }
             "created_at" => {
-                created_at = Some(At::parse(
-                    v.as_str()
-                        .ok_or_else(|| bad_field("created_at", "expected a UTC datetime"))?,
-                )?)
+                created_at =
+                    Some(At::parse(v.as_str().ok_or_else(|| {
+                        bad_field("created_at", "expected a UTC datetime")
+                    })?)?)
             }
             "updated_at" => {
-                updated_at = Some(At::parse(
-                    v.as_str()
-                        .ok_or_else(|| bad_field("updated_at", "expected a UTC datetime"))?,
-                )?)
+                updated_at =
+                    Some(At::parse(v.as_str().ok_or_else(|| {
+                        bad_field("updated_at", "expected a UTC datetime")
+                    })?)?)
             }
             other => {
                 if other.starts_with("x-") {
@@ -822,7 +871,7 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
                 } else {
                     match mode {
                         ParseMode::Strict => {
-                            return Err(FormatError::UnknownKey(other.to_string()))
+                            return Err(FormatError::UnknownKey(other.to_string()));
                         }
                         ParseMode::Import => {
                             warnings.push(format!("unknown key `{other}` ignored"))
@@ -882,7 +931,9 @@ fn validate_tag_name(tag: &str) -> FormatResult<()> {
     let ok = !tag.is_empty()
         && tag.split('/').all(|seg| {
             let mut chars = seg.chars();
-            let first_ok = chars.next().is_some_and(|c| c.is_alphanumeric() || c == '_');
+            let first_ok = chars
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
             first_ok && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '-')
         });
     if ok {
@@ -973,8 +1024,7 @@ mod tests {
         // After `confirm`, an external note is active: the file may say so.
         let text = minimal_text()
             .replace("confidence: stated", "confidence: external")
-            .replace("source: user", "source: import:web")
-            .replace("status: active", "status: active");
+            .replace("source: user", "source: import:web");
         let p = parse(&text, ParseMode::Strict).unwrap(/* test-only */);
         assert_eq!(p.note.status, Status::Active);
     }
@@ -997,8 +1047,10 @@ mod tests {
 
     #[test]
     fn json_round_trip_with_extensions() {
-        let text =
-            minimal_text().replace("status: active", "status: active\nx-homun: {bot: casa}\nx-n: 7");
+        let text = minimal_text().replace(
+            "status: active",
+            "status: active\nx-homun: {bot: casa}\nx-n: 7",
+        );
         let p = parse(&text, ParseMode::Strict).unwrap(/* test-only */);
         let j = p.note.to_json();
         let back = Note::from_json(&j).unwrap(/* test-only */);
@@ -1044,25 +1096,34 @@ mod tests {
 
     #[test]
     fn bad_values_are_readable_errors() {
-        assert!(parse(
-            &minimal_text().replace("type: fact", "type: idea"),
-            ParseMode::Strict
-        )
-        .is_err());
-        assert!(parse(
-            &minimal_text().replace("id: 01JC8Z6Q2W8M3N5V4T7Y9R0P1S", "id: corto"),
-            ParseMode::Strict
-        )
-        .is_err());
-        assert!(parse(
-            &minimal_text().replace("status: active", "tags: [\"tag con spazi\"]"),
-            ParseMode::Strict
-        )
-        .is_err());
-        assert!(parse(
-            &minimal_text().replace("updated_at: 2026-09-03T10:12:00Z", "updated_at: 2026-09-03"),
-            ParseMode::Strict
-        )
-        .is_err());
+        assert!(
+            parse(
+                &minimal_text().replace("type: fact", "type: idea"),
+                ParseMode::Strict
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                &minimal_text().replace("id: 01JC8Z6Q2W8M3N5V4T7Y9R0P1S", "id: corto"),
+                ParseMode::Strict
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                &minimal_text().replace("status: active", "tags: [\"tag con spazi\"]"),
+                ParseMode::Strict
+            )
+            .is_err()
+        );
+        assert!(
+            parse(
+                &minimal_text()
+                    .replace("updated_at: 2026-09-03T10:12:00Z", "updated_at: 2026-09-03"),
+                ParseMode::Strict
+            )
+            .is_err()
+        );
     }
 }

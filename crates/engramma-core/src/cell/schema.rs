@@ -13,7 +13,8 @@ pub const SCHEMA_VERSION: i64 = 2;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 2] = [r#"
+pub const MIGRATIONS: [&str; 2] = [
+    r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
                         scope TEXT, source TEXT, confidence TEXT, status TEXT,
@@ -40,21 +41,20 @@ CREATE INDEX idx_notes_status_valid ON notes(status, valid_to);
 CREATE INDEX idx_notes_type ON notes(type);
 CREATE INDEX idx_note_tags_tag ON note_tags(tag);
 "#,
-r#"
+    r#"
 -- v2: reindexing a note deletes its derived edges by note id; without this
 -- index every write scans the whole edge table (measured: the 100k-note
 -- benchmark collapsed to ~190 notes/s).
 CREATE INDEX idx_edges_note ON edges(note_id);
-"#];
+"#,
+];
 
 /// Apply pending migrations inside `tx` and update `meta.schema_version`.
 ///
 /// # Errors
 /// [`CellError::Db`] on SQL failure.
 pub fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
-    )?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);")?;
     let current: i64 = tx
         .query_row(
             "SELECT value FROM meta WHERE key = 'schema_version'",

@@ -4,9 +4,9 @@
 //! tags and `## Relations` entries. Code blocks, inline code and HTML never
 //! contribute; tags are additionally excluded from headings (spec §2–§4).
 
-use std::collections::BTreeSet;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use regex::Regex;
+use std::collections::BTreeSet;
 
 use crate::error::{FormatError, FormatResult};
 use crate::format::Validity;
@@ -101,25 +101,55 @@ pub fn analyze(body: &str) -> FormatResult<BodyAnalysis> {
                 }
             }
             Event::Code(_) => {
-                flush_run(&mut out, &mut seen_links, &mut seen_tags, &mut run, &mut last_char)?;
+                flush_run(
+                    &mut out,
+                    &mut seen_links,
+                    &mut seen_tags,
+                    &mut run,
+                    &mut last_char,
+                )?;
                 last_char = Some('`');
             }
             Event::Html(_) | Event::InlineHtml(_) | Event::SoftBreak | Event::HardBreak => {
-                flush_run(&mut out, &mut seen_links, &mut seen_tags, &mut run, &mut last_char)?;
+                flush_run(
+                    &mut out,
+                    &mut seen_links,
+                    &mut seen_tags,
+                    &mut run,
+                    &mut last_char,
+                )?;
                 if matches!(ev, Event::SoftBreak | Event::HardBreak) {
                     last_char = Some('\n');
                 }
             }
             Event::Start(Tag::CodeBlock(_)) => {
-                flush_run(&mut out, &mut seen_links, &mut seen_tags, &mut run, &mut last_char)?;
+                flush_run(
+                    &mut out,
+                    &mut seen_links,
+                    &mut seen_tags,
+                    &mut run,
+                    &mut last_char,
+                )?;
                 in_code_block = true;
             }
             Event::End(TagEnd::CodeBlock) => {
-                flush_run(&mut out, &mut seen_links, &mut seen_tags, &mut run, &mut last_char)?;
+                flush_run(
+                    &mut out,
+                    &mut seen_links,
+                    &mut seen_tags,
+                    &mut run,
+                    &mut last_char,
+                )?;
                 in_code_block = false;
             }
             Event::Start(Tag::Heading { level, .. }) => {
-                flush_run(&mut out, &mut seen_links, &mut seen_tags, &mut run, &mut last_char)?;
+                flush_run(
+                    &mut out,
+                    &mut seen_links,
+                    &mut seen_tags,
+                    &mut run,
+                    &mut last_char,
+                )?;
                 in_heading = true;
                 heading_text.clear();
                 heading_level = level;
@@ -127,7 +157,13 @@ pub fn analyze(body: &str) -> FormatResult<BodyAnalysis> {
                 in_relations = false;
             }
             Event::End(TagEnd::Heading(_)) => {
-                flush_run(&mut out, &mut seen_links, &mut seen_tags, &mut run, &mut last_char)?;
+                flush_run(
+                    &mut out,
+                    &mut seen_links,
+                    &mut seen_tags,
+                    &mut run,
+                    &mut last_char,
+                )?;
                 in_heading = false;
                 if heading_level <= HeadingLevel::H2 && heading_text.trim() == "Relations" {
                     in_relations = true;
@@ -136,28 +172,58 @@ pub fn analyze(body: &str) -> FormatResult<BodyAnalysis> {
                 scan_links(&heading_text, &mut seen_links, &mut out.links)?;
             }
             Event::Start(Tag::Paragraph) | Event::Start(Tag::List(_)) => {
-                flush_run(&mut out, &mut seen_links, &mut seen_tags, &mut run, &mut last_char)?;
+                flush_run(
+                    &mut out,
+                    &mut seen_links,
+                    &mut seen_tags,
+                    &mut run,
+                    &mut last_char,
+                )?;
                 last_char = None;
             }
             Event::Start(Tag::Item) => {
-                flush_run(&mut out, &mut seen_links, &mut seen_tags, &mut run, &mut last_char)?;
+                flush_run(
+                    &mut out,
+                    &mut seen_links,
+                    &mut seen_tags,
+                    &mut run,
+                    &mut last_char,
+                )?;
                 in_item = true;
                 item_text.clear();
                 last_char = None;
             }
             Event::End(TagEnd::Item) => {
-                flush_run(&mut out, &mut seen_links, &mut seen_tags, &mut run, &mut last_char)?;
+                flush_run(
+                    &mut out,
+                    &mut seen_links,
+                    &mut seen_tags,
+                    &mut run,
+                    &mut last_char,
+                )?;
                 if in_relations {
                     out.relations.push(parse_relation_line(&item_text)?);
                 }
                 in_item = false;
             }
             _ => {
-                flush_run(&mut out, &mut seen_links, &mut seen_tags, &mut run, &mut last_char)?;
+                flush_run(
+                    &mut out,
+                    &mut seen_links,
+                    &mut seen_tags,
+                    &mut run,
+                    &mut last_char,
+                )?;
             }
         }
     }
-    flush_run(&mut out, &mut seen_links, &mut seen_tags, &mut run, &mut last_char)?;
+    flush_run(
+        &mut out,
+        &mut seen_links,
+        &mut seen_tags,
+        &mut run,
+        &mut last_char,
+    )?;
     Ok(out)
 }
 
@@ -175,11 +241,14 @@ fn flush_run(
     let masked = scan_links(run, seen_links, &mut out.links)?;
     for cap in tag_re().captures_iter(&masked) {
         let preceded_ok = match cap.get(1) {
-            Some(m) if m.start() == 0 => last_char.map_or(true, char::is_whitespace),
+            Some(m) if m.start() == 0 => last_char.is_none_or(char::is_whitespace),
             _ => true,
         };
         if preceded_ok {
-            let tag = cap.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let tag = cap
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
             if seen_tags.insert(tag.clone()) {
                 out.tags.push(tag);
             }
@@ -198,7 +267,7 @@ fn scan_links(
     links: &mut Vec<String>,
 ) -> FormatResult<String> {
     let mut masked = text.to_string();
-    
+
     for cap in link_re().captures_iter(text) {
         let name = cap
             .get(1)
@@ -220,7 +289,6 @@ fn scan_links(
     }
     Ok(masked)
 }
-
 
 /// Parse one `- rel:: [[Dst]] (from … to …)` line.
 fn parse_relation_line(line: &str) -> FormatResult<RelationDecl> {
@@ -280,10 +348,7 @@ mod tests {
         assert!(a.relations[0].from.is_some());
         assert!(a.relations[0].to.is_none());
         assert_eq!(
-            a.relations[2]
-                .to
-                .as_ref()
-                .map(|t| t.to_db_string()),
+            a.relations[2].to.as_ref().map(|t| t.to_db_string()),
             Some("2024-12-31".to_string())
         );
     }
@@ -312,6 +377,8 @@ mod tests {
 
     #[test]
     fn relations_only_at_level_one_or_two() {
-        assert!(analyze("### Relations\n- a:: [[B]]\n").unwrap(/* test-only */).relations.is_empty());
+        assert!(
+            analyze("### Relations\n- a:: [[B]]\n").unwrap(/* test-only */).relations.is_empty()
+        );
     }
 }

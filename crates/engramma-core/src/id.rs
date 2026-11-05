@@ -68,14 +68,8 @@ pub fn node_id() -> &'static str {
     NODE.get_or_init(|| {
         // Two random ULIDs hashed together: no timing information, different on
         // every process start, stable for the process lifetime.
-        let a = shared()
-            .next()
-            .map(|u| u.to_string())
-            .unwrap_or_default();
-        let b = shared()
-            .next()
-            .map(|u| u.to_string())
-            .unwrap_or_default();
+        let a = shared().next().map(|u| u.to_string()).unwrap_or_default();
+        let b = shared().next().map(|u| u.to_string()).unwrap_or_default();
         let h = blake3::hash(format!("{a}{b}").as_bytes());
         h.to_hex()[..12].to_string()
     })

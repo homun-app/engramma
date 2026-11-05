@@ -72,7 +72,10 @@ impl NotePatch {
     fn to_set(&self) -> Value {
         let mut m = serde_json::Map::new();
         if let Some(t) = &self.title {
-            m.insert("title".into(), t.clone().map(Value::String).unwrap_or(Value::Null));
+            m.insert(
+                "title".into(),
+                t.clone().map(Value::String).unwrap_or(Value::Null),
+            );
         }
         if let Some(b) = &self.body {
             m.insert("body".into(), Value::String(b.clone()));
@@ -84,7 +87,10 @@ impl NotePatch {
             );
         }
         if let Some(s) = &self.scope {
-            m.insert("scope".into(), s.clone().map(Value::String).unwrap_or(Value::Null));
+            m.insert(
+                "scope".into(),
+                s.clone().map(Value::String).unwrap_or(Value::Null),
+            );
         }
         if let Some(l) = self.lang {
             m.insert("lang".into(), Value::String(l.as_str().into()));
@@ -116,12 +122,7 @@ impl NotePatch {
                 "x".into(),
                 Value::Array(
                     x.iter()
-                        .map(|(k, v)| {
-                            Value::Array(vec![
-                                Value::String(k.clone()),
-                                v.to_json(),
-                            ])
-                        })
+                        .map(|(k, v)| Value::Array(vec![Value::String(k.clone()), v.to_json()]))
                         .collect(),
                 ),
             );
@@ -179,7 +180,7 @@ fn per_cell_lock(path: &Path) -> Arc<Mutex<()>> {
     let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     map.lock()
         .map_err(|_| CellError::Db("cell lock registry poisoned".into()))
-        .and_then(|mut m| Ok(m.entry(path.to_path_buf()).or_default().clone()))
+        .map(|mut m| m.entry(path.to_path_buf()).or_default().clone())
         .unwrap_or_else(|_| Arc::new(Mutex::new(())))
 }
 
@@ -192,9 +193,7 @@ fn configure(conn: &Connection) -> Result<(), CellError> {
 }
 
 fn now_ms() -> u64 {
-    OffsetDateTime::now_utc()
-        .unix_timestamp()
-        .max(0) as u64 * 1000
+    OffsetDateTime::now_utc().unix_timestamp().max(0) as u64 * 1000
         + u32::from(OffsetDateTime::now_utc().millisecond()) as u64
 }
 
@@ -262,10 +261,10 @@ impl Cell {
             let hlc_s: Option<String> = conn
                 .query_row("SELECT value FROM meta WHERE key='hlc'", [], |r| r.get(0))
                 .ok();
-            if let Some(s) = hlc_s {
-                if let Ok(h) = Hlc::parse(&s) {
-                    clock.restore(&h);
-                }
+            if let Some(s) = hlc_s
+                && let Ok(h) = Hlc::parse(&s)
+            {
+                clock.restore(&h);
             }
         }
         Ok(Cell {
@@ -379,11 +378,7 @@ impl Cell {
             OpKind::PutNote,
             Some(note.id),
             actor,
-            Value::Object(
-                [("note".to_string(), note.to_json())]
-                    .into_iter()
-                    .collect(),
-            ),
+            Value::Object([("note".to_string(), note.to_json())].into_iter().collect()),
         )
     }
 
@@ -544,19 +539,18 @@ impl Cell {
             )));
         }
         let inner = self.lock()?;
-        let mut stmt = inner.conn.prepare(
-            "SELECT id FROM notes WHERE id LIKE ?1 || '%' ORDER BY id",
-        )?;
-        let ids: Vec<String> = stmt
-            .query_map([input], |r| r.get(0))?
-            .flatten()
-            .collect();
+        let mut stmt = inner
+            .conn
+            .prepare("SELECT id FROM notes WHERE id LIKE ?1 || '%' ORDER BY id")?;
+        let ids: Vec<String> = stmt.query_map([input], |r| r.get(0))?.flatten().collect();
         drop(stmt);
         match ids.first() {
             Some(only) if ids.len() == 1 => {
                 Ulid::from_string(only).map_err(|_| CellError::Db("bad id".into()))
             }
-            None => Err(CellError::NoteNotFound(format!("no note starts with `{input}`"))),
+            None => Err(CellError::NoteNotFound(format!(
+                "no note starts with `{input}`"
+            ))),
             Some(_) => Err(CellError::Invalid(format!(
                 "`{input}` is ambiguous ({} notes)",
                 ids.len()
@@ -630,17 +624,17 @@ impl Cell {
              FROM ops WHERE seq > ?1 ORDER BY seq",
         )?;
         let rows = stmt.query_map([seq], |r| {
-            Ok(ops::op_from_row(
-                r.get(0)?,
-                &r.get::<_, String>(1)?,
-                &r.get::<_, String>(2)?,
-                &r.get::<_, String>(3)?,
-                &r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?.as_deref(),
-                &r.get::<_, String>(6)?,
-                &r.get::<_, String>(7)?,
-                &r.get::<_, String>(8)?,
-            ))
+            Ok(ops::op_from_row(ops::OpRow {
+                seq: r.get(0)?,
+                op_id: &r.get::<_, String>(1)?,
+                hlc: &r.get::<_, String>(2)?,
+                actor: &r.get::<_, String>(3)?,
+                kind: &r.get::<_, String>(4)?,
+                note_id: r.get::<_, Option<String>>(5)?.as_deref(),
+                payload_json: &r.get::<_, String>(6)?,
+                prev_hash: &r.get::<_, String>(7)?,
+                hash: &r.get::<_, String>(8)?,
+            }))
         })?;
         let mut out = Vec::new();
         for row in rows {
@@ -703,23 +697,24 @@ impl Cell {
     fn now_at(&self) -> Result<At, CellError> {
         let inner = self.lock()?;
         let ms = inner.clock.wall_ms();
-        Ok(At(
-            OffsetDateTime::from_unix_timestamp(ms as i64 / 1000)
-                .map_err(|e| CellError::Invalid(format!("clock out of range: {e}")))?
-                .replace_millisecond((ms % 1000) as u16)
-                .map_err(|e| CellError::Invalid(format!("clock out of range: {e}")))?,
-        ))
+        Ok(At(OffsetDateTime::from_unix_timestamp(ms as i64 / 1000)
+            .map_err(|e| CellError::Invalid(format!("clock out of range: {e}")))?
+            .replace_millisecond((ms % 1000) as u16)
+            .map_err(|e| {
+                CellError::Invalid(format!("clock out of range: {e}"))
+            })?))
     }
 }
 
 /// Read a note through any transaction-ish handle.
 pub(crate) fn get_note_tx(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<Note, CellError> {
-    let frontmatter_json: String = tx.query_row(
-        "SELECT frontmatter_json FROM notes WHERE id = ?1",
-        [id.to_string()],
-        |r| r.get(0),
-    )
-    .map_err(|_| CellError::NoteNotFound(id.to_string()))?;
+    let frontmatter_json: String = tx
+        .query_row(
+            "SELECT frontmatter_json FROM notes WHERE id = ?1",
+            [id.to_string()],
+            |r| r.get(0),
+        )
+        .map_err(|_| CellError::NoteNotFound(id.to_string()))?;
     let body: String = tx.query_row(
         "SELECT body FROM notes WHERE id = ?1",
         [id.to_string()],
@@ -736,19 +731,37 @@ pub(crate) fn get_note_tx(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<N
 
 /// Row-by-row comparison of two cell states (ops included; internal FTS
 /// rowids excluded — the index is rebuilt identically by construction).
-fn compare_states(
-    a: &Connection,
-    b: &Connection,
-) -> Result<Option<String>, CellError> {
+fn compare_states(a: &Connection, b: &Connection) -> Result<Option<String>, CellError> {
     let tables = [
-        ("notes", "SELECT id, type, title, body, frontmatter_json, scope, source, confidence, status, valid_from, valid_to, created_at, updated_at, version, body_norm FROM notes ORDER BY id"),
-        ("note_versions", "SELECT note_id, version, op_id, snapshot_json FROM note_versions ORDER BY note_id, version"),
+        (
+            "notes",
+            "SELECT id, type, title, body, frontmatter_json, scope, source, confidence, status, valid_from, valid_to, created_at, updated_at, version, body_norm FROM notes ORDER BY id",
+        ),
+        (
+            "note_versions",
+            "SELECT note_id, version, op_id, snapshot_json FROM note_versions ORDER BY note_id, version",
+        ),
         ("tags", "SELECT name, parent FROM tags ORDER BY name"),
-        ("note_tags", "SELECT note_id, tag FROM note_tags ORDER BY note_id, tag"),
-        ("entities", "SELECT id, name, type, note_id FROM entities ORDER BY id"),
-        ("edges", "SELECT id, src, rel, dst, note_id, valid_from, valid_to, confidence, status FROM edges ORDER BY id"),
-        ("supersedes", "SELECT new_id, old_id FROM supersedes ORDER BY new_id, old_id"),
-        ("ops", "SELECT seq, op_id, hlc, actor, kind, note_id, payload_json, prev_hash, hash FROM ops ORDER BY seq"),
+        (
+            "note_tags",
+            "SELECT note_id, tag FROM note_tags ORDER BY note_id, tag",
+        ),
+        (
+            "entities",
+            "SELECT id, name, type, note_id FROM entities ORDER BY id",
+        ),
+        (
+            "edges",
+            "SELECT id, src, rel, dst, note_id, valid_from, valid_to, confidence, status FROM edges ORDER BY id",
+        ),
+        (
+            "supersedes",
+            "SELECT new_id, old_id FROM supersedes ORDER BY new_id, old_id",
+        ),
+        (
+            "ops",
+            "SELECT seq, op_id, hlc, actor, kind, note_id, payload_json, prev_hash, hash FROM ops ORDER BY seq",
+        ),
         ("meta", "SELECT key, value FROM meta ORDER BY key"),
     ];
     for (name, sql) in tables {
@@ -855,7 +868,10 @@ mod tests {
         cell.put_note(&n, "tester").unwrap(/* test-only */);
         let back = cell.get(&n.id).unwrap(/* test-only */);
         assert_eq!(back, n);
-        assert!(matches!(cell.get(&Ulid::nil()), Err(CellError::NoteNotFound(_))));
+        assert!(matches!(
+            cell.get(&Ulid::nil()),
+            Err(CellError::NoteNotFound(_))
+        ));
     }
 
     #[test]
@@ -892,7 +908,10 @@ mod tests {
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].note.body, "corpo iniziale [[Roma]]");
         cell.restore(&n.id, 1, "tester").unwrap(/* test-only */);
-        assert_eq!(cell.get(&n.id).unwrap(/* test-only */).body, "corpo iniziale [[Roma]]");
+        assert_eq!(
+            cell.get(&n.id).unwrap(/* test-only */).body,
+            "corpo iniziale [[Roma]]"
+        );
     }
 
     #[test]
@@ -940,7 +959,10 @@ mod tests {
         // set_status cannot make an external note active
         assert!(cell.set_status(&n.id, Status::Active, "tester").is_err());
         cell.confirm(&n.id, "fabio").unwrap(/* test-only */);
-        assert_eq!(cell.get(&n.id).unwrap(/* test-only */).status, Status::Active);
+        assert_eq!(
+            cell.get(&n.id).unwrap(/* test-only */).status,
+            Status::Active
+        );
         // confirming again fails
         assert!(cell.confirm(&n.id, "fabio").is_err());
     }
@@ -960,7 +982,8 @@ mod tests {
         let mut person = note(1, "bio di Giulia");
         person.note_type = NoteType::Person;
         person.title = Some("Giulia".into());
-        person.body = "Giulia, partner di [[Fabio]].\n\n## Relations\n- works_at:: [[Studio Rossi]]\n".into();
+        person.body =
+            "Giulia, partner di [[Fabio]].\n\n## Relations\n- works_at:: [[Studio Rossi]]\n".into();
         cell.put_note(&person, "tester").unwrap(/* test-only */);
         let inner = cell.lock().unwrap(/* test-only */);
         let entities: i64 = inner
@@ -976,7 +999,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap(/* test-only */);
-        assert_eq!(subject_note.as_deref(), Some(person.id.to_string().as_str()));
+        assert_eq!(
+            subject_note.as_deref(),
+            Some(person.id.to_string().as_str())
+        );
         let works_at: i64 = inner
             .conn
             .query_row(
@@ -996,7 +1022,6 @@ mod tests {
             .unwrap(/* test-only */);
         assert_eq!(mentions, 1);
     }
-
 
     #[test]
     fn fts_follows_edits() {

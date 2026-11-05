@@ -6,9 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
+use engramma_core::Cell;
 use engramma_core::format::{Lang, Note, ParseMode};
 use engramma_core::search::Query;
-use engramma_core::{Cell, Confidence};
 use serde::Deserialize;
 use time::OffsetDateTime;
 
@@ -75,13 +75,16 @@ fn golden_cell() -> (tempfile::TempDir, Cell) {
         // ensure quarantine rules at birth (the two external notes are written
         // already `quarantined`, so put_note accepts them as-is).
         let _ = &mut note;
-        cell.put_note(&note, "golden").unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+        cell.put_note(&note, "golden")
+            .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
     }
     (dir, cell)
 }
 
 fn titles(hits: &[engramma_core::search::Hit]) -> Vec<String> {
-    hits.iter().map(|h| h.note.display_title().to_string()).collect()
+    hits.iter()
+        .map(|h| h.note.display_title().to_string())
+        .collect()
 }
 
 #[test]
@@ -96,7 +99,10 @@ fn golden_vault_imports_and_verifies() {
     let quarantined = cell
         .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes WHERE status = 'quarantined'")
         .unwrap(/* test-only */);
-    assert_eq!(quarantined[0], "2", "the two web rumors must be quarantined");
+    assert_eq!(
+        quarantined[0], "2",
+        "the two web rumors must be quarantined"
+    );
 }
 
 #[test]
@@ -111,8 +117,7 @@ fn golden_queries() {
         let mut q = Query::text(&gq.q).k(5).graph_hops(2);
         q.lang = Some(Lang::It);
         if let Some(a) = &gq.as_of {
-            let v = engramma_core::Validity::parse(a)
-                .unwrap_or_else(|e| panic!("{}: {e}", gq.q));
+            let v = engramma_core::Validity::parse(a).unwrap_or_else(|e| panic!("{}: {e}", gq.q));
             q.filters.as_of = Some(v.start());
         }
         let hits = cell.search_with_now(&q, golden_now()).unwrap(/* test-only */);
@@ -129,13 +134,8 @@ fn golden_queries() {
         // the expect list holds acceptable alternatives: any of them is a
         // correct answer in the top 5; an empty list (quarantine questions)
         // only checks the bans below
-        let found = gq
-            .expect
-            .is_empty()
-            || gq
-            .expect
-            .iter()
-            .any(|wanted| {
+        let found = gq.expect.is_empty()
+            || gq.expect.iter().any(|wanted| {
                 titles
                     .iter()
                     .any(|t| t.to_lowercase().contains(&wanted.to_lowercase()))
@@ -147,7 +147,9 @@ fn golden_queries() {
             ));
         }
         for banned in &gq.expect_not {
-            let leaked = titles.iter().any(|t| t.to_lowercase().contains(&banned.to_lowercase()));
+            let leaked = titles
+                .iter()
+                .any(|t| t.to_lowercase().contains(&banned.to_lowercase()));
             if leaked {
                 failures.push(format!(
                     "[{}] `{}` leaked quarantined note matching {:?} in {:?}",
@@ -175,11 +177,18 @@ fn golden_story_invariants() {
             golden_now(),
         )
         .unwrap(/* test-only */);
-    assert!(titles(&fabio_new).iter().any(|t| t.contains("Fabio abita a Milano")));
+    assert!(
+        titles(&fabio_new)
+            .iter()
+            .any(|t| t.contains("Fabio abita a Milano"))
+    );
     let statuses = cell
         .debug_column("SELECT status FROM notes WHERE title LIKE '%abitava%' ORDER BY id")
         .unwrap(/* test-only */);
-    assert_eq!(statuses, vec!["superseded".to_string(), "superseded".to_string()]);
+    assert_eq!(
+        statuses,
+        vec!["superseded".to_string(), "superseded".to_string()]
+    );
 
     // multi-hop graph: the direct Fabio→Studio Rossi path is `works_at`;
     // the partner path Fabio→Giulia is one step.

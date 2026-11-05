@@ -99,7 +99,11 @@ impl std::fmt::Display for Hlc {
     /// pair of nodes with equal-length ids**; structural [`Ord`] is the
     /// authoritative comparison.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:012x}{:08x}.{}", self.physical_ms, self.counter, self.node)
+        write!(
+            f,
+            "{:012x}{:08x}.{}",
+            self.physical_ms, self.counter, self.node
+        )
     }
 }
 
@@ -111,7 +115,9 @@ pub struct HlcClock {
 
 impl std::fmt::Debug for HlcClock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HlcClock").field("now", &self.now).finish_non_exhaustive()
+        f.debug_struct("HlcClock")
+            .field("now", &self.now)
+            .finish_non_exhaustive()
     }
 }
 

@@ -24,7 +24,11 @@ impl Drop for Mcp {
 
 impl Mcp {
     fn send(&mut self, line: &str) {
-        let stdin = self.child.stdin.as_mut().expect(/* test-only */ "stdin open");
+        let stdin = self
+            .child
+            .stdin
+            .as_mut()
+            .expect(/* test-only */ "stdin open");
         stdin.write_all(line.as_bytes()).unwrap(/* test-only */);
         stdin.write_all(b"\n").unwrap(/* test-only */);
         stdin.flush().unwrap(/* test-only */);
@@ -102,7 +106,11 @@ fn cell_root(root: &std::path::Path) -> std::path::PathBuf {
 fn mcp_stdio_roundtrip_and_isolation() {
     let dir = tempfile::tempdir().unwrap(/* test-only */);
     let cells = cell_root(dir.path());
-    let note = make_cell(&cells, "famiglia", "Fabio ha traslocato a [[Milano]] con [[Giulia]].");
+    let note = make_cell(
+        &cells,
+        "famiglia",
+        "Fabio ha traslocato a [[Milano]] con [[Giulia]].",
+    );
     // a second cell that is NOT exposed
     make_cell(&cells, "segreta", "Nota riservata su [[Torino]].");
 
@@ -112,7 +120,9 @@ fn mcp_stdio_roundtrip_and_isolation() {
     mcp.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0.0"}}}"#);
     let init = mcp.read_response(1);
     assert!(
-        init["result"]["serverInfo"]["name"].as_str().is_some_and(|n| n == "engramma"),
+        init["result"]["serverInfo"]["name"]
+            .as_str()
+            .is_some_and(|n| n == "engramma"),
         "{init}"
     );
     mcp.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
@@ -198,10 +208,13 @@ fn mcp_stdio_roundtrip_and_isolation() {
     });
     mcp.send(&call.to_string());
     let res = mcp.read_response(5);
-    assert!(res["result"]["content"][0]["text"]
+    assert!(
+        res["result"]["content"][0]["text"]
         .as_str()
         .unwrap(/* t */)
-        .contains("Milano"), "{res}");
+        .contains("Milano"),
+        "{res}"
+    );
 
     drop(mcp);
 }

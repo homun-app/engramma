@@ -121,7 +121,10 @@ pub fn hit_human(h: &Hit, index: usize) -> String {
     );
     out.push_str(&format!("\n   score {:.4}", h.score));
     if !h.explain.matched_terms.is_empty() {
-        out.push_str(&format!("\n   termini: {}", h.explain.matched_terms.join(", ")));
+        out.push_str(&format!(
+            "\n   termini: {}",
+            h.explain.matched_terms.join(", ")
+        ));
     }
     if let Some(r) = h.explain.bm25_rank {
         out.push_str(&format!("\n   rango BM25: {r}"));
@@ -129,9 +132,11 @@ pub fn hit_human(h: &Hit, index: usize) -> String {
     if let Some(via) = &h.explain.via {
         out.push_str(&format!("\n   via: {via}"));
     }
-    out.push_str(&format!("\n   validità: {} → {}",
+    out.push_str(&format!(
+        "\n   validità: {} → {}",
         h.explain.valid_from.as_deref().unwrap_or("sempre"),
-        h.explain.valid_to.as_deref().unwrap_or("ora")));
+        h.explain.valid_to.as_deref().unwrap_or("ora")
+    ));
     out.push_str(&format!("\n   fonte: {}", h.explain.source));
     out
 }

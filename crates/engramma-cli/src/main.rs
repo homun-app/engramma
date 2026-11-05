@@ -177,7 +177,7 @@ fn root(cli: &Cli) -> PathBuf {
     cli.root
         .clone()
         .or_else(|| std::env::var("ENGRAMMA_ROOT").ok().map(PathBuf::from))
-        .or_else(|| home_root())
+        .or_else(home_root)
         .unwrap_or_else(|| PathBuf::from(".engramma"))
 }
 
@@ -208,7 +208,10 @@ fn cell_path(cli: &Cli, name: &str) -> Result<PathBuf, CliError> {
 fn open_cell(cli: &Cli) -> Result<Cell, CliError> {
     let path = cell_path(cli, &cli.cell)?;
     Cell::open(&path).map_err(|e| {
-        CliError::internal(format!("cell `{}`: {e} (run `engramma init` first?)", cli.cell))
+        CliError::internal(format!(
+            "cell `{}`: {e} (run `engramma init` first?)",
+            cli.cell
+        ))
     })
 }
 
@@ -241,6 +244,8 @@ fn read_body(file: &str) -> Result<String, CliError> {
     }
 }
 
+// Every field of a note as an explicit argument: the count is the point.
+#[allow(clippy::too_many_arguments)]
 fn build_note(
     id: Ulid,
     now: At,
@@ -285,10 +290,7 @@ fn parse_as_of(s: &str) -> Result<time::OffsetDateTime, CliError> {
 }
 
 fn print_json(v: &serde_json::Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(v).unwrap_or_default()
-    );
+    println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
 }
 
 fn main() -> ExitCode {
@@ -394,9 +396,8 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             let edited = std::fs::read_to_string(&tmp)?;
             std::fs::remove_file(&tmp).ok();
-            let parsed =
-                engramma_core::format::parse(&edited, engramma_core::ParseMode::Strict)
-                    .map_err(CliError::from)?;
+            let parsed = engramma_core::format::parse(&edited, engramma_core::ParseMode::Strict)
+                .map_err(CliError::from)?;
             let mut n = parsed.note;
             if n.id != note.id {
                 return Err(CliError::usage("the note id cannot change in edit"));
@@ -416,10 +417,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 lang: n.lang.filter(|l| Some(*l) != note.lang),
                 source: (n.source != note.source).then(|| n.source.clone()),
                 confidence: (n.confidence != note.confidence).then_some(n.confidence),
-                valid_from: (n.valid_from != note.valid_from).then(|| n.valid_from.clone()),
-                valid_to: (n.valid_to != note.valid_to).then(|| n.valid_to.clone()),
-                extensions: (n.extensions != note.extensions)
-                    .then(|| n.extensions.clone()),
+                valid_from: (n.valid_from != note.valid_from).then_some(n.valid_from),
+                valid_to: (n.valid_to != note.valid_to).then_some(n.valid_to),
+                extensions: (n.extensions != note.extensions).then(|| n.extensions.clone()),
             };
             cell.patch_note(&id, &patch, "cli")?;
             if cli.json {
@@ -504,8 +504,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 q.filters.types.push(parse_type(t)?);
             }
             if let Some(l) = lang {
-                q.lang =
-                    Some(Lang::parse(l).map_err(|e| CliError::usage(e.to_string()))?);
+                q.lang = Some(Lang::parse(l).map_err(|e| CliError::usage(e.to_string()))?);
             }
             let hits = cell.search(&q)?;
             if cli.json {
@@ -571,9 +570,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     if cli.json {
                         let arr: Vec<serde_json::Value> = steps
                             .iter()
-                            .map(|s| {
-                                serde_json::json!({"from": s.from, "rel": s.rel, "to": s.to})
-                            })
+                            .map(|s| serde_json::json!({"from": s.from, "rel": s.rel, "to": s.to}))
                             .collect();
                         print_json(&serde_json::json!({ "from": a, "to": b, "steps": arr }));
                     } else {
@@ -620,9 +617,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             if cli.json {
                 let arr: Vec<serde_json::Value> = es
                     .iter()
-                    .map(|e| {
-                        serde_json::json!({"name": e.name, "id": e.id, "note_id": e.note_id})
-                    })
+                    .map(|e| serde_json::json!({"name": e.name, "id": e.id, "note_id": e.note_id}))
                     .collect();
                 print_json(&serde_json::json!({ "entities": arr }));
             } else {
@@ -645,7 +640,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                         h.explain.valid_from.as_deref().unwrap_or("sempre"),
                         h.explain.valid_to.as_deref().unwrap_or("ora"),
                         h.note.display_title(),
-                        &h.note.id.to_string()[..8.min(26)],
+                        &h.note.id.to_string()[..8],
                     );
                 }
             }
@@ -781,10 +776,10 @@ fn run_cell(cli: &Cli, action: &CellAction) -> Result<(), CliError> {
                 for entry in std::fs::read_dir(&dir)? {
                     let entry = entry?;
                     let p = entry.path();
-                    if p.extension().is_some_and(|e| e == "sqlite") {
-                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                            names.push(stem.to_string());
-                        }
+                    if p.extension().is_some_and(|e| e == "sqlite")
+                        && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                    {
+                        names.push(stem.to_string());
                     }
                 }
             }
@@ -832,6 +827,9 @@ fn report_ok(cli: &Cli, verb: &str, what: &str) {
 fn tempfile_in_engramma_tmp() -> Result<PathBuf, CliError> {
     let dir = std::env::temp_dir().join("engramma-edit");
     std::fs::create_dir_all(&dir)?;
-    let name = format!("{}.md", engramma_core::id::new_ulid().map_err(CliError::from)?);
+    let name = format!(
+        "{}.md",
+        engramma_core::id::new_ulid().map_err(CliError::from)?
+    );
     Ok(dir.join(name))
 }

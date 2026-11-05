@@ -11,12 +11,12 @@ pub mod port;
 pub mod search;
 pub mod text;
 
-pub use error::{CellError, FormatError, PortError, SearchError};
-pub use port::{export, import_cell, import_obsidian};
-pub use format::{Confidence, Lang, Note, NoteType, ParseMode, Status, Validity};
 pub use cell::{Cell, NotePatch, VerifyReport};
-pub use search::{Explain, Filters, Hit, Query, Weights};
+pub use error::{CellError, FormatError, PortError, SearchError};
+pub use format::{Confidence, Lang, Note, NoteType, ParseMode, Status, Validity};
 pub use hlc::{Hlc, HlcClock};
+pub use port::{export, import_cell, import_obsidian};
+pub use search::{Explain, Filters, Hit, Query, Weights};
 
 #[cfg(test)]
 mod setup_checks {

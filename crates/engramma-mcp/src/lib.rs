@@ -20,8 +20,8 @@ use rmcp::{ErrorData as McpError, ServerHandler, serve_server};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use engramma_core::search::{Hit, Query};
 use engramma_core::Cell;
+use engramma_core::search::{Hit, Query};
 
 /// An open, exposed cell.
 pub struct MemoryServer {
@@ -53,8 +53,7 @@ impl MemoryServer {
         let mut cells = HashMap::new();
         for name in names {
             let path = root.join("cells").join(format!("{name}.sqlite"));
-            let cell = Cell::open(&path)
-                .map_err(|e| anyhow::anyhow!("cell {name}: {e}"))?;
+            let cell = Cell::open(&path).map_err(|e| anyhow::anyhow!("cell {name}: {e}"))?;
             cells.insert(name.clone(), cell);
         }
         Ok(Self {
@@ -191,7 +190,10 @@ impl MemoryServer {
     /// from third parties — never appear in these results: the memory engine
     /// hides them until a human confirms them, so do not treat their absence
     /// as a denial.
-    async fn memory_search(&self, params: Parameters<SearchParams>) -> Result<CallToolResult, McpError> {
+    async fn memory_search(
+        &self,
+        params: Parameters<SearchParams>,
+    ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
         let cell = self.cell(&p.cell)?;
         let mut q = Query::text(&p.query).k(p.limit.unwrap_or(10));
@@ -242,7 +244,10 @@ impl MemoryServer {
     /// is connected to and through which relation (`partner_of`, `works_at`,
     /// `lives_in`, …), with the validity of each edge. Useful for "who/what
     /// is related to X" questions that search text cannot answer.
-    async fn memory_neighbors(&self, params: Parameters<NeighborsParams>) -> Result<CallToolResult, McpError> {
+    async fn memory_neighbors(
+        &self,
+        params: Parameters<NeighborsParams>,
+    ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
         let cell = self.cell(&p.cell)?;
         let ns = cell
@@ -265,12 +270,13 @@ impl MemoryServer {
     /// Tags used in the memory with their note counts. A prefix includes its
     /// children ("casa" also counts "casa/milano"). Use it to explore how the
     /// memory is organised before filtering searches.
-    async fn memory_tags(&self, params: Parameters<TagsParams>) -> Result<CallToolResult, McpError> {
+    async fn memory_tags(
+        &self,
+        params: Parameters<TagsParams>,
+    ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
         let cell = self.cell(&p.cell)?;
-        let tags = cell
-            .tags(p.prefix.as_deref().unwrap_or(""))
-            .map_err(err)?;
+        let tags = cell.tags(p.prefix.as_deref().unwrap_or("")).map_err(err)?;
         let arr: Vec<serde_json::Value> = tags
             .iter()
             .map(|t| serde_json::json!({"name": t.name, "parent": t.parent, "note_count": t.note_count}))
@@ -283,7 +289,10 @@ impl MemoryServer {
     /// facts that replaced each other appear in chronological order with
     /// their `valid_from`/`valid_to`. This is the tool for "how did X change
     /// over time" questions.
-    async fn memory_timeline(&self, params: Parameters<TimelineParams>) -> Result<CallToolResult, McpError> {
+    async fn memory_timeline(
+        &self,
+        params: Parameters<TimelineParams>,
+    ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
         let cell = self.cell(&p.cell)?;
         let tl = cell.timeline(&p.entity).map_err(err)?;
@@ -295,20 +304,16 @@ impl MemoryServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
-        )
-        .with_server_info(rmcp::model::Implementation::new(
-            "engramma",
-            env!("CARGO_PKG_VERSION"),
-        ))
-        .with_instructions(format!(
-            "Read-only access to the engramma memory engine. Exposed cells: {}. \
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(rmcp::model::Implementation::new(
+                "engramma",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(format!(
+                "Read-only access to the engramma memory engine. Exposed cells: {}. \
              Quarantined notes never appear: they wait for human confirmation.",
-            self.names().join(", ")
-        ))
+                self.names().join(", ")
+            ))
     }
 }
 

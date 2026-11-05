@@ -266,10 +266,7 @@ impl Cell {
 
         // 2. RRF fusion over the single ranked list (the function exists and
         // is tested for v0.2; with one list the rerank below uses bm25_norm).
-        let _rrf = rrf_fuse(
-            &[text_hits.iter().map(|(id, _)| id.clone()).collect()],
-            60,
-        );
+        let _rrf = rrf_fuse(&[text_hits.iter().map(|(id, _)| id.clone()).collect()], 60);
 
         // Normalised seed scores for the graph expansion (§6.3.3: the added
         // notes keep a weight that decays per hop from the seed they came
@@ -300,7 +297,8 @@ impl Cell {
         }
 
         // 4. Collect note rows for all candidates and apply filters.
-        let mut candidates: Vec<(String, Option<usize>, Option<(u8, String, f64)>)> = Vec::new();
+        // (note id, BM25 rank, graph info (hops, path, seed score))
+        let mut candidates: Vec<Candidate> = Vec::new();
 
         for (rank, (id, _)) in text_hits.iter().enumerate() {
             candidates.push((id.clone(), Some(rank + 1), None));
@@ -337,19 +335,16 @@ impl Cell {
             // body_norm already holds the stemmed title+body (computed at
             // write time): reuse it instead of re-stemming per candidate.
             let norm: String = conn
-                .query_row(
-                    "SELECT body_norm FROM notes WHERE id = ?1",
-                    [&id],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT body_norm FROM notes WHERE id = ?1", [&id], |r| {
+                    r.get(0)
+                })
                 .unwrap_or_default();
             let words: BTreeSet<&str> = norm.split(' ').filter(|w| !w.is_empty()).collect();
             let tag_words = note_tag_string(conn, &id);
             let matched: Vec<String> = terms
                 .iter()
                 .filter(|t| {
-                    words.contains(t.as_str())
-                        || tag_words.split(' ').any(|w| w == t.as_str())
+                    words.contains(t.as_str()) || tag_words.split(' ').any(|w| w == t.as_str())
                 })
                 .cloned()
                 .collect();
@@ -432,7 +427,9 @@ impl Cell {
                 if !frontier.contains(&e.src) && !frontier.contains(&e.dst) {
                     continue;
                 }
-                let (other, direction) = if e.src == *frontier.iter().find(|s| **s == e.src).unwrap_or(&e.dst) && frontier.contains(&e.src)
+                let (other, direction) = if e.src
+                    == *frontier.iter().find(|s| **s == e.src).unwrap_or(&e.dst)
+                    && frontier.contains(&e.src)
                 {
                     (e.dst.clone(), "->")
                 } else {
@@ -447,7 +444,10 @@ impl Cell {
                     valid_from: e.valid_from.clone(),
                     valid_to: e.valid_to.clone(),
                 };
-                if !out.iter().any(|n| n.entity == hop.entity && n.rel == hop.rel && n.depth == hop.depth) {
+                if !out
+                    .iter()
+                    .any(|n| n.entity == hop.entity && n.rel == hop.rel && n.depth == hop.depth)
+                {
                     out.push(hop);
                 }
                 if seen_entities.insert(other.clone()) {
@@ -493,14 +493,14 @@ impl Cell {
                 }
             }
         }
-        if !visited.contains(&b.to_string()) {
+        if !visited.contains(b) {
             return Ok(None);
         }
         // Reconstruct (depth guard: give up beyond 4 steps).
         let mut steps: Vec<PathStep> = Vec::new();
         let mut cur = b.to_string();
         let mut guard = 0;
-        while cur != a.to_string() && guard < 5 {
+        while cur != a && guard < 5 {
             let Some((from, rel)) = parents.get(&cur) else {
                 return Ok(None);
             };
@@ -512,7 +512,7 @@ impl Cell {
             cur = from.clone();
             guard += 1;
         }
-        if cur != a.to_string() || steps.len() > 4 {
+        if cur != a || steps.len() > 4 {
             return Ok(None);
         }
         steps.reverse();
@@ -604,7 +604,9 @@ impl Cell {
         let mut out = Vec::new();
         for id in ids {
             if let Ok(note) = read_note_by_id(&inner.conn, &id) {
-                if note.status == Status::Deleted {
+                // like search: tombstones never, quarantine not by default;
+                // superseded notes stay — the timeline is the change history
+                if matches!(note.status, Status::Deleted | Status::Quarantined) {
                     continue;
                 }
                 out.push(Hit {
@@ -621,7 +623,8 @@ impl Cell {
                     },
                 });
                 if let Some(last) = out.last_mut() {
-                    last.explain.valid_from = last.note.valid_from.as_ref().map(|v| v.to_db_string());
+                    last.explain.valid_from =
+                        last.note.valid_from.as_ref().map(|v| v.to_db_string());
                     last.explain.valid_to = last.note.valid_to.as_ref().map(|v| v.to_db_string());
                     last.explain.confidence = last.note.confidence;
                     last.explain.source = last.note.source.clone();
@@ -692,7 +695,8 @@ fn read_note_by_id(conn: &rusqlite::Connection, id: &str) -> Result<Note, Search
         [id],
         |r| r.get(0),
     )?;
-    let body: String = conn.query_row("SELECT body FROM notes WHERE id = ?1", [id], |r| r.get(0))?;
+    let body: String =
+        conn.query_row("SELECT body FROM notes WHERE id = ?1", [id], |r| r.get(0))?;
     let mut note =
         Note::from_json(&serde_json::from_str(&fm).map_err(|e| SearchError::Db(e.to_string()))?)
             .map_err(|e| SearchError::Db(e.to_string()))?;
@@ -736,15 +740,15 @@ fn passes_filters(note: &Note, f: &Filters, now: OffsetDateTime) -> bool {
     if !f.types.is_empty() && !f.types.contains(&note.note_type) {
         return false;
     }
-    if let Some(min) = f.min_confidence {
-        if confidence_rank(note.confidence) < confidence_rank(min) {
-            return false;
-        }
+    if let Some(min) = f.min_confidence
+        && confidence_rank(note.confidence) < confidence_rank(min)
+    {
+        return false;
     }
-    if let Some(scope) = &f.scope {
-        if note.scope.as_deref() != Some(scope.as_str()) {
-            return false;
-        }
+    if let Some(scope) = &f.scope
+        && note.scope.as_deref() != Some(scope.as_str())
+    {
+        return false;
     }
     if !f.tags.is_empty() {
         let note_tags: Vec<String> = note.tags.clone();
@@ -758,7 +762,11 @@ fn passes_filters(note: &Note, f: &Filters, now: OffsetDateTime) -> bool {
         }
     }
     if let Some(as_of) = f.as_of {
-        if !note.valid_from.as_ref().is_none_or(|v| v.covers_from(as_of)) {
+        if !note
+            .valid_from
+            .as_ref()
+            .is_none_or(|v| v.covers_from(as_of))
+        {
             return false;
         }
         if !note.valid_to.as_ref().is_none_or(|v| v.covers_to(as_of)) {
@@ -766,7 +774,11 @@ fn passes_filters(note: &Note, f: &Filters, now: OffsetDateTime) -> bool {
         }
     } else {
         // Current truth by default: not yet started, already expired — out.
-        if note.valid_from.as_ref().is_some_and(|v| !v.covers_from(now)) {
+        if note
+            .valid_from
+            .as_ref()
+            .is_some_and(|v| !v.covers_from(now))
+        {
             return false;
         }
         // Events are historical records: their `valid_to` is when they ended,
@@ -829,6 +841,10 @@ fn load_edges_where(
 /// Seeds come from the notes' own bodies (links, relations, subject), so the
 /// walk only needs edges adjacent to the frontier — the indexed `src`/`dst`
 /// columns — never the whole edge table.
+/// A search candidate: a note id, where it came from in the BM25 list, and
+/// the graph discovery (hops, path, inherited seed score) when applicable.
+type Candidate = (String, Option<usize>, Option<(u8, String, f64)>);
+
 #[allow(clippy::too_many_arguments)]
 fn expand_graph(
     conn: &rusqlite::Connection,
@@ -853,10 +869,10 @@ fn expand_graph(
                 names.push(r.dst.clone());
             }
         }
-        if let Some(subject) = note.subject_entity() {
-            if !names.contains(&subject) {
-                names.push(subject);
-            }
+        if let Some(subject) = note.subject_entity()
+            && !names.contains(&subject)
+        {
+            names.push(subject);
         }
         for name in &names {
             entities
@@ -899,7 +915,10 @@ fn expand_graph(
             let note_like = to.starts_with("note:");
             let (base, score) = entities.get(&from).cloned().unwrap_or_default();
             let dest = if note_like {
-                format!("(nota {})", to.get(5..).map(|id| &id[..8.min(id.len())]).unwrap_or("?"))
+                format!(
+                    "(nota {})",
+                    to.get(5..).map(|id| &id[..8.min(id.len())]).unwrap_or("?")
+                )
             } else {
                 format!("[[{to}]]")
             };
@@ -908,10 +927,12 @@ fn expand_graph(
                 entities.entry(to.clone()).or_insert((path.clone(), score));
                 next.insert(to.clone());
             }
-            if let Some(nid) = &e.note_id {
-                if !exclude.contains(nid) && !extra.contains_key(nid) && *nid != from {
-                    extra.insert(nid.clone(), (hop, path, score));
-                }
+            if let Some(nid) = &e.note_id
+                && !exclude.contains(nid)
+                && !extra.contains_key(nid)
+                && *nid != from
+            {
+                extra.insert(nid.clone(), (hop, path, score));
             }
         }
         frontier = next.into_iter().collect();
@@ -923,8 +944,8 @@ fn expand_graph(
 mod tests {
     use super::*;
     use crate::cell::Cell;
-    use ulid::Ulid;
     use crate::format::NoteType;
+    use ulid::Ulid;
 
     fn at(day: u32) -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_800_000_000 + i64::from(day) * 86_400)
@@ -964,13 +985,29 @@ mod tests {
         giulia.body = "## Relations\n- works_at:: [[Studio Rossi]]\n".into();
         cell.put_note(&giulia, "t").unwrap(/* test-only */);
         // facts
-        let mut fact = note(3, "Fabio abita a Milano", "[[Fabio]] ha traslocato a [[Milano]] a settembre.", NoteType::Fact);
-        fact.valid_from = Some(crate::format::Validity::parse("2026-09-01").unwrap(/* test-only */));
+        let mut fact = note(
+            3,
+            "Fabio abita a Milano",
+            "[[Fabio]] ha traslocato a [[Milano]] a settembre.",
+            NoteType::Fact,
+        );
+        fact.valid_from =
+            Some(crate::format::Validity::parse("2026-09-01").unwrap(/* test-only */));
         cell.put_note(&fact, "t").unwrap(/* test-only */);
-        let mut old = note(4, "Fabio abitava a Roma", "[[Fabio]] viveva a [[Roma]].", NoteType::Fact);
+        let mut old = note(
+            4,
+            "Fabio abitava a Roma",
+            "[[Fabio]] viveva a [[Roma]].",
+            NoteType::Fact,
+        );
         old.valid_from = Some(crate::format::Validity::parse("2020-01-01").unwrap(/* test-only */));
         cell.put_note(&old, "t").unwrap(/* test-only */);
-        let mut ext = note(5, "Notizia web", "Si dice che [[Fabio]] traslochi a [[Torino]].", NoteType::Fact);
+        let mut ext = note(
+            5,
+            "Notizia web",
+            "Si dice che [[Fabio]] traslochi a [[Torino]].",
+            NoteType::Fact,
+        );
         ext.confidence = Confidence::External;
         ext.status = Status::Quarantined;
         ext.source = "import:web".into();
@@ -981,7 +1018,6 @@ mod tests {
     fn now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_810_000_000).unwrap(/* test-only */)
     }
-    const NOW_TS: i64 = 1_810_000_000;
 
     #[test]
     fn rrf_single_list_preserves_order() {
@@ -989,10 +1025,7 @@ mod tests {
         assert!(r["a"] > r["b"]);
         // two lists: overlap wins
         let r2 = rrf_fuse(
-            &[
-                vec!["a".into(), "b".into()],
-                vec!["b".into(), "c".into()],
-            ],
+            &[vec!["a".into(), "b".into()], vec!["b".into(), "c".into()]],
             60,
         );
         assert!(r2["b"] > r2["a"] && r2["b"] > r2["c"]);
@@ -1006,7 +1039,12 @@ mod tests {
             .unwrap(/* test-only */);
         assert!(!hits.is_empty());
         assert_eq!(hits[0].note.id.to_string(), format!("01{:024}", 3));
-        assert!(hits[0].explain.matched_terms.contains(&"trasloc".to_string()));
+        assert!(
+            hits[0]
+                .explain
+                .matched_terms
+                .contains(&"trasloc".to_string())
+        );
         // Ranks are positions in the BM25 candidate list *before* filters:
         // the quarantined web note can rank first and then be filtered out.
         assert_eq!(hits[0].explain.bm25_rank, Some(2));
@@ -1030,7 +1068,12 @@ mod tests {
     fn temporal_query_surfaces_old_note() {
         let (_d, cell) = setup();
         // close the old note with a supersede
-        let mut new = note(6, "Fabio vive a Milano", "Fabio abita a [[Milano]].", NoteType::Fact);
+        let mut new = note(
+            6,
+            "Fabio vive a Milano",
+            "Fabio abita a [[Milano]].",
+            NoteType::Fact,
+        );
         new.valid_from = Some(crate::format::Validity::parse("2026-09-01").unwrap(/* test-only */));
         cell.supersede(
             &Ulid::from_string(&format!("01{:024}", 4)).unwrap(/* test-only */),
@@ -1054,7 +1097,11 @@ mod tests {
         let hits_now = cell
             .search_with_now(&Query::text("Fabio dove abita").k(10), now())
             .unwrap(/* test-only */);
-        assert!(hits_now.iter().all(|h| !h.note.display_title().contains("Roma")));
+        assert!(
+            hits_now
+                .iter()
+                .all(|h| !h.note.display_title().contains("Roma"))
+        );
     }
 
     #[test]
@@ -1066,7 +1113,10 @@ mod tests {
             .search_with_now(&Query::text("Fabio").k(10).graph_hops(2), now())
             .unwrap(/* test-only */);
         let ids: Vec<String> = hits.iter().map(|h| h.note.id.to_string()).collect();
-        assert!(ids.contains(&format!("01{:024}", 2)), "Giulia note via graph: {hits:?}");
+        assert!(
+            ids.contains(&format!("01{:024}", 2)),
+            "Giulia note via graph: {hits:?}"
+        );
         let via = hits
             .iter()
             .find(|h| h.note.id.to_string() == format!("01{:024}", 2))
@@ -1074,7 +1124,10 @@ mod tests {
             .explain
             .via
             .clone();
-        assert!(via.as_deref().is_some_and(|v| v.contains("->")), "path: {via:?}");
+        assert!(
+            via.as_deref().is_some_and(|v| v.contains("->")),
+            "path: {via:?}"
+        );
     }
 
     #[test]
@@ -1090,7 +1143,12 @@ mod tests {
     #[test]
     fn tags_filter_includes_children() {
         let (_d, cell) = setup();
-        let mut n = note(7, "Lista cose", "cose da fare per il trasloco", NoteType::Note);
+        let mut n = note(
+            7,
+            "Lista cose",
+            "cose da fare per il trasloco",
+            NoteType::Note,
+        );
         n.tags = vec!["casa/milano/trasloco".into()];
         cell.put_note(&n, "t").unwrap(/* test-only */);
         let mut q = Query::text("trasloco");
@@ -1105,8 +1163,14 @@ mod tests {
     fn neighbors_and_path() {
         let (_d, cell) = setup();
         let ns = cell.neighbors("Fabio", 2, &[]).unwrap(/* test-only */);
-        assert!(ns.iter().any(|n| n.entity == "Giulia" && n.rel == "partner_of"));
-        assert!(ns.iter().any(|n| n.entity == "Studio Rossi" && n.rel == "works_at"));
+        assert!(
+            ns.iter()
+                .any(|n| n.entity == "Giulia" && n.rel == "partner_of")
+        );
+        assert!(
+            ns.iter()
+                .any(|n| n.entity == "Studio Rossi" && n.rel == "works_at")
+        );
         let p = cell.path("Fabio", "Studio Rossi").unwrap(/* test-only */);
         let steps = p.expect("path exists");
         assert_eq!(steps.len(), 2);

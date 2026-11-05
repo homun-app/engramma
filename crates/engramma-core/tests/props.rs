@@ -32,12 +32,6 @@ fn ulid(n: u32) -> Ulid {
     Ulid::from_string(&s).unwrap(/* test-only: valid Crockford digits */)
 }
 
-fn any_lang() -> impl Strategy<Value = Option<Lang>> {
-    proptest::option::of(proptest::sample::select(Vec::from([
-        Lang::It, Lang::En, Lang::Fr, Lang::De, Lang::Es, Lang::Pt,
-    ])))
-}
-
 fn any_tag() -> impl Strategy<Value = String> {
     (r"[a-z0-9_]{1,8}", proptest::option::of(r"[a-z0-9_]{1,8}")).prop_map(|(a, b)| match b {
         Some(b) => format!("{a}/{b}"),
@@ -55,9 +49,8 @@ fn any_ext_value() -> impl Strategy<Value = YamlValue> {
     leaf.prop_recursive(2, 8, 3, |inner| {
         prop_oneof![
             proptest::collection::vec(inner.clone(), 0..3).prop_map(YamlValue::Seq),
-            proptest::collection::vec((r"x-[a-z]{1,6}".prop_map(String::from), inner), 0..3).prop_map(
-                YamlValue::Map
-            ),
+            proptest::collection::vec((r"x-[a-z]{1,6}".prop_map(String::from), inner), 0..3)
+                .prop_map(YamlValue::Map),
         ]
     })
 }
@@ -85,16 +78,46 @@ fn any_note() -> impl Strategy<Value = Note> {
         proptest::option::of((1000u32..2000, 1000u32..2000)),
         0u32..100,
         1000u64..2000,
-        proptest::collection::vec((r"x-[a-z]{1,6}".prop_map(String::from), any_ext_value()), 0..2),
+        proptest::collection::vec(
+            (r"x-[a-z]{1,6}".prop_map(String::from), any_ext_value()),
+            0..2,
+        ),
     )
         .prop_map(
-            |(n, note_type, title, body_lines, tags, lang, source, confidence, validity, sup, t, ext)| {
+            |(
+                n,
+                note_type,
+                title,
+                body_lines,
+                tags,
+                lang,
+                source,
+                confidence,
+                validity,
+                sup,
+                t,
+                ext,
+            )| {
                 let (vf, vt) = match validity {
                     Some((from, to)) => {
-                        let f = Validity::parse(&format!("20{:02}-{:02}-{:02}", 20 + from / 300, 1 + from % 12, 1 + from % 28))
-                            .unwrap_or_else(|_| Validity::parse("2024-01-01").unwrap(/* fixed fallback */));
-                        let t2 = Validity::parse(&format!("20{:02}-{:02}-{:02}", 20 + to / 300, 1 + to % 12, 1 + to % 28))
-                            .unwrap_or_else(|_| Validity::parse("2025-01-01").unwrap(/* fixed fallback */));
+                        let f = Validity::parse(&format!(
+                            "20{:02}-{:02}-{:02}",
+                            20 + from / 300,
+                            1 + from % 12,
+                            1 + from % 28
+                        ))
+                        .unwrap_or_else(
+                            |_| Validity::parse("2024-01-01").unwrap(/* fixed fallback */),
+                        );
+                        let t2 = Validity::parse(&format!(
+                            "20{:02}-{:02}-{:02}",
+                            20 + to / 300,
+                            1 + to % 12,
+                            1 + to % 28
+                        ))
+                        .unwrap_or_else(
+                            |_| Validity::parse("2025-01-01").unwrap(/* fixed fallback */),
+                        );
                         (Some(f), Some(t2))
                     }
                     None => (None, None),
@@ -208,11 +231,14 @@ proptest! {
     /// including jumps backwards.
     #[test]
     fn hlc_monotonic(clock_readings in proptest::collection::vec(0u64..1_000_000, 1..100)) {
-        let mut t = 0u64;
-        let mut clock = HlcClock::new("n1", move || t);
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let t = Arc::new(AtomicU64::new(0));
+        let tc = Arc::clone(&t);
+        let mut clock = HlcClock::new("n1", move || tc.load(Ordering::Relaxed));
         let mut prev: Option<Hlc> = None;
         for r in clock_readings {
-            t = r;
+            t.store(r, Ordering::Relaxed);
             let h = clock.tick();
             if let Some(p) = prev {
                 prop_assert!(h > p, "hlc went backwards: {p:?} -> {h:?}");
@@ -251,7 +277,10 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) {
                         ..Default::default()
                     };
                     if cell.patch_note(id, &patch, "prop").is_ok() {
-                        version_targets.push((*id, cell.history(id).map(|h| h.len() as i64).unwrap_or(1).max(1)));
+                        version_targets.push((
+                            *id,
+                            cell.history(id).map(|h| h.len() as i64).unwrap_or(1).max(1),
+                        ));
                     }
                 }
             }
@@ -270,7 +299,7 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) {
                 }
             }
             7 => {
-                if let Some(id) = known.first() {
+                if let Some(_id) = known.first() {
                     let mut ext = any_note_of(next(), i + 2000);
                     ext.confidence = Confidence::External;
                     ext.status = Status::Quarantined;
@@ -301,8 +330,6 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) {
                 }
             }
         }
-        assert!(cell.verify().map(|r| r.ok()).unwrap_or(false) || true, /* progress */
-               "verify must not be called here");
     }
     // every op kind that fired leaves a trace in the log
     let ops = cell.ops().unwrap(/* test-only */);
@@ -318,7 +345,12 @@ fn any_note_of(seed: u64, i: u16) -> Note {
         "## Relations\n- lives_in:: [[Roma]]\n",
         "## Relations\n- works_at:: [[Acme]] (from 2020-01-01 to 2024-12-31)\n",
     ];
-    let types = [NoteType::Fact, NoteType::Person, NoteType::Preference, NoteType::Note];
+    let types = [
+        NoteType::Fact,
+        NoteType::Person,
+        NoteType::Preference,
+        NoteType::Note,
+    ];
     let idx = (seed % 5) as usize;
     let t = (seed % 4) as usize;
     let mut note = Note {

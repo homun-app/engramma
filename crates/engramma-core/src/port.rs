@@ -12,8 +12,8 @@ use ulid::Ulid;
 
 use crate::cell::Cell;
 use crate::error::{FormatError, PortError};
-use crate::format::{self, Note, Status};
 use crate::format::ParseMode;
+use crate::format::{self, Note, Status};
 
 /// Format version written into `engramma.json`.
 pub const FORMAT_VERSION: u64 = 0;
@@ -90,19 +90,17 @@ pub fn export(cell: &Cell, dir: &Path) -> Result<ExportSummary, PortError> {
             .conn
             .prepare("SELECT id FROM notes ORDER BY id")
             .map_err(|e| PortError::Cell(crate::error::CellError::Db(e.to_string())))?;
-        let ids = stmt
-            .query_map([], |r| r.get(0))
+
+        stmt.query_map([], |r| r.get(0))
             .map_err(|e| PortError::Cell(crate::error::CellError::Db(e.to_string())))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| PortError::Cell(crate::error::CellError::Db(e.to_string())))?;
-        ids
+            .map_err(|e| PortError::Cell(crate::error::CellError::Db(e.to_string())))?
     };
     for id in ids {
-        let ulid = Ulid::from_string(&id)
-            .map_err(|_| PortError::Cell(crate::error::CellError::Db(format!("bad note id {id}"))))?;
-        let note = cell
-            .get(&ulid)
-            .map_err(PortError::Cell)?;
+        let ulid = Ulid::from_string(&id).map_err(|_| {
+            PortError::Cell(crate::error::CellError::Db(format!("bad note id {id}")))
+        })?;
+        let note = cell.get(&ulid).map_err(PortError::Cell)?;
         if note.status == Status::Deleted {
             summary.tombstones += 1;
             continue;
@@ -110,12 +108,10 @@ pub fn export(cell: &Cell, dir: &Path) -> Result<ExportSummary, PortError> {
         let type_dir = dir.join(note.note_type.as_str());
         fs::create_dir_all(&type_dir)?;
         let base = format!("{}-{}", slugify(note.display_title()), &id[..8]);
-        let text = note
-            .serialize()
-            .map_err(|e| PortError::Note {
-                path: type_dir.join(&base),
-                source: e,
-            })?;
+        let text = note.serialize().map_err(|e| PortError::Note {
+            path: type_dir.join(&base),
+            source: e,
+        })?;
         // Same slug and id8 are rare but possible: keep names unique.
         let mut name = format!("{base}.md");
         let mut n = 2;
@@ -124,7 +120,9 @@ pub fn export(cell: &Cell, dir: &Path) -> Result<ExportSummary, PortError> {
             n += 1;
         }
         if let Err(e) = fs::write(type_dir.join(&name), text) {
-            summary.errors.push(format!("{}: {e}", type_dir.join(name).display()));
+            summary
+                .errors
+                .push(format!("{}: {e}", type_dir.join(name).display()));
         } else {
             summary.written += 1;
         }
@@ -160,9 +158,7 @@ fn walk_markdown(root: &Path, skipped: &mut Vec<String>) -> Result<Vec<Found>, P
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = fs::read_dir(&dir)?;
-        let mut names: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
+        let mut names: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
         names.sort();
         for path in names {
             let name = path
@@ -241,11 +237,9 @@ pub fn import_cell(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSummary
                 }
                 match cell.put_note(&note, actor) {
                     Ok(()) => {
-                        if needs_confirm {
-                            if let Err(e) = cell.confirm(&note.id, actor) {
-                                summary.errors.push(format!("{}: {e}", f.relative));
-                                continue;
-                            }
+                        if needs_confirm && let Err(e) = cell.confirm(&note.id, actor) {
+                            summary.errors.push(format!("{}: {e}", f.relative));
+                            continue;
                         }
                         summary.imported += 1;
                     }
@@ -288,27 +282,24 @@ pub fn import_obsidian(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSum
         let parsed = format::parse(&text, ParseMode::Import);
         let note = match parsed {
             Ok(p) => p.note,
-            Err(FormatError::NoFrontmatter) | Err(FormatError::MissingField(_)) => {
-                Note {
-                    id: crate::id::new_ulid()
-                        .map_err(PortError::Cell)?,
-                    note_type: crate::format::NoteType::Note,
-                    title: None,
-                    body: text,
-                    tags: vec![],
-                    scope: None,
-                    lang: None,
-                    source: format!("import:obsidian/{}", f.relative.replace('\\', "/")),
-                    confidence: crate::format::Confidence::Stated,
-                    status: Status::Active,
-                    valid_from: None,
-                    valid_to: None,
-                    supersedes: vec![],
-                    created_at: crate::format::At(mtime),
-                    updated_at: crate::format::At(mtime),
-                    extensions: vec![],
-                }
-            }
+            Err(FormatError::NoFrontmatter) | Err(FormatError::MissingField(_)) => Note {
+                id: crate::id::new_ulid().map_err(PortError::Cell)?,
+                note_type: crate::format::NoteType::Note,
+                title: None,
+                body: text,
+                tags: vec![],
+                scope: None,
+                lang: None,
+                source: format!("import:obsidian/{}", f.relative.replace('\\', "/")),
+                confidence: crate::format::Confidence::Stated,
+                status: Status::Active,
+                valid_from: None,
+                valid_to: None,
+                supersedes: vec![],
+                created_at: crate::format::At(mtime),
+                updated_at: crate::format::At(mtime),
+                extensions: vec![],
+            },
             Err(e) => {
                 summary.errors.push(format!("{}: {e}", f.relative));
                 continue;
@@ -359,7 +350,7 @@ mod tests {
         assert_eq!(slugify("Fabio abita a Milano!"), "fabio-abita-a-milano");
         assert_eq!(slugify("Città del mare — 2026"), "citta-del-mare-2026");
         assert_eq!(slugify("???"), "note");
-        assert_eq!(slugify("Grande progetto lungoooooooooooo").len() <= 60, true);
+        assert!(slugify("Grande progetto lungoooooooooooo").len() <= 60);
     }
 
     #[test]
@@ -367,7 +358,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("c.sqlite"), "famiglia", "t")
             .unwrap(/* test-only */);
-        let fabio = note(1, "Fabio", "Fabio.\n\n## Relations\n- partner_of:: [[Giulia]]\n");
+        let fabio = note(
+            1,
+            "Fabio",
+            "Fabio.\n\n## Relations\n- partner_of:: [[Giulia]]\n",
+        );
         let giulia = note(2, "Giulia", "Giulia vive a [[Milano]]. #casa/milano");
         cell.put_note(&fabio, "t").unwrap(/* test-only */);
         cell.put_note(&giulia, "t").unwrap(/* test-only */);

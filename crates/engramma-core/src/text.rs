@@ -87,18 +87,17 @@ const STOPWORDS: &[&str] = &[
     "lui", "lei", "noi", "voi", "loro", "il", "lo", "la", "i", "gli", "le", "un", "uno", "una",
     "di", "a", "al", "allo", "alla", "ai", "agli", "alle", "da", "dal", "dallo", "dalla", "dai",
     "dagli", "dalle", "in", "nel", "nello", "nella", "nei", "negli", "nelle", "con", "su", "sul",
-    "sullo", "sulla", "sui", "sugli", "sulle", "per", "tra", "fra", "del", "dello", "della",
-    "dei", "degli", "delle", "era", "erano", "ero", "sono", "stato", "stata", "stati",
-    "state", "essere", "fa", "fanno", "fatto", "ha", "hai", "hanno", "ho", "sia", "va",
-    "vanno", "questo", "questa", "questi", "queste", "quello", "quella", "quelli",
-    "quelle", "cui", "ne", "ci", "vi", "mi", "ti", "se", "anche", "solo", "molto", "poco",
-    "piu", "meno", "ogni", "tutti", "tutto", "tutta", "tutte", "alcuni", "alcuno",
-    "nessuno", "altro", "altra", "altri", "altre", "senza", "verso", "cio",
-    "adesso", "ancora", "prima", "dopo", "sempre", "mai", "poi", "gia", "qui", "la",
+    "sullo", "sulla", "sui", "sugli", "sulle", "per", "tra", "fra", "del", "dello", "della", "dei",
+    "degli", "delle", "era", "erano", "ero", "sono", "stato", "stata", "stati", "state", "essere",
+    "fa", "fanno", "fatto", "ha", "hai", "hanno", "ho", "sia", "va", "vanno", "questo", "questa",
+    "questi", "queste", "quello", "quella", "quelli", "quelle", "cui", "ne", "ci", "vi", "mi",
+    "ti", "se", "anche", "solo", "molto", "poco", "piu", "meno", "ogni", "tutti", "tutto", "tutta",
+    "tutte", "alcuni", "alcuno", "nessuno", "altro", "altra", "altri", "altre", "senza", "verso",
+    "cio", "adesso", "ancora", "prima", "dopo", "sempre", "mai", "poi", "gia", "qui", "la",
     // inglese
-    "the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "by", "is", "are", "was",
-    "were", "be", "been", "who", "whats", "what", "where", "when", "why", "how", "does", "do",
-    "did", "his", "her", "their", "its", "and", "or", "but", "not", "now", "still", "then",
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "by", "is", "are", "was", "were",
+    "be", "been", "who", "whats", "what", "where", "when", "why", "how", "does", "do", "did",
+    "his", "her", "their", "its", "and", "or", "but", "not", "now", "still", "then",
 ];
 
 pub fn query_terms(text: &str, lang: Option<Lang>) -> Vec<String> {
@@ -158,10 +157,10 @@ pub fn strip_diacritics(s: &str) -> String {
             'À'..='Þ' | 'à'..='þ' if !matches!(c, '×' | '÷') => {
                 // Ranges exclude × (00D7) and ÷ (00F7) via the guard; map the
                 // rest through the table below.
-                out.push_str(&latin1(c));
+                out.push_str(latin1(c));
             }
             // Latin Extended-A
-            '\u{0100}'..='\u{017F}' => out.push_str(&latin_ext_a(c)),
+            '\u{0100}'..='\u{017F}' => out.push_str(latin_ext_a(c)),
             _ => out.push(c),
         }
     }
@@ -222,7 +221,10 @@ mod tests {
 
     #[test]
     fn diacritics() {
-        assert_eq!(strip_diacritics("città perù Übung déjà"), "citta peru ubung deja");
+        assert_eq!(
+            strip_diacritics("città perù Übung déjà"),
+            "citta peru ubung deja"
+        );
         assert_eq!(strip_diacritics("Łódź Œuvre"), "lodz oeuvre");
         assert_eq!(strip_diacritics("2 × 3 ÷ 2"), "2 × 3 ÷ 2");
     }
@@ -264,7 +266,10 @@ mod tests {
             ),
             Some(Lang::It)
         );
-        assert_eq!(detect_lang("The quick brown fox jumps over the lazy dog"), Some(Lang::En));
+        assert_eq!(
+            detect_lang("The quick brown fox jumps over the lazy dog"),
+            Some(Lang::En)
+        );
         // Unsupported languages get no stemming.
         assert_eq!(detect_lang("Привет, как дела сегодня"), None);
     }

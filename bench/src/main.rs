@@ -39,27 +39,73 @@ const FIRST: [&str; 32] = [
     "Ettore", "Fiora",
 ];
 const LAST: [&str; 24] = [
-    "Rossi", "Bianchi", "Ferrari", "Russo", "Brambilla", "Conti", "Esposito", "Ricci", "Marino",
-    "Greco", "Bruno", "Gallo", "Contini", "Lombardi", "Moretti", "Fontana", "Barbieri", "Rinaldi",
-    "Caruso", "Morelli", "Ferrara", "Gatti", "Martini", "Leone",
+    "Rossi",
+    "Bianchi",
+    "Ferrari",
+    "Russo",
+    "Brambilla",
+    "Conti",
+    "Esposito",
+    "Ricci",
+    "Marino",
+    "Greco",
+    "Bruno",
+    "Gallo",
+    "Contini",
+    "Lombardi",
+    "Moretti",
+    "Fontana",
+    "Barbieri",
+    "Rinaldi",
+    "Caruso",
+    "Morelli",
+    "Ferrara",
+    "Gatti",
+    "Martini",
+    "Leone",
 ];
 const CITIES: [&str; 18] = [
     "Roma", "Milano", "Torino", "Genova", "Bologna", "Firenze", "Venezia", "Verona", "Trieste",
     "Napoli", "Bari", "Palermo", "Cagliari", "Perugia", "Siena", "Padova", "Brescia", "Mantova",
 ];
 const COMPANIES: [&str; 14] = [
-    "Studio Aurora", "TechNova", "Ferro&Figli", "Archimedea", "VerdeAcqua", "Datariver",
-    "Officine Lupini", "CasaModerna", "Numeria", "PonteDigital", "AlbaCoop", "SudProgetti",
-    "NordEstIngegneria", "MetroStudio",
+    "Studio Aurora",
+    "TechNova",
+    "Ferro&Figli",
+    "Archimedea",
+    "VerdeAcqua",
+    "Datariver",
+    "Officine Lupini",
+    "CasaModerna",
+    "Numeria",
+    "PonteDigital",
+    "AlbaCoop",
+    "SudProgetti",
+    "NordEstIngegneria",
+    "MetroStudio",
 ];
 const PROJECTS: [&str; 12] = [
-    "Progetto Aurora", "Ponte Nuovo", "Biblioteca Civica", "Campus Verde", "Museo del Porto",
-    "Ospedale Est", "Quartiere Sole", "Stadio Nord", "Parco Fluviale", "Torre Ovest",
-    "Campus Mare", "Rete Metropolitana",
+    "Progetto Aurora",
+    "Ponte Nuovo",
+    "Biblioteca Civica",
+    "Campus Verde",
+    "Museo del Porto",
+    "Ospedale Est",
+    "Quartiere Sole",
+    "Stadio Nord",
+    "Parco Fluviale",
+    "Torre Ovest",
+    "Campus Mare",
+    "Rete Metropolitana",
 ];
 const FOODS: [&str; 8] = [
-    "la pasta alla norma", "il risotto allo zafferano", "la pizza margherita",
-    "la ribollita", "gli gnocchi di patate", "il pesto alla genovese", "la caponata",
+    "la pasta alla norma",
+    "il risotto allo zafferano",
+    "la pizza margherita",
+    "la ribollita",
+    "gli gnocchi di patate",
+    "il pesto alla genovese",
+    "la caponata",
     "le lasagne al forno",
 ];
 
@@ -84,6 +130,8 @@ fn ts(year: i32, month: u8, day: u8) -> At {
     At(date.midnight().assume_utc())
 }
 
+// A data-builder with every field of a note; the argument count is the point.
+#[allow(clippy::too_many_arguments)]
 fn base_note(
     id: ulid::Ulid,
     note_type: NoteType,
@@ -133,7 +181,7 @@ fn build_corpus(target: usize) -> Corpus {
         ulid::Ulid::from_parts(1_800_000_000_000, u128::from(counter))
     };
 
-    let n_people = (target / 20).max(50).min(3_000);
+    let n_people = (target / 20).clamp(50, 3_000);
     // person index -> (name, city_current, company, partner_idx)
     let mut people: Vec<(String, usize, usize, Option<usize>)> = Vec::new();
     for i in 0..n_people {
@@ -163,7 +211,7 @@ fn build_corpus(target: usize) -> Corpus {
     }
 
     // Person notes (with relations) and their histories.
-    for (_i, (name, city, company, partner)) in people.iter().enumerate() {
+    for (name, city, company, partner) in people.iter() {
         let person_id = nid();
         let mut body = format!("{name}. ");
         if let Some(p) = partner {
@@ -176,7 +224,7 @@ fn build_corpus(target: usize) -> Corpus {
         if let Some(p) = partner {
             body.push_str(&format!("- partner_of:: [[{}]]\n", people[*p].0));
         }
-        let mut person_note = base_note(
+        let person_note = base_note(
             person_id,
             NoteType::Person,
             name.clone(),
@@ -196,7 +244,10 @@ fn build_corpus(target: usize) -> Corpus {
             old_id,
             NoteType::Fact,
             format!("{name} abitava a {}", CITIES[old_city]),
-            format!("{name} abitava a [[{}]] dal 2020 al 2023.", CITIES[old_city]),
+            format!(
+                "{name} abitava a [[{}]] dal 2020 al 2023.",
+                CITIES[old_city]
+            ),
             vec![format!("casa/{}", slug(CITIES[old_city]))],
             Some(validity(2020, 2, 1)),
             Some(validity(2023, 12, 31)),
@@ -229,7 +280,10 @@ fn build_corpus(target: usize) -> Corpus {
             old_work,
             NoteType::Fact,
             format!("{name} lavorava da {}", COMPANIES[old_co]),
-            format!("{name} lavorava presso [[{}]] fino al 2023.", COMPANIES[old_co]),
+            format!(
+                "{name} lavorava presso [[{}]] fino al 2023.",
+                COMPANIES[old_co]
+            ),
             vec![format!("lavoro/{}", slug(COMPANIES[old_co]))],
             Some(validity(2019, 3, 1)),
             Some(validity(2023, 12, 31)),
@@ -241,7 +295,10 @@ fn build_corpus(target: usize) -> Corpus {
             cur_work,
             NoteType::Fact,
             format!("{name} lavora da {}", COMPANIES[*company]),
-            format!("{name} lavora presso [[{}]] come dipendente dal 2024.", COMPANIES[*company]),
+            format!(
+                "{name} lavora presso [[{}]] come dipendente dal 2024.",
+                COMPANIES[*company]
+            ),
             vec![format!("lavoro/{}", slug(COMPANIES[*company]))],
             Some(validity(2024, 1, 1)),
             None,
@@ -339,8 +396,20 @@ fn build_corpus(target: usize) -> Corpus {
     for _ in 0..fillers {
         let i = rng.below(n_people as u64) as usize;
         let (ref name, ref city, ref company, _) = people[i];
-        let months = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio",
-            "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+        let months = [
+            "gennaio",
+            "febbraio",
+            "marzo",
+            "aprile",
+            "maggio",
+            "giugno",
+            "luglio",
+            "agosto",
+            "settembre",
+            "ottobre",
+            "novembre",
+            "dicembre",
+        ];
         let m = months[rng.below(12) as usize];
         let body = match rng.below(4) {
             0 => format!(
@@ -367,7 +436,11 @@ fn build_corpus(target: usize) -> Corpus {
             format!("Appunto {m} su {name}"),
             body,
             vec![format!("casa/{}", slug(CITIES[*city]))],
-            Some(validity(2025, 1 + rng.below(12) as u8, 1 + rng.below(27) as u8)),
+            Some(validity(
+                2025,
+                1 + rng.below(12) as u8,
+                1 + rng.below(27) as u8,
+            )),
             None,
             vec![],
             ts(2025, 1 + rng.below(12) as u8, 2),
@@ -377,27 +450,28 @@ fn build_corpus(target: usize) -> Corpus {
     // Multi-hop questions: "dove lavora il partner di X" — the answer is the
     // partner's current-work note (found by its deterministic title).
     for (i, (name, _, _, partner)) in people.iter().enumerate() {
-        if i % 7 == 0 {
-            if let Some(p) = partner {
-                let pname = &people[*p].0;
-                let work = notes.iter().find(|n| {
-                    n.note_type == NoteType::Fact
-                        && n.title.as_deref() == Some(format!("{pname} lavora da {}", COMPANIES[people[*p].2]).as_str())
-                });
-                let partner_note = notes.iter().find(|n| {
-                    n.note_type == NoteType::Person && n.title.as_deref() == Some(pname.as_str())
-                });
-                if let Some(w) = work {
-                    let mut ids = vec![w.id.to_string()];
-                    if let Some(pn) = partner_note {
-                        ids.push(pn.id.to_string());
-                    }
-                    questions.push(Question {
-                        text: format!("dove lavora il partner di {name}"),
-                        as_of: None,
-                        expect_ids: ids,
-                    });
+        if i % 7 == 0
+            && let Some(p) = partner
+        {
+            let pname = &people[*p].0;
+            let work = notes.iter().find(|n| {
+                n.note_type == NoteType::Fact
+                    && n.title.as_deref()
+                        == Some(format!("{pname} lavora da {}", COMPANIES[people[*p].2]).as_str())
+            });
+            let partner_note = notes.iter().find(|n| {
+                n.note_type == NoteType::Person && n.title.as_deref() == Some(pname.as_str())
+            });
+            if let Some(w) = work {
+                let mut ids = vec![w.id.to_string()];
+                if let Some(pn) = partner_note {
+                    ids.push(pn.id.to_string());
                 }
+                questions.push(Question {
+                    text: format!("dove lavora il partner di {name}"),
+                    as_of: None,
+                    expect_ids: ids,
+                });
             }
         }
     }
@@ -444,7 +518,8 @@ fn run(target: usize, dir: &std::path::Path) -> RunReport {
     // insert
     let t0 = Instant::now();
     for note in &corpus.notes {
-        cell.put_note(note, "bench").expect(/* generated notes are valid */ "put");
+        cell.put_note(note, "bench")
+            .expect(/* generated notes are valid */ "put");
     }
     let insert_s = t0.elapsed().as_secs_f64();
 
@@ -459,7 +534,8 @@ fn run(target: usize, dir: &std::path::Path) -> RunReport {
     let open_ms = open_times.iter().sum::<f64>() / open_times.len() as f64;
 
     // search — full pipeline, and text-only (graph_hops = 0) for profiling
-    let now = OffsetDateTime::from_unix_timestamp(1_810_000_000).expect(/* fixed valid ts */ "ts");
+    let now =
+        OffsetDateTime::from_unix_timestamp(1_810_000_000).expect(/* fixed valid ts */ "ts");
     let mut text_only: Vec<f64> = Vec::new();
     for q in &corpus.questions {
         if q.expect_ids.is_empty() {
@@ -488,15 +564,14 @@ fn run(target: usize, dir: &std::path::Path) -> RunReport {
             query.filters.as_of = Some(a);
         }
         let t = Instant::now();
-        let results = cell.search_with_now(&query, now).expect(/* valid query */ "search");
+        let results = cell
+            .search_with_now(&query, now)
+            .expect(/* valid query */ "search");
         latencies.push(t.elapsed().as_secs_f64() * 1000.0);
         let ids: Vec<String> = results.iter().map(|h| h.note.id.to_string()).collect();
 
         // recall@5 and reciprocal rank
-        if let Some(rank) = ids
-            .iter()
-            .position(|i| q.expect_ids.contains(i))
-        {
+        if let Some(rank) = ids.iter().position(|i| q.expect_ids.contains(i)) {
             hits_at_5 += 1;
             mrr_sum += 1.0 / (rank + 1) as f64;
         }
@@ -504,7 +579,8 @@ fn run(target: usize, dir: &std::path::Path) -> RunReport {
     }
 
     // file size (checkpoint the WAL first, like a rest after a bulk load)
-    cell.checkpoint().expect(/* single bench writer */ "checkpoint");
+    cell.checkpoint()
+        .expect(/* single bench writer */ "checkpoint");
     drop(cell);
     let file_bytes = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
     let _ = std::fs::remove_file(&db);
@@ -516,8 +592,16 @@ fn run(target: usize, dir: &std::path::Path) -> RunReport {
         search_p50_ms: percentile(latencies.clone(), 0.5),
         search_p95_ms: percentile(latencies.clone(), 0.95),
         text_only_p50_ms: percentile(text_only, 0.5),
-        recall_at_5: if answered == 0 { 0.0 } else { hits_at_5 as f64 / answered as f64 },
-        mrr: if answered == 0 { 0.0 } else { mrr_sum / answered as f64 },
+        recall_at_5: if answered == 0 {
+            0.0
+        } else {
+            hits_at_5 as f64 / answered as f64
+        },
+        mrr: if answered == 0 {
+            0.0
+        } else {
+            mrr_sum / answered as f64
+        },
         questions: answered,
         file_bytes,
     }
