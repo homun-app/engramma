@@ -111,8 +111,9 @@ never exported; superseded notes are.
 
 ### `verify`
 Recomputes the hash chain, rebuilds the whole state by replaying the log in
-memory and compares every table. JSON: `{ops, hash_chain_ok, replay_ok,
-mismatch, ok}`.
+memory, compares every table and runs the FTS integrity-check (the index
+must hold exactly the non-tombstoned notes). JSON: `{ops, hash_chain_ok,
+replay_ok, fts_ok, mismatch, ok}`.
 
 ### `mcp --cells a,b`
 Starts the read-only MCP server on stdio. Without `--cells` it refuses to

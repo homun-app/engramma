@@ -151,15 +151,44 @@ pub struct VerifyReport {
     pub hash_chain_ok: bool,
     /// Replay produced the same tables.
     pub replay_ok: bool,
-    /// First mismatch, when `replay_ok` is false.
+    /// The FTS index matches its content table (integrity-check).
+    pub fts_ok: bool,
+    /// First mismatch, when something failed.
     pub mismatch: Option<String>,
 }
 
 impl VerifyReport {
     /// Everything passed.
     pub fn ok(&self) -> bool {
-        self.hash_chain_ok && self.replay_ok
+        self.hash_chain_ok && self.replay_ok && self.fts_ok
     }
+}
+
+/// Run the FTS5 integrity-check: the index must match what its content table
+/// implies (every FTS column has a twin in `notes` since schema v3).
+fn fts_integrity_check(conn: &Connection) -> Result<(), CellError> {
+    conn.execute(
+        "INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')",
+        [],
+    )?;
+    // SQLite 3.54's integrity-check verifies the index structure but does
+    // NOT compare an external-content index with its content table (checked
+    // by hand), so compare the indexed rowid set ourselves: it must be
+    // exactly the non-tombstoned notes.
+    let diverged: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM (SELECT rowid AS id FROM notes WHERE status != 'deleted'
+                                       EXCEPT SELECT id FROM notes_fts_docsize))
+             + (SELECT COUNT(*) FROM (SELECT id FROM notes_fts_docsize
+                                      EXCEPT SELECT rowid FROM notes WHERE status != 'deleted'))",
+        [],
+        |r| r.get(0),
+    )?;
+    if diverged > 0 {
+        return Err(CellError::Db(format!(
+            "the index holds {diverged} rowid(s) more or fewer than the living notes"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) struct Inner {
@@ -693,6 +722,7 @@ impl Cell {
                     ops: 0,
                     hash_chain_ok: false,
                     replay_ok: false,
+                    fts_ok: false,
                     mismatch: Some(format!("unreadable log: {e}")),
                 });
             }
@@ -729,14 +759,27 @@ impl Cell {
                 ops: source_ops.len(),
                 hash_chain_ok: chain_ok,
                 replay_ok: false,
+                fts_ok: false,
                 mismatch: Some(format!("replay failed: {e}")),
             });
         }
-        let mismatch = compare_states(&inner.conn, &rebuild_conn)?;
+        let mut mismatch = compare_states(&inner.conn, &rebuild_conn)?;
+        // The FTS index is not part of the logical replay: check it against
+        // its content table, on the live cell and on the rebuild alike.
+        let fts_ok = match fts_integrity_check(&inner.conn)
+            .and_then(|()| fts_integrity_check(&rebuild_conn))
+        {
+            Ok(()) => true,
+            Err(e) => {
+                mismatch = Some(mismatch.unwrap_or_else(|| format!("fts index: {e}")));
+                false
+            }
+        };
         Ok(VerifyReport {
             ops: source_ops.len(),
             hash_chain_ok: chain_ok,
             replay_ok: mismatch.is_none(),
+            fts_ok,
             mismatch,
         })
     }
@@ -782,7 +825,7 @@ fn compare_states(a: &Connection, b: &Connection) -> Result<Option<String>, Cell
     let tables = [
         (
             "notes",
-            "SELECT id, type, title, body, frontmatter_json, scope, source, confidence, status, valid_from, valid_to, created_at, updated_at, version, body_norm FROM notes ORDER BY id",
+            "SELECT id, type, title, body, frontmatter_json, scope, source, confidence, status, valid_from, valid_to, created_at, updated_at, version, body_norm, tags_text FROM notes ORDER BY id",
         ),
         (
             "note_versions",
@@ -1377,5 +1420,59 @@ mod tests {
             !report.ok() && report.mismatch.is_some(),
             "a tampered kind must fail verification: {report:?}"
         );
+    }
+
+    #[test]
+    fn tags_text_is_the_deterministic_fts_twin() {
+        let (_d, cell) = test_cell();
+        let mut n = note(1, "ordinamento [[Milano]]");
+        n.tags = vec!["beta".into(), "alfa".into()];
+        n.body = "corpo #gamma".into();
+        cell.put_note(&n, "t").unwrap(/* test-only */);
+        let id = n.id.to_string();
+        let tags_text = cell
+            .debug_column(&format!("SELECT tags_text FROM notes WHERE id = '{id}'"))
+            .unwrap(/* test-only */);
+        assert_eq!(
+            tags_text,
+            vec!["alfa beta gamma".to_string()],
+            "tags_text must be sorted and space-joined"
+        );
+    }
+
+    #[test]
+    fn fts_index_is_really_verified() {
+        let (_d, cell) = test_cell();
+        cell.put_note(&note(1, "indicizzami [[Roma]]"), "t")
+            .unwrap(/* test-only */);
+        assert!(cell.verify().unwrap(/* test-only */).ok());
+        // remove the document from the FTS index without touching the note:
+        // the replay still matches, only the index is rotten
+        {
+            let inner = cell.lock().unwrap(/* test-only */);
+            let (rowid, title, body_norm, tags_text): (i64, String, String, String) = inner
+                .conn
+                .query_row(
+                    "SELECT n.rowid, n.title, n.body_norm, n.tags_text
+                     FROM notes n JOIN notes_fts f ON f.rowid = n.rowid LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap(/* test-only */);
+            inner
+                .conn
+                .execute(
+                    "INSERT INTO notes_fts(notes_fts, rowid, title, body_norm, tags_text)
+                     VALUES ('delete', ?1, ?2, ?3, ?4)",
+                    rusqlite::params![rowid, title, body_norm, tags_text],
+                )
+                .unwrap(/* test-only */);
+        }
+        let report = cell.verify().unwrap(/* test-only */);
+        assert!(
+            !report.ok(),
+            "a rotten FTS index must fail verification: {report:?}"
+        );
+        assert!(!report.fts_ok, "{report:?}");
     }
 }

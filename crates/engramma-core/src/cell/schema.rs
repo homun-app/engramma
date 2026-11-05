@@ -3,17 +3,16 @@
 //! Cell schema and numbered migrations (DESIGN §4.2, without `notes_vec`).
 //!
 //! Every migration runs inside a transaction; `meta.schema_version` stores the
-//! number of applied migrations. The FTS table mirrors the schema exactly as
-//! written in the design; the `tags` column has no twin column in `notes`
-//! (external-content FTS only reads the content table during `rebuild` and
-//! `integrity-check`, which we never run — see REPORT).
+//! number of applied migrations. Since v3 every FTS column has a twin column
+//! in `notes` (`tags_text`), so the index is verified with an integrity-check
+//! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 2] = [
+pub const MIGRATIONS: [&str; 3] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -47,7 +46,43 @@ CREATE INDEX idx_note_tags_tag ON note_tags(tag);
 -- benchmark collapsed to ~190 notes/s).
 CREATE INDEX idx_edges_note ON edges(note_id);
 "#,
+    r#"
+-- v3: the FTS `tags` column gains a twin column in `notes`. Without it the
+-- index could not be verified (rebuild/integrity-check would read a
+-- nonexistent notes.tags): delete/insert discipline was trusted, not checked.
+ALTER TABLE notes ADD COLUMN tags_text TEXT NOT NULL DEFAULT '';
+DROP TABLE notes_fts;
+CREATE VIRTUAL TABLE notes_fts USING fts5(title, body_norm, tags_text, content='notes', content_rowid='rowid',
+                                          tokenize='unicode61 remove_diacritics 2');
+"#,
 ];
+
+/// Rust-side migration steps, run right after the SQL of version `v`.
+fn migrate_rust(tx: &rusqlite::Transaction<'_>, v: i64) -> Result<(), crate::error::CellError> {
+    if v == 3 {
+        // Backfill `tags_text` deterministically (tags sorted, space-joined —
+        // the same value `apply` writes), then rebuild the index from it.
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM notes")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.flatten().collect()
+        };
+        for id in ids {
+            let mut tags: Vec<String> = {
+                let mut stmt = tx.prepare("SELECT tag FROM note_tags WHERE note_id = ?1")?;
+                let rows = stmt.query_map([&id], |r| r.get::<_, String>(0))?;
+                rows.flatten().collect()
+            };
+            tags.sort();
+            tx.execute(
+                "UPDATE notes SET tags_text = ?2 WHERE id = ?1",
+                rusqlite::params![id, tags.join(" ")],
+            )?;
+        }
+        tx.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')", [])?;
+    }
+    Ok(())
+}
 
 /// Apply pending migrations inside `tx` and update `meta.schema_version`.
 ///
@@ -69,6 +104,7 @@ pub fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellE
         let v = (i + 1) as i64;
         if v > current {
             tx.execute_batch(sql)?;
+            migrate_rust(tx, v)?;
             tx.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = ?1",

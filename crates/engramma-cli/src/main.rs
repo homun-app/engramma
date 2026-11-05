@@ -769,12 +769,13 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "ops": report.ops,
                     "hash_chain_ok": report.hash_chain_ok,
                     "replay_ok": report.replay_ok,
+                    "fts_ok": report.fts_ok,
                     "mismatch": report.mismatch,
                     "ok": report.ok(),
                 }));
             } else if report.ok() {
                 println!(
-                    "registro verificato: {} operazioni, catena hash e ricostruzione a posto",
+                    "registro verificato: {} operazioni, catena hash, ricostruzione e indice FTS a posto",
                     report.ops
                 );
             } else {

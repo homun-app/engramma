@@ -93,7 +93,8 @@ CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         scope TEXT, source TEXT, confidence TEXT, status TEXT,
                         valid_from TEXT, valid_to TEXT,
                         created_at TEXT, updated_at TEXT, version INTEGER,
-                        body_norm TEXT);             -- testo normalizzato per FTS (§ 6.1)
+                        body_norm TEXT,              -- testo normalizzato per FTS (§ 6.1)
+                        tags_text TEXT);             -- gemella della colonna FTS tags (v0.1.1: l'indice è verificabile)
 CREATE TABLE note_versions (note_id TEXT, version INTEGER, op_id TEXT, snapshot_json TEXT,
                             PRIMARY KEY (note_id, version));
 CREATE TABLE tags      (name TEXT PRIMARY KEY, parent TEXT);
@@ -105,7 +106,7 @@ CREATE TABLE edges     (id TEXT PRIMARY KEY, src TEXT, rel TEXT, dst TEXT,   -- 
 CREATE TABLE supersedes (new_id TEXT, old_id TEXT, PRIMARY KEY (new_id, old_id));
 CREATE TABLE ops       (seq INTEGER PRIMARY KEY, op_id TEXT UNIQUE, hlc TEXT, actor TEXT,
                         kind TEXT, note_id TEXT, payload_json TEXT, prev_hash TEXT, hash TEXT);
-CREATE VIRTUAL TABLE notes_fts USING fts5(title, body_norm, tags, content='notes', content_rowid='rowid',
+CREATE VIRTUAL TABLE notes_fts USING fts5(title, body_norm, tags_text, content='notes', content_rowid='rowid',
                                           tokenize='unicode61 remove_diacritics 2');
 -- v0.2: CREATE VIRTUAL TABLE notes_vec USING vec0(embedding float[N]); + tabella embedding_meta(model, dim)
 ```

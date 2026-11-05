@@ -356,9 +356,9 @@ fn apply_init(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     Ok(())
 }
 
-/// Full column set of `notes` (everything but computed FTS columns).
+/// Full column set of `notes` (FTS twin columns included).
 const NOTE_COLS: &str = "id, type, title, body, frontmatter_json, scope, source, confidence, status, \
-     valid_from, valid_to, created_at, updated_at, version, body_norm";
+     valid_from, valid_to, created_at, updated_at, version, body_norm, tags_text";
 
 /// Header-only canonical JSON for `frontmatter_json` (the body lives in the
 /// `notes.body` column; the placeholder keeps the JSON model complete).
@@ -383,9 +383,9 @@ struct NoteRow {
     version: i64,
     /// `body_norm` as last written (FTS delete values must match the insert).
     body_norm: String,
-    /// Sorted space-joined tags at read time (same function the FTS insert
-    /// uses, so external-content deletes stay exact).
-    fts_tags: String,
+    /// `tags_text` as last written: the exact value the FTS index holds for
+    /// this row (external-content deletes must repeat it byte for byte).
+    tags_text: String,
 }
 
 fn read_note(tx: &Transaction<'_>, id: &Ulid) -> Result<Option<NoteRow>, CellError> {
@@ -406,20 +406,13 @@ fn read_note(tx: &Transaction<'_>, id: &Ulid) -> Result<Option<NoteRow>, CellErr
     let rowid: i64 = row.get(0)?;
     let version: i64 = row.get(14)?;
     let body_norm: String = row.get(15).unwrap_or_default();
-    let mut tags: Vec<String> = Vec::new();
-    {
-        let mut stmt = tx.prepare("SELECT tag FROM note_tags WHERE note_id = ?1 ORDER BY tag")?;
-        let rows = stmt.query_map([id.to_string()], |r| r.get::<_, String>(0))?;
-        for t in rows {
-            tags.push(t?);
-        }
-    }
+    let tags_text: String = row.get(16).unwrap_or_default();
     Ok(Some(NoteRow {
         rowid,
         note,
         version,
         body_norm,
-        fts_tags: tags.join(" "),
+        tags_text,
     }))
 }
 
@@ -436,12 +429,12 @@ fn fts_delete(
     rowid: i64,
     title: &str,
     body_norm: &str,
-    tags: &str,
+    tags_text: &str,
 ) -> Result<(), CellError> {
     tx.execute(
-        "INSERT INTO notes_fts(notes_fts, rowid, title, body_norm, tags)
+        "INSERT INTO notes_fts(notes_fts, rowid, title, body_norm, tags_text)
          VALUES ('delete', ?1, ?2, ?3, ?4)",
-        rusqlite::params![rowid, title, body_norm, tags],
+        rusqlite::params![rowid, title, body_norm, tags_text],
     )?;
     Ok(())
 }
@@ -451,11 +444,11 @@ fn fts_insert(
     rowid: i64,
     title: &str,
     body_norm: &str,
-    tags: &str,
+    tags_text: &str,
 ) -> Result<(), CellError> {
     tx.execute(
-        "INSERT INTO notes_fts(rowid, title, body_norm, tags) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![rowid, title, body_norm, tags],
+        "INSERT INTO notes_fts(rowid, title, body_norm, tags_text) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![rowid, title, body_norm, tags_text],
     )?;
     Ok(())
 }
@@ -573,16 +566,21 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
         .map_err(|e| CellError::Invalid(format!("note {id} body: {e}")))?;
 
     // --- FTS: drop the old row first (values as inserted), then rebuild.
-    if let Some(old) = old {
-        // The index may not hold the row (e.g. it was deleted earlier); the
-        // failed delete is harmless then, so ignore the error.
-        let _ = fts_delete(
+    // The index holds exactly the non-tombstoned notes: a delete for a
+    // rowid that is not there corrupts FTS5's internal accounting (the
+    // "database disk image is malformed" error it raises is not a no-op —
+    // one delete later the row refuses to leave the index), so tombstones
+    // never issue one and the error is no longer swallowed.
+    if let Some(old) = old
+        && old.note.status != Status::Deleted
+    {
+        fts_delete(
             tx,
             old.rowid,
             old.note.title.as_deref().unwrap_or(""),
             &old.body_norm,
-            &old.fts_tags,
-        );
+            &old.tags_text,
+        )?;
     }
     // --- tags tables
     tx.execute("DELETE FROM note_tags WHERE note_id = ?1", [id.to_string()])?;
@@ -617,14 +615,19 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
             )?;
         }
     }
-    // --- FTS insert with the new (deterministic) tags value.
+    // --- tags_text twin + FTS insert with the same deterministic value.
+    let tags_text = fts_tags_value(&all_tags);
+    tx.execute(
+        "UPDATE notes SET tags_text = ?2 WHERE id = ?1",
+        rusqlite::params![id.to_string(), tags_text],
+    )?;
     if row.note.status != Status::Deleted {
         fts_insert(
             tx,
             row.rowid,
             row.note.title.as_deref().unwrap_or(""),
             &row.body_norm,
-            &fts_tags_value(&all_tags),
+            &tags_text,
         )?;
     }
 
