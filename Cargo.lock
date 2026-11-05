@@ -682,6 +682,8 @@ dependencies = [
 name = "engramma-embed"
 version = "0.1.0-dev"
 dependencies = [
+ "engramma-core",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",

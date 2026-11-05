@@ -44,9 +44,16 @@ pub trait Embedder: Send + Sync {
     /// ([`chunk_note`]). The builtin model overrides this with the exact
     /// tokenizer count; remote embedders keep the conservative default
     /// (~4 characters per token for European languages).
-    fn approx_tokens(&self, _text: &str) -> usize {
-        4
+    fn approx_tokens(&self, text: &str) -> usize {
+        default_token_estimate(text)
     }
+}
+
+/// Conservative token estimate for embedders without a local tokenizer:
+/// ~4 characters per token for European languages, at least one.
+#[must_use]
+pub fn default_token_estimate(text: &str) -> usize {
+    text.chars().count().div_ceil(4)
 }
 
 /// The text a note is embedded on: `title + "\n\n" + body`, without the

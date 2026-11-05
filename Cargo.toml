@@ -40,3 +40,6 @@ tract-onnx = "0.23.10"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 # Ollama and external OpenAI-compatible embedding endpoints.
 ureq = { version = "3.5", features = ["json"] }
+# sha256 of model files: ring is already in the tree (rustls, via ureq), so
+# declaring it here adds no new crate to Cargo.lock.
+ring = "0.17"
