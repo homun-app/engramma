@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Engramma core: note format, cells, change log, search (v0.1).
+//! Engramma core: note format, cells, change log, search, embedding
+//! contract (v0.2).
 
 pub mod cell;
+pub mod embed;
 pub mod error;
 pub mod format;
 pub mod hlc;
@@ -12,7 +14,8 @@ pub mod search;
 pub mod text;
 
 pub use cell::{Cell, NotePatch, VerifyReport};
-pub use error::{CellError, FormatError, PortError, SearchError};
+pub use embed::{Embedder, TextKind};
+pub use error::{CellError, EmbedError, FormatError, PortError, SearchError};
 pub use format::{Confidence, Lang, Note, NoteType, ParseMode, Status, Validity};
 pub use hlc::{Hlc, HlcClock};
 pub use port::{export, import_cell, import_obsidian};

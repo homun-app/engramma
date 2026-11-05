@@ -117,5 +117,29 @@ impl From<rusqlite::Error> for SearchError {
     }
 }
 
+/// Errors returned by embedding (the trait lives in `engramma-core`, the
+/// implementations in `engramma-embed`).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum EmbedError {
+    /// The model files are missing from the local cache (run `engramma model pull`).
+    #[error("embedding model missing: {0}")]
+    ModelMissing(String),
+    /// The model is present but unusable (bad hash, bad config, wrong shapes).
+    #[error("bad embedding model: {0}")]
+    BadModel(String),
+    /// A remote embedder failed (transport, HTTP status, malformed response).
+    #[error("embedding endpoint error: {0}")]
+    Remote(String),
+    /// An embedding came back with the wrong dimension.
+    #[error("embedding dimension mismatch: expected {expected}, got {got}")]
+    Dimension {
+        /// Expected dimension.
+        expected: usize,
+        /// Received dimension.
+        got: usize,
+    },
+}
+
 /// Result alias for format parsing.
 pub type FormatResult<T> = Result<T, FormatError>;
