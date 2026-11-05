@@ -161,17 +161,16 @@ impl VerifyReport {
     }
 }
 
-struct Inner {
-    conn: Connection,
+pub(crate) struct Inner {
+    pub(crate) conn: Connection,
     clock: HlcClock,
-    node: String,
 }
 
 /// An open cell. Cheap to clone; one process-wide write lock per file.
 #[derive(Clone)]
 pub struct Cell {
     path: PathBuf,
-    inner: Arc<Mutex<Inner>>,
+    pub(crate) inner: Arc<Mutex<Inner>>,
     write_lock: Arc<Mutex<()>>,
 }
 
@@ -258,8 +257,7 @@ impl Cell {
             }
             tx.commit()?;
         }
-        let node = crate::id::node_id().to_string();
-        let mut clock = HlcClock::new(node.clone(), now_ms);
+        let mut clock = HlcClock::new(crate::id::node_id().to_string(), now_ms);
         {
             let hlc_s: Option<String> = conn
                 .query_row("SELECT value FROM meta WHERE key='hlc'", [], |r| r.get(0))
@@ -272,13 +270,13 @@ impl Cell {
         }
         Ok(Cell {
             path: path.to_path_buf(),
-            inner: Arc::new(Mutex::new(Inner { conn, clock, node })),
+            inner: Arc::new(Mutex::new(Inner { conn, clock })),
             write_lock: per_cell_lock(path),
         })
     }
 
     /// The cell file path.
-    pub fn path(&self) -> &Path {
+    pub fn file_path(&self) -> &Path {
         &self.path
     }
 
