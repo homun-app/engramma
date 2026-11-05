@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 3] = [
+pub const MIGRATIONS: [&str; 4] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -54,6 +54,20 @@ ALTER TABLE notes ADD COLUMN tags_text TEXT NOT NULL DEFAULT '';
 DROP TABLE notes_fts;
 CREATE VIRTUAL TABLE notes_fts USING fts5(title, body_norm, tags_text, content='notes', content_rowid='rowid',
                                           tokenize='unicode61 remove_diacritics 2');
+"#,
+    r#"
+-- v4 (DESIGN §6.2): derived embedding storage. These tables are NOT part of
+-- the log, the replay or the export: vectors are recomputed from the notes
+-- and never enter `ops`, so the determinism of §4.3 does not depend on
+-- floating point across platforms or tract versions. Every row carries the
+-- model and the hashes of the text it embeds.
+CREATE TABLE embedding_models (model TEXT PRIMARY KEY, dim INTEGER, state TEXT,  -- building|ready|retired
+                               created_at TEXT);
+CREATE TABLE note_vectors (note_id TEXT, chunk INTEGER, model TEXT, content_hash TEXT,
+                           note_hash TEXT,        -- blake3(model || title\n\nbody): staleness without a tokenizer
+                           vec BLOB,              -- f32 little-endian, L2-normalised
+                           PRIMARY KEY (model, note_id, chunk));
+CREATE INDEX idx_note_vectors_note ON note_vectors(note_id);
 "#,
 ];
 

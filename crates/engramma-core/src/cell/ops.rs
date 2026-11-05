@@ -945,6 +945,9 @@ fn apply_delete(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     note.updated_at = updated_at;
     write_note(tx, &note, true, false)?;
     reindex_note(tx, &id, Some(&old))?;
+    // A tombstone has no vectors, in any model (derived data: the delete is
+    // the single authority, no later sweep needed).
+    super::vectors::delete_note_vectors(tx, &id)?;
     Ok(())
 }
 

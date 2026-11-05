@@ -8,6 +8,7 @@
 
 pub mod ops;
 pub mod schema;
+pub mod vectors;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,10 +19,12 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
+use crate::embed::Embedder;
 use crate::error::CellError;
 use crate::format::{At, Note, Status, Validity};
 use crate::hlc::{Hlc, HlcClock};
 use ops::{Op, OpKind};
+pub use vectors::{EmbedPendingReport, ModelCoverage, ModelRow, ModelState};
 
 /// A manual edge as created by [`Cell::link`].
 #[derive(Debug, Clone)]
@@ -155,6 +158,9 @@ pub struct VerifyReport {
     pub fts_ok: bool,
     /// First mismatch, when something failed.
     pub mismatch: Option<String>,
+    /// Vector coverage per model, reported separately: embeddings are
+    /// derived data and their absence is never a verification failure.
+    pub coverage: Vec<ModelCoverage>,
 }
 
 impl VerifyReport {
@@ -584,6 +590,171 @@ impl Cell {
     }
 
     // ------------------------------------------------------------------
+    // derived vectors (schema v4): blue/green models, pending embedding
+    // ------------------------------------------------------------------
+
+    /// Register an embedding model for this cell, in `building` state (the
+    /// blue/green start, DESIGN §7): `embed_pending` fills it while the
+    /// `ready` model keeps serving searches.
+    ///
+    /// # Errors
+    /// [`CellError::Invalid`] when another model is already building.
+    pub fn add_model(&self, model_id: &str, dim: usize) -> Result<(), CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let mut inner = self.lock()?;
+        let tx = inner
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        vectors::VectorTx { conn: &tx }.add_model(model_id, dim)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The registered embedding models.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn models(&self) -> Result<Vec<ModelRow>, CellError> {
+        let inner = self.lock()?;
+        vectors::VectorTx { conn: &inner.conn }.models()
+    }
+
+    /// Embed pending notes in batches with `embedder`, at most `max` notes in
+    /// this call. Embedding happens **outside** the cell lock and outside
+    /// every write transaction: writes stay fast, readers stay served. When a
+    /// `building` model reaches 100% coverage it is promoted to `ready` in
+    /// one transaction (the previous ready model retires and its vectors go).
+    ///
+    /// # Errors
+    /// [`CellError::Invalid`] when the embedder is not the cell's target
+    /// model, or the embedding call fails; [`CellError::Db`] on SQL failure.
+    pub fn embed_pending(
+        &self,
+        embedder: &dyn Embedder,
+        max: usize,
+    ) -> Result<EmbedPendingReport, CellError> {
+        self.embed_pending_inner(embedder, max, false)
+    }
+
+    /// Like [`Cell::embed_pending`], but re-embeds every living note even
+    /// when its hash is current (`engramma embed --all`).
+    ///
+    /// # Errors
+    /// As [`Cell::embed_pending`].
+    pub fn embed_all(
+        &self,
+        embedder: &dyn Embedder,
+        max: usize,
+    ) -> Result<EmbedPendingReport, CellError> {
+        self.embed_pending_inner(embedder, max, true)
+    }
+
+    fn embed_pending_inner(
+        &self,
+        embedder: &dyn Embedder,
+        max: usize,
+        force: bool,
+    ) -> Result<EmbedPendingReport, CellError> {
+        if max == 0 {
+            return Ok(EmbedPendingReport {
+                done: 0,
+                remaining: 0,
+                promoted: None,
+            });
+        }
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let mut done = 0_usize;
+        let mut promoted: Option<String> = None;
+        let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            if done >= max {
+                break;
+            }
+            // Pick the batch and drop the lock before the (slow) embedding.
+            let batch = {
+                let inner = self.lock()?;
+                let vx = vectors::VectorTx { conn: &inner.conn };
+                let Some(target) = vx.embed_target()? else {
+                    break;
+                };
+                if target.model != embedder.model_id() {
+                    return Err(CellError::Invalid(format!(
+                        "the cell wants `{}` but this embedder is `{}` (run `engramma model use {}`)",
+                        target.model,
+                        embedder.model_id(),
+                        embedder.model_id()
+                    )));
+                }
+                let take = vectors::BATCH.min(max - done);
+                let (batch, _remaining) = vx.pending(&target.model, take, force, &processed)?;
+                batch
+            };
+            if batch.is_empty() {
+                break;
+            }
+            let embedded = vectors::embed_notes(embedder, &batch)?;
+            {
+                let mut inner = self.lock()?;
+                let tx = inner.conn.transaction()?;
+                let vx = vectors::VectorTx { conn: &tx };
+                for (id, chunks) in &embedded {
+                    let note = batch
+                        .iter()
+                        .find(|n| n.id == *id)
+                        .ok_or_else(|| CellError::Db("batch mismatch".into()))?;
+                    vx.write_note_vectors(
+                        embedder.model_id(),
+                        id,
+                        note.title.as_deref(),
+                        &note.body,
+                        chunks,
+                    )?;
+                }
+                tx.commit()?;
+            }
+            for (id, _) in &embedded {
+                processed.insert(id.clone());
+            }
+            done += embedded.len();
+        }
+        // Blue/green: a building model with full coverage becomes ready, the
+        // old ready model retires with its vectors — one transaction.
+        {
+            let inner = self.lock()?;
+            let vx = vectors::VectorTx { conn: &inner.conn };
+            if let Some(target) = vx.embed_target()?
+                && target.state == ModelState::Building
+                && target.model == embedder.model_id()
+                && let Some(p) = vx.promote_if_complete(&target.model)?
+            {
+                promoted = Some(p);
+            }
+        }
+        let remaining = {
+            let inner = self.lock()?;
+            let vx = vectors::VectorTx { conn: &inner.conn };
+            match vx.embed_target()? {
+                Some(t) if t.model == embedder.model_id() => {
+                    vx.pending(&t.model, 0, false, &std::collections::HashSet::new())?
+                        .1
+                }
+                _ => 0,
+            }
+        };
+        Ok(EmbedPendingReport {
+            done,
+            remaining,
+            promoted,
+        })
+    }
+
+    // ------------------------------------------------------------------
     // reads
     // ------------------------------------------------------------------
 
@@ -757,6 +928,7 @@ impl Cell {
                     replay_ok: false,
                     fts_ok: false,
                     mismatch: Some(format!("unreadable log: {e}")),
+                    coverage: Vec::new(),
                 });
             }
         };
@@ -794,6 +966,7 @@ impl Cell {
                 replay_ok: false,
                 fts_ok: false,
                 mismatch: Some(format!("replay failed: {e}")),
+                coverage: Vec::new(),
             });
         }
         let mut mismatch = compare_states(&inner.conn, &rebuild_conn)?;
@@ -808,12 +981,18 @@ impl Cell {
                 false
             }
         };
+        // Vector coverage is reported, not verified: embeddings are derived
+        // data, recomputable from the notes at any time.
+        let coverage = vectors::VectorTx { conn: &inner.conn }
+            .coverage()
+            .unwrap_or_default();
         Ok(VerifyReport {
             ops: source_ops.len(),
             hash_chain_ok: chain_ok,
             replay_ok: mismatch.is_none(),
             fts_ok,
             mismatch,
+            coverage,
         })
     }
 
