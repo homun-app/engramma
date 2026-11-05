@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 use time::OffsetDateTime;
 use ulid::Ulid;
@@ -193,8 +193,9 @@ fn configure(conn: &Connection) -> Result<(), CellError> {
 }
 
 fn now_ms() -> u64 {
-    OffsetDateTime::now_utc().unix_timestamp().max(0) as u64 * 1000
-        + u32::from(OffsetDateTime::now_utc().millisecond()) as u64
+    // One single read: two `now_utc()` calls can straddle a second boundary
+    // and put the combined value almost a second in the past.
+    u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or_default()
 }
 
 impl Cell {
@@ -328,6 +329,15 @@ impl Cell {
             .map_err(|_| CellError::Db("cell mutex poisoned".into()))
     }
 
+    /// Replace the HLC clock — tests inject skewed wall clocks to play
+    /// multiple processes on the same file.
+    #[cfg(test)]
+    pub(crate) fn inject_clock(&self, clock: HlcClock) -> Result<(), CellError> {
+        let mut inner = self.lock()?;
+        inner.clock = clock;
+        Ok(())
+    }
+
     /// Build and append an operation, then apply it, in one transaction.
     #[allow(clippy::too_many_arguments)]
     fn execute(
@@ -343,10 +353,21 @@ impl Cell {
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
         let mut inner = self.lock()?;
         let op_id = crate::id::new_ulid()?;
-        let hlc = inner.clock.tick();
-        let tx = inner
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Inner { conn, clock } = &mut *inner;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Inside the write transaction: align with the newest HLC in the log
+        // before ticking. Another process may have written since we opened
+        // (the daemon and the CLI share a cell); without this, an operation
+        // could receive an HLC lower than its predecessor's in the log.
+        let logged: Option<String> = tx
+            .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
+            .optional()?;
+        if let Some(s) = logged
+            && let Ok(h) = Hlc::parse(&s)
+        {
+            clock.observe(&h);
+        }
+        let hlc = clock.tick();
         let (prev_seq, prev_hash): (i64, String) = tx
             .query_row(
                 "SELECT seq, hash FROM ops ORDER BY seq DESC LIMIT 1",
@@ -1135,5 +1156,35 @@ mod tests {
         let meta = cell.meta().unwrap(/* test-only */);
         let hlc = meta.get("hlc").cloned().unwrap_or_default();
         assert!(crate::hlc::Hlc::parse(&hlc).is_ok());
+    }
+
+    #[test]
+    fn hlc_is_strictly_monotonic_across_two_writers() {
+        // Two handles on the same file, like the Homun daemon and the CLI:
+        // the second one runs with a wall clock one hour ahead. Writes must
+        // carry strictly increasing HLCs in `seq` order, whichever wrote.
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let path = dir.path().join("two.sqlite");
+        let a = Cell::create(&path, "p", "a").unwrap(/* test-only */);
+        let b = Cell::open(&path).unwrap(/* test-only */);
+        let ahead = now_ms() + 3_600_000;
+        b.inject_clock(crate::hlc::HlcClock::new("b", move || ahead))
+            .unwrap(/* test-only */);
+        for i in 0..12 {
+            let cell = if i % 2 == 0 { &a } else { &b };
+            cell.put_note(&note(i + 1, "corpo [[Milano]]"), "w")
+                .unwrap(/* test-only */);
+        }
+        let ops = a.ops().unwrap(/* test-only */);
+        for pair in ops.windows(2) {
+            assert!(
+                pair[1].hlc > pair[0].hlc,
+                "seq {} -> {}: {:?} then {:?}",
+                pair[0].seq,
+                pair[1].seq,
+                pair[0].hlc,
+                pair[1].hlc
+            );
+        }
     }
 }
