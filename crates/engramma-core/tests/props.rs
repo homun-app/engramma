@@ -52,6 +52,27 @@ fn any_ext_value() -> impl Strategy<Value = YamlValue> {
     })
 }
 
+/// Deduplicate the keys of generated `x-` maps, recursively: the serialiser
+/// writes what it is given, and a YAML mapping with duplicate keys is not a
+/// valid note (the parser rejects it). Generation alone can produce
+/// duplicates; the round trip must not depend on that luck.
+fn dedup_ext(v: YamlValue) -> YamlValue {
+    match v {
+        YamlValue::Map(pairs) => {
+            let mut seen = std::collections::HashSet::new();
+            YamlValue::Map(
+                pairs
+                    .into_iter()
+                    .filter(|(k, _)| seen.insert(k.clone()))
+                    .map(|(k, v)| (k, dedup_ext(v)))
+                    .collect(),
+            )
+        }
+        YamlValue::Seq(items) => YamlValue::Seq(items.into_iter().map(dedup_ext).collect()),
+        other => other,
+    }
+}
+
 fn any_note() -> impl Strategy<Value = Note> {
     (
         0u32..1000,
@@ -78,7 +99,14 @@ fn any_note() -> impl Strategy<Value = Note> {
         proptest::collection::vec(
             (r"x-[a-z]{1,6}".prop_map(String::from), any_ext_value()),
             0..2,
-        ),
+        )
+        .prop_map(|mut ext| {
+            let mut seen = std::collections::HashSet::new();
+            ext.retain(|(k, _)| seen.insert(k.clone()));
+            ext.into_iter()
+                .map(|(k, v)| (k, dedup_ext(v)))
+                .collect::<Vec<_>>()
+        }),
     )
         .prop_map(
             |(
