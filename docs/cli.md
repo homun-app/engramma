@@ -1,4 +1,4 @@
-# `engramma` CLI reference (v0.1)
+# `engramma` CLI reference (v0.1 + v0.2)
 
 Common options (global):
 
@@ -118,6 +118,73 @@ memory, compares every table and runs the FTS integrity-check (the index
 must hold exactly the non-tombstoned notes). JSON: `{ops, hash_chain_ok,
 replay_ok, fts_ok, mismatch, ok}`.
 
+### `search TEXT` (v0.2)
+Options: `--mode text|vector|hybrid` (default: `hybrid` when the cell has a
+`ready` embedding model matching the configured embedder, else `text`),
+`--fusion rrf|convex-0.3|convex-0.5|convex-0.7` (default `convex-0.7`),
+`--tau` (abstention floor for vector-only results, default 0.30), plus the
+v0.1 options (`--k`, `--hops`, `--as-of`, `--tag`, `--type`,
+`--include-quarantined`, `--lang`).
+
+JSON adds `mode`, `embed_ms`, `search_ms`, and per hit: `raw_score` (before
+the display normalisation — the top hit is not always "1.0 of something")
+and the new explain fields:
+
+```json
+{ "query": "...", "mode": "hybrid", "embed_ms": 8.2, "search_ms": 3.1,
+  "hits": [
+    { "score": 1.0, "raw_score": 0.612,
+      "explain": { "matched_terms": ["milan"], "bm25_rank": 1,
+                    "semantic_rank": 2, "cosine": 0.8268,
+                    "fused_score": 0.93, "lists": ["text", "vector"],
+                    "winning_chunk": 0, "via": null,
+                    "confidence": "stated", "valid_from": "2026-09-01",
+                    "valid_to": null, "source": "user" },
+      "note": { ... } } ] }
+```
+
+Human output prints lists, ranks, cosine and the winning chunk.
+
+### `model list|pull ID|use ID` (v0.2)
+`list` shows the known models (builtin + user folders with their own
+`manifest.json`), their size, whether they are downloaded, and their state
+in this cell (`building|ready|retired|—`). `pull` downloads the pinned
+revision and verifies each file's sha256 before renaming it into place (a
+failed check leaves no partial file). `use` registers the model in the
+cell as `building` — the blue/green switch — and writes `<root>/config.json`
+for the builtin kind. Remote embedders are configured by writing the file
+by hand:
+
+```json
+{ "embedder": { "kind": "ollama", "model": "nomic-embed-text",
+                 "url": "http://127.0.0.1:11434", "dim": 768 } }
+{ "embedder": { "kind": "http", "model": "text-embedding-3-small",
+                 "url": "https://api.example.com", "token_env": "MY_TOKEN",
+                 "dim": 1536 } }
+```
+
+JSON `list`: `{model_root, models: [{id, model_id, dim, max_tokens, bytes,
+downloaded, state}]}`; `use`: `{model, state: "building", config}`.
+
+### `embed [--all]` (v0.2)
+Embeds the pending notes with the configured embedder, in batches, and
+promotes a `building` model to `ready` when its coverage reaches 100% (the
+old model retires and its vectors are deleted, in one transaction).
+`--all` re-embeds every living note. JSON: `{embedded, pending, promoted?}`.
+`add` and `import` run the pass automatically (`--no-embed` skips it: the
+notes stay pending).
+
 ### `mcp --cells a,b`
 Starts the read-only MCP server on stdio. Without `--cells` it refuses to
-start (no cell would be exposed).
+start (no cell would be exposed). `memory_search` joins the vector branch
+automatically when the cell has a `ready` model matching the embedder in
+`<root>/config.json`; without a configuration every search is the v0.1
+text+graph one.
+
+### Models: where they live, and licences
+
+`ENGRAMMA_MODEL_DIR` overrides the model root (default
+`~/.cache/engramma/models`). The builtin Granite models are Apache-2.0.
+EmbeddingGemma is supported only as a user folder with its own manifest
+(its Gemma licence forbids bundling or auto-downloading the weights); no
+test runs with it.

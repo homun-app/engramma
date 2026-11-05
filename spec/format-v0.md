@@ -3,6 +3,10 @@
 Status: **draft, unstable** (v0.1). Fields are in English; content is in the user's
 language. This document is normative for `engramma-core::format` in v0.1.
 
+Embedding vectors are **not** part of this format: they are derived data
+recomputed from the notes (see `docs/DESIGN.md` §6.2) and never travel in
+note files or exports.
+
 A note is a UTF-8 Markdown file with an optional YAML frontmatter header:
 
 ```text

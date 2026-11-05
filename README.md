@@ -18,12 +18,15 @@ search** (text + graph + time) that **explains** every result.
   overwritten.
 - **Quarantine by default**: content scraped or inferred from third parties is
   born `quarantined` and never appears in results until a human confirms it.
+- **Mixed search (v0.2)**: text (BM25) and **meaning** (local embeddings)
+  fused, with the graph and time on top. Paraphrases with no word in common
+  with the note are found; the explanation says which branch carried each
+  result.
 - **MCP**: read-only access for Claude and other MCP clients, scoped to the
   cells you choose.
 
-**Status: v0.1 — the format is unstable.** Text + graph + time search is in;
-semantic (embedding) search arrives in v0.2, the bidirectional Markdown view
-in v0.3. See `docs/DESIGN.md` for the full roadmap.
+**Status: v0.2 — the format is unstable.** The bidirectional Markdown view
+arrives in v0.3. See `docs/DESIGN.md` for the full roadmap.
 
 ## Install from source
 
@@ -61,6 +64,14 @@ engramma neighbors Giulia
 engramma path Fabio "Studio Rossi"
 engramma timeline Fabio
 engramma tags casa
+
+# semantic search (v0.2): download the model once
+engramma model pull granite-embedding-97m-multilingual-r2
+engramma model use granite-embedding-97m-multilingual-r2   # blue/green + config
+engramma embed                                            # fill the vectors
+engramma search "in che città si è trasferita la coppia"   # no shared words
+engramma search "in che città si è trasferita la coppia" --mode text   # text only
+engramma search "Where does Fabio live?"                  # across languages
 
 # provenance, versions, verification
 engramma get <id>            # id prefix works too
@@ -107,6 +118,17 @@ path, validity) and its `source`. Quarantined notes never appear.
 }
 ```
 
+### Ollama or any OpenAI-compatible endpoint
+
+Write `<root>/config.json` (see `docs/cli.md`) and run `engramma embed`:
+
+```json
+{ "embedder": { "kind": "ollama", "model": "nomic-embed-text",
+                 "url": "http://127.0.0.1:11434", "dim": 768 } }
+```
+
+Without a configuration the search stays text + graph, exactly as in v0.1.
+
 **Claude Code**:
 
 ```sh
@@ -115,13 +137,26 @@ claude mcp add engramma -- /path/to/engramma mcp --root ~/.engramma --cells fami
 
 ## Layout
 
-- `crates/engramma-core` — format, cell, change log, search (no network I/O)
+- `crates/engramma-core` — format, cell, change log, search, vector index
+  (no network I/O)
+- `crates/engramma-embed` — the embedders: builtin ONNX via tract (pure
+  Rust), Ollama, OpenAI-compatible HTTP
 - `crates/engramma-cli` — the `engramma` binary
 - `crates/engramma-mcp` — the MCP server (stdio, read-only)
 - `spec/` — the note format specification, with valid/invalid examples used
   as tests
 - `bench/` — the benchmark (`engramma-bench`, deterministic corpus)
 - `docs/` — `DESIGN.md` (the project document), `cli.md`, `architecture.md`
+
+## Model licences
+
+The builtin Granite embedding models are Apache-2.0. **EmbeddingGemma** is
+supported only via a user-supplied folder with its own `manifest.json`:
+its Gemma licence terms do not allow bundling or auto-downloading the
+weights, so it is not included and no test runs with it.
+
+Tests that need the real models fail with a clear message when the models
+are absent; CI without models sets `ENGRAMMA_SKIP_MODEL_TESTS=1`.
 
 ## License
 
