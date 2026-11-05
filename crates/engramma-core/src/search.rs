@@ -860,7 +860,15 @@ fn edges_touching_frontier(
             ins.execute([id])?;
         }
     }
-    let vis = edge_visible("e", "n", include_quarantined);
+    // `edges.status` mirrors the declaring note at write time (derived edges
+    // are rewritten on every note write), so visibility needs no join — a
+    // join over notes doubled the 100k search p95. A manual edge with a
+    // note_id keeps the status it was created with.
+    let vis = if include_quarantined {
+        "(e.note_id IS NULL OR e.status != 'deleted')"
+    } else {
+        "(e.note_id IS NULL OR e.status NOT IN ('quarantined', 'deleted'))"
+    };
     let rel_clause = if rels.is_empty() {
         String::new()
     } else {
@@ -873,7 +881,6 @@ fn edges_touching_frontier(
         format!(
             "SELECT e.id AS eid, e.src, e.rel, e.dst, e.note_id, e.valid_from, e.valid_to
              FROM frontier f CROSS JOIN edges e ON e.{endpoint} = f.id
-             LEFT JOIN notes n ON n.id = e.note_id
              WHERE {vis}{rel_clause}"
         )
     };

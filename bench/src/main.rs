@@ -4,8 +4,16 @@
 //! insert / search / open / recall measurements (§11). Run in `--release`.
 //!
 //! ```text
-//! engramma-bench [--notes 10000] [--notes 100000] [--out bench/RESULTS.md]
+//! engramma-bench [--notes 10000] [--notes 100000] [--out PATH.md] [--runs 3]
 //! ```
+//!
+//! `--notes` is repeatable (bare numbers also work). Every size runs `--runs`
+//! times (default 3) and the table reports the **median** of each metric,
+//! for two corpus variants: **viva** (current facts carry a recent
+//! `updated_at`, like a living memory — the recency weight matters) and
+//! **uniform** (the same `updated_at` for every note — pure text+graph
+//! ranking). Without `--out` the report goes to `bench/RESULTS.md`; with it,
+//! only there (RESULTS.md is left alone).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -169,8 +177,10 @@ fn validity(y: i64, m: u8, d: u8) -> engramma_core::Validity {
 }
 
 /// Build the corpus: `target` notes of story around people, places, projects,
-/// with changes over time, plus questions with expected answers.
-fn build_corpus(target: usize) -> Corpus {
+/// with changes over time, plus questions with expected answers. With
+/// `uniform_updated_at` every note gets the same `updated_at`, so the
+/// recency weight cannot tell facts from fillers.
+fn build_corpus(target: usize, uniform_updated_at: bool) -> Corpus {
     let mut rng = Rng(SEED);
     let mut notes: Vec<Note> = Vec::with_capacity(target + 16);
     let mut questions: Vec<Question> = Vec::new();
@@ -476,6 +486,12 @@ fn build_corpus(target: usize) -> Corpus {
         }
     }
 
+    if uniform_updated_at {
+        let fixed = ts(2026, 10, 28);
+        for n in notes.iter_mut() {
+            n.updated_at = fixed;
+        }
+    }
     Corpus { notes, questions }
 }
 
@@ -497,6 +513,7 @@ fn percentile(mut xs: Vec<f64>, p: f64) -> f64 {
 }
 
 struct RunReport {
+    variant: &'static str,
     notes: usize,
     insert_notes_per_s: f64,
     open_ms: f64,
@@ -509,8 +526,8 @@ struct RunReport {
     file_bytes: u64,
 }
 
-fn run(target: usize, dir: &std::path::Path) -> RunReport {
-    let corpus = build_corpus(target);
+fn run(target: usize, dir: &std::path::Path, uniform_updated_at: bool) -> RunReport {
+    let corpus = build_corpus(target, uniform_updated_at);
     let db = dir.join(format!("bench-{target}.sqlite"));
     let _ = std::fs::remove_file(&db);
     let cell = Cell::create(&db, "bench", "bench").expect(/* fresh file */ "create cell");
@@ -586,6 +603,11 @@ fn run(target: usize, dir: &std::path::Path) -> RunReport {
     let _ = std::fs::remove_file(&db);
 
     RunReport {
+        variant: if uniform_updated_at {
+            "uniform"
+        } else {
+            "viva"
+        },
         notes: corpus.notes.len(),
         insert_notes_per_s: corpus.notes.len() as f64 / insert_s,
         open_ms,
@@ -607,16 +629,40 @@ fn run(target: usize, dir: &std::path::Path) -> RunReport {
     }
 }
 
-fn markdown(reports: &[RunReport]) -> String {
-    let mut out = String::from(
-        "# Benchmark Engramma v0.1\n\nGenerato da `engramma-bench` (seme fisso, corpus sintetico italiano; macchina: vedi REPORT.md). \
-         Obiettivi del §11 del documento di progetto in fondo.\n\n\
-         | note | inserimento (note/s) | apertura cella (ms) | ricerca p50 (ms) | ricerca p95 (ms) | solo testo p50 (ms) | richiamo@5 | MRR | domande | file (MB) |\n\
-         |---|---|---|---|---|---|---|---|---|---|\n",
+fn median(mut xs: Vec<f64>) -> f64 {
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    percentile(xs, 0.5)
+}
+
+/// Median of every metric over the single-run reports of one variant+size.
+fn median_report(variant: &'static str, runs: &[RunReport]) -> RunReport {
+    let pick = |f: fn(&RunReport) -> f64| median(runs.iter().map(f).collect());
+    RunReport {
+        variant,
+        notes: runs[0].notes,
+        insert_notes_per_s: pick(|r| r.insert_notes_per_s),
+        open_ms: pick(|r| r.open_ms),
+        search_p50_ms: pick(|r| r.search_p50_ms),
+        search_p95_ms: pick(|r| r.search_p95_ms),
+        text_only_p50_ms: pick(|r| r.text_only_p50_ms),
+        recall_at_5: pick(|r| r.recall_at_5),
+        mrr: pick(|r| r.mrr),
+        questions: runs[0].questions,
+        file_bytes: runs.iter().map(|r| r.file_bytes).max().unwrap_or(0),
+    }
+}
+
+fn markdown(reports: &[RunReport], runs: usize) -> String {
+    let mut out = format!(
+        "# Benchmark Engramma v0.1.1\n\nGenerato da `engramma-bench` (seme fisso, corpus sintetico italiano; macchina: vedi REPORT.md). \
+         Ogni riga è la **mediana di {runs} giri**. Obiettivi del §11 del documento di progetto in fondo.\n\n\
+         | corpus | note | inserimento (note/s) | apertura cella (ms) | ricerca p50 (ms) | ricerca p95 (ms) | solo testo p50 (ms) | richiamo@5 | MRR | domande | file (MB) |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|\n"
     );
     for r in reports {
         out.push_str(&format!(
-            "| {} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.3} | {:.3} | {} | {:.1} |\n",
+            "| {} | {} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.3} | {:.3} | {} | {:.1} |\n",
+            r.variant,
             r.notes,
             r.insert_notes_per_s,
             r.open_ms,
@@ -630,19 +676,54 @@ fn markdown(reports: &[RunReport]) -> String {
         ));
     }
     out.push_str(
-        "\nNel corpus i fatti correnti hanno `updated_at` recente (ottobre 2026, come una memoria viva) e i riempitivi datano 2025. Nota: l'inserimento è una `put_note` per nota (una transazione ciascuna, fsync in WAL/NORMAL). \
-         La ricerca è testo+grafo (2 passi, come le domande multi-salto) con 5 risultati. Richiamo@5 e MRR sulle domande generatrici.\n",
+        "\nDue varianti per dimensione: **viva** — i fatti correnti hanno `updated_at` recente (ottobre 2026, come una memoria viva) e i riempitivi datano 2025, quindi il peso di recenza lavora; **uniform** — lo stesso `updated_at` per ogni nota, così il ranking è solo testo+grafo (quanto del richiamo dipendeva dalla recenza si vede dal confronto). \
+         Nota: l'inserimento è una `put_note` per nota (una transazione ciascuna, fsync in WAL/NORMAL). La ricerca è testo+grafo (2 passi, come le domande multi-salto) con 5 risultati. Richiamo@5 e MRR sulle domande generatrici. \
+         La varianza tra giri è riportata in REPORT.md (il primo giro a freddo è sempre il più lento: il file nasce e cresce).\n",
     );
     out
 }
 
-fn main() {
-    let mut targets: Vec<usize> = Vec::new();
-    for arg in std::env::args().skip(1) {
-        if let Ok(n) = arg.parse::<usize>() {
-            targets.push(n);
+/// CLI configuration (unit-tested).
+struct Args {
+    targets: Vec<usize>,
+    /// `None` = default location (`bench/RESULTS.md`).
+    out: Option<PathBuf>,
+    runs: usize,
+}
+
+fn parse_args(args: impl Iterator<Item = String>) -> Args {
+    let mut a = Args {
+        targets: Vec::new(),
+        out: None,
+        runs: 3,
+    };
+    let mut it = args.peekable();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--notes" => {
+                if let Some(n) = it.next().and_then(|v| v.parse().ok()) {
+                    a.targets.push(n);
+                }
+            }
+            "--out" => a.out = it.next().map(PathBuf::from),
+            "--runs" => {
+                if let Some(r) = it.next().and_then(|v| v.parse::<usize>().ok()) {
+                    a.runs = r.clamp(1, 9);
+                }
+            }
+            other => {
+                if let Ok(n) = other.parse::<usize>() {
+                    a.targets.push(n);
+                }
+            }
         }
     }
+    a
+}
+
+fn main() {
+    let args = parse_args(std::env::args().skip(1));
+    let mut targets = args.targets;
     if targets.is_empty() {
         targets = vec![10_000, 100_000];
     }
@@ -650,12 +731,57 @@ fn main() {
     std::fs::create_dir_all(&dir).expect(/* temp dir */ "mkdir");
     let mut reports = Vec::new();
     for t in &targets {
-        eprintln!("benchmark con {t} note…");
-        reports.push(run(*t, &dir));
+        for uniform in [false, true] {
+            let mut runs: Vec<RunReport> = Vec::with_capacity(args.runs);
+            for i in 1..=args.runs {
+                eprintln!(
+                    "benchmark {t} note, corpus {}, giro {i}/{}…",
+                    if uniform { "uniform" } else { "viva" },
+                    args.runs
+                );
+                runs.push(run(*t, &dir, uniform));
+            }
+            reports.push(median_report(
+                if uniform { "uniform" } else { "viva" },
+                &runs,
+            ));
+        }
     }
-    let md = markdown(&reports);
+    let md = markdown(&reports, args.runs);
     print!("{md}");
-    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("RESULTS.md");
-    std::fs::write(&out, &md).expect(/* crate dir is writable */ "write RESULTS.md");
+    // --out writes only there; without it the report lands in bench/RESULTS.md
+    let out = args
+        .out
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("RESULTS.md"));
+    std::fs::write(&out, &md).expect(/* target dir is writable */ "write report");
     eprintln!("scritto {}", out.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn args_flags_and_defaults() {
+        let a = parse_args(
+            ["--notes", "10", "--notes", "20", "--out", "altrove.md"]
+                .map(String::from)
+                .into_iter(),
+        );
+        assert_eq!(a.targets, vec![10, 20]);
+        assert_eq!(a.out.as_deref(), Some(std::path::Path::new("altrove.md")));
+        assert_eq!(a.runs, 3);
+
+        // bare numbers still work, and no --out means the default location
+        let b = parse_args(std::iter::once("100000".to_string()));
+        assert_eq!(b.targets, vec![100_000]);
+        assert!(b.out.is_none());
+
+        let c = parse_args(
+            ["--runs", "1", "--notes", "5"]
+                .map(String::from)
+                .into_iter(),
+        );
+        assert_eq!(c.runs, 1);
+    }
 }
