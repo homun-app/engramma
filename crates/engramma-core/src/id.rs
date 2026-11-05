@@ -75,9 +75,12 @@ pub fn node_id() -> &'static str {
     })
 }
 
-/// The first 8 characters of a ULID, used in export file names.
+/// The last 8 characters of a ULID (its random part), used wherever a short
+/// id is shown: the first 8 are the timestamp and collide in bulk imports
+/// (every ULID minted within ~256 ms shares them).
 pub fn id8(u: &Ulid) -> String {
-    u.to_string()[..8].to_string()
+    let s = u.to_string();
+    s[s.len() - 8..].to_string()
 }
 
 #[cfg(test)]
@@ -93,6 +96,17 @@ mod tests {
             assert!(u > prev);
             prev = u;
         }
+    }
+
+    #[test]
+    fn id8_is_the_random_suffix() {
+        // the first 8 chars are the timestamp (they collide in bulk imports:
+        // ~256 ms of ULIDs share them); the last 8 are the random part
+        let u = Ulid::from_string("01GD0000000000000000000110").unwrap(/* test-only */);
+        assert_eq!(id8(&u), "00000110");
+        let a = new_ulid().unwrap(/* test-only */);
+        let b = new_ulid().unwrap(/* test-only */);
+        assert_ne!(id8(&a), id8(&b), "same-millisecond ids must differ in id8");
     }
 
     #[test]

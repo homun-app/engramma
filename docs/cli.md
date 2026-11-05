@@ -9,7 +9,10 @@ Common options (global):
 | `--json` | stable JSON output (schemas below) |
 
 **Exit codes**: `0` success, `2` usage error, `3` note not found, `4`
-internal error. Note ids accept a unique prefix (≥ 4 characters).
+internal error. Note ids accept a unique prefix or suffix (≥ 4 characters).
+Short ids shown by the CLI and used in export file names are the **last 8**
+characters of the ULID — its random part: the first 8 are a timestamp and
+collide in bulk imports.
 
 ## Commands
 

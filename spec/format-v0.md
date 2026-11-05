@@ -182,9 +182,10 @@ sorted at every level, no whitespace).
 
 ## 7. Folders
 
-**Engramma export**: `<dir>/<type>/<slug>-<id8>.md` (`id8` = first 8 chars of the
-ULID; `slug` = kebab-case of the title, ASCII-folded, truncated to 60 chars,
-`note` when empty) plus `engramma.json`
+**Engramma export**: `<dir>/<type>/<slug>-<id8>.md` (`id8` = the **last 8**
+characters of the ULID, its random part — the first 8 are a timestamp and
+collide in bulk imports; `slug` = kebab-case of the title, ASCII-folded,
+truncated to 60 chars, `note` when empty) plus `engramma.json`
 `{"format_version": 0, "cell": "<name>", "exported_at": "<RFC3339>", "note_count": N}`.
 Tombstones (`status: deleted`) are not exported; superseded notes are.
 

@@ -107,7 +107,11 @@ pub fn export(cell: &Cell, dir: &Path) -> Result<ExportSummary, PortError> {
         }
         let type_dir = dir.join(note.note_type.as_str());
         fs::create_dir_all(&type_dir)?;
-        let base = format!("{}-{}", slugify(note.display_title()), &id[..8]);
+        let base = format!(
+            "{}-{}",
+            slugify(note.display_title()),
+            crate::id::id8(&ulid)
+        );
         let text = note.serialize().map_err(|e| PortError::Note {
             path: type_dir.join(&base),
             source: e,
@@ -423,7 +427,8 @@ mod tests {
         assert_eq!(s.written, 2);
         assert_eq!(s.tombstones, 1);
         assert!(out.join("engramma.json").is_file());
-        assert!(out.join("person").join("fabio-01000000.md").is_file());
+        // the short id is the ULID's random suffix, not its timestamp prefix
+        assert!(out.join("person").join("fabio-00000001.md").is_file());
 
         let cell2 = Cell::create(&dir.path().join("c2.sqlite"), "famiglia", "t")
             .unwrap(/* test-only */);

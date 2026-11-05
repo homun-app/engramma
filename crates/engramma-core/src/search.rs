@@ -1015,7 +1015,9 @@ fn expand_graph(
             let dest = if note_like {
                 format!(
                     "(nota {})",
-                    to.get(5..).map(|id| &id[..8.min(id.len())]).unwrap_or("?")
+                    to.get(5..)
+                        .and_then(|id| id.get(id.len().saturating_sub(8)..))
+                        .unwrap_or("?")
                 )
             } else {
                 format!("[[{to}]]")

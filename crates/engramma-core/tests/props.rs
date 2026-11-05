@@ -23,12 +23,9 @@ fn ts(secs: i64) -> At {
 }
 
 fn ulid(n: u32) -> Ulid {
-    // counter at the FRONT: the first 8 characters (used in export file
-    // names) must differ between notes
-    let mut s = format!("01P{n}");
-    while s.len() < 26 {
-        s.push('0');
-    }
+    // counter at the BACK: the last 8 characters (used in export file names
+    // and CLI display) must differ between notes
+    let s = format!("01{}{n:08}", "0".repeat(16));
     Ulid::from_string(&s).unwrap(/* test-only: valid Crockford digits */)
 }
 

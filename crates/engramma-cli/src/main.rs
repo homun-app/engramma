@@ -572,7 +572,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                         .note_id
                         .as_deref()
                         .filter(|id| id.len() >= 8)
-                        .map(|id| format!(" (nota {})", &id[..8]))
+                        .map(|id| format!(" (nota {})", &id[id.len() - 8..]))
                         .unwrap_or_default();
                     println!(
                         "{}{} {} {}{}",
@@ -673,7 +673,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                         h.explain.valid_from.as_deref().unwrap_or("sempre"),
                         h.explain.valid_to.as_deref().unwrap_or("ora"),
                         h.note.display_title(),
-                        &h.note.id.to_string()[..8],
+                        engramma_core::id::id8(&h.note.id),
                     );
                 }
             }

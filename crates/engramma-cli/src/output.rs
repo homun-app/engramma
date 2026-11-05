@@ -117,7 +117,7 @@ pub fn hit_human(h: &Hit, index: usize) -> String {
         index,
         h.note.status.as_str(),
         h.note.display_title(),
-        &h.note.id.to_string()[..8],
+        engramma_core::id::id8(&h.note.id),
     );
     out.push_str(&format!("\n   score {:.4}", h.score));
     if !h.explain.matched_terms.is_empty() {

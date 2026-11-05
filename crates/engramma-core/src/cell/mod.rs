@@ -587,11 +587,13 @@ impl Cell {
     // reads
     // ------------------------------------------------------------------
 
-    /// Resolve a full ULID or a prefix (≥4 chars) to one note id.
+    /// Resolve a full ULID, a unique prefix or a unique **suffix** (≥4 chars)
+    /// to one note id. Suffixes are the natural handle: the last 8 characters
+    /// are the random part, which is what the CLI shows.
     ///
     /// # Errors
     /// [`CellError::NoteNotFound`] when nothing matches;
-    /// [`CellError::Invalid`] when the prefix is ambiguous or malformed.
+    /// [`CellError::Invalid`] when the fragment is ambiguous or malformed.
     pub fn resolve_note_id(&self, input: &str) -> Result<Ulid, CellError> {
         if input.len() == 26 {
             return Ulid::from_string(input)
@@ -599,13 +601,13 @@ impl Cell {
         }
         if input.len() < 4 || !input.chars().all(|c| c.is_ascii_alphanumeric()) {
             return Err(CellError::Invalid(format!(
-                "`{input}` is neither a ULID nor a prefix of at least 4 characters"
+                "`{input}` is neither a ULID nor a prefix/suffix of at least 4 characters"
             )));
         }
         let inner = self.lock()?;
-        let mut stmt = inner
-            .conn
-            .prepare("SELECT id FROM notes WHERE id LIKE ?1 || '%' ORDER BY id")?;
+        let mut stmt = inner.conn.prepare(
+            "SELECT id FROM notes WHERE id LIKE ?1 || '%' OR id LIKE '%' || ?1 ORDER BY id",
+        )?;
         let ids: Vec<String> = stmt.query_map([input], |r| r.get(0))?.flatten().collect();
         drop(stmt);
         match ids.first() {
@@ -613,7 +615,7 @@ impl Cell {
                 Ulid::from_string(only).map_err(|_| CellError::Db("bad id".into()))
             }
             None => Err(CellError::NoteNotFound(format!(
-                "no note starts with `{input}`"
+                "no note starts or ends with `{input}`"
             ))),
             Some(_) => Err(CellError::Invalid(format!(
                 "`{input}` is ambiguous ({} notes)",
@@ -1452,6 +1454,32 @@ mod tests {
             vec!["alfa beta gamma".to_string()],
             "tags_text must be sorted and space-joined"
         );
+    }
+
+    #[test]
+    fn resolve_accepts_prefix_and_suffix() {
+        let (_d, cell) = test_cell();
+        cell.put_note(&note(1, "prima [[Milano]]"), "t")
+            .unwrap(/* test-only */);
+        let full = format!("01{:024}", 1);
+        // unique suffix (the random part — what the CLI displays)
+        let resolved = cell.resolve_note_id("00000001").unwrap(/* test-only */);
+        assert_eq!(resolved.to_string(), full);
+        // prefix still works when unique
+        assert_eq!(
+            cell.resolve_note_id("0100").unwrap(/* test-only */).to_string(),
+            full
+        );
+        // too short (the minimum is 4 characters)
+        assert!(cell.resolve_note_id("001").is_err());
+        // two notes sharing a suffix → ambiguity is an error
+        let mut other = note(2, "seconda");
+        // same random suffix, different ULID
+        other.id = Ulid::from_string("01BBBBBBBBBBBBBBBB00000001")
+            .unwrap(/* test-only */);
+        cell.put_note(&other, "t").unwrap(/* test-only */);
+        let err = cell.resolve_note_id("00000001").unwrap_err(/* test-only */);
+        assert!(err.to_string().contains("ambiguous"), "{err}");
     }
 
     #[test]
