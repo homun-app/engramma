@@ -142,6 +142,13 @@ level, no whitespace** (serde_json with BTreeMaps; floats are emitted in Rust's
 shortest round-trip form and are therefore avoided in payloads — timestamps and
 dates are strings).
 
+The payload always carries an **envelope** with `op_id`, `hlc`, `actor`,
+`kind` and `note_id` (`null` when the op has none): these fields are inside
+the hashed bytes, so the hash binds the whole logical row. The columns of
+`ops` are an index over the payload: reading a log, the columns must agree
+with the envelope — a disagreement is a verification error even when the hash
+chain itself recomputes cleanly.
+
 Hash chain: `hash = blake3(prev_hash || payload_json_canonical)` where
 `prev_hash` is the `hash` of the previous op (ASCII lowercase hex, 64 chars) or
 64 `0` chars for the first op. `verify_log` recomputes the whole chain.
@@ -149,6 +156,24 @@ Hash chain: `hash = blake3(prev_hash || payload_json_canonical)` where
 `apply(state, op)` is deterministic: IDs, HLC and timestamps are generated when
 the operation is **created** and travel inside the payload; `apply` reads no
 clock, no randomness, no I/O.
+
+### 6.1 Golden vector of the hash rule
+
+A fixed input with its expected hash, so that any silent change of the
+canonical JSON (for instance a dependency enabling serde_json's
+`preserve_order`, which would stop sorting map keys) breaks a test instead of
+every cell ever written:
+
+```text
+prev_hash = 0000000000000000000000000000000000000000000000000000000000000000
+payload   = {"actor":"engramma","hlc":"01a17720ca0000000007.0123456789ab",
+             "kind":"init","note_id":null,"op_id":"01F7ZQ6VTSATW2BQ5Z9R0P1S8T","x":1}
+hash      = a217239290ba91e17196ab1812bd01a1e3d05e71f6048387017212636c555d46
+```
+
+The reference implementation builds that object by inserting the keys in a
+different order and serialises with `serde_json` (maps are BTreeMaps: keys
+sorted at every level, no whitespace).
 
 ## 7. Folders
 

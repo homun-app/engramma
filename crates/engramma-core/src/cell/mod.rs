@@ -678,13 +678,25 @@ impl Cell {
     // ------------------------------------------------------------------
 
     /// Verify the hash chain, then rebuild the whole state in memory by
-    /// replaying the log and compare every table.
+    /// replaying the log and compare every table. Corruption (unreadable
+    /// rows, columns disagreeing with the hashed envelope, a broken chain, a
+    /// diverging replay) is reported in the report, not as an error.
     ///
     /// # Errors
-    /// [`CellError::Db`] on SQL failure.
+    /// [`CellError::Db`] only on infrastructure failures.
     pub fn verify(&self) -> Result<VerifyReport, CellError> {
         let inner = self.lock()?;
-        let source_ops = ops::read_ops(&inner.conn)?;
+        let source_ops = match ops::read_ops(&inner.conn) {
+            Ok(ops) => ops,
+            Err(e) => {
+                return Ok(VerifyReport {
+                    ops: 0,
+                    hash_chain_ok: false,
+                    replay_ok: false,
+                    mismatch: Some(format!("unreadable log: {e}")),
+                });
+            }
+        };
         let mut chain_ok = true;
         let mut prev = ops::GENESIS_HASH.to_string();
         for op in &source_ops {
@@ -698,13 +710,27 @@ impl Cell {
         // Rebuild in memory.
         let mut rebuild_conn = Connection::open_in_memory()?;
         configure(&rebuild_conn)?;
+        let mut replay_err: Option<String> = None;
         {
             let tx = rebuild_conn.transaction()?;
             schema::migrate(&tx)?;
             for op in &source_ops {
-                ops::apply(&tx, op)?;
+                if let Err(e) = ops::apply(&tx, op) {
+                    replay_err = Some(e.to_string());
+                    break;
+                }
             }
-            tx.commit()?;
+            if replay_err.is_none() {
+                tx.commit()?;
+            }
+        }
+        if let Some(e) = replay_err {
+            return Ok(VerifyReport {
+                ops: source_ops.len(),
+                hash_chain_ok: chain_ok,
+                replay_ok: false,
+                mismatch: Some(format!("replay failed: {e}")),
+            });
         }
         let mismatch = compare_states(&inner.conn, &rebuild_conn)?;
         Ok(VerifyReport {
@@ -1186,5 +1212,62 @@ mod tests {
                 pair[1].hlc
             );
         }
+    }
+
+    #[test]
+    fn tampering_a_column_breaks_verify() {
+        let (_d, cell) = test_cell();
+        cell.put_note(&note(1, "prima"), "t")
+            .unwrap(/* test-only */);
+        cell.put_note(&note(2, "seconda"), "t")
+            .unwrap(/* test-only */);
+        // Swap the note_id COLUMNS of the two puts: the payloads (hashed)
+        // stay untouched, the replay is unaffected — only the agreement
+        // between columns and envelope can catch it.
+        {
+            let inner = cell.lock().unwrap(/* test-only */);
+            inner
+                .conn
+                .execute(
+                    "UPDATE ops SET note_id = CASE seq
+                        WHEN 2 THEN (SELECT note_id FROM ops WHERE seq = 3)
+                        WHEN 3 THEN (SELECT note_id FROM ops WHERE seq = 2)
+                     END WHERE seq IN (2, 3)",
+                    [],
+                )
+                .unwrap(/* test-only */);
+        }
+        let report = cell.verify().unwrap(/* test-only */);
+        assert!(
+            !report.ok(),
+            "a swapped column must fail verification: {report:?}"
+        );
+        assert!(
+            report
+                .mismatch
+                .as_deref()
+                .is_some_and(|m| m.contains("note_id")),
+            "the mismatch should point at the column: {:?}",
+            report.mismatch
+        );
+    }
+
+    #[test]
+    fn tampering_the_kind_column_breaks_verify() {
+        let (_d, cell) = test_cell();
+        cell.put_note(&note(1, "prima"), "t")
+            .unwrap(/* test-only */);
+        {
+            let inner = cell.lock().unwrap(/* test-only */);
+            inner
+                .conn
+                .execute("UPDATE ops SET kind = 'confirm' WHERE seq = 2", [])
+                .unwrap(/* test-only */);
+        }
+        let report = cell.verify().unwrap(/* test-only */);
+        assert!(
+            !report.ok() && report.mismatch.is_some(),
+            "a tampered kind must fail verification: {report:?}"
+        );
     }
 }

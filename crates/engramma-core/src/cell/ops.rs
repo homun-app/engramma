@@ -120,14 +120,64 @@ pub fn op_hash(prev_hash: &str, payload_json: &str) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// Build the payload skeleton common to every op.
-fn envelope(op_id: &Ulid, hlc: &crate::hlc::Hlc, actor: &str, kind: OpKind) -> Value {
+/// Build the payload skeleton common to every op: the envelope travels inside
+/// the hashed payload, so the hash binds `op_id`, `hlc`, `actor`, `kind` and
+/// `note_id` — the columns of `ops` are an index over it.
+fn envelope(
+    op_id: &Ulid,
+    hlc: &crate::hlc::Hlc,
+    actor: &str,
+    kind: OpKind,
+    note_id: Option<Ulid>,
+) -> Value {
     let mut m = serde_json::Map::new();
     m.insert("op_id".into(), op_id.to_string().into());
     m.insert("hlc".into(), hlc.to_string().into());
     m.insert("actor".into(), actor.into());
     m.insert("kind".into(), kind.as_str().into());
+    m.insert(
+        "note_id".into(),
+        note_id
+            .map(|u| Value::String(u.to_string()))
+            .unwrap_or(Value::Null),
+    );
     Value::Object(m)
+}
+
+/// The columns of an op row must agree with the payload envelope on every
+/// field. The chain hash covers the payload only: without this check a
+/// tampered column (say, `kind`) would leave the chain — and possibly the
+/// replay — looking valid.
+fn check_envelope(op: &Op) -> Result<(), CellError> {
+    let mismatch = |field: &'static str| {
+        CellError::Invalid(format!(
+            "op {}: the `{field}` column disagrees with the payload envelope",
+            op.op_id
+        ))
+    };
+    let get = |k: &str| op.payload.get(k);
+    if get("op_id").and_then(Value::as_str) != Some(op.op_id.to_string().as_str()) {
+        return Err(mismatch("op_id"));
+    }
+    if get("hlc").and_then(Value::as_str) != Some(op.hlc.to_string().as_str()) {
+        return Err(mismatch("hlc"));
+    }
+    if get("actor").and_then(Value::as_str) != Some(op.actor.as_str()) {
+        return Err(mismatch("actor"));
+    }
+    if get("kind").and_then(Value::as_str) != Some(op.kind.as_str()) {
+        return Err(mismatch("kind"));
+    }
+    let column = op.note_id.map(|u| u.to_string());
+    let envelope_ok = match get("note_id") {
+        Some(Value::Null) => column.is_none(),
+        Some(Value::String(s)) => column.as_deref() == Some(s.as_str()),
+        _ => false,
+    };
+    if !envelope_ok {
+        return Err(mismatch("note_id"));
+    }
+    Ok(())
 }
 
 /// Assemble a complete [`Op`] (without seq/hash) from a payload.
@@ -145,14 +195,19 @@ pub fn make_op(
     let Value::Object(fields) = &mut payload else {
         return Err(CellError::Invalid("op payload must be an object".into()));
     };
-    let mut env = match envelope(&op_id, &hlc, actor, kind) {
+    let mut env = match envelope(&op_id, &hlc, actor, kind, note_id) {
         Value::Object(m) => m,
         _ => unreachable!("envelope is always an object"),
     };
     for (k, v) in fields.iter() {
+        if matches!(k.as_str(), "op_id" | "hlc" | "actor" | "kind" | "note_id") {
+            return Err(CellError::Invalid(format!(
+                "op payload must not override the envelope field `{k}`"
+            )));
+        }
         env.insert(k.clone(), v.clone());
     }
-    Ok(Op {
+    let op = Op {
         seq: 0,
         op_id,
         hlc,
@@ -162,7 +217,9 @@ pub fn make_op(
         payload: Value::Object(env),
         prev_hash: String::new(),
         hash: String::new(),
-    })
+    };
+    check_envelope(&op)?;
+    Ok(op)
 }
 
 /// The raw fields of a stored `ops` row (one per column).
@@ -182,9 +239,10 @@ pub struct OpRow<'a> {
 /// Rebuild an [`Op`] from a stored `ops` row.
 ///
 /// # Errors
-/// [`CellError::Invalid`] on malformed rows.
+/// [`CellError::Invalid`] on malformed rows — including columns that disagree
+/// with the payload envelope.
 pub fn op_from_row(r: OpRow<'_>) -> Result<Op, CellError> {
-    Ok(Op {
+    let op = Op {
         seq: r.seq,
         op_id: Ulid::from_string(r.op_id)
             .map_err(|_| CellError::Invalid(format!("bad op_id `{}`", r.op_id)))?,
@@ -200,7 +258,9 @@ pub fn op_from_row(r: OpRow<'_>) -> Result<Op, CellError> {
             .map_err(|e| CellError::Invalid(format!("bad payload in op {}: {e}", r.op_id)))?,
         prev_hash: r.prev_hash.to_string(),
         hash: r.hash.to_string(),
-    })
+    };
+    check_envelope(&op)?;
+    Ok(op)
 }
 
 // ---------------------------------------------------------------------------
@@ -208,12 +268,15 @@ pub fn op_from_row(r: OpRow<'_>) -> Result<Op, CellError> {
 // ---------------------------------------------------------------------------
 
 /// Apply one operation inside an open transaction. Deterministic: the payload
-/// carries everything; nothing is read from the environment.
+/// carries everything; nothing is read from the environment. The row's
+/// columns must agree with the payload envelope — `apply` follows the
+/// envelope, the columns are only an index.
 ///
 /// # Errors
 /// [`CellError`] on invariant violations (missing note, illegal transition,
 /// malformed payload) or SQL failures.
 pub fn apply(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
+    check_envelope(op)?;
     // The row in `ops` and the state change live in the same transaction, and
     // replay inserts them identically (explicit seq keeps the numbering).
     tx.execute(
@@ -989,4 +1052,101 @@ pub fn read_ops(conn: &Connection) -> Result<Vec<Op>, CellError> {
         })?
         .collect::<Result<Result<Vec<_>, _>, _>>()??;
     Ok(ops)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The golden vector of spec §6.1: a fixed payload with its expected
+    /// hash. Any silent change of the canonical JSON (e.g. a dependency
+    /// enabling serde_json's `preserve_order`) breaks this test before it
+    /// breaks every cell ever written.
+    #[test]
+    fn hash_golden_vector() {
+        // keys inserted in scrambled order: the canonical form must sort them
+        let mut m = serde_json::Map::new();
+        m.insert("x".into(), serde_json::json!(1));
+        m.insert("kind".into(), serde_json::json!("init"));
+        m.insert("note_id".into(), serde_json::Value::Null);
+        m.insert(
+            "hlc".into(),
+            serde_json::json!("01a17720ca0000000007.0123456789ab"),
+        );
+        m.insert(
+            "op_id".into(),
+            serde_json::json!("01F7ZQ6VTSATW2BQ5Z9R0P1S8T"),
+        );
+        m.insert("actor".into(), serde_json::json!("engramma"));
+        let canonical = serde_json::Value::Object(m).to_string();
+        assert_eq!(
+            canonical,
+            "{\"actor\":\"engramma\",\"hlc\":\"01a17720ca0000000007.0123456789ab\",\
+             \"kind\":\"init\",\"note_id\":null,\"op_id\":\"01F7ZQ6VTSATW2BQ5Z9R0P1S8T\",\"x\":1}"
+        );
+        assert_eq!(
+            op_hash(GENESIS_HASH, &canonical),
+            "a217239290ba91e17196ab1812bd01a1e3d05e71f6048387017212636c555d46"
+        );
+    }
+
+    #[test]
+    fn envelope_covers_the_whole_row() {
+        let at = crate::format::At::parse("2026-11-05T10:00:00Z").unwrap(/* test-only */);
+        let base = crate::Note {
+            id: Ulid::from_string("01F7ZQ6VTSATW2BQ5Z9R0P1S8T")
+                .unwrap(/* test-only: valid ULID */),
+            note_type: crate::format::NoteType::Fact,
+            title: None,
+            body: "corpo".into(),
+            tags: vec![],
+            scope: None,
+            lang: None,
+            source: "test".into(),
+            confidence: crate::format::Confidence::Stated,
+            status: crate::format::Status::Active,
+            valid_from: None,
+            valid_to: None,
+            supersedes: vec![],
+            created_at: at,
+            updated_at: at,
+            extensions: vec![],
+        };
+        let hlc = crate::hlc::Hlc::parse("01a17720ca0000000007.0123456789ab")
+            .unwrap(/* test-only */);
+        let op = make_op(
+            base.id,
+            hlc.clone(),
+            "engramma",
+            OpKind::PutNote,
+            Some(base.id),
+            serde_json::json!({ "note": base.to_json() }),
+        )
+        .unwrap(/* test-only */);
+        // the envelope carries note_id too
+        assert_eq!(
+            op.payload.get("note_id").and_then(Value::as_str),
+            Some("01F7ZQ6VTSATW2BQ5Z9R0P1S8T")
+        );
+        check_envelope(&op).unwrap(/* test-only */);
+        // a disagreeing column is caught
+        let mut tampered = op.clone();
+        tampered.kind = OpKind::Confirm;
+        assert!(check_envelope(&tampered).is_err());
+        let mut tampered_null = op.clone();
+        tampered_null.note_id = None;
+        assert!(check_envelope(&tampered_null).is_err());
+        // payloads cannot smuggle envelope keys
+        assert!(
+            make_op(
+                base.id,
+                hlc.clone(),
+                "engramma",
+                OpKind::Init,
+                None,
+                serde_json::json!({ "kind": "confirm" }),
+            )
+            .is_err()
+        );
+    }
 }
