@@ -1100,6 +1100,49 @@ mod tests {
     }
 
     #[test]
+    fn superseded_requires_valid_to_through_every_operation() {
+        // v0.1.1 leftover: the format and the import reject a `superseded`
+        // note without `valid_to`, but the cell API could still produce one
+        // (a patch clearing `valid_to`, a `put` with the status already set).
+        let (_d, cell) = test_cell();
+        let mut old = note(1, "Fabio abita a [[Roma]]");
+        old.valid_from = Some(Validity(
+            time::Date::from_calendar_date(2020, time::Month::January, 1)
+                .unwrap(/* test-only */),
+            None,
+        ));
+        cell.put_note(&old, "tester").unwrap(/* test-only */);
+        let mut new = note(2, "Fabio abita a [[Milano]]");
+        new.valid_from = Some(Validity(
+            time::Date::from_calendar_date(2026, time::Month::September, 1)
+                .unwrap(/* test-only */),
+            None,
+        ));
+        cell.supersede(&old.id, &new, None, "tester")
+            .unwrap(/* test-only */);
+        // a patch clearing valid_to on the superseded note must be refused
+        let err = cell.patch_note(
+            &old.id,
+            &NotePatch {
+                valid_to: Some(None),
+                ..Default::default()
+            },
+            "tester",
+        );
+        assert!(err.is_err(), "superseded without valid_to came back");
+        // and so must a full replace
+        let mut again = old.clone();
+        again.status = Status::Superseded;
+        again.valid_to = None;
+        assert!(cell.put_note(&again, "tester").is_err());
+        // the note is untouched: still superseded with a closed validity
+        let back = cell.get(&old.id).unwrap(/* test-only */);
+        assert_eq!(back.status, Status::Superseded);
+        assert!(back.valid_to.is_some());
+        assert!(cell.verify().unwrap(/* test-only */).ok());
+    }
+
+    #[test]
     fn entities_and_edges_derive_from_body() {
         let (_d, cell) = test_cell();
         let mut person = note(1, "bio di Giulia");

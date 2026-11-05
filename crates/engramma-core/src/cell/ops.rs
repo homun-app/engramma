@@ -489,6 +489,15 @@ fn write_note(
             "an `external` note can only be `quarantined` (only `confirm` promotes it)".into(),
         ));
     }
+    // The cell-level twin of the format rule: a superseded note always has a
+    // closed validity. The format rejects it on parse and the import closes
+    // it in two phases, but a patch (or a full replace) could still produce
+    // one through the API.
+    if note.status == Status::Superseded && note.valid_to.is_none() {
+        return Err(CellError::Invalid(
+            "a `superseded` note must have `valid_to` (use `supersede`)".into(),
+        ));
+    }
     // Manual edges that cite this note follow its status in the same
     // operation (deterministic, replayed like the rest): a quarantined or
     // deleted note must not keep its manual edges visible.
