@@ -366,7 +366,9 @@ dependencies = [
  "engramma-mcp",
  "serde_json",
  "tempfile",
+ "time",
  "tokio",
+ "ulid",
 ]
 
 [[package]]
@@ -400,6 +402,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "ulid",
 ]
 
 [[package]]

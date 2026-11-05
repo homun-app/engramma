@@ -501,6 +501,42 @@ impl Cell {
     // reads
     // ------------------------------------------------------------------
 
+    /// Resolve a full ULID or a prefix (≥4 chars) to one note id.
+    ///
+    /// # Errors
+    /// [`CellError::NoteNotFound`] when nothing matches;
+    /// [`CellError::Invalid`] when the prefix is ambiguous or malformed.
+    pub fn resolve_note_id(&self, input: &str) -> Result<Ulid, CellError> {
+        if input.len() == 26 {
+            return Ulid::from_string(input)
+                .map_err(|_| CellError::Invalid(format!("`{input}` is not a ULID")));
+        }
+        if input.len() < 4 || !input.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err(CellError::Invalid(format!(
+                "`{input}` is neither a ULID nor a prefix of at least 4 characters"
+            )));
+        }
+        let inner = self.lock()?;
+        let mut stmt = inner.conn.prepare(
+            "SELECT id FROM notes WHERE id LIKE ?1 || '%' ORDER BY id",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map([input], |r| r.get(0))?
+            .flatten()
+            .collect();
+        drop(stmt);
+        match ids.first() {
+            Some(only) if ids.len() == 1 => {
+                Ulid::from_string(only).map_err(|_| CellError::Db("bad id".into()))
+            }
+            None => Err(CellError::NoteNotFound(format!("no note starts with `{input}`"))),
+            Some(_) => Err(CellError::Invalid(format!(
+                "`{input}` is ambiguous ({} notes)",
+                ids.len()
+            ))),
+        }
+    }
+
     /// Read a note (with its body).
     ///
     /// # Errors
