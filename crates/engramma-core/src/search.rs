@@ -390,7 +390,8 @@ impl Cell {
     /// Neighbours of an entity (or `note:<id>`), BFS up to `depth`, optionally
     /// restricted to some relations. Edges declared by quarantined or deleted
     /// notes are excluded unless `include_quarantined`; manual edges (no
-    /// declaring note) always stay. Returns the edges, nearest first.
+    /// declaring note) always stay. One indexed frontier query per level (at
+    /// most [`WALK_LIMIT`] edges each, in id order); returns nearest first.
     ///
     /// # Errors
     /// [`SearchError`] on SQL failures.
@@ -405,24 +406,27 @@ impl Cell {
             .inner
             .lock()
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
-        let edges = load_edges(&inner.conn, rels, include_quarantined)?;
+        let conn = &inner.conn;
         let mut out: Vec<Neighbor> = Vec::new();
         let mut seen_entities: BTreeSet<String> = BTreeSet::from([start.to_string()]);
         let mut frontier: Vec<String> = vec![start.to_string()];
         for d in 1..=depth {
+            if frontier.is_empty() {
+                break;
+            }
+            let edges =
+                edges_touching_frontier(conn, &frontier, rels, include_quarantined, WALK_LIMIT)?;
+            let frontier_set: BTreeSet<&str> = frontier.iter().map(String::as_str).collect();
             let mut next: Vec<String> = Vec::new();
             for e in &edges {
-                if !frontier.contains(&e.src) && !frontier.contains(&e.dst) {
-                    continue;
-                }
-                let (other, direction) = if frontier.contains(&e.src) {
-                    (e.dst.clone(), "->")
+                let (other, direction) = if frontier_set.contains(e.src.as_str()) {
+                    (e.dst.as_str(), "->")
                 } else {
-                    (e.src.clone(), "<-")
+                    (e.src.as_str(), "<-")
                 };
                 let hop = Neighbor {
                     depth: d,
-                    entity: other.clone(),
+                    entity: other.to_string(),
                     rel: e.rel.clone(),
                     direction: direction.to_string(),
                     note_id: e.note_id.clone(),
@@ -435,20 +439,20 @@ impl Cell {
                 {
                     out.push(hop);
                 }
-                if seen_entities.insert(other.clone()) {
-                    next.push(other);
+                if seen_entities.insert(other.to_string()) {
+                    next.push(other.to_string());
                 }
             }
             frontier = next;
-            if frontier.is_empty() {
-                break;
-            }
         }
         Ok(out)
     }
 
-    /// Shortest path between two entities, depth ≤ 4. Edges declared by
-    /// quarantined or deleted notes are excluded unless `include_quarantined`.
+    /// Shortest path between two entities, depth ≤ 4. The cap applies **while
+    /// visiting**: levels beyond it are never expanded (the walk touches only
+    /// the edges adjacent to the frontier, never the whole table). Edges
+    /// declared by quarantined or deleted notes are excluded unless
+    /// `include_quarantined`.
     ///
     /// # Errors
     /// [`SearchError`] on SQL failures.
@@ -462,49 +466,56 @@ impl Cell {
             .inner
             .lock()
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
-        let edges = load_edges(&inner.conn, &[], include_quarantined)?;
-        // BFS with parent tracking.
-        let mut parents: HashMap<String, (String, String)> = HashMap::new(); // node -> (from, rel)
-        let mut queue: Vec<String> = vec![a.to_string()];
-        let mut visited: BTreeSet<String> = BTreeSet::from([a.to_string()]);
-        while let Some(node) = queue.first().cloned() {
-            queue.remove(0);
-            if node == b {
-                break;
-            }
+        let conn = &inner.conn;
+        if a == b {
+            return Ok(Some(Vec::new()));
+        }
+        // Level-order BFS with parent tracking.
+        let mut parents: HashMap<String, (String, String)> = HashMap::new(); // node -> (parent, rel)
+        let mut discovered: BTreeSet<String> = BTreeSet::from([a.to_string()]);
+        let mut frontier: Vec<String> = vec![a.to_string()];
+        let mut found = false;
+        for _ in 0..4 {
+            let edges =
+                edges_touching_frontier(conn, &frontier, &[], include_quarantined, WALK_LIMIT)?;
+            let frontier_set: BTreeSet<&str> = frontier.iter().map(String::as_str).collect();
+            let mut next: Vec<String> = Vec::new();
             for e in &edges {
-                if e.src == node && !visited.contains(&e.dst) {
-                    visited.insert(e.dst.clone());
-                    parents.insert(e.dst.clone(), (node.clone(), e.rel.clone()));
-                    queue.push(e.dst.clone());
-                } else if e.dst == node && !visited.contains(&e.src) {
-                    visited.insert(e.src.clone());
-                    parents.insert(e.src.clone(), (node.clone(), e.rel.clone()));
-                    queue.push(e.src.clone());
+                let (from, to) = if frontier_set.contains(e.src.as_str()) {
+                    (e.src.as_str(), e.dst.as_str())
+                } else {
+                    (e.dst.as_str(), e.src.as_str())
+                };
+                if discovered.insert(to.to_string()) {
+                    parents.insert(to.to_string(), (from.to_string(), e.rel.clone()));
+                    if to == b {
+                        found = true;
+                        break;
+                    }
+                    next.push(to.to_string());
                 }
             }
+            if found || next.is_empty() {
+                break;
+            }
+            frontier = next;
         }
-        if !visited.contains(b) {
+        if !found {
             return Ok(None);
         }
-        // Reconstruct (depth guard: give up beyond 4 steps).
+        // Reconstruct from the parents.
         let mut steps: Vec<PathStep> = Vec::new();
         let mut cur = b.to_string();
-        let mut guard = 0;
-        while cur != a && guard < 5 {
-            let Some((from, rel)) = parents.get(&cur) else {
+        while cur != a {
+            let Some((parent, rel)) = parents.get(&cur) else {
                 return Ok(None);
             };
             steps.push(PathStep {
-                from: from.clone(),
+                from: parent.clone(),
                 rel: rel.clone(),
                 to: cur.clone(),
             });
-            cur = from.clone();
-            guard += 1;
-        }
-        if cur != a || steps.len() > 4 {
-            return Ok(None);
+            cur = parent.clone();
         }
         steps.reverse();
         Ok(Some(steps))
@@ -810,14 +821,6 @@ fn passes_filters(note: &Note, f: &Filters, now: OffsetDateTime) -> bool {
     true
 }
 
-fn load_edges(
-    conn: &rusqlite::Connection,
-    rels: &[&str],
-    include_quarantined: bool,
-) -> Result<Vec<EdgeRow>, SearchError> {
-    load_edges_where(conn, "1=1", rels, include_quarantined, None)
-}
-
 /// SQL fragment: edges declared by a note the default view hides (quarantined
 /// or deleted). Manual edges (`link`, no declaring note) always stay. `en` is
 /// the alias of the LEFT JOIN over `notes`.
@@ -829,44 +832,75 @@ fn edge_visible(edge: &str, en: &str, include_quarantined: bool) -> String {
     }
 }
 
-/// Load edges filtered by an SQL condition (over `e.src`/`e.dst` columns) and
-/// by declaring-note visibility.
-fn load_edges_where(
+/// Bounded, deterministic walk: a hub entity (a city mentioned by hundreds of
+/// notes) would otherwise drag its whole neighbourhood in.
+const WALK_LIMIT: u64 = 400;
+
+/// Load the edges that touch the frontier (either endpoint), restricted to
+/// `rels` when non-empty, in edge-id order with at most `limit` rows.
+///
+/// The frontier travels in a temp table and the relations as `?` parameters:
+/// values are never spliced into the statement, and no IN list can outgrow
+/// SQLite's variable limit. Two indexed branches (one per endpoint) united:
+/// an edge with both endpoints in the frontier comes out once.
+fn edges_touching_frontier(
     conn: &rusqlite::Connection,
-    filter: &str,
+    frontier: &[String],
     rels: &[&str],
     include_quarantined: bool,
-    limit: Option<u64>,
+    limit: u64,
 ) -> Result<Vec<EdgeRow>, SearchError> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS frontier (id TEXT PRIMARY KEY) WITHOUT ROWID;",
+    )?;
+    conn.execute("DELETE FROM frontier", [])?;
+    {
+        let mut ins = conn.prepare("INSERT OR IGNORE INTO frontier (id) VALUES (?1)")?;
+        for id in frontier {
+            ins.execute([id])?;
+        }
+    }
+    let vis = edge_visible("e", "n", include_quarantined);
     let rel_clause = if rels.is_empty() {
         String::new()
     } else {
-        let placeholders = rels
-            .iter()
-            .map(|r| format!("'{}'", r.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(" AND e.rel IN ({placeholders})")
+        format!(" AND e.rel IN ({})", vec!["?"; rels.len()].join(", "))
     };
-    let limit_clause = limit
-        .map(|l| format!(" ORDER BY e.id LIMIT {l}"))
-        .unwrap_or_default();
+    let branch = |endpoint: &str| {
+        // CROSS JOIN pins the join order: the (tiny) frontier drives indexed
+        // lookups on edges. A plain JOIN lets the planner scan `edges` whole
+        // to keep the ORDER BY cheap (checked with EXPLAIN QUERY PLAN).
+        format!(
+            "SELECT e.id AS eid, e.src, e.rel, e.dst, e.note_id, e.valid_from, e.valid_to
+             FROM frontier f CROSS JOIN edges e ON e.{endpoint} = f.id
+             LEFT JOIN notes n ON n.id = e.note_id
+             WHERE {vis}{rel_clause}"
+        )
+    };
     let sql = format!(
-        "SELECT e.src, e.rel, e.dst, e.note_id, e.valid_from, e.valid_to
-         FROM edges e LEFT JOIN notes n ON n.id = e.note_id
-         WHERE ({filter}){rel_clause} AND {}
-         {limit_clause}",
-        edge_visible("e", "n", include_quarantined)
+        "SELECT eid, src, rel, dst, note_id, valid_from, valid_to FROM ({}
+         UNION {})
+         ORDER BY eid LIMIT ?",
+        branch("src"),
+        branch("dst")
     );
+    // The branches each bind the rel list, then the LIMIT.
+    let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(2 * rels.len() + 1);
+    for r in rels.iter().chain(rels.iter()) {
+        params.push(rusqlite::types::Value::Text((*r).to_string()));
+    }
+    params.push(rusqlite::types::Value::Integer(
+        i64::try_from(limit).unwrap_or(i64::MAX),
+    ));
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
         Ok(EdgeRow {
-            src: r.get(0)?,
-            rel: r.get(1)?,
-            dst: r.get(2)?,
-            note_id: r.get(3)?,
-            valid_from: r.get(4)?,
-            valid_to: r.get(5)?,
+            src: r.get(1)?,
+            rel: r.get(2)?,
+            dst: r.get(3)?,
+            note_id: r.get(4)?,
+            valid_from: r.get(5)?,
+            valid_to: r.get(6)?,
         })
     })?;
     let mut out = Vec::new();
@@ -955,35 +989,23 @@ fn expand_graph(
         }
     }
 
-    // BFS over entity adjacency, one edge query per level.
+    // BFS over entity adjacency, one indexed frontier query per level.
     let mut frontier: Vec<String> = entities.keys().cloned().collect();
     for hop in 1..=max_hops {
         if frontier.is_empty() {
             break;
         }
-        let listed = frontier
-            .iter()
-            .map(|n| format!("'{}'", n.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(",");
-        // Bounded, deterministic walk: a hub entity (a city mentioned by
-        // hundreds of notes) would otherwise drag its whole neighbourhood in.
-        let edges = load_edges_where(
-            conn,
-            &format!("e.src IN ({listed}) OR e.dst IN ({listed})"),
-            &[],
-            include_quarantined,
-            Some(400),
-        )?;
+        let edges = edges_touching_frontier(conn, &frontier, &[], include_quarantined, WALK_LIMIT)?;
+        let frontier_set: BTreeSet<String> = frontier.iter().cloned().collect();
         let mut next: BTreeSet<String> = BTreeSet::new();
         for e in &edges {
             if !valid_at(&e.valid_from, &e.valid_to, as_of) {
                 continue;
             }
             // Which endpoint is in the frontier, and what lies on the other side?
-            let (from, to) = if frontier.contains(&e.src) && !e.src.starts_with("note:") {
+            let (from, to) = if frontier_set.contains(&e.src) && !e.src.starts_with("note:") {
                 (e.src.clone(), e.dst.clone())
-            } else if frontier.contains(&e.dst) && !e.dst.starts_with("note:") {
+            } else if frontier_set.contains(&e.dst) && !e.dst.starts_with("note:") {
                 (e.dst.clone(), e.src.clone())
             } else {
                 continue;
@@ -1343,6 +1365,139 @@ mod tests {
             .path("Fabio", "Torino", true)
             .unwrap(/* test-only */)
             .is_some());
+    }
+
+    #[test]
+    fn hostile_names_travel_as_parameters() {
+        let (_d, cell) = setup();
+        // an entity with an apostrophe and a relation that closes the quoted
+        // literal: both must travel as SQL parameters, never spliced text
+        cell.link(
+            &crate::cell::EdgeInput {
+                src: "D'Angelo".into(),
+                rel: "') OR 1=1 --".into(),
+                dst: "Milano".into(),
+                note_id: None,
+                valid_from: None,
+                valid_to: None,
+                confidence: Confidence::Stated,
+            },
+            "t",
+        )
+        .unwrap(/* test-only */);
+        let ns = cell
+            .neighbors("D'Angelo", 1, &[], false)
+            .unwrap(/* test-only */);
+        assert_eq!(
+            ns.iter().map(|n| n.entity.as_str()).collect::<Vec<_>>(),
+            vec!["Milano"],
+            "an injected rel would drag the whole graph in: {ns:?}"
+        );
+        // the same hostile value as a rel filter matches nothing from Fabio
+        let ns2 = cell
+            .neighbors("Fabio", 1, &[ "') OR 1=1 --"], false)
+            .unwrap(/* test-only */);
+        assert!(
+            ns2.is_empty(),
+            "1=1 must not have matched every edge: {ns2:?}"
+        );
+        // and a search whose seeds reach D'Angelo stays quiet
+        let mut da = note(
+            8,
+            "Appunto su D'Angelo",
+            "Nota su [[D'Angelo]] e [[Milano]].",
+            NoteType::Fact,
+        );
+        da.tags = vec!["x".into()];
+        cell.put_note(&da, "t").unwrap(/* test-only */);
+        let hits = cell
+            .search_with_now(&Query::text("D'Angelo").k(10), now())
+            .unwrap(/* test-only */);
+        assert!(
+            hits.len() <= 6,
+            "the walk grabbed the whole graph: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn neighbors_rel_filter_applies_in_both_directions() {
+        let (_d, cell) = setup();
+        // outgoing: Fabio -partner_of-> Giulia
+        let out = cell
+            .neighbors("Fabio", 1, &["partner_of"], false)
+            .unwrap(/* test-only */);
+        assert_eq!(
+            out.iter()
+                .filter(|n| n.rel == "partner_of")
+                .map(|n| (n.entity.as_str(), n.direction.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("Giulia", "->")]
+        );
+        // incoming: Giulia -works_at-> Studio Rossi, asked from the dst side
+        let inc = cell
+            .neighbors("Studio Rossi", 1, &["works_at"], false)
+            .unwrap(/* test-only */);
+        assert_eq!(
+            inc.iter()
+                .filter(|n| n.rel == "works_at")
+                .map(|n| (n.entity.as_str(), n.direction.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("Giulia", "<-")]
+        );
+    }
+
+    #[test]
+    fn path_beyond_four_hops_is_none_without_scanning_everything() {
+        let (_d, cell) = setup();
+        // a 6-hop chain: Nodo5 -next-> Nodo4 -> … -> Nodo0 -next-> Fabio
+        let mut prev = "Fabio".to_string();
+        for i in 0..6 {
+            let name = format!("Nodo{i}");
+            let mut p = note(i + 20, &name, "", NoteType::Person);
+            p.body = format!("## Relations\n- next:: [[{prev}]]\n");
+            cell.put_note(&p, "t").unwrap(/* test-only */);
+            prev = name;
+        }
+        // a detached blob of edges the bounded walk must never look at
+        // (inserted directly: this test is about reads, not about the log)
+        {
+            let inner = cell.inner.lock().unwrap(/* test-only */);
+            for i in 0..20_000 {
+                inner
+                    .conn
+                    .execute(
+                        "INSERT INTO edges (id, src, rel, dst, note_id, confidence, status)
+                         VALUES (?1, ?2, 'blob', ?3, NULL, 'stated', 'active')",
+                        rusqlite::params![format!("b{i:06}"), format!("X{i}"), format!("Y{i}")],
+                    )
+                    .unwrap(/* test-only */);
+            }
+        }
+        // count the work: any full-table scan crosses the blob (20k rows ≥
+        // ~200k VDBE steps); the bounded walk stays far below
+        let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let mut inner = cell.inner.lock().unwrap(/* test-only */);
+            let s = std::sync::Arc::clone(&steps);
+            inner
+                .conn
+                .progress_handler(1, Some(move || {
+                    s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    false
+                }))
+                .unwrap(/* test-only */);
+        }
+        let found = cell.path("Nodo5", "Fabio", false).unwrap(/* test-only */);
+        assert!(found.is_none(), "6 hops must exceed the 4-step cap");
+        // a short path is still found (and cheap)
+        let short = cell.path("Nodo3", "Fabio", false).unwrap(/* test-only */);
+        assert_eq!(short.expect("4 hops").len(), 4);
+        let used = steps.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            used < 100_000,
+            "the walk scanned the whole edge table ({used} VDBE steps; the \
+             blob alone is 20 000 rows)"
+        );
     }
 
     #[test]
