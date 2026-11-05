@@ -337,3 +337,231 @@ a posto». (Uscite complete nelle note di lavoro della sessione.)
    `rebuild`/`integrity-check` invece del solo replay.
 6. **Registro**: 246 MB per 100k note; oltre alla compattazione (v0.3),
    valutare se il payload debba portare l'intera nota o un diff.
+
+---
+
+# REPORT — Engramma v0.1.1 (correzioni della verifica v0.1)
+
+Data: 2026-11-05. Base: `main` @ `81b9f9f` (tag `fase-v0.1`). Un commit per
+punto, sempre con il test che fallisce prima della correzione (per due punti
+la dimostrazione del fallimento è stata fatta disabilitando temporaneamente
+la correzione e mostrando il rosso, vedi sotto). Tutto offline, Rust 1.95,
+nessuna crate nuova (unica variazione: la feature `hooks` di `rusqlite`, che
+compila più codice della stessa crate — `Cargo.lock` invariato).
+
+## Cosa è stato fatto, punto per punto
+
+### P0.1 — la quarantena non trapela più
+
+- `search`: i semi dell'allargamento nel grafo sono solo i candidati che
+  superano i filtri (stato, quarantena, sostituite, `as_of`); gli archi
+  dichiarati da note in quarantena o cancellate non si attraversano (salvo
+  `include_quarantined`). Il riordino riusa le note già lette.
+- `neighbors`, `path`, `timeline`, `tags`: di norma escludono archi e conteggi
+  delle note dichiaranti in quarantena o cancellate (gli archi manuali senza
+  nota restano sempre); nuovo parametro `include_quarantined`, CLI
+  `--include-quarantined` sui quattro comandi.
+- MCP: `memory_get` su una nota in quarantena o cancellata risponde con lo
+  stesso identico errore di una nota inesistente (nessun oracolo); la CLI
+  `get` la mostra, con la riga «⚠ stato: …».
+- Domande dorate 31–33 (`campione`; `gara regionale crossfit`; `Foster
+  Londra`) con `expect_empty`: tutte e tre fallivano prima (dieci note su
+  Fabio con punteggio ~1,0). Il banco ora controlla anche che nessun `via`
+  attraversi una nota nascosta (attivo da P1.9 in poi, quando gli id corti
+  sono diventati discriminabili). «offerta Foster Partners Londra» non è
+  stata usata: «partners» condivide lo stem «partner» con le relazioni
+  `partner_of` di mezza volta attiva.
+
+### P0.2 — SQL parametrico, frontiera in tabella temporanea
+
+- `edges_touching_frontier`: frontiera in `CREATE TEMP TABLE frontier` +
+  `CROSS JOIN` (fissa l'ordine: con un JOIN plain il planner scansionava
+  `edges` intero per pagare l'ORDER BY a poco — verificato con EXPLAIN QUERY
+  PLAN), relazioni come `?`, ordine per id e limite deterministici.
+- Il parametro `filter: &str` è scomparso dall'API interna: nessuna funzione
+  riceve più frammenti SQL.
+- `neighbors` e `path` camminano per livelli con una interrogazione indicizzata
+  a livello; `path` si ferma a 4 passi durante la visita.
+- Test: relazione `') OR 1=1 --` ed entità `D'Angelo` senza archi estranei;
+  filtro `rels` valido in entrambe le direzioni; `path` a profondità > 4 è
+  `None` e il conteggio dei passi VDBE (progress handler, feature `hooks` di
+  rusqlite) prova che il blob di 20 000 archi non viene toccato — prima
+  760 638 passi, ora bounded.
+
+### P0.3 — HLC con più processi
+
+- Dentro la `BEGIN IMMEDIATE`: leggi `meta.hlc`, `clock.observe(…)`, solo
+  dopo `tick()`. `now_ms()` da una lettura sola (`unix_timestamp_nanos() /
+  1_000_000`).
+- Test: due `Cell` sullo stesso file, la seconda con l'orologio iniettato
+  (`#[cfg(test)] inject_clock`) in avanti di un'ora; scritture alternate con
+  HLC strettamente crescente nell'ordine di `seq`. Prima della correzione
+  (dimostrazione con l'`observe` disabilitato) seq 3→4 andava indietro
+  di un'ora.
+
+### P0.4 — l'hash vincola l'intera riga del registro
+
+- L'envelope del payload porta anche `note_id`: `op_id`, `hlc`, `actor`,
+  `kind`, `note_id` sono tutti nei byte hashati; le colonne sono un indice.
+- `check_envelope` in `op_from_row` e in `apply` (il rigioco segue
+  l'envelope); `make_op` rifiuta i payload che provano a sovrascrivere un
+  campo dell'envelope; `verify` riporta la corruzione nel report invece di
+  propagare errori.
+- Vettore dorato dell'hash in spec §6.1 e in un test (payload fisso, hash
+  atteso, chiavi inserite in ordine sparso): un cambio silenzioso del JSON
+  canonico (per esempio `preserve_order` di serde_json) rompe un test, non
+  le celle scritte.
+- Il test con i due `note_id` scambiati fra due `put_note` passava la
+  verifica intera sulla v0.1 (catena valida, rigioco identico): era il buco
+  vero; la colonna `kind` manomessa cade pure, ora all'origine.
+
+### P0.5 — una nota sostituita ha la validità chiusa
+
+- Regola in spec §1.8 e nel validatore: `status: superseded` richiede
+  `valid_to`; errore in stretta, avviso in importazione, dove la validità si
+  chiude alla `valid_from` della nota che la cita in `supersedes` (import in
+  due fasi: prima tutto il parse, poi le scritture — la nota che chiude può
+  arrivare dopo nel cammino).
+- Vault dorato: `060-fabio-vegetariano.md` riceve `valid_to: 2026-09-30`;
+  domanda dorata 34 (`cosa mangia Fabio`, `as_of` 2026-10-15, `k` per
+  domanda) → solo «onnivoro»; invariante nuova: nessun `superseded` senza
+  `valid_to` nella cella dorata. Timeline a mano: «2020-01-06 → 2026-09-30».
+
+### P1.6 — test di proprietà del registro più forti
+
+- Bersaglio sorteggiato fra le note note (prima era sempre `first()`: una
+  cancellazione zittiva tutto), 40–60 operazioni per caso, conteggio delle
+  operazioni riuscite per tipo, `set_status` finalmente coperto (quarantena
+  e rilascio delle note non esterne).
+- Test su 256 semi: ogni `OpKind` riesce almeno 20 volte.
+- Rigioco incrementale (§9): `ops[..k]` + `changes_since(k)` = rigioco
+  completo, per k casuale e ai bordi, su 6 semi × 36 operazioni.
+
+### P1.7 — colonna `tags_text` (migrazione v3) e indice FTS verificato
+
+- `notes.tags_text`, valorizzata da `apply` (tag ordinati, spazio-joined);
+  `notes_fts` ricreata su `tags_text` e ricostruita dal contenuto; backfill
+  deterministico in Rust dentro la migrazione.
+- `verify` esegue l'integrity-check FTS su cella viva e rigioco e confronta
+  l'insieme dei rowid indicizzati con le note non lapide. Nota onesta:
+  l'integrity-check di SQLite 3.54 su tabelle external-content NON confronta
+  indice e contenuto (provato a mano: documento tolto, deriva del testo e
+  duplicati passano tutti) — verifica solo la struttura interna; per questo
+  il confronto degli insiemi lo facciamo da soli.
+- **Bug vero scovato dal controllo nuovo**: il `delete` FTS su un rowid non
+  indicizzato (ogni scrittura su una lapide: patch, restore, supersede del
+  cancellato) corrompe la contabilità interna di FTS5; l'errore «database
+  disk image is malformed» era ingoiato da un `let _` e la riga rifiutava di
+  uscire dall'indice una cancellazione dopo. Riprodotto in sqlite3 puro e su
+  un seme di proptest. Ora il delete si emette solo per note indicizzate e
+  l'errore non si ingoia.
+
+### P1.8 — `debug_column` in sola lettura
+
+- Rifiuta gli statement non read-only (`Statement::readonly()`) e le query
+  senza una sola colonna; `#[doc(hidden)]` e dichiarata fuori dal contratto
+  pubblico. Prima il `DELETE FROM notes` del test girava davvero (provato
+  con la guardia disabilitata).
+
+### P1.9 — id corti = parte casuale
+
+- `id8()` restituisce gli **ultimi 8** caratteri (quelli random: i primi 8
+  sono il timestamp e collidono nelle importazioni di massa — nel vault
+  dorato tutte le note erano «01GD0000»). Lo usano export, `via`, timeline e
+  output CLI umano.
+- `resolve_note_id` accetta prefisso **o suffisso** (≥ 4 caratteri) con
+  ambiguità segnalata; spec §7 e `docs/cli.md` aggiornati.
+
+### P2.10 — MCP: `cell` facoltativa con una sola cella
+
+- `cell` è `Option` in tutti gli strumenti: con una cella esposta è il
+  default; con più celle l'omissione è un errore che le elenca. README e
+  descrizioni aggiornate.
+
+### P2.11 — benchmark
+
+- `--notes N` (ripetibile, i numeri nudi restano), `--out PATH` (senza più
+  toccare `bench/RESULTS.md` quando è passato), `--runs K` (default 3,
+  mediana per metrica). Il parsing degli argomenti è fattorizzato e
+  unit-testato.
+- Due varianti per dimensione: **viva** (fatti correnti con `updated_at`
+  recente, la recenza lavora) e **uniform** (lo stesso `updated_at` per
+  tutte: ranking solo testo+grafo). La differenza di MRR a 10k (0,858 contro
+  0,810) misura quanto la recenza contribute: è reale ma non enorme.
+- **Varianza** (il motivo della mediana): cinque giri singoli a 10k a
+  macchina ferma hanno dato 2 761–3 441 note/s, p50 5,1–5,4 ms, p95
+  7,8–9,4 ms. Il giro a freddo della verifica aveva dato 1 943 note/s e p95
+  19 ms contro i 3 159/6,6 dichiarati dalla v0.1: i numeri della v0.1 erano
+  un giro fortunato su macchina calda, non una media. Misurare con build
+  concorrenti in corso gonfia vistosamente il p95 (un giro intermedio fatto
+  mentre altri test compilavano ha dato p95 129,6 ms a 100k, contro 84,6
+  della stessa macchina ferma).
+- **Regressione cercata e in gran parte recuperata**: la prima versione
+  della visibilità archi (LEFT JOIN su `notes`) portava il p50/p95 a 100k a
+  75/130 ms anche a macchina ferma. La visibilità ora usa `edges.status`
+  (che rispecchia la nota dichiarante a ogni riscrittura) senza JOIN: il
+  divario residuo contro la v0.1 (p95 84,6 contro 64,7) è la tabella
+  temporanea e l'UNION contro la vecchia query con letterali: il p95 a 100k
+  rimane aperto per la v0.2 come da programma. Nota semantica: un arco
+  manuale con `note_id` mantiene lo stato che aveva alla creazione (se la
+  nota referenziata viene poi messa in quarantena, l'arco manuale resta
+  visibile; gli archi derivati no).
+
+### P2.12 — astensione dorata con parole presenti nel corpus
+
+- Domande 35 («vegetariano») e 36 («backend»), `as_of` 2026-10-15,
+  `expect_empty`: le parole esistono solo in due note sostituite con validità
+  chiusa (060 e 080). Sulla v0.1 la prima usciva per la validità aperta, la
+  seconda per l'allargamento del grafo dalla nota esclusa.
+
+## Numeri del benchmark (macOS, Apple Silicon, release, mediana di 3 giri)
+
+| corpus | note | inserimento (note/s) | apertura (ms) | p50 (ms) | p95 (ms) | solo testo p50 (ms) | richiamo@5 | MRR | file (MB) |
+|---|---|---|---|---|---|---|---|---|---|
+| viva    | 10 000  | 3 547 | 1,1 | 4,8 | 8,1  | 1,9 | 0,938 | 0,858 | 24,2 |
+| uniform | 10 000  | 3 558 | 1,0 | 4,8 | 7,8  | 1,9 | 0,938 | 0,810 | 24,2 |
+| viva    | 100 000 | 2 586 | 2,0 | 48,2 | 84,6 | 25,8 | 0,896 | 0,759 | 247,8 |
+| uniform | 100 000 | 2 284 | 1,9 | 50,0 | 84,5 | 26,1 | 0,890 | 0,767 | 247,8 |
+
+Contro gli obiettivi del §11: inserimento ≥ 2 000 note/s rispettato
+(10k e 100k, entrambe le varianti); apertura ≤ 50 ms rispettata; p95
+ricerca ≤ 30 ms rispettato a 10k (8,1 ms), mancato a 100k (84,6 ms) —
+resta aperto per la v0.2 insieme alla taratura dei pesi sul ramo dei
+vettori; il confronto viva/uniform mostra che il richiamo non dipende in
+maniera critica dalla recenza (0,896/0,890 a 100k, 0,938 uguale a 10k).
+
+## Prove a mano (richieste dalla chiusura)
+
+- `search "campione"` → «nessun risultato sopra soglia» ✓ (e anche
+  «gara regionale crossfit» e «Foster Londra» si astengono);
+- `neighbors Fabio` → nessun arco della nota 0110, `(nota 000000XX)`
+  distinguibili ora che gli id corti sono la parte casuale ✓;
+- `timeline Fabio` → «2020-01-06 → 2026-09-30  Fabio vegetariano», niente
+  più «→ ora» ✓;
+- in più: `verify` sulla cella dorata («catena hash, ricostruzione e indice
+  FTS a posto»), `get` su una nota in quarantena con l'avviso di stato,
+  server MCP a cella unica senza argomento `cell`.
+
+## Scelte e note di questa fase
+
+1. **Visibilità archi su `edges.status`** (vedi P2.11): niente JOIN, a costo
+   di un arco manuale con `note_id` che resta visibile se la nota referenziata
+   finisce in quarantena. Gli archi derivati (la quasi totalità) seguono
+   sempre la loro nota. Da ripensare se gli archi manuali con nota diventeranno
+   comuni.
+2. **Feature `hooks` di rusqlite**: serve al progress handler del test del
+   cammino limitato. Nessuna crate nuova; lock invariato.
+3. **`superseded` senza `valid_to` via API**: il formato e l'import lo
+   impediscono, ma una `patch_note` che azzera `valid_to` su una nota
+   sostituta può ancora produrlo (la cella non ha il guardia). Segnato come
+   angolo noto; il validatore d'importazione lo riprende al giro dopo.
+4. **Astensione**: resta «nessun risultato sopra soglia» quando nessun
+   segnale sopravvive ai filtri; la soglia assoluta è rimandata alla
+   taratura v0.2, come da REPORT v0.1.
+
+## Cosa non ho potuto provare
+
+- Come in v0.1: CI mai eseguita (nessun runner), advisory di cargo-deny
+  offline, altre piattaforme.
+- Il benchmark misura la macchina di sviluppo con altri processi utente:
+  per questo la mediana di tre giri e l'intervallo dichiarato nella varianza.
