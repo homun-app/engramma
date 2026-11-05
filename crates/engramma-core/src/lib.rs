@@ -2,6 +2,7 @@
 
 //! Engramma core: note format, cells, change log, search (v0.1).
 
+pub mod cell;
 pub mod error;
 pub mod format;
 pub mod hlc;
@@ -10,6 +11,7 @@ pub mod text;
 
 pub use error::{CellError, FormatError, PortError, SearchError};
 pub use format::{Confidence, Lang, Note, NoteType, ParseMode, Status, Validity};
+pub use cell::{Cell, NotePatch, VerifyReport};
 pub use hlc::{Hlc, HlcClock};
 
 #[cfg(test)]
