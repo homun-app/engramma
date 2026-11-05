@@ -304,6 +304,42 @@ fn mcp_stdio_roundtrip_and_isolation() {
         );
     }
 
+    // ...and through a short id too: resolving a prefix/suffix must neither
+    // reveal the hidden note's full id nor answer differently from a
+    // fragment that matches nothing
+    let rumour_full = rumour.id.to_string();
+    let hidden_suffix = rumour_full[18..].to_string();
+    let mut answers: Vec<String> = Vec::new();
+    for (id_req, fragment) in [(10, hidden_suffix.clone()), (11, "ZZZZZZZZ".to_string())] {
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id_req,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_get",
+                "arguments": {"cell": "famiglia", "id": fragment}
+            }
+        });
+        mcp.send(&call.to_string());
+        let res = mcp.read_response(id_req);
+        let raw = res.to_string();
+        assert!(
+            !raw.contains(&rumour_full),
+            "short-id resolution revealed the hidden note's full id: {raw}"
+        );
+        answers.push(
+            res["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .replace(&fragment, "<id>"),
+        );
+    }
+    assert!(!answers[0].is_empty(), "expected an error: {answers:?}");
+    assert_eq!(
+        answers[0], answers[1],
+        "a hidden note's fragment must answer exactly like an unknown fragment"
+    );
+
     drop(mcp);
 }
 

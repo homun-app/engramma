@@ -244,17 +244,21 @@ impl MemoryServer {
     async fn memory_get(&self, params: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
         let cell = self.cell_or_default(&p.cell)?;
-        let id = resolve_id(cell, &p.id)?;
-        let note = cell
-            .get(&id)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        // Hidden (quarantined/deleted) and absent notes answer with the same
+        // error, which echoes only what the caller sent: resolving a short id
+        // must not reveal a hidden note's full id or existence.
+        let not_found = || McpError::invalid_params(format!("note `{}` not found", p.id), None);
+        let id = match ulid::Ulid::from_string(&p.id) {
+            Ok(id) => id,
+            Err(_) => match cell.resolve_visible_note_id(&p.id) {
+                Ok(id) => id,
+                Err(engramma_core::CellError::NoteNotFound(_)) => return Err(not_found()),
+                Err(e) => return Err(McpError::invalid_params(e.to_string(), None)),
+            },
+        };
+        let note = cell.get(&id).map_err(|_| not_found())?;
         if matches!(note.status, Status::Quarantined | Status::Deleted) {
-            // Same error as a nonexistent note: no way to tell a hidden note
-            // from an absent one through this server.
-            return Err(McpError::invalid_params(
-                format!("note {id} not found"),
-                None,
-            ));
+            return Err(not_found());
         }
         tool_ok(&serde_json::json!({
             "note": {
@@ -352,14 +356,6 @@ impl ServerHandler for MemoryServer {
                 self.names().join(", ")
             ))
     }
-}
-
-fn resolve_id(cell: &Cell, input: &str) -> Result<ulid::Ulid, McpError> {
-    ulid::Ulid::from_string(input)
-        .ok()
-        .map(Ok)
-        .unwrap_or_else(|| cell.resolve_note_id(input))
-        .map_err(|e| McpError::invalid_params(e.to_string(), None))
 }
 
 /// Run the stdio server. Never returns on success until stdin closes.

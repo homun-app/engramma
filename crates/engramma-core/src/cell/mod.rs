@@ -595,6 +595,20 @@ impl Cell {
     /// [`CellError::NoteNotFound`] when nothing matches;
     /// [`CellError::Invalid`] when the fragment is ambiguous or malformed.
     pub fn resolve_note_id(&self, input: &str) -> Result<Ulid, CellError> {
+        self.resolve_note_id_where(input, false)
+    }
+
+    /// Like [`Cell::resolve_note_id`], but quarantined and deleted notes do
+    /// not exist for the resolution: they neither match nor make a fragment
+    /// ambiguous. Meant for surfaces that must not reveal hidden notes (MCP).
+    ///
+    /// # Errors
+    /// As [`Cell::resolve_note_id`].
+    pub fn resolve_visible_note_id(&self, input: &str) -> Result<Ulid, CellError> {
+        self.resolve_note_id_where(input, true)
+    }
+
+    fn resolve_note_id_where(&self, input: &str, visible_only: bool) -> Result<Ulid, CellError> {
         if input.len() == 26 {
             return Ulid::from_string(input)
                 .map_err(|_| CellError::Invalid(format!("`{input}` is not a ULID")));
@@ -605,9 +619,12 @@ impl Cell {
             )));
         }
         let inner = self.lock()?;
-        let mut stmt = inner.conn.prepare(
-            "SELECT id FROM notes WHERE id LIKE ?1 || '%' OR id LIKE '%' || ?1 ORDER BY id",
-        )?;
+        let mut stmt = inner.conn.prepare(if visible_only {
+            "SELECT id FROM notes WHERE (id LIKE ?1 || '%' OR id LIKE '%' || ?1)
+               AND status NOT IN ('quarantined', 'deleted') ORDER BY id"
+        } else {
+            "SELECT id FROM notes WHERE id LIKE ?1 || '%' OR id LIKE '%' || ?1 ORDER BY id"
+        })?;
         let ids: Vec<String> = stmt.query_map([input], |r| r.get(0))?.flatten().collect();
         drop(stmt);
         match ids.first() {
