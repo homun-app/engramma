@@ -308,6 +308,85 @@ fn mcp_stdio_roundtrip_and_isolation() {
 }
 
 #[test]
+fn mcp_single_cell_is_the_default() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let cells = cell_root(dir.path());
+    make_cell(
+        &cells,
+        "famiglia",
+        "Fabio ha traslocato a [[Milano]] con [[Giulia]].",
+    );
+    let mut mcp = spawn(dir.path(), "famiglia");
+    mcp.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0.0"}}}"#);
+    let _ = mcp.read_response(1);
+    mcp.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+
+    // no `cell` argument: with one exposed cell it is the default
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "memory_search",
+            "arguments": {"query": "traslocato"}
+        }
+    });
+    mcp.send(&call.to_string());
+    let res = mcp.read_response(2);
+    let text = res["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap(/* t */);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap(/* t */);
+    assert!(
+        parsed["hits"].as_array().is_some_and(|h| !h.is_empty()),
+        "single-cell server must accept calls without `cell`: {parsed}"
+    );
+
+    // memory_get and memory_timeline too
+    for (id_req, tool, args) in [
+        (3, "memory_timeline", serde_json::json!({"entity": "Fabio"})),
+        (4, "memory_tags", serde_json::json!({"prefix": ""})),
+    ] {
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id_req,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": args}
+        });
+        mcp.send(&call.to_string());
+        let res = mcp.read_response(id_req);
+        assert!(res.get("error").is_none(), "{tool} without cell: {res}");
+    }
+    drop(mcp);
+
+    // with two exposed cells and no `cell`, the server must ask
+    make_cell(&cells, "lavoro", "Nota di lavoro su [[Torino]].");
+    let mut mcp = spawn(dir.path(), "famiglia,lavoro");
+    mcp.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0.0"}}}"#);
+    let _ = mcp.read_response(1);
+    mcp.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "memory_search",
+            "arguments": {"query": "traslocato"}
+        }
+    });
+    mcp.send(&call.to_string());
+    let res = mcp.read_response(5);
+    assert!(
+        res.get("error").is_some_and(|e| {
+            e["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("which cell"))
+        }),
+        "two cells and no argument must be an error naming them: {res}"
+    );
+}
+
+#[test]
 fn mcp_without_cells_refuses() {
     let dir = tempfile::tempdir().unwrap(/* test-only */);
     cell_root(dir.path());

@@ -74,6 +74,28 @@ impl MemoryServer {
             .get(name)
             .ok_or_else(|| not_exposed(name, &self.names()))
     }
+
+    /// The cell a tool call addresses: the named one, or the only exposed
+    /// cell when the caller left `cell` out.
+    fn cell_or_default(&self, name: &Option<String>) -> Result<&Cell, McpError> {
+        match name.as_deref() {
+            Some(n) => self.cell(n),
+            None => {
+                let mut cells = self.cells.values();
+                match (cells.next(), cells.next()) {
+                    // exactly one exposed cell: it is the default
+                    (Some(only), None) => Ok(only),
+                    _ => Err(McpError::invalid_params(
+                        format!(
+                            "which cell? This server exposes more than one: {}. Pass `cell`.",
+                            self.names().join(", ")
+                        ),
+                        None,
+                    )),
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,8 +143,9 @@ fn tool_ok(value: &serde_json::Value) -> Result<CallToolResult, McpError> {
 #[derive(Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 struct SearchParams {
-    /// Cell to search. Must be one of the exposed cells.
-    cell: String,
+    /// Cell to search. Must be one of the exposed cells; may be omitted
+    /// when the server exposes exactly one.
+    cell: Option<String>,
     /// Natural-language query, same language as the notes.
     query: String,
     /// Maximum results (default 10).
@@ -141,8 +164,9 @@ struct SearchParams {
 #[derive(Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 struct GetParams {
-    /// Cell that holds the note.
-    cell: String,
+    /// Cell that holds the note. May be omitted when the server exposes
+    /// exactly one.
+    cell: Option<String>,
     /// Note id (or an id prefix).
     id: String,
 }
@@ -150,8 +174,8 @@ struct GetParams {
 #[derive(Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 struct NeighborsParams {
-    /// Cell to query.
-    cell: String,
+    /// Cell to query. May be omitted when the server exposes exactly one.
+    cell: Option<String>,
     /// Entity name, e.g. "Fabio".
     entity: String,
     /// BFS depth, default 1 (max 3).
@@ -162,8 +186,8 @@ struct NeighborsParams {
 #[derive(Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 struct TagsParams {
-    /// Cell to query.
-    cell: String,
+    /// Cell to query. May be omitted when the server exposes exactly one.
+    cell: Option<String>,
     /// Tag prefix; children are included (e.g. "casa" matches "casa/milano").
     #[serde(default)]
     prefix: Option<String>,
@@ -172,8 +196,8 @@ struct TagsParams {
 #[derive(Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 struct TimelineParams {
-    /// Cell to query.
-    cell: String,
+    /// Cell to query. May be omitted when the server exposes exactly one.
+    cell: Option<String>,
     /// Entity name whose timeline you want.
     entity: String,
 }
@@ -196,7 +220,7 @@ impl MemoryServer {
         params: Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let cell = self.cell(&p.cell)?;
+        let cell = self.cell_or_default(&p.cell)?;
         let mut q = Query::text(&p.query).k(p.limit.unwrap_or(10));
         if let Some(h) = p.graph_hops {
             q.graph_hops = h.min(2);
@@ -219,7 +243,7 @@ impl MemoryServer {
     /// content waiting for human confirmation.
     async fn memory_get(&self, params: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let cell = self.cell(&p.cell)?;
+        let cell = self.cell_or_default(&p.cell)?;
         let id = resolve_id(cell, &p.id)?;
         let note = cell
             .get(&id)
@@ -260,7 +284,7 @@ impl MemoryServer {
         params: Parameters<NeighborsParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let cell = self.cell(&p.cell)?;
+        let cell = self.cell_or_default(&p.cell)?;
         let ns = cell
             .neighbors(&p.entity, p.depth.unwrap_or(1).min(3), &[], false)
             .map_err(err)?;
@@ -286,7 +310,7 @@ impl MemoryServer {
         params: Parameters<TagsParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let cell = self.cell(&p.cell)?;
+        let cell = self.cell_or_default(&p.cell)?;
         let tags = cell
             .tags(p.prefix.as_deref().unwrap_or(""), false)
             .map_err(err)?;
@@ -307,7 +331,7 @@ impl MemoryServer {
         params: Parameters<TimelineParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let cell = self.cell(&p.cell)?;
+        let cell = self.cell_or_default(&p.cell)?;
         let tl = cell.timeline(&p.entity, false).map_err(err)?;
         let arr: Vec<serde_json::Value> = tl.iter().map(hit_json).collect();
         tool_ok(&serde_json::json!({ "entity": p.entity, "notes": arr }))

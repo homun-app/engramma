@@ -83,7 +83,8 @@ engramma confirm <id>                  # a human vouches for it
 
 ## MCP (read-only)
 
-`engramma mcp` speaks MCP over stdio and exposes only the cells you name:
+`engramma mcp` speaks MCP over stdio and exposes only the cells you name
+(when there is just one, tool calls may omit the `cell` argument):
 
 ```sh
 engramma mcp --cells famiglia,preferenze
