@@ -12,6 +12,7 @@ pub mod id;
 pub mod port;
 pub mod search;
 pub mod text;
+pub mod vector;
 
 pub use cell::{Cell, NotePatch, VerifyReport};
 pub use embed::{Embedder, TextKind};
@@ -20,6 +21,7 @@ pub use format::{Confidence, Lang, Note, NoteType, ParseMode, Status, Validity};
 pub use hlc::{Hlc, HlcClock};
 pub use port::{export, import_cell, import_obsidian};
 pub use search::{Explain, Filters, Hit, Query, Weights};
+pub use vector::{FlatI8, IndexHit, IndexRow, VectorIndex};
 
 #[cfg(test)]
 mod setup_checks {
