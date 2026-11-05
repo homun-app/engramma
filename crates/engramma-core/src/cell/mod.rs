@@ -23,6 +23,7 @@ use crate::embed::Embedder;
 use crate::error::CellError;
 use crate::format::{At, Note, Status, Validity};
 use crate::hlc::{Hlc, HlcClock};
+use crate::vector::VectorIndex;
 use ops::{Op, OpKind};
 pub use vectors::{EmbedPendingReport, ModelCoverage, ModelRow, ModelState};
 
@@ -197,9 +198,24 @@ fn fts_integrity_check(conn: &Connection) -> Result<(), CellError> {
     Ok(())
 }
 
+/// The in-memory vector index and its freshness bookkeeping.
+pub(crate) struct IndexState {
+    /// Model the index was built for (the `ready` one at build time).
+    pub(crate) model: String,
+    /// `PRAGMA data_version` at build time: another process writing the cell
+    /// bumps it, and the next semantic search rebuilds.
+    pub(crate) data_version: i64,
+    /// The int8 index.
+    pub(crate) idx: crate::vector::FlatI8,
+}
+
 pub(crate) struct Inner {
     pub(crate) conn: Connection,
     clock: HlcClock,
+    /// Lazily built on the first semantic search (opening a cell stays ≤ 50 ms).
+    pub(crate) index: Option<IndexState>,
+    /// LRU cache of embedded queries, per model (256 entries each).
+    pub(crate) query_cache: std::collections::HashMap<String, crate::search::LruCache>,
 }
 
 /// An open cell. Cheap to clone; one process-wide write lock per file.
@@ -305,7 +321,12 @@ impl Cell {
         }
         Ok(Cell {
             path: path.to_path_buf(),
-            inner: Arc::new(Mutex::new(Inner { conn, clock })),
+            inner: Arc::new(Mutex::new(Inner {
+                conn,
+                clock,
+                index: None,
+                query_cache: std::collections::HashMap::new(),
+            })),
             write_lock: per_cell_lock(path),
         })
     }
@@ -402,7 +423,12 @@ impl Cell {
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
         let mut inner = self.lock()?;
         let op_id = crate::id::new_ulid()?;
-        let Inner { conn, clock } = &mut *inner;
+        let Inner {
+            conn,
+            clock,
+            index: _,
+            query_cache: _,
+        } = &mut *inner;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Inside the write transaction: align with the newest HLC in the log
         // before ticking. Another process may have written since we opened
@@ -430,6 +456,14 @@ impl Cell {
         op.hash = ops::op_hash(&op.prev_hash, &ops::canonical_json(&op.payload));
         ops::apply(&tx, &op)?;
         tx.commit()?;
+        // A tombstone leaves the index immediately (its vectors were deleted
+        // inside the op). The guard is the one this method already holds.
+        if kind == OpKind::DeleteNote
+            && let Some(id) = note_id
+            && let Some(st) = &mut inner.index
+        {
+            st.idx.remove(&id.to_string());
+        }
         Ok(())
     }
 
@@ -718,6 +752,27 @@ impl Cell {
                 }
                 tx.commit()?;
             }
+            // This cell's own writes update the in-memory index in place
+            // (another process's writes are caught by `data_version`).
+            {
+                let mut inner = self.lock()?;
+                if let Some(st) = &mut inner.index
+                    && st.model == embedder.model_id()
+                {
+                    for (id, chunks) in &embedded {
+                        if chunks.is_empty() {
+                            st.idx.remove(id);
+                        } else {
+                            let rows: Vec<(i64, Vec<f32>)> = chunks
+                                .iter()
+                                .enumerate()
+                                .map(|(i, (_, v))| (i64::try_from(i).unwrap_or(0), v.clone()))
+                                .collect();
+                            st.idx.upsert(id, &rows);
+                        }
+                    }
+                }
+            }
             for (id, _) in &embedded {
                 processed.insert(id.clone());
             }
@@ -726,13 +781,29 @@ impl Cell {
         // Blue/green: a building model with full coverage becomes ready, the
         // old ready model retires with its vectors — one transaction.
         {
-            let inner = self.lock()?;
-            let vx = vectors::VectorTx { conn: &inner.conn };
-            if let Some(target) = vx.embed_target()?
-                && target.state == ModelState::Building
-                && target.model == embedder.model_id()
-                && let Some(p) = vx.promote_if_complete(&target.model)?
-            {
+            let mut inner = self.lock()?;
+            let swapped = {
+                let vx = vectors::VectorTx { conn: &inner.conn };
+                match vx.embed_target() {
+                    Ok(Some(target))
+                        if target.state == ModelState::Building
+                            && target.model == embedder.model_id() =>
+                    {
+                        match vx.promote_if_complete(&target.model) {
+                            Ok(Some(p)) => Some(p),
+                            Ok(None) => None,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Ok(_) => None,
+                    Err(e) => return Err(e),
+                }
+            };
+            if let Some(p) = swapped {
+                // the ready model changed: the index rebuilds on the next
+                // semantic search (never a mixed index: searches served
+                // before this point used the old model end to end)
+                inner.index = None;
                 promoted = Some(p);
             }
         }

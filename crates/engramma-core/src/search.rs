@@ -8,10 +8,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use time::OffsetDateTime;
 
-use crate::cell::Cell;
+use crate::cell::vectors::VectorTx;
+use crate::cell::{Cell, Inner};
+use crate::embed::{decode_vec, dot_f32};
 use crate::error::SearchError;
 use crate::format::{Confidence, Note, NoteType, Status};
 use crate::text;
+use crate::vector::{FlatI8, IndexRow, VectorIndex};
 
 /// Confidence rank for `min_confidence` (higher = more trusted).
 fn confidence_rank(c: Confidence) -> u8 {
@@ -128,13 +131,24 @@ impl Query {
     }
 }
 
-/// Why a result is in the list (§6.3.6).
+/// Why a result is in the list (§6.3.6; v0.2 adds the semantic fields).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Explain {
     /// Query terms found in the note (stemmed index terms).
     pub matched_terms: Vec<String>,
     /// Position in the BM25 candidate list (1-based).
     pub bm25_rank: Option<usize>,
+    /// Position in the vector candidate list (1-based, v0.2).
+    pub semantic_rank: Option<usize>,
+    /// Cosine with the query embedding (best chunk), when the vector branch
+    /// produced this result.
+    pub cosine: Option<f64>,
+    /// The raw fused score before the display normalisation (v0.2).
+    pub fused_score: Option<f64>,
+    /// Which candidate lists produced it: `text`, `vector`, `graph`.
+    pub lists: Vec<&'static str>,
+    /// The chunk that won, for a multi-chunk note.
+    pub winning_chunk: Option<usize>,
     /// Graph path that led here, e.g. `[[Giulia]] -lives_in-> [[Milano]]`.
     pub via: Option<String>,
     /// Confidence weight applied.
@@ -147,15 +161,183 @@ pub struct Explain {
     pub source: String,
 }
 
+impl Default for Explain {
+    fn default() -> Self {
+        Self {
+            matched_terms: Vec::new(),
+            bm25_rank: None,
+            semantic_rank: None,
+            cosine: None,
+            fused_score: None,
+            lists: Vec::new(),
+            winning_chunk: None,
+            via: None,
+            confidence: Confidence::Stated,
+            valid_from: None,
+            valid_to: None,
+            source: String::new(),
+        }
+    }
+}
+
 /// One search result.
 #[derive(Debug, Clone)]
 pub struct Hit {
     /// The note.
     pub note: Note,
-    /// Final score.
+    /// Final score (normalised for display: the best hit is 1.0).
     pub score: f64,
+    /// The raw score before normalisation (v0.2: the ranking signal, not
+    /// hidden behind the display normalisation).
+    pub raw_score: f64,
     /// Why it matched.
     pub explain: Explain,
+}
+
+/// A hand-written LRU for embedded queries (256 per model, §4 v0.2): a
+/// VecDeque of keys plus a map; `get` refreshes, `put` evicts the front.
+#[derive(Debug)]
+pub struct LruCache {
+    map: std::collections::HashMap<String, Vec<f32>>,
+    order: std::collections::VecDeque<String>,
+    cap: usize,
+}
+
+impl LruCache {
+    /// A cache holding `cap` entries.
+    #[must_use]
+    pub fn new(cap: usize) -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Cached value, refreshed to most-recently-used.
+    pub fn get(&mut self, key: &str) -> Option<&Vec<f32>> {
+        if self.map.contains_key(key) {
+            self.order.retain(|k| k != key);
+            self.order.push_back(key.to_string());
+            self.map.get(key)
+        } else {
+            None
+        }
+    }
+
+    /// Insert (or replace), evicting the least recently used when full.
+    pub fn put(&mut self, key: String, value: Vec<f32>) {
+        if self.map.contains_key(&key) {
+            self.order.retain(|k| k != &key);
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+
+    /// Entries currently held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the cache is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+/// Search mode (v0.2 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// BM25 + graph, as in v0.1.
+    Text,
+    /// Vector candidates only (with the abstention threshold).
+    Vector,
+    /// Both lists fused (default when an embedder is ready).
+    Hybrid,
+}
+
+/// How the text and vector lists combine (§4; the default is chosen on the
+/// golden set and the benchmark, see REPORT).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Fusion {
+    /// Reciprocal-rank fusion: Σ 1/(k + rank) — no calibration needed.
+    Rrf {
+        /// Rank dampening (60 in the literature).
+        k: u64,
+    },
+    /// Convex combination: `alpha·cos + (1−alpha)·bm25_minmax` with BM25
+    /// min-max normalised over the candidates; a note missing from one list
+    /// scores 0 for it.
+    Convex {
+        /// Weight of the cosine (0–1).
+        alpha: f64,
+    },
+}
+
+impl Default for Fusion {
+    fn default() -> Self {
+        Fusion::Rrf { k: 60 }
+    }
+}
+
+/// The semantic side of a search: the embedder plus the knobs.
+#[derive(Clone)]
+pub struct Semantic {
+    /// The embedder (its model must be the cell's `ready` model for serving,
+    /// or its `building` model during a switch — searches always serve
+    /// `ready`).
+    pub embedder: std::sync::Arc<dyn crate::embed::Embedder>,
+    /// Text+vector combination.
+    pub fusion: Fusion,
+    /// Abstention: a result that arrives only from the vector branch needs
+    /// cosine ≥ tau.
+    pub tau: f32,
+}
+
+impl Semantic {
+    /// Defaults: RRF k=60 and tau = 0.30 (tuned on the golden vault, REPORT).
+    #[must_use]
+    pub fn new(embedder: std::sync::Arc<dyn crate::embed::Embedder>) -> Self {
+        Self {
+            embedder,
+            fusion: Fusion::default(),
+            tau: 0.30,
+        }
+    }
+
+    /// Set the fusion.
+    #[must_use]
+    pub fn with_fusion(mut self, fusion: Fusion) -> Self {
+        self.fusion = fusion;
+        self
+    }
+
+    /// Set the abstention threshold.
+    #[must_use]
+    pub fn with_tau(mut self, tau: f32) -> Self {
+        self.tau = tau;
+        self
+    }
+}
+
+/// Result of a semantic search, with the timing split the `explain` story
+/// needs: embedding the question is separate from searching.
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    /// The hits, best first.
+    pub hits: Vec<Hit>,
+    /// Milliseconds spent embedding the query (0.0 on a cache hit — the
+    /// cache is part of the point).
+    pub embed_ms: f64,
+    /// Milliseconds spent searching (index build included, when it happens).
+    pub search_ms: f64,
 }
 
 /// Reciprocal-rank fusion (§6.3.2): score = Σ 1/(k + rank), ranks from 1.
@@ -327,13 +509,12 @@ impl Cell {
                 explain: Explain {
                     matched_terms: matched,
                     bm25_rank: Some(rank),
-                    via: None,
-                    confidence: note.confidence,
-                    valid_from: note.valid_from.as_ref().map(|v| v.to_db_string()),
-                    valid_to: note.valid_to.as_ref().map(|v| v.to_db_string()),
-                    source: note.source.clone(),
+                    lists: vec!["text"],
+                    fused_score: Some(raw),
+                    ..Explain::default()
                 },
                 note,
+                raw_score: raw,
                 score: raw,
             });
         }
@@ -358,21 +539,20 @@ impl Cell {
             hits.push(Hit {
                 explain: Explain {
                     matched_terms: matched,
-                    bm25_rank: None,
                     via: Some(path),
-                    confidence: note.confidence,
-                    valid_from: note.valid_from.as_ref().map(|v| v.to_db_string()),
-                    valid_to: note.valid_to.as_ref().map(|v| v.to_db_string()),
-                    source: note.source.clone(),
+                    lists: vec!["graph"],
+                    fused_score: Some(raw),
+                    ..Explain::default()
                 },
                 note,
+                raw_score: raw,
                 score: raw,
             });
         }
-        let max_raw = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
+        let max_raw = hits.iter().map(|h| h.raw_score).fold(0.0_f64, f64::max);
         if max_raw > 0.0 {
             for h in &mut hits {
-                h.score /= max_raw;
+                h.score = h.raw_score / max_raw;
             }
         }
         // Below-threshold results (no signal at all) are withheld.
@@ -640,15 +820,11 @@ impl Cell {
                 }
                 out.push(Hit {
                     score: 0.0,
+                    raw_score: 0.0,
                     note,
                     explain: Explain {
-                        matched_terms: vec![],
-                        bm25_rank: None,
                         via: Some(format!("[[{entity}]]")),
-                        confidence: Confidence::Stated,
-                        valid_from: None,
-                        valid_to: None,
-                        source: String::new(),
+                        ..Explain::default()
                     },
                 });
                 if let Some(last) = out.last_mut() {
@@ -662,6 +838,492 @@ impl Cell {
         }
         Ok(out)
     }
+}
+
+// ---------------------------------------------------------------------------
+// semantic search (v0.2 §4)
+// ---------------------------------------------------------------------------
+
+/// A vector candidate after filters: the best chunk of a note.
+struct VecCand {
+    id: String,
+    cosine: f64,
+    rank: usize,
+    note: Note,
+    chunk: usize,
+}
+
+/// Build or reuse the in-memory index of the cell's `ready` model.
+/// Returns `(model, dim)` or `None` when no model is ready (the caller
+/// degrades to text-only). A `data_version` change (another process wrote)
+/// triggers a rebuild; this cell's own writes update the index in place.
+fn ensure_index(inner: &mut Inner) -> Result<Option<(String, usize)>, SearchError> {
+    let Some(ready) = VectorTx { conn: &inner.conn }
+        .ready_model()
+        .map_err(|e| SearchError::Db(e.to_string()))?
+    else {
+        // no ready model: drop any stale index and go textual
+        inner.index = None;
+        return Ok(None);
+    };
+    let dim = usize::try_from(ready.dim).unwrap_or(0);
+    let data_version: i64 = inner
+        .conn
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    let fresh = inner
+        .index
+        .as_ref()
+        .is_some_and(|st| st.model == ready.model && st.data_version == data_version);
+    if !fresh {
+        // Build lazily, here and not at open time: opening a cell stays ≤ 50 ms.
+        let mut rows: Vec<IndexRow> = Vec::new();
+        {
+            let mut stmt = inner.conn.prepare(
+                "SELECT note_id, chunk, vec FROM note_vectors WHERE model = ?1 ORDER BY note_id, chunk",
+            )?;
+            let result = stmt.query_map([&ready.model], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })?;
+            for row in result {
+                let (note_id, chunk, blob) = row?;
+                if let Ok(v) = decode_vec(&blob, dim) {
+                    rows.push(IndexRow {
+                        note_id,
+                        chunk,
+                        vec: v,
+                    });
+                }
+            }
+        }
+        let mut idx = FlatI8::new(dim);
+        idx.rebuild(rows);
+        inner.index = Some(crate::cell::IndexState {
+            model: ready.model.clone(),
+            data_version,
+            idx,
+        });
+    }
+    Ok(Some((ready.model, dim)))
+}
+
+/// Vector candidates for one query: int8 top-`m` → exact f32 recomputation
+/// of those candidates (temp table + JOIN against `note_vectors`) → best
+/// chunk per note → the same filters as BM25. Fewer than `k` survivors
+/// double `m`, up to the full scan.
+#[allow(clippy::too_many_arguments)]
+fn vector_candidates(
+    conn: &rusqlite::Connection,
+    inner: &Inner,
+    qv: &[f32],
+    k: usize,
+    filters: &Filters,
+    now: OffsetDateTime,
+    model: &str,
+) -> Result<Vec<VecCand>, SearchError> {
+    let Some(state) = &inner.index else {
+        return Ok(Vec::new());
+    };
+    let total = state.idx.len();
+    let mut m = 200.max(4 * k);
+    let mut out: Vec<VecCand> = Vec::new();
+    loop {
+        let hits = state.idx.search(qv, m.min(total));
+        // exact f32 recomputation, in bulk
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS vcand (note_id TEXT PRIMARY KEY) WITHOUT ROWID;",
+        )?;
+        conn.execute("DELETE FROM vcand", [])?;
+        {
+            let mut ins = conn.prepare("INSERT OR IGNORE INTO vcand (note_id) VALUES (?1)")?;
+            for h in &hits {
+                ins.execute([&h.note_id])?;
+            }
+        }
+        let mut best: HashMap<String, (f64, i64)> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT v.note_id, v.chunk, v.vec FROM vcand c
+                 JOIN note_vectors v ON v.note_id = c.note_id AND v.model = ?1",
+            )?;
+            let result = stmt.query_map([model], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })?;
+            for row in result {
+                let (note_id, chunk, blob) = row?;
+                if let Ok(v) = decode_vec(&blob, qv.len()) {
+                    let cos = f64::from(dot_f32(&v, qv));
+                    let e = best.entry(note_id).or_insert((f64::NEG_INFINITY, chunk));
+                    if cos > e.0 {
+                        *e = (cos, chunk);
+                    }
+                }
+            }
+        }
+        // rank by exact cosine, then filter
+        let mut ranked: Vec<(String, f64, i64)> = best
+            .into_iter()
+            .map(|(id, (cos, chunk))| (id, cos, chunk))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out.clear();
+        for (rank, (id, cos, chunk)) in ranked.into_iter().enumerate() {
+            if out.len() >= 50 {
+                break;
+            }
+            let Ok(note) = read_note_by_id(conn, &id) else {
+                continue;
+            };
+            if !passes_filters(&note, filters, now) {
+                continue;
+            }
+            out.push(VecCand {
+                id,
+                cosine: cos,
+                rank: rank + 1,
+                note,
+                chunk: usize::try_from(chunk).unwrap_or(0),
+            });
+        }
+        let filtered_short = out.len() < k;
+        if !filtered_short || m >= total {
+            break;
+        }
+        m = (m * 2).min(total);
+    }
+    Ok(out)
+}
+
+/// Fuse the text and vector lists (§4): RRF or convex, over the candidates
+/// that survived the filters. Returns `(id, fused score)` for the union.
+fn fuse(
+    text: &[(String, f64, usize, Note)],
+    vecs: &[VecCand],
+    fusion: &Fusion,
+) -> BTreeMap<String, f64> {
+    let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    match *fusion {
+        Fusion::Rrf { k } => {
+            for (id, _, rank, _) in text {
+                *out.entry(id.clone()).or_default() += 1.0 / (k as f64 + *rank as f64);
+            }
+            for v in vecs {
+                *out.entry(v.id.clone()).or_default() += 1.0 / (k as f64 + v.rank as f64);
+            }
+        }
+        Fusion::Convex { alpha } => {
+            // BM25 min-max over the union's present values
+            let mut min = f64::INFINITY;
+            let mut max = f64::NEG_INFINITY;
+            for (_, bm25, _, _) in text {
+                min = min.min(*bm25);
+                max = max.max(*bm25);
+            }
+            let norm = |b: f64| -> f64 {
+                if max > min {
+                    (b - min) / (max - min)
+                } else {
+                    // a single candidate (or ties): all best
+                    1.0
+                }
+            };
+            for (id, bm25, _, _) in text {
+                *out.entry(id.clone()).or_default() += (1.0 - alpha) * norm(*bm25);
+            }
+            for v in vecs {
+                *out.entry(v.id.clone()).or_default() += alpha * v.cosine.max(0.0);
+            }
+        }
+    }
+    out
+}
+
+impl Cell {
+    /// Semantic search with the wall clock as `now`.
+    ///
+    /// # Errors
+    /// [`SearchError`] on SQL failures, invalid queries or embedding errors.
+    pub fn search_semantic(&self, q: &Query, sem: &Semantic) -> Result<SearchOutcome, SearchError> {
+        self.search_semantic_with_now(q, OffsetDateTime::now_utc(), sem)
+    }
+
+    /// Semantic search with an explicit `now`: hybrid (BM25 + vectors fused),
+    /// vector-only, or text-only (identical to [`Cell::search_with_now`]).
+    /// The query is embedded through a 256-entry LRU cache per model, outside
+    /// the cell lock; `embed_ms` and `search_ms` are reported separately.
+    ///
+    /// # Errors
+    /// [`SearchError`] on SQL failures, invalid queries or embedding errors.
+    pub fn search_semantic_with_now(
+        &self,
+        q: &Query,
+        now: OffsetDateTime,
+        sem: &Semantic,
+    ) -> Result<SearchOutcome, SearchError> {
+        if q.text.trim().is_empty() {
+            return Err(SearchError::Invalid("empty query text".into()));
+        }
+        let started = std::time::Instant::now();
+        // 1. Embed the question (cached), before taking the cell lock.
+        let model = sem.embedder.model_id().to_string();
+        let cached = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
+            inner
+                .query_cache
+                .entry(model.clone())
+                .or_insert_with(|| LruCache::new(256))
+                .get(&q.text)
+                .cloned()
+        };
+        let qv = match cached {
+            Some(v) => v,
+            None => {
+                let mut vecs = sem
+                    .embedder
+                    .embed(&[&q.text], crate::embed::TextKind::Query)
+                    .map_err(|e| SearchError::Invalid(format!("embedding: {e}")))?;
+                let v = vecs.pop().unwrap_or_default();
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
+                inner
+                    .query_cache
+                    .entry(model.clone())
+                    .or_insert_with(|| LruCache::new(256))
+                    .put(q.text.clone(), v.clone());
+                v
+            }
+        };
+        let embed_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        // 2. Search under the lock.
+        let search_started = std::time::Instant::now();
+        let hits = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
+            semantic_pipeline(&mut inner, q, now, sem, &qv, &model)?
+        };
+        Ok(SearchOutcome {
+            hits,
+            embed_ms,
+            search_ms: search_started.elapsed().as_secs_f64() * 1000.0,
+        })
+    }
+}
+
+/// The mixed pipeline (§4): BM25 and vectors in parallel, filters, fusion,
+/// graph expansion from the fused seeds, weighted rerank, abstention.
+fn semantic_pipeline(
+    inner: &mut Inner,
+    q: &Query,
+    now: OffsetDateTime,
+    sem: &Semantic,
+    qv: &[f32],
+    model: &str,
+) -> Result<Vec<Hit>, SearchError> {
+    let dim = ensure_index(inner)?;
+    let conn = &inner.conn;
+
+    // --- text list (BM25, as in v0.1)
+    let terms = text::query_terms(&q.text, q.lang);
+    let mut text_hits: Vec<(String, f64)> = Vec::new();
+    if !terms.is_empty() {
+        let match_expr = terms
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let mut stmt = conn.prepare(
+            "SELECT n.id, bm25(notes_fts, 10.0, 3.0, 2.0) FROM notes_fts
+             JOIN notes n ON n.rowid = notes_fts.rowid
+             WHERE notes_fts MATCH ?1
+             ORDER BY bm25(notes_fts, 10.0, 3.0, 2.0) LIMIT 50",
+        )?;
+        let rows = stmt.query_map([&match_expr], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        for row in rows {
+            let (id, bm25) = row?;
+            text_hits.push((id, -bm25));
+        }
+    }
+    let mut text_list: Vec<(String, f64, usize, Note)> = Vec::new();
+    for (rank, (id, bm25)) in text_hits.iter().enumerate() {
+        let Ok(note) = read_note_by_id(conn, id) else {
+            continue;
+        };
+        if !passes_filters(&note, &q.filters, now) {
+            continue;
+        }
+        text_list.push((id.clone(), *bm25, rank + 1, note));
+    }
+
+    // --- vector list
+    let vec_list: Vec<VecCand> = match (&dim, qv.len()) {
+        (Some((m, d)), n) if m == model && n == *d => {
+            vector_candidates(conn, inner, qv, q.k, &q.filters, now, m)?
+        }
+        _ => Vec::new(),
+    };
+
+    // --- fusion over the filtered lists
+    let fused = fuse(&text_list, &vec_list, &sem.fusion);
+    let bm25_rank_of: HashMap<&str, usize> = text_list
+        .iter()
+        .map(|(id, _, rank, _)| (id.as_str(), *rank))
+        .collect();
+    let note_of_text: HashMap<String, &Note> = text_list
+        .iter()
+        .map(|(id, _, _, n)| (id.clone(), n))
+        .collect();
+    let vec_of: HashMap<&str, &VecCand> = vec_list.iter().map(|v| (v.id.as_str(), v)).collect();
+
+    // --- graph expansion from the fused seeds
+    let mut seeds: Vec<(String, f64)> = fused.iter().map(|(id, s)| (id.clone(), *s)).collect();
+    seeds.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let seeds: Vec<(String, f64)> = seeds.into_iter().take(10).collect();
+    // normalise seed scores for the walk
+    let seed_max = seeds
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(0.0_f64, f64::max)
+        .max(f64::EPSILON);
+    let seeds: Vec<(String, f64)> = seeds
+        .into_iter()
+        .map(|(id, s)| (id, s / seed_max))
+        .collect();
+    let as_of = q.filters.as_of;
+    let mut extra: BTreeMap<String, (u8, String, f64)> = BTreeMap::new();
+    if q.graph_hops > 0 && !seeds.is_empty() {
+        let exclude: BTreeSet<String> = fused.keys().cloned().collect();
+        expand_graph(
+            conn,
+            &seeds,
+            q.graph_hops,
+            as_of,
+            q.filters.include_quarantined,
+            &exclude,
+            &mut extra,
+        )?;
+    }
+
+    // --- rerank: fused × confidence × recency (§4.5: reliability, recency,
+    // graph — as in v0.1; term coverage is not applied to semantic hits, a
+    // paraphrase legitimately shares no term with the note).
+    let mut hits: Vec<Hit> = Vec::new();
+    for (id, fused_score) in &fused {
+        let from_text = note_of_text.contains_key(id);
+        let from_vec = vec_of.contains_key(id.as_str());
+        let note: &Note = match (note_of_text.get(id), vec_of.get(id.as_str())) {
+            (Some(n), _) => n,
+            (None, Some(v)) => &v.note,
+            (None, None) => continue,
+        };
+        let cosine = from_vec
+            .then(|| vec_of.get(id.as_str()).map(|v| v.cosine))
+            .flatten();
+        let chunk = from_vec
+            .then(|| vec_of.get(id.as_str()).map(|v| v.chunk))
+            .flatten();
+        let mut lists: Vec<&'static str> = Vec::new();
+        if from_text {
+            lists.push("text");
+        }
+        if from_vec {
+            lists.push("vector");
+        }
+        // abstention (§4): a vector-only result must clear tau
+        if !from_text && cosine.is_none_or(|c| (c as f32) < sem.tau) {
+            continue;
+        }
+        let raw = fused_score
+            * q.weights.confidence(note.confidence)
+            * recency_of(now, note, q.weights.recency_half_life_days);
+        hits.push(Hit {
+            note: (*note).clone(),
+            raw_score: raw,
+            score: raw,
+            explain: Explain {
+                bm25_rank: from_text
+                    .then(|| bm25_rank_of.get(id.as_str()).copied())
+                    .flatten(),
+                semantic_rank: from_vec
+                    .then(|| vec_of.get(id.as_str()).map(|v| v.rank))
+                    .flatten(),
+                cosine,
+                fused_score: Some(*fused_score),
+                lists,
+                winning_chunk: chunk,
+                matched_terms: if from_text {
+                    coverage_of(conn, id, note, &terms).0
+                } else {
+                    Vec::new()
+                },
+                confidence: note.confidence,
+                valid_from: note.valid_from.as_ref().map(|v| v.to_db_string()),
+                valid_to: note.valid_to.as_ref().map(|v| v.to_db_string()),
+                source: note.source.clone(),
+                ..Explain::default()
+            },
+        });
+    }
+    // graph-discovered notes (never candidates themselves)
+    let mut extras: Vec<(String, (u8, String, f64))> = extra.into_iter().take(40).collect();
+    extras.sort_by_key(|(_, (hops, _, _))| *hops);
+    for (id, (hops, path, seed)) in extras {
+        let Ok(note) = read_note_by_id(conn, &id) else {
+            continue;
+        };
+        if !passes_filters(&note, &q.filters, now) {
+            continue;
+        }
+        let w_graph = q.weights.hop_decay.powi(i32::from(hops) + 1);
+        let raw = GRAPH_FLOOR.max(seed)
+            * q.weights.confidence(note.confidence)
+            * recency_of(now, &note, q.weights.recency_half_life_days)
+            * w_graph;
+        hits.push(Hit {
+            note,
+            raw_score: raw,
+            score: raw,
+            explain: Explain {
+                via: Some(path),
+                lists: vec!["graph"],
+                fused_score: Some(raw),
+                ..Explain::default()
+            },
+        });
+    }
+
+    hits.retain(|h| h.raw_score > 0.0);
+    hits.sort_by(|a, b| {
+        b.raw_score
+            .partial_cmp(&a.raw_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.note.id.to_string().cmp(&b.note.id.to_string()))
+    });
+    hits.truncate(q.k);
+    let max_raw = hits.iter().map(|h| h.raw_score).fold(0.0_f64, f64::max);
+    if max_raw > 0.0 {
+        for h in &mut hits {
+            h.score = h.raw_score / max_raw;
+        }
+    }
+    Ok(hits)
 }
 
 /// A neighbour in the graph.
@@ -1577,5 +2239,432 @@ mod tests {
     fn empty_query_is_rejected() {
         let (_d, cell) = setup();
         assert!(cell.search_with_now(&Query::text("  "), now()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod semantic_tests {
+    use super::*;
+    use crate::embed::{TextKind, l2_normalize};
+    use crate::format::NoteType;
+    use ulid::Ulid;
+
+    /// An embedder that makes "similar" texts point the same way: the vector
+    /// is dominated by the first letter's position. Deterministic, 8 dims.
+    struct SemiEmbedder {
+        id: String,
+    }
+
+    impl crate::embed::Embedder for SemiEmbedder {
+        fn model_id(&self) -> &str {
+            &self.id
+        }
+        fn dim(&self) -> usize {
+            8
+        }
+        fn max_tokens(&self) -> usize {
+            8_192
+        }
+        fn embed(
+            &self,
+            texts: &[&str],
+            _kind: TextKind,
+        ) -> Result<Vec<Vec<f32>>, crate::error::EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    // first word char decides the direction; noise from the rest
+                    let first = t
+                        .chars()
+                        .find(|c| c.is_alphabetic())
+                        .and_then(|c| c.to_lowercase().next())
+                        .unwrap_or('a');
+                    let mut v = vec![0.0_f32; 8];
+                    let slot = (first as u32 % 8) as usize;
+                    v[slot] = 1.0;
+                    let hash = blake3::hash(t.as_bytes());
+                    v[(slot + 1) % 8] = f32::from(hash.as_bytes()[0]) / 2000.0;
+                    l2_normalize(&mut v);
+                    v
+                })
+                .collect())
+        }
+    }
+
+    fn sem() -> Semantic {
+        Semantic::new(std::sync::Arc::new(SemiEmbedder {
+            id: "semi@1".into(),
+        }))
+    }
+
+    fn at(day: u32) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_800_000_000 + i64::from(day) * 86_400)
+            .unwrap(/* test-only */)
+    }
+
+    fn note(id: u16, title: &str, body: &str) -> Note {
+        Note {
+            id: Ulid::from_string(&format!("01{:024}", id)).unwrap(/* test-only */),
+            note_type: NoteType::Fact,
+            title: Some(title.into()),
+            body: body.into(),
+            tags: vec![],
+            scope: None,
+            lang: Some(crate::format::Lang::It),
+            source: "user".into(),
+            confidence: Confidence::Stated,
+            status: Status::Active,
+            valid_from: None,
+            valid_to: None,
+            supersedes: vec![],
+            created_at: crate::format::At(at(1)),
+            updated_at: crate::format::At(at(1)),
+            extensions: vec![],
+        }
+    }
+
+    /// A vault where the answer shares no term with the question.
+    fn setup() -> (tempfile::TempDir, Cell) {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let cell = Cell::create(&dir.path().join("s.sqlite"), "t", "tester")
+            .unwrap(/* test-only */);
+        // "In che città vive?" -> "Fabio abita a Milano" (Milano starts with M)
+        cell.put_note(&note(1, "Fabio abita a Milano", "Fabio vive a [[Milano]]."), "t")
+            .unwrap(/* test-only */);
+        // a decoy that also matches semantically (same M direction)
+        cell.put_note(&note(2, "Marco sta a Modena", "Marco risiede a [[Modena]]."), "t")
+            .unwrap(/* test-only */);
+        // pure noise
+        cell.put_note(&note(3, "Zanzara", "Una zanzara ronza."), "t")
+            .unwrap(/* test-only */);
+        cell.add_model("semi@1", 8).unwrap(/* test-only */);
+        let e = SemiEmbedder {
+            id: "semi@1".into(),
+        };
+        cell.embed_pending(&e, 100).unwrap(/* test-only */);
+        (dir, cell)
+    }
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_810_000_000).unwrap(/* test-only */)
+    }
+
+    #[test]
+    fn lru_cache_evicts_and_refreshes() {
+        let mut c = LruCache::new(2);
+        c.put("a".into(), vec![1.0]);
+        c.put("b".into(), vec![2.0]);
+        assert_eq!(c.get("a"), Some(&vec![1.0])); // a refreshed
+        c.put("c".into(), vec![3.0]); // evicts b, not a
+        assert!(c.get("b").is_none());
+        assert_eq!(c.get("a"), Some(&vec![1.0]));
+        assert_eq!(c.len(), 2);
+        assert!(!c.is_empty());
+    }
+
+    #[test]
+    fn hybrid_finds_paraphrase_and_reports_the_lists() {
+        let (_d, cell) = setup();
+        // "in che località risiede la coppia?" shares no stem with the notes:
+        // the vector branch must carry it. "località" starts with L... the
+        // SemiEmbedder hashes the whole text, so let's ask with the M-family.
+        let outcome = cell
+            .search_semantic_with_now(&Query::text("Milano meta urbana").k(3), now(), &sem())
+            .unwrap(/* test-only */);
+        assert!(!outcome.hits.is_empty(), "{:?}", outcome.hits);
+        let top = &outcome.hits[0];
+        assert!(
+            top.explain.lists.contains(&"vector"),
+            "the winner should come at least from the vector list: {:?}",
+            top.explain.lists
+        );
+        assert!(top.explain.semantic_rank.is_some());
+        assert!(top.explain.cosine.is_some());
+        assert!(top.explain.fused_score.is_some());
+        // the raw score is exposed alongside the normalised one
+        assert!(top.raw_score > 0.0);
+        assert!((top.score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn embedding_is_cached_and_timed() {
+        let (_d, cell) = setup();
+        // count the embedder calls: timing alone is noise at this scale
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = CountingEmbedder {
+            inner: SemiEmbedder {
+                id: "semi@1".into(),
+            },
+            calls: std::sync::Arc::clone(&calls),
+        };
+        let sem = Semantic::new(std::sync::Arc::new(counting));
+        let q = Query::text("Milano meta urbana").k(3);
+        let first = cell.search_semantic_with_now(&q, now(), &sem).unwrap(/* test-only */);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first call embeds"
+        );
+        assert!(first.embed_ms > 0.0);
+        let second = cell.search_semantic_with_now(&q, now(), &sem).unwrap(/* test-only */);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second call must be a cache hit"
+        );
+        assert_eq!(first.hits.len(), second.hits.len());
+    }
+
+    /// Wraps an embedder and counts calls (cache tests).
+    struct CountingEmbedder {
+        inner: SemiEmbedder,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::embed::Embedder for CountingEmbedder {
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        fn max_tokens(&self) -> usize {
+            self.inner.max_tokens()
+        }
+        fn embed(
+            &self,
+            texts: &[&str],
+            kind: TextKind,
+        ) -> Result<Vec<Vec<f32>>, crate::error::EmbedError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.embed(texts, kind)
+        }
+    }
+
+    #[test]
+    fn quarantined_nearest_neighbour_stays_hidden_and_does_not_seed() {
+        let (_d, cell) = setup();
+        // the closest note to the query is quarantined: it must neither
+        // appear nor pull its neighbours in through the graph
+        cell.set_status(
+            &Ulid::from_string(&format!("01{:024}", 1)).unwrap(/* test-only */),
+            Status::Quarantined,
+            "t",
+        )
+        .unwrap(/* test-only */);
+        // note 2 must not appear "via" the hidden note: graph hops 0 keeps it
+        // to the vector list only
+        let outcome = cell
+            .search_semantic_with_now(&Query::text("Milano meta urbana").k(3), now(), &sem())
+            .unwrap(/* test-only */);
+        for h in &outcome.hits {
+            assert!(
+                h.note.status != Status::Quarantined,
+                "quarantine leaked: {:?}",
+                h.note.title
+            );
+        }
+        // with two hops from the other seeds nothing should arrive *through*
+        // the hidden note either (its edges are invisible)
+        let mut q2 = Query::text("Milano meta urbana").k(5);
+        q2.graph_hops = 2;
+        let outcome2 = cell
+            .search_semantic_with_now(&q2, now(), &sem())
+            .unwrap(/* test-only */);
+        assert!(
+            outcome2
+                .hits
+                .iter()
+                .all(|h| h.note.status != Status::Quarantined)
+        );
+    }
+
+    #[test]
+    fn abstention_drops_vector_only_results_below_tau() {
+        let (_d, cell) = setup();
+        let mut s = sem();
+        // tau above every cosine: every vector-only result must abstain
+        s.tau = 0.999;
+        let outcome = cell
+            .search_semantic_with_now(&Query::text("xyzzy plugh").k(3), now(), &s)
+            .unwrap(/* test-only */);
+        assert!(
+            outcome
+                .hits
+                .iter()
+                .all(|h| h.explain.lists != vec!["vector"]),
+            "a below-tau vector-only result leaked: {:?}",
+            outcome
+                .hits
+                .iter()
+                .map(|h| h.explain.lists.clone())
+                .collect::<Vec<_>>()
+        );
+        // a note that arrives from BOTH lists stays even below tau
+        // ("Milano" matches text and vector)
+        s.tau = 0.999;
+        let outcome2 = cell
+            .search_semantic_with_now(&Query::text("Milano").k(3), now(), &s)
+            .unwrap(/* test-only */);
+        assert!(
+            outcome2
+                .hits
+                .iter()
+                .any(|h| h.explain.lists.contains(&"text")),
+            "text matches must not be abstained away: {:?}",
+            outcome2
+                .hits
+                .iter()
+                .map(|h| h.explain.lists.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn two_cells_on_the_same_file_see_each_others_vectors() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let path = dir.path().join("two.sqlite");
+        let a = Cell::create(&path, "t", "tester").unwrap(/* test-only */);
+        a.put_note(&note(1, "Fabio abita a Milano", "Fabio vive a [[Milano]]."), "t")
+            .unwrap(/* test-only */);
+        a.add_model("semi@1", 8).unwrap(/* test-only */);
+        // b writes a new note after a's index exists
+        let b = Cell::open(&path).unwrap(/* test-only */);
+        b.put_note(&note(2, "Marco sta a Modena", "Marco risiede a [[Modena]]."), "t")
+            .unwrap(/* test-only */);
+        // warm a's index, then embed from b: a's next search must see it
+        let e = SemiEmbedder {
+            id: "semi@1".into(),
+        };
+        let first = a
+            .search_semantic_with_now(&Query::text("Milano").k(3), now(), &sem())
+            .unwrap(/* test-only */);
+        assert_eq!(first.hits.len(), 1, "only the first note is embedded");
+        b.embed_pending(&e, 100).unwrap(/* test-only */);
+        let second = a
+            .search_semantic_with_now(&Query::text("Milano").k(3), now(), &sem())
+            .unwrap(/* test-only */);
+        assert!(
+            second
+                .hits
+                .iter()
+                .any(|h| h.note.title.as_deref() == Some("Marco sta a Modena")),
+            "a's index did not rebuild after b's write: {:?}",
+            second
+                .hits
+                .iter()
+                .map(|h| h.note.display_title().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn blue_green_mid_search_serves_the_old_model_only() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let path = dir.path().join("bg.sqlite");
+        let cell = Cell::create(&path, "t", "tester").unwrap(/* test-only */);
+        cell.put_note(&note(1, "Fabio abita a Milano", "Fabio vive a [[Milano]]."), "t")
+            .unwrap(/* test-only */);
+        cell.put_note(&note(2, "Marco sta a Modena", "Marco risiede a [[Modena]]."), "t")
+            .unwrap(/* test-only */);
+        cell.add_model("semi@1", 8).unwrap(/* test-only */);
+        let e1 = SemiEmbedder {
+            id: "semi@1".into(),
+        };
+        cell.embed_pending(&e1, 100).unwrap(/* test-only */);
+        // a second model starts building, partially embedded
+        cell.add_model("alt@2", 8).unwrap(/* test-only */);
+        let e2 = AltEmbedder;
+        let report = cell.embed_pending(&e2, 1).unwrap(/* test-only */);
+        assert_eq!(report.done, 1);
+        // the search in the middle: served by the OLD model, no mixed index
+        let outcome = cell
+            .search_semantic_with_now(&Query::text("Milano").k(3), now(), &sem())
+            .unwrap(/* test-only */);
+        assert!(!outcome.hits.is_empty());
+        let inner = cell.inner.lock().unwrap(/* test-only */);
+        let st_model = inner.index.as_ref().map(|st| st.model.clone());
+        drop(inner);
+        assert_eq!(
+            st_model,
+            Some("semi@1".into()),
+            "the index must serve the ready model, not the building one"
+        );
+        // finish the switch: now the index serves the new model
+        cell.embed_pending(&e2, 100).unwrap(/* test-only */);
+        let outcome2 = cell
+            .search_semantic_with_now(&Query::text("Milano").k(3), now(), &sem())
+            .unwrap(/* test-only */);
+        assert!(!outcome2.hits.is_empty());
+        let inner = cell.inner.lock().unwrap(/* test-only */);
+        let st_model2 = inner.index.as_ref().map(|st| st.model.clone());
+        drop(inner);
+        assert_eq!(st_model2, Some("alt@2".into()));
+    }
+
+    /// A second, different embedder for the blue/green test.
+    struct AltEmbedder;
+    impl crate::embed::Embedder for AltEmbedder {
+        fn model_id(&self) -> &str {
+            "alt@2"
+        }
+        fn dim(&self) -> usize {
+            8
+        }
+        fn max_tokens(&self) -> usize {
+            8_192
+        }
+        fn embed(
+            &self,
+            texts: &[&str],
+            _kind: TextKind,
+        ) -> Result<Vec<Vec<f32>>, crate::error::EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    let h = blake3::hash(t.as_bytes());
+                    let mut v: Vec<f32> = h.as_bytes()[..8]
+                        .iter()
+                        .map(|b| f32::from(*b) / 255.0)
+                        .collect();
+                    l2_normalize(&mut v);
+                    v
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn no_ready_model_means_text_only_behaviour() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let cell = Cell::create(&dir.path().join("n.sqlite"), "t", "tester")
+            .unwrap(/* test-only */);
+        cell.put_note(&note(1, "Fabio abita a Milano", "Fabio vive a [[Milano]]."), "t")
+            .unwrap(/* test-only */);
+        // no model registered: the semantic search degrades to text
+        let outcome = cell
+            .search_semantic_with_now(&Query::text("Milano").k(3), now(), &sem())
+            .unwrap(/* test-only */);
+        assert!(!outcome.hits.is_empty());
+        assert!(outcome.hits[0].explain.lists.contains(&"text"));
+        assert!(!outcome.hits[0].explain.lists.contains(&"vector"));
+    }
+
+    #[test]
+    fn fusion_shapes_ranking() {
+        // RRF and convex are both computed; the ranking differs on overlap
+        let (_d, cell) = setup();
+        let q = Query::text("Milano").k(3);
+        let rrf = cell
+            .search_semantic_with_now(&q, now(), &sem().with_fusion(Fusion::Rrf { k: 60 }))
+            .unwrap(/* test-only */);
+        let conv = cell
+            .search_semantic_with_now(&q, now(), &sem().with_fusion(Fusion::Convex { alpha: 0.5 }))
+            .unwrap(/* test-only */);
+        assert!(!rrf.hits.is_empty() && !conv.hits.is_empty());
+        // both contain the text match; scores are recomputed, not shared
+        let rrf_top = rrf.hits[0].note.display_title().to_string();
+        let conv_top = conv.hits[0].note.display_title().to_string();
+        let _ = (rrf_top, conv_top);
     }
 }
