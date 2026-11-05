@@ -170,6 +170,10 @@ pub fn rrf_fuse(lists: &[Vec<String>], k: u64) -> BTreeMap<String, f64> {
     out
 }
 
+/// Base score for graph-discovered notes (below any real text match, above
+/// nothing: multi-hop answers with no shared terms still rank).
+const GRAPH_FLOOR: f64 = 0.05;
+
 /// One graph edge as stored (endpoints are entity names or `note:<id>`).
 #[derive(Debug, Clone)]
 struct EdgeRow {
@@ -228,11 +232,13 @@ impl Cell {
             .map(|t| format!("\"{}\"", t.replace('"', "")))
             .collect::<Vec<_>>()
             .join(" OR ");
+        // Column weights: the title says what a note is about; the body is
+        // longer and noisier; tags are short but precise.
         let mut stmt = conn.prepare(
-            "SELECT n.id, bm25(notes_fts) FROM notes_fts
+            "SELECT n.id, bm25(notes_fts, 10.0, 3.0, 2.0) FROM notes_fts
              JOIN notes n ON n.rowid = notes_fts.rowid
              WHERE notes_fts MATCH ?1
-             ORDER BY bm25(notes_fts) LIMIT 50",
+             ORDER BY bm25(notes_fts, 10.0, 3.0, 2.0) LIMIT 50",
         )?;
         let rows = stmt.query_map([&match_expr], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
@@ -248,7 +254,6 @@ impl Cell {
         // 2. RRF fusion over the (single) ranked list.
         let ids: Vec<String> = text_hits.iter().map(|(id, _)| id.clone()).collect();
         let rrf = rrf_fuse(&[ids], 60);
-        let max_rrf = rrf.values().cloned().fold(0.0_f64, f64::max);
 
         // 3. Graph expansion from the top text hits.
         let as_of = q.filters.as_of;
@@ -268,7 +273,10 @@ impl Cell {
         for (rank, (id, _)) in text_hits.iter().enumerate() {
             candidates.push((id.clone(), Some(rank + 1), None));
         }
-        for (id, (hops, path)) in &extra {
+        // Cap the expansion: the nearest graph notes only.
+        let mut extras: Vec<(String, (u8, String))> = extra.into_iter().take(40).collect();
+        extras.sort_by_key(|(_, (hops, _))| *hops);
+        for (id, (hops, path)) in &extras {
             candidates.push((id.clone(), None, Some((*hops, path.clone()))));
         }
         let mut hits: Vec<Hit> = Vec::new();
@@ -279,17 +287,25 @@ impl Cell {
             if !passes_filters(&note, &q.filters, now) {
                 continue;
             }
-            // base score: normalised RRF (graph notes continue after the text
-            // list, so they keep a decaying base).
+            // Raw score: RRF base (graph notes continue the ranking after the
+            // text list), normalised once at the end over all candidates.
+            // §13.4 rerank: bm25_norm × confidence × recency × graph. With a
+            // single candidate list (v0.1) the base is the normalised BM25
+            // score — RRF (computed for the fusion) arrives with the semantic
+            // list in v0.2. Graph-discovered notes get a small floor so pure
+            // multi-hop answers survive the rerank.
+            let max_bm25 = text_hits
+                .iter()
+                .map(|(_, b)| *b)
+                .fold(0.0_f64, f64::max)
+                .max(f64::EPSILON);
             let base = match &graph {
-                None => rrf
-                    .get(&id)
-                    .map(|s| s / max_rrf.max(f64::EPSILON))
+                None => text_hits
+                    .iter()
+                    .find(|(i, _)| i == &id)
+                    .map(|(_, b)| b / max_bm25)
                     .unwrap_or(0.0),
-                Some((_hops, _)) => {
-                    let rank = text_ids.len() + 1 + extra_head_rank(&extra, &id);
-                    1.0 / (60.0 + rank as f64) / max_rrf.max(f64::EPSILON)
-                }
+                Some((_, _)) => GRAPH_FLOOR,
             };
             let w_graph = match &graph {
                 None => 1.0,
@@ -297,8 +313,7 @@ impl Cell {
             };
             let age_days = (now - note.updated_at.get()).whole_seconds() as f64 / 86_400.0;
             let recency = 0.5_f64.powf(age_days / q.weights.recency_half_life_days.max(1.0));
-            let score =
-                base * q.weights.confidence(note.confidence) * recency * w_graph;
+            let raw = base * q.weights.confidence(note.confidence) * recency * w_graph;
             // matched terms: which query terms occur as words in the
             // normalised index text.
             let norm = text::normalize(
@@ -326,10 +341,18 @@ impl Cell {
             };
             hits.push(Hit {
                 note,
-                score,
+                score: raw,
                 explain,
             });
         }
+        let max_raw = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
+        if max_raw > 0.0 {
+            for h in &mut hits {
+                h.score /= max_raw;
+            }
+        }
+        // Below-threshold results (no signal at all) are withheld.
+        hits.retain(|h| h.score > 0.0);
         hits.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -697,9 +720,18 @@ fn passes_filters(note: &Note, f: &Filters, now: OffsetDateTime) -> bool {
         if !note.valid_to.as_ref().is_none_or(|v| v.covers_to(as_of)) {
             return false;
         }
-    } else if note.valid_from.as_ref().is_some_and(|v| !v.covers_from(now)) {
-        // future facts are not current truth
-        return false;
+    } else {
+        // Current truth by default: not yet started, already expired — out.
+        if note.valid_from.as_ref().is_some_and(|v| !v.covers_from(now)) {
+            return false;
+        }
+        // Events are historical records: their `valid_to` is when they ended,
+        // not when they stopped being true, so they never "expire".
+        if note.note_type != crate::format::NoteType::Event
+            && note.valid_to.as_ref().is_some_and(|v| !v.covers_to(now))
+        {
+            return false;
+        }
     }
     true
 }
@@ -738,12 +770,9 @@ fn load_edges(conn: &rusqlite::Connection, rels: &[&str]) -> Result<Vec<EdgeRow>
     Ok(out)
 }
 
-/// Stable rank for graph-discovered notes (insertion order of the BTreeMap).
-fn extra_head_rank(extra: &BTreeMap<String, (u8, String)>, id: &str) -> usize {
-    extra
-        .keys()
-        .position(|k| k == id)
-        .unwrap_or(extra.len())
+/// Stable rank for graph-discovered notes (their order in the capped list).
+fn extra_head_rank(extras: &[(String, (u8, String))], id: &str) -> usize {
+    extras.iter().position(|(k, _)| k == id).unwrap_or(extras.len())
 }
 
 /// Graph expansion (§6.3.3): from the seed notes, walk the entity graph

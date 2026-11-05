@@ -1,5 +1,5 @@
 ---
-id: 01JC8ZB0000000000000000000B
+id: 01JC8ZB000000000000000000B
 type: fact
 title: Giulia lavora per Acme
 source: import:chatgpt/2026-11-04

@@ -100,9 +100,13 @@ impl YamlValue {
         })
     }
 
-    /// Canonical YAML flow-form scalar, as specified in §5.4.
+    /// Canonical YAML flow-form scalar, as specified in §5.4. Control
+    /// characters need double quotes (single-quoted YAML folds newlines and
+    /// would not survive a round trip).
     pub fn emit_scalar(s: &str) -> String {
-        if needs_quoting(s) {
+        if s.chars().any(|c| c.is_control()) {
+            format!("\"{}\"", escape_double(s))
+        } else if needs_quoting(s) {
             format!("'{}'", s.replace('\'', "''"))
         } else {
             s.to_string()
@@ -149,12 +153,43 @@ impl YamlValue {
     }
 }
 
+/// Escape a string for YAML double-quoted style.
+fn escape_double(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => {
+                let code = c as u32;
+                out.push_str(&format!("\\x{:02x}", code & 0xff));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Does a plain scalar need single quotes to survive a round trip? Follows the
 /// YAML plain-scalar rules that matter here: no `": "` or trailing `:`, no
 /// `" #"` or leading `#`, none of the flow/reserved indicators, and nothing
 /// that would read back as a bool, null or number.
 fn needs_quoting(s: &str) -> bool {
+    let starts_with_indicator = s
+        .chars()
+        .next()
+        .is_some_and(|c| {
+            matches!(
+                c,
+                '\'' | '"' | '!' | '&' | '*' | ',' | '>' | '?' | '|' | '%' | '@' | '`' | '#'
+                    | '[' | ']' | '{' | '}' | '-' | ':'
+            )
+        });
     if s.is_empty()
+        || starts_with_indicator
         || s.starts_with(' ')
         || s.ends_with(' ')
         || s.contains(": ")
@@ -165,18 +200,34 @@ fn needs_quoting(s: &str) -> bool {
             matches!(
                 c,
                 '{' | '}' | '[' | ']' | ',' | '&' | '*' | '?' | '|' | '<' | '>' | '=' | '!'
-                    | '%' | '@' | '`' | '"' | '\'' | '\n' | '\t'
+                    | '%' | '@' | '`' | '\n' | '\t'
             )
         })
     {
         return true;
     }
     let lower = s.to_ascii_lowercase();
+    // YAML core-schema numbers (and the 1.1 octal legacy: `0755`) must be
+    // quoted, or they would read back as integers.
+    let yaml_number = s.parse::<i64>().is_ok()
+        || s.parse::<f64>().is_ok()
+        || regex_number_like(s);
     matches!(
         lower.as_str(),
         "true" | "false" | "null" | "~" | "yes" | "no" | "on" | "off"
-    ) || s.parse::<i64>().is_ok()
-        || s.parse::<f64>().is_ok()
+    ) || yaml_number
+}
+
+/// Hex (`0x1f`), octal (`0o17`/legacy `0755`) and binary (`0b101`) forms.
+fn regex_number_like(s: &str) -> bool {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"^(?:0[xX][0-9a-fA-F]+|0[oO][0-7]+|0[bB][01]+|0[0-9]+)$",
+        )
+        .unwrap(/* static regex, valid by construction */)
+    });
+    re.is_match(s)
 }
 
 /// Parse a frontmatter string into ordered `(key, value)` pairs.

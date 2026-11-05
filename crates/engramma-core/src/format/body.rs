@@ -44,7 +44,7 @@ fn link_re() -> &'static Regex {
 fn tag_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?:^|\s)#([\p{L}\p{N}_]+(?:/[\p{L}\p{N}_]+)*)")
+        Regex::new(r"(?:^|\s)#([\p{L}\p{N}_][\p{L}\p{N}_-]*(?:/[\p{L}\p{N}_][\p{L}\p{N}_-]*)*)")
             .unwrap(/* static regex, valid by construction */)
     })
 }

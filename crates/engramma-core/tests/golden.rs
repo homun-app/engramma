@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Golden tests (§13.8): the Italian vault of ~60 notes (Fabio and Giulia's
+//! 2026) and 30 questions with expected answers, plus `verify` on the golden
+//! cell.
+
+use std::path::{Path, PathBuf};
+
+use engramma_core::format::{Lang, Note, ParseMode};
+use engramma_core::search::Query;
+use engramma_core::{Cell, Confidence};
+use serde::Deserialize;
+use time::OffsetDateTime;
+
+#[derive(Deserialize)]
+struct GoldenQuery {
+    #[allow(dead_code, reason = "kept for readability of the JSON file")]
+    id: u32,
+    #[serde(default)]
+    category: String,
+    q: String,
+    #[serde(default)]
+    expect: Vec<String>,
+    #[serde(default)]
+    expect_not: Vec<String>,
+    #[serde(default)]
+    expect_empty: bool,
+    #[serde(default)]
+    as_of: Option<String>,
+}
+
+fn golden_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden")
+}
+
+/// All `.md` files of the vault, in a deterministic order.
+fn vault_files() -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap(/* test-only */)
+            .map(|e| e.unwrap(/* test-only */).path())
+            .collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|e| e == "md") {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&golden_dir().join("vault-it"), &mut out);
+    out
+}
+
+/// The "now" of the golden questions: everything in the story has happened.
+fn golden_now() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(1_810_000_000).unwrap(/* fixed golden instant */)
+}
+
+/// Build the golden cell from the vault files (deterministic order).
+fn golden_cell() -> (tempfile::TempDir, Cell) {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let cell = Cell::create(&dir.path().join("famiglia.sqlite"), "famiglia", "golden")
+        .unwrap(/* test-only */);
+    let files = vault_files();
+    assert!(files.len() >= 55, "golden vault too small: {}", files.len());
+    for f in &files {
+        let text = std::fs::read_to_string(f).unwrap(/* test-only */);
+        let parsed = engramma_core::format::parse(&text, ParseMode::Strict)
+            .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+        let mut note = parsed.note;
+        // The vault is authored as of Nov 2026; keep created/updated as-is but
+        // ensure quarantine rules at birth (the two external notes are written
+        // already `quarantined`, so put_note accepts them as-is).
+        let _ = &mut note;
+        cell.put_note(&note, "golden").unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+    }
+    (dir, cell)
+}
+
+fn titles(hits: &[engramma_core::search::Hit]) -> Vec<String> {
+    hits.iter().map(|h| h.note.display_title().to_string()).collect()
+}
+
+#[test]
+fn golden_vault_imports_and_verifies() {
+    let (_d, cell) = golden_cell();
+    let meta = cell.meta().unwrap(/* test-only */);
+    assert_eq!(meta.get("cell_name").map(String::as_str), Some("famiglia"));
+    let report = cell.verify().unwrap(/* test-only */);
+    assert!(report.ok(), "verify failed: {:?}", report.mismatch);
+    assert!(report.ops >= 55);
+    // the two external notes are quarantined and stay so
+    let quarantined = cell
+        .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes WHERE status = 'quarantined'")
+        .unwrap(/* test-only */);
+    assert_eq!(quarantined[0], "2", "the two web rumors must be quarantined");
+}
+
+#[test]
+fn golden_queries() {
+    let (_d, cell) = golden_cell();
+    let raw = std::fs::read_to_string(golden_dir().join("queries.json")).unwrap(/* t */);
+    let queries: Vec<GoldenQuery> = serde_json::from_str(&raw).unwrap(/* test-only */);
+    assert!(queries.len() >= 25, "want at least 25 golden questions");
+
+    let mut failures: Vec<String> = Vec::new();
+    for gq in &queries {
+        let mut q = Query::text(&gq.q).k(5).graph_hops(2);
+        q.lang = Some(Lang::It);
+        if let Some(a) = &gq.as_of {
+            let v = engramma_core::Validity::parse(a)
+                .unwrap_or_else(|e| panic!("{}: {e}", gq.q));
+            q.filters.as_of = Some(v.start());
+        }
+        let hits = cell.search_with_now(&q, golden_now()).unwrap(/* test-only */);
+        let titles = titles(&hits);
+        if gq.expect_empty {
+            if !hits.is_empty() {
+                failures.push(format!(
+                    "[{}] `{}` should have no results, got {:?}",
+                    gq.category, gq.q, titles
+                ));
+            }
+            continue;
+        }
+        for wanted in &gq.expect {
+            let found = titles.iter().any(|t| t.to_lowercase().contains(&wanted.to_lowercase()));
+            if !found {
+                failures.push(format!(
+                    "[{}] `{}` expected a note matching {:?} in top 5, got {:?}",
+                    gq.category, gq.q, wanted, titles
+                ));
+            }
+        }
+        for banned in &gq.expect_not {
+            let leaked = titles.iter().any(|t| t.to_lowercase().contains(&banned.to_lowercase()));
+            if leaked {
+                failures.push(format!(
+                    "[{}] `{}` leaked quarantined note matching {:?} in {:?}",
+                    gq.category, gq.q, banned, titles
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} golden failures:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn golden_story_invariants() {
+    let (_d, cell) = golden_cell();
+    // Fabio lives in Milan now (valid_from September), and the old Roma note
+    // is superseded with closed validity.
+    let fabio_new = cell
+        .search_with_now(
+            &Query::text("Fabio abita Milano").k(3),
+            golden_now(),
+        )
+        .unwrap(/* test-only */);
+    assert!(titles(&fabio_new).iter().any(|t| t.contains("Fabio abita a Milano")));
+    let statuses = cell
+        .debug_column("SELECT status FROM notes WHERE title LIKE '%abitava%' ORDER BY id")
+        .unwrap(/* test-only */);
+    assert_eq!(statuses, vec!["superseded".to_string(), "superseded".to_string()]);
+
+    // multi-hop graph: the direct Fabio→Studio Rossi path is `works_at`;
+    // the partner path Fabio→Giulia is one step.
+    let path = cell.path("Fabio", "Studio Rossi").unwrap(/* test-only */);
+    let steps = path.expect("path Fabio→Studio Rossi exists");
+    assert!(steps.len() <= 4);
+    assert_eq!(steps.last().unwrap(/* test-only */).to, "Studio Rossi");
+    let partner = cell.path("Fabio", "Giulia").unwrap(/* test-only */);
+    assert!(partner.is_some_and(|p| p.len() == 1 && p[0].rel == "partner_of"));
+    // and the two-hop answer exists: Giulia -works_at-> Studio Rossi
+    let via_giulia = cell.path("Giulia", "Studio Rossi").unwrap(/* test-only */);
+    assert!(via_giulia.is_some_and(|p| p.len() == 1 && p[0].rel == "works_at"));
+    // no external note ever reaches active without confirm
+    let active_external = cell
+        .debug_column(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM notes WHERE confidence = 'external' AND status = 'active'",
+        )
+        .unwrap(/* test-only */);
+    assert_eq!(active_external[0], "0");
+
+    // confirm one quarantined note, then it appears
+    let qid = cell
+        .debug_column("SELECT id FROM notes WHERE status = 'quarantined' LIMIT 1")
+        .unwrap(/* test-only */)[0]
+        .clone();
+    let id = ulid_from(&qid);
+    cell.confirm(&id, "golden-test").unwrap(/* test-only */);
+    let now_active = cell
+        .debug_column(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM notes WHERE confidence = 'external' AND status = 'active'",
+        )
+        .unwrap(/* test-only */);
+    assert_eq!(now_active[0], "1");
+    // and the verify still passes after confirm
+    assert!(cell.verify().unwrap(/* test-only */).ok());
+}
+
+/// Small helper to rebuild a ULID from the golden ids.
+fn ulid_from(s: &str) -> ulid::Ulid {
+    ulid::Ulid::from_string(s).unwrap(/* test-only: from our own column */)
+}
+
+/// The golden corpus also feeds a Note round-trip check: every vault file is
+/// stable through parse→serialize.
+#[test]
+fn golden_files_are_canonical() {
+    let files = vault_files();
+    for f in &files {
+        let text = std::fs::read_to_string(f).unwrap(/* test-only */);
+        let parsed = engramma_core::format::parse(&text, ParseMode::Strict)
+            .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+        let canonical: Note = parsed.note;
+        let again = canonical.serialize().unwrap(/* test-only */);
+        assert_eq!(text, again, "{} is not canonical", f.display());
+    }
+}

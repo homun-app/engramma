@@ -280,6 +280,21 @@ impl Cell {
         &self.path
     }
 
+    /// Run a read-only query returning one TEXT column per row. Meant for
+    /// tests and tooling that need to compare states.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] when the query is not a single-column SELECT.
+    pub fn debug_column(&self, sql: &str) -> Result<Vec<String>, CellError> {
+        let inner = self.lock()?;
+        let mut stmt = inner.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .flatten()
+            .collect();
+        Ok(rows)
+    }
+
     /// Cell metadata (`cell_id`, `cell_name`, …).
     ///
     /// # Errors

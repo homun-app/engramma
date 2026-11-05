@@ -834,16 +834,11 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
     }
 
     let confidence = confidence.ok_or(FormatError::MissingField("confidence"))?;
+    // `external` notes default to `quarantined` at birth; an explicit other
+    // status is accepted because it may be the post-`confirm` (or superseded)
+    // state — the cell API, not the parser, owns the lifecycle.
     let status = match status {
-        Some(s) => {
-            if confidence == Confidence::External && s != Status::Quarantined {
-                return Err(bad_field(
-                    "status",
-                    "an `external` note can only be `quarantined`",
-                ));
-            }
-            s
-        }
+        Some(s) => s,
         None if confidence == Confidence::External => Status::Quarantined,
         None => Status::Active,
     };
@@ -886,7 +881,9 @@ fn bad_field(field: &'static str, message: impl Into<String>) -> FormatError {
 fn validate_tag_name(tag: &str) -> FormatResult<()> {
     let ok = !tag.is_empty()
         && tag.split('/').all(|seg| {
-            !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_')
+            let mut chars = seg.chars();
+            let first_ok = chars.next().is_some_and(|c| c.is_alphanumeric() || c == '_');
+            first_ok && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '-')
         });
     if ok {
         Ok(())
@@ -972,18 +969,14 @@ mod tests {
     }
 
     #[test]
-    fn external_with_active_is_rejected() {
-        let text = "---\n\
-             id: 01JC8Z6Q2W8M3N5V4T7Y9R0P1S\n\
-             type: fact\n\
-             source: import:web\n\
-             confidence: external\n\
-             status: active\n\
-             created_at: 2026-09-03T10:12:00Z\n\
-             updated_at: 2026-09-03T10:12:00Z\n\
-             ---\n\
-             No.\n";
-        assert!(parse(text, ParseMode::Strict).is_err());
+    fn external_with_active_is_a_confirmed_note() {
+        // After `confirm`, an external note is active: the file may say so.
+        let text = minimal_text()
+            .replace("confidence: stated", "confidence: external")
+            .replace("source: user", "source: import:web")
+            .replace("status: active", "status: active");
+        let p = parse(&text, ParseMode::Strict).unwrap(/* test-only */);
+        assert_eq!(p.note.status, Status::Active);
     }
 
     #[test]

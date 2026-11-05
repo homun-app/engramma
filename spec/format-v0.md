@@ -50,8 +50,10 @@ Validation rules (each violation is a readable error):
 2. A date field accepts `YYYY-MM-DD` or a UTC datetime; the `*_at` fields accept
    **only** a UTC datetime. On round-trip `valid_*` keeps the granularity it was
    written with; `*_at` always serialises as `YYYY-MM-DDTHH:MM:SSZ`.
-3. `confidence: external` forces `status: quarantined`; any other status written
-   in the header is an error.
+3. `confidence: external` notes are **born** `quarantined` (the cell API
+   enforces this at creation); after `confirm` they are `active`, and later
+   they can be `superseded` — so a file may legitimately carry `external` with
+   any status, and only the cell knows whether the lifecycle was followed.
 4. `status: deleted`/`superseded` is valid on parse (exports carry them) but the
    cell API never writes them directly through `put_note`.
 5. Unknown keys:
@@ -59,8 +61,9 @@ Validation rules (each violation is a readable error):
    - not starting with `x-`: **error** in strict mode (the default for Engramma
      folders); **warning + dropped** in import mode (Obsidian and friends).
 6. Duplicate keys are a YAML error (saphyr rejects them).
-7. `tags` entries must match `tag-name`: one or more segments of
-   `[A-Za-z0-9_]` (Unicode letters allowed), separated by `/`, no empty segment.
+7. `tags` entries must match `tag-name`: one or more segments separated by
+   `/`; each segment starts with a letter, digit or `_` (Unicode letters
+   allowed) and continues with letters, digits, `_` or `-`. No empty segment.
    `casa/milano` declares `casa` as parent of `casa/milano`.
 
 ## 2. Body: links
@@ -98,7 +101,7 @@ holds one relation per list item:
 ## 4. Body: tags
 
 `#tag/child` in body **text** (not in headings, not in code) adds the tag to the
-note's tags, exactly like a frontmatter tag. Tag characters as in §1.7. A tag
+note's tags, exactly like a frontmatter tag. Tag characters as in §1.7 (hyphens allowed after the first character). A tag
 must be preceded by start-of-text or whitespace and not be part of a `[[…]]`
 link.
 
@@ -115,8 +118,10 @@ link.
 3. Lists are flow: `[a, b]` after a tag name or a comma+space; empty list `[]`.
 4. Strings are emitted bare when they contain no `": "` sequence, no trailing
    `:`, no `" #"` sequence, no leading `#` or whitespace, none of
-   `{}[],&*?|<>=!%@\`"'` (and no tab/newline), are non-empty, and do not parse
-   as a bool, null or number; otherwise single-quoted with `''` escaping.
+   `{}[],&*?|<>=!%@\`` (and no tab/newline), are non-empty, and do not parse
+   as a bool, null or number; otherwise single-quoted with `''` escaping
+   (single and double quotes do not force quoting: they escape or pass
+   through).
 5. `x-*` values are emitted in flow style; maps `{k: v, k2: v2}` (insertion
    order), nested values by the same rules; null as `null`.
 6. `valid_*` serialise as written (date stays a date); `*_at` as

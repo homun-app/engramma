@@ -1,0 +1,240 @@
+[
+  {
+    "id": 1,
+    "category": "fattuale",
+    "q": "dove abita Fabio",
+    "expect": [
+      "Fabio abita a Milano"
+    ]
+  },
+  {
+    "id": 2,
+    "category": "fattuale",
+    "q": "chi è il partner di Fabio",
+    "expect": [
+      "Giulia"
+    ]
+  },
+  {
+    "id": 3,
+    "category": "fattuale",
+    "q": "dove lavora Giulia",
+    "expect": [
+      "Giulia lavora allo Studio Rossi"
+    ]
+  },
+  {
+    "id": 4,
+    "category": "fattuale",
+    "q": "che lavoro fa Fabio",
+    "expect": [
+      "Fabio lavora allo Studio Rossi"
+    ]
+  },
+  {
+    "id": 5,
+    "category": "fattuale",
+    "q": "chi è Marco Rossi",
+    "expect": [
+      "Marco Rossi"
+    ]
+  },
+  {
+    "id": 6,
+    "category": "fattuale",
+    "q": "di cosa si occupa Elena Bianchi",
+    "expect": [
+      "Elena Bianchi"
+    ]
+  },
+  {
+    "id": 7,
+    "category": "fattuale",
+    "q": "quando è il compleanno di Fabio",
+    "expect": [
+      "compleanno di Fabio"
+    ]
+  },
+  {
+    "id": 8,
+    "category": "fattuale",
+    "q": "che musica suona Giulia",
+    "expect": [
+      "pianoforte"
+    ]
+  },
+  {
+    "id": 9,
+    "category": "fattuale",
+    "q": "dove si allena Fabio",
+    "expect": [
+      "Palestra"
+    ]
+  },
+  {
+    "id": 10,
+    "category": "fattuale",
+    "q": "qual è il ristorante preferito di Fabio e Giulia",
+    "expect": [
+      "Trattoria da Lucrezia"
+    ]
+  },
+  {
+    "id": 11,
+    "category": "temporale",
+    "q": "dove abitava Fabio",
+    "as_of": "2026-08-15",
+    "expect": [
+      "Fabio abitava a Roma"
+    ]
+  },
+  {
+    "id": 12,
+    "category": "temporale",
+    "q": "in che quartiere stava Fabio a Roma",
+    "as_of": "2026-08-15",
+    "expect": [
+      "Fabio abitava a Roma"
+    ]
+  },
+  {
+    "id": 13,
+    "category": "temporale",
+    "q": "dove lavorava Fabio prima",
+    "as_of": "2026-08-15",
+    "expect": [
+      "TaskForce"
+    ]
+  },
+  {
+    "id": 14,
+    "category": "temporale",
+    "q": "cosa è successo a giugno",
+    "as_of": "2026-06-30",
+    "expect": [
+      "Matrimonio di Sara"
+    ]
+  },
+  {
+    "id": 15,
+    "category": "aggiornamento",
+    "q": "cosa mangia Fabio adesso",
+    "expect": [
+      "onnivoro"
+    ]
+  },
+  {
+    "id": 16,
+    "category": "aggiornamento",
+    "q": "Fabio è ancora vegetariano",
+    "expect": [
+      "onnivoro"
+    ]
+  },
+  {
+    "id": 17,
+    "category": "aggiornamento",
+    "q": "dove vive Fabio dopo il trasloco",
+    "expect": [
+      "Milano"
+    ]
+  },
+  {
+    "id": 18,
+    "category": "multi-salto",
+    "q": "dove lavora il partner di Fabio",
+    "expect": [
+      "Studio Rossi"
+    ]
+  },
+  {
+    "id": 19,
+    "category": "multi-salto",
+    "q": "chi è la sorella della partner di Fabio",
+    "expect": [
+      "Sara"
+    ]
+  },
+  {
+    "id": 20,
+    "category": "multi-salto",
+    "q": "chi è il capoprogetto di Fabio",
+    "expect": [
+      "Marco Rossi"
+    ]
+  },
+  {
+    "id": 21,
+    "category": "quarantena",
+    "q": "ha vinto una gara di crossfit",
+    "expect_not": [
+      "crossfit"
+    ]
+  },
+  {
+    "id": 22,
+    "category": "quarantena",
+    "q": "Giulia andrà a lavorare a Londra",
+    "expect_not": [
+      "Foster"
+    ]
+  },
+  {
+    "id": 23,
+    "category": "astensione",
+    "q": "quale automobile guida",
+    "expect_empty": true
+  },
+  {
+    "id": 24,
+    "category": "astensione",
+    "q": "il nome del gatto",
+    "expect_empty": true
+  },
+  {
+    "id": 25,
+    "category": "astensione",
+    "q": "quale banca usa la coppia per il mutuo",
+    "expect_empty": true
+  },
+  {
+    "id": 26,
+    "category": "fattuale",
+    "q": "il trasloco da Roma",
+    "expect": [
+      "trasloco"
+    ]
+  },
+  {
+    "id": 27,
+    "category": "fattuale",
+    "q": "come è andato il viaggio a Torino",
+    "expect": [
+      "Viaggio a Torino"
+    ]
+  },
+  {
+    "id": 28,
+    "category": "fattuale",
+    "q": "gli esami del sangue di ottobre",
+    "expect": [
+      "checkup"
+    ]
+  },
+  {
+    "id": 29,
+    "category": "fattuale",
+    "q": "chi ha regalato il basilico",
+    "expect": [
+      "vicina"
+    ]
+  },
+  {
+    "id": 30,
+    "category": "fattuale",
+    "q": "il progetto di Fabio in studio",
+    "expect": [
+      "Aurora"
+    ]
+  }
+]

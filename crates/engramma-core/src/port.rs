@@ -109,13 +109,20 @@ pub fn export(cell: &Cell, dir: &Path) -> Result<ExportSummary, PortError> {
         }
         let type_dir = dir.join(note.note_type.as_str());
         fs::create_dir_all(&type_dir)?;
-        let name = format!("{}-{}.md", slugify(note.display_title()), &id[..8]);
+        let base = format!("{}-{}", slugify(note.display_title()), &id[..8]);
         let text = note
             .serialize()
             .map_err(|e| PortError::Note {
-                path: type_dir.join(&name),
+                path: type_dir.join(&base),
                 source: e,
             })?;
+        // Same slug and id8 are rare but possible: keep names unique.
+        let mut name = format!("{base}.md");
+        let mut n = 2;
+        while type_dir.join(&name).exists() {
+            name = format!("{base}-{n}.md");
+            n += 1;
+        }
         if let Err(e) = fs::write(type_dir.join(&name), text) {
             summary.errors.push(format!("{}: {e}", type_dir.join(name).display()));
         } else {
@@ -222,8 +229,26 @@ pub fn import_cell(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSummary
                     summary.skipped.push(format!("{}: tombstone", f.relative));
                     continue;
                 }
-                match cell.put_note(&parsed.note, actor) {
-                    Ok(()) => summary.imported += 1,
+                let mut note = parsed.note.clone();
+                // `put_note` always births `external` notes in quarantine;
+                // a file with `external` + another status describes a note
+                // that was confirmed later: rebuild that with `confirm` so the
+                // log keeps the invariant.
+                let needs_confirm = note.confidence == crate::format::Confidence::External
+                    && note.status != Status::Quarantined;
+                if note.confidence == crate::format::Confidence::External {
+                    note.status = Status::Quarantined;
+                }
+                match cell.put_note(&note, actor) {
+                    Ok(()) => {
+                        if needs_confirm {
+                            if let Err(e) = cell.confirm(&note.id, actor) {
+                                summary.errors.push(format!("{}: {e}", f.relative));
+                                continue;
+                            }
+                        }
+                        summary.imported += 1;
+                    }
                     Err(e) => summary.errors.push(format!("{}: {e}", f.relative)),
                 }
                 summary.warnings.extend(parsed.warnings);

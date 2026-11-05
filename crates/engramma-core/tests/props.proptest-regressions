@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6eff93b640a4bc2cecb9502468870c3d9496706e654a51e3ef56530acb9acc13 # shrinks to seed = 5057102026775464
+cc 1c29e8336e817a32844e9709f2e5a03c611806ef4828578e0dd26457dbc8a601 # shrinks to seed = 5241886955120911949
+cc 7f8fcd8763c16fa16ece47f7ed06d8f3bbd32a131fc8aaa2788b3b61a3ce18fb # shrinks to note = Note { id: Ulid(2243072242887045535525174414223081472), note_type: Fact, title: None, body: "", tags: ["0o0"], scope: None, lang: None, source: "0", confidence: Stated, status: Active, valid_from: None, valid_to: None, supersedes: [Ulid(2243072242887045535525174414223081472)], created_at: At(2023-11-14 22:30:00.0 +00:00:00), updated_at: At(2023-11-14 22:30:00.0 +00:00:00), extensions: [] }
+cc 75936345a54389cf66f56a0a20ac49378bc1994cd9b2779c4f8d55921b6957fb # shrinks to seed = 8814876244029561882
+cc 85a221c82de83e0617e37da2e5fed418d23bd7323eab2be0449e74218f74d7f5 # shrinks to note = Note { id: Ulid(2243072242887045535525174414223081472), note_type: Fact, title: Some("'"), body: "", tags: [], scope: None, lang: None, source: "_", confidence: Stated, status: Active, valid_from: None, valid_to: None, supersedes: [Ulid(2243072242887045535525174414223081472)], created_at: At(2023-11-14 22:30:00.0 +00:00:00), updated_at: At(2023-11-14 22:30:00.0 +00:00:00), extensions: [] }

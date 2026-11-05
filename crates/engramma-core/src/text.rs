@@ -78,6 +78,24 @@ pub fn normalize_for_index(title: Option<&str>, body: &str, lang: Option<Lang>) 
 /// language (queries are short) — the token is searched in its raw form and in
 /// the stem of every supported language (deduplicated). Recall-oriented: BM25
 /// still ranks better-fitting documents first.
+/// Italian and English question words and fillers: they match almost every
+/// document and carry no signal, so they are dropped from queries.
+const STOPWORDS: &[&str] = &[
+    // italiano
+    "dove", "chi", "che", "cosa", "quando", "quale", "quali", "quanto", "quanti", "quanta",
+    "quante", "come", "perche", "quale", "e", "ed", "o", "ma", "non", "si", "no", "io", "tu",
+    "lui", "lei", "noi", "voi", "loro", "il", "lo", "la", "i", "gli", "le", "un", "uno", "una",
+    "di", "a", "al", "allo", "alla", "ai", "agli", "alle", "da", "dal", "dallo", "dalla", "dai",
+    "dagli", "dalle", "in", "nel", "nello", "nella", "nei", "negli", "nelle", "con", "su", "sul",
+    "sullo", "sulla", "sui", "sugli", "sulle", "per", "tra", "fra", "del", "dello", "della",
+    "dei", "degli", "delle", "era", "sono", "stato", "stata", "stati", "state", "essere",
+    "adesso", "ancora", "prima", "dopo", "sempre", "mai", "poi", "gia", "qui", "la",
+    // inglese
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "by", "is", "are", "was",
+    "were", "be", "been", "who", "whats", "what", "where", "when", "why", "how", "does", "do",
+    "did", "his", "her", "their", "its", "and", "or", "but", "not", "now", "still", "then",
+];
+
 pub fn query_terms(text: &str, lang: Option<Lang>) -> Vec<String> {
     let lowered = text.to_lowercase();
     let tokens = tokenize(&lowered);
@@ -89,12 +107,27 @@ pub fn query_terms(text: &str, lang: Option<Lang>) -> Vec<String> {
     };
     let detected = lang.or_else(|| detect_lang(text));
     for token in tokens {
+        // Stopwords are dropped both raw and after stemming ("è" stems to
+        // "e" in Italian: both spellings must go).
+        if STOPWORDS.contains(&token) {
+            continue;
+        }
         match detected {
-            Some(l) => push(normalize(token, Some(l))),
+            Some(l) => {
+                let stem = normalize(token, Some(l));
+                if !STOPWORDS.contains(&stem.as_str()) {
+                    push(stem);
+                }
+            }
             None => {
-                push(token.to_string());
+                let mut stems: Vec<String> = vec![token.to_string()];
                 for l in [Lang::It, Lang::En, Lang::Fr, Lang::De, Lang::Es, Lang::Pt] {
-                    push(normalize(token, Some(l)));
+                    stems.push(normalize(token, Some(l)));
+                }
+                for stem in stems {
+                    if !STOPWORDS.contains(&stem.as_str()) {
+                        push(stem);
+                    }
                 }
             }
         }
