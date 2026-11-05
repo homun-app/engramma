@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use engramma_core::format::{At, Lang, Note, NoteType};
-use engramma_core::search::Query;
-use engramma_core::{Cell, Confidence, Status};
+use engramma_core::search::{Fusion, Mode, Query, Semantic};
+use engramma_core::{Cell, Confidence, Embedder, Status};
 use time::OffsetDateTime;
 
 /// Fixed seed: same corpus on every run, on every machine.
@@ -124,6 +124,8 @@ struct Question {
     /// Acceptable answer note ids (the fact, and where present the person
     /// note, whose body carries the same information).
     expect_ids: Vec<String>,
+    /// Benchmark category: fattuali | parafrasi | multi-salto | inglese.
+    category: &'static str,
 }
 
 struct Corpus {
@@ -359,6 +361,7 @@ fn build_corpus(target: usize, uniform_updated_at: bool) -> Corpus {
                     text: format!("che cosa mangia volentieri {name}"),
                     as_of: None,
                     expect_ids: vec![cur_p.to_string()],
+                    category: "fattuali",
                 });
             }
         }
@@ -382,21 +385,61 @@ fn build_corpus(target: usize, uniform_updated_at: bool) -> Corpus {
 
         // A couple of questions per person (sampled).
         match rng.below(6) {
-            0 => questions.push(Question {
-                text: format!("dove abita {name}"),
-                as_of: None,
-                expect_ids: vec![cur_id.to_string(), person_id.to_string()],
-            }),
-            1 => questions.push(Question {
-                text: format!("dove lavora {name}"),
-                as_of: None,
-                expect_ids: vec![cur_work.to_string(), person_id.to_string()],
-            }),
-            2 => questions.push(Question {
-                text: format!("dove abitava {name}"),
-                as_of: Some(validity(2022, 6, 15).start()),
-                expect_ids: vec![old_id.to_string()],
-            }),
+            0 => {
+                questions.push(Question {
+                    text: format!("dove abita {name}"),
+                    as_of: None,
+                    expect_ids: vec![cur_id.to_string(), person_id.to_string()],
+                    category: "fattuali",
+                });
+                // paraphrase at a fixed model: no shared root with the note
+                questions.push(Question {
+                    text: format!("in quale citta risiede {name}"),
+                    as_of: None,
+                    expect_ids: vec![cur_id.to_string(), person_id.to_string()],
+                    category: "parafrasi",
+                });
+                questions.push(Question {
+                    text: format!("Where does {} live these days?", name),
+                    as_of: None,
+                    expect_ids: vec![cur_id.to_string(), person_id.to_string()],
+                    category: "inglese",
+                });
+            }
+            1 => {
+                questions.push(Question {
+                    text: format!("dove lavora {name}"),
+                    as_of: None,
+                    expect_ids: vec![cur_work.to_string(), person_id.to_string()],
+                    category: "fattuali",
+                });
+                questions.push(Question {
+                    text: format!("in quale impiego e' impegnato {name}"),
+                    as_of: None,
+                    expect_ids: vec![cur_work.to_string(), person_id.to_string()],
+                    category: "parafrasi",
+                });
+                questions.push(Question {
+                    text: format!("Where does {} work?", name),
+                    as_of: None,
+                    expect_ids: vec![cur_work.to_string(), person_id.to_string()],
+                    category: "inglese",
+                });
+            }
+            2 => {
+                questions.push(Question {
+                    text: format!("dove abitava {name}"),
+                    as_of: Some(validity(2022, 6, 15).start()),
+                    expect_ids: vec![old_id.to_string()],
+                    category: "fattuali",
+                });
+                questions.push(Question {
+                    text: format!("qual era la residenza precedente di {name}"),
+                    as_of: Some(validity(2022, 6, 15).start()),
+                    expect_ids: vec![old_id.to_string()],
+                    category: "parafrasi",
+                });
+            }
             _ => {}
         }
     }
@@ -481,6 +524,7 @@ fn build_corpus(target: usize, uniform_updated_at: bool) -> Corpus {
                     text: format!("dove lavora il partner di {name}"),
                     as_of: None,
                     expect_ids: ids,
+                    category: "multi-salto",
                 });
             }
         }
@@ -524,9 +568,39 @@ struct RunReport {
     mrr: f64,
     questions: usize,
     file_bytes: u64,
+    // v0.2 semantic metrics (None when no embedder ran)
+    semantic: Option<SemanticReport>,
 }
 
+/// The v0.2 columns: embedding throughput, index build and memory, vector
+/// and hybrid latencies, per-mode quality.
+#[derive(Default, Clone)]
+struct SemanticReport {
+    model: String,
+    embed_notes_per_s: f64,
+    index_build_ms: f64,
+    index_mem_mb: f64,
+    vector_p50_ms: f64,
+    vector_p95_ms: f64,
+    hybrid_warm_p50_ms: f64,
+    hybrid_warm_p95_ms: f64,
+    hybrid_cold_p50_ms: f64,
+    hybrid_cold_p95_ms: f64,
+    /// (mode, category) -> (recall@5, MRR, questions)
+    quality: Vec<(String, String, f64, f64, usize)>,
+}
+
+#[allow(clippy::too_many_lines)]
 fn run(target: usize, dir: &std::path::Path, uniform_updated_at: bool) -> RunReport {
+    run_semantic(target, dir, uniform_updated_at, None)
+}
+
+fn run_semantic(
+    target: usize,
+    dir: &std::path::Path,
+    uniform_updated_at: bool,
+    embedder: Option<&std::sync::Arc<dyn Embedder>>,
+) -> RunReport {
     let corpus = build_corpus(target, uniform_updated_at);
     let db = dir.join(format!("bench-{target}.sqlite"));
     let _ = std::fs::remove_file(&db);
@@ -595,6 +669,164 @@ fn run(target: usize, dir: &std::path::Path, uniform_updated_at: bool) -> RunRep
         answered += 1;
     }
 
+    // ------------------------------------------------------------------
+    // v0.2: the semantic pass (skipped without an embedder)
+    // ------------------------------------------------------------------
+    let semantic = embedder.map(|embedder| {
+        let model = embedder.model_id().to_string();
+        cell.add_model(&model, embedder.dim())
+            .expect(/* bench embedder is valid */ "add model");
+        // embedding throughput: batched, threads (the embedder decides)
+        let t0 = Instant::now();
+        let mut total_done = 0_usize;
+        loop {
+            let r = cell
+                .embed_pending(embedder.as_ref(), 256)
+                .expect(/* valid notes */ "embed");
+            total_done += r.done;
+            if r.done == 0 || r.remaining == 0 {
+                break;
+            }
+        }
+        let embed_s = t0.elapsed().as_secs_f64();
+        let embed_notes_per_s = total_done as f64 / embed_s.max(1e-9);
+
+        // index build: the first semantic search builds it (lazy by design)
+        let mut first = Query::text("Milano").k(5);
+        first.lang = Some(Lang::It);
+        let sem = Semantic::new(std::sync::Arc::clone(embedder));
+        let t_build = Instant::now();
+        let _ = cell
+            .search_semantic(&first, &sem)
+            .expect(/* valid */ "search");
+        let index_build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
+        // index memory: int8 codes + f32 scales + row bookkeeping (~40 B/row)
+        let vecs: usize = cell
+            .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM note_vectors")
+            .map(|v| v.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0))
+            .unwrap_or(0);
+        let index_mem_mb = (vecs * (embedder.dim() + 4 + 40)) as f64 / 1e6;
+
+        let now = OffsetDateTime::from_unix_timestamp(1_810_000_000).expect(/* fixed */ "ts");
+        let mk_query = |q: &Question| {
+            let mut query = Query::text(&q.text).k(5).graph_hops(2);
+            query.lang = Some(Lang::It);
+            if let Some(a) = q.as_of {
+                query.filters.as_of = Some(a);
+            }
+            query
+        };
+        // cold pass: query embedding included (LRU empty)
+        let mut cold: Vec<f64> = Vec::new();
+        for q in &corpus.questions {
+            if q.expect_ids.is_empty() {
+                continue;
+            }
+            let t = Instant::now();
+            let _ = cell.search_semantic_with_now(&mk_query(q), now, &sem);
+            cold.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        // warm pass: same queries again — pure search, cache hits
+        let mut warm: Vec<f64> = Vec::new();
+        for q in &corpus.questions {
+            if q.expect_ids.is_empty() {
+                continue;
+            }
+            let t = Instant::now();
+            let _ = cell.search_semantic_with_now(&mk_query(q), now, &sem);
+            warm.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        // pure vector mode latencies (warm)
+        let sem_vec = sem.clone().with_mode(Mode::Vector);
+        let mut vlat: Vec<f64> = Vec::new();
+        for q in &corpus.questions {
+            if q.expect_ids.is_empty() {
+                continue;
+            }
+            let t = Instant::now();
+            let _ = cell.search_semantic_with_now(&mk_query(q), now, &sem_vec);
+            vlat.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        // per-mode quality by category
+        let mut quality: Vec<(String, String, f64, f64, usize)> = Vec::new();
+        let mut score_mode = |name: &str, mode: char, fusion: Option<Fusion>| {
+            let categories = ["fattuali", "parafrasi", "multi-salto", "inglese"];
+            for cat in categories {
+                let (recall, mrr, n) = {
+                    let mut hits5 = 0_usize;
+                    let mut mrr_sum = 0.0_f64;
+                    let mut answered = 0_usize;
+                    for q in &corpus.questions {
+                        if q.expect_ids.is_empty() || q.category != cat {
+                            continue;
+                        }
+                        let results = match mode {
+                            't' => cell
+                                .search_with_now(&mk_query(q), now)
+                                .expect(/* valid */ "search"),
+                            'v' => {
+                                cell.search_semantic_with_now(&mk_query(q), now, &sem_vec)
+                                    .expect(/* valid */ "search")
+                                    .hits
+                            }
+                            _ => {
+                                let s = match fusion {
+                                    Some(f) => sem.clone().with_fusion(f),
+                                    None => sem.clone(),
+                                };
+                                cell.search_semantic_with_now(&mk_query(q), now, &s)
+                                    .expect(/* valid */ "search")
+                                    .hits
+                            }
+                        };
+                        let ids: Vec<String> =
+                            results.iter().map(|h| h.note.id.to_string()).collect();
+                        if let Some(rank) = ids.iter().position(|i| q.expect_ids.contains(i)) {
+                            hits5 += 1;
+                            mrr_sum += 1.0 / (rank + 1) as f64;
+                        }
+                        answered += 1;
+                    }
+                    (
+                        if answered == 0 {
+                            0.0
+                        } else {
+                            hits5 as f64 / answered as f64
+                        },
+                        if answered == 0 {
+                            0.0
+                        } else {
+                            mrr_sum / answered as f64
+                        },
+                        answered,
+                    )
+                };
+                quality.push((name.to_string(), cat.to_string(), recall, mrr, n));
+            }
+        };
+        score_mode("testo", 't', None);
+        score_mode("vettori", 'v', None);
+        score_mode("rrf", 'h', Some(Fusion::Rrf { k: 60 }));
+        score_mode("convex-0.3", 'h', Some(Fusion::Convex { alpha: 0.3 }));
+        score_mode("convex-0.5", 'h', Some(Fusion::Convex { alpha: 0.5 }));
+        score_mode("convex-0.7", 'h', Some(Fusion::Convex { alpha: 0.7 }));
+
+        SemanticReport {
+            model,
+            embed_notes_per_s,
+            index_build_ms,
+            index_mem_mb,
+            vector_p50_ms: percentile(vlat.clone(), 0.5),
+            vector_p95_ms: percentile(vlat.clone(), 0.95),
+            hybrid_warm_p50_ms: percentile(warm.clone(), 0.5),
+            hybrid_warm_p95_ms: percentile(warm.clone(), 0.95),
+            hybrid_cold_p50_ms: percentile(cold.clone(), 0.5),
+            hybrid_cold_p95_ms: percentile(cold.clone(), 0.95),
+            quality,
+        }
+    });
+
     // file size (checkpoint the WAL first, like a rest after a bulk load)
     cell.checkpoint()
         .expect(/* single bench writer */ "checkpoint");
@@ -626,6 +858,7 @@ fn run(target: usize, dir: &std::path::Path, uniform_updated_at: bool) -> RunRep
         },
         questions: answered,
         file_bytes,
+        semantic,
     }
 }
 
@@ -649,13 +882,39 @@ fn median_report(variant: &'static str, runs: &[RunReport]) -> RunReport {
         mrr: pick(|r| r.mrr),
         questions: runs[0].questions,
         file_bytes: runs.iter().map(|r| r.file_bytes).max().unwrap_or(0),
+        semantic: median_semantic(runs),
     }
+}
+
+/// Median of the semantic scalars; the per-mode quality table comes from the
+/// first run (deterministic corpus: the numbers do not move between runs).
+fn median_semantic(runs: &[RunReport]) -> Option<SemanticReport> {
+    let with_sem: Vec<&SemanticReport> = runs.iter().filter_map(|r| r.semantic.as_ref()).collect();
+    if with_sem.is_empty() {
+        return None;
+    }
+    let base = with_sem[0].clone();
+    let pick = |f: fn(&SemanticReport) -> f64| median(with_sem.iter().map(|r| f(r)).collect());
+    Some(SemanticReport {
+        model: base.model,
+        embed_notes_per_s: pick(|r| r.embed_notes_per_s),
+        index_build_ms: pick(|r| r.index_build_ms),
+        index_mem_mb: pick(|r| r.index_mem_mb),
+        vector_p50_ms: pick(|r| r.vector_p50_ms),
+        vector_p95_ms: pick(|r| r.vector_p95_ms),
+        hybrid_warm_p50_ms: pick(|r| r.hybrid_warm_p50_ms),
+        hybrid_warm_p95_ms: pick(|r| r.hybrid_warm_p95_ms),
+        hybrid_cold_p50_ms: pick(|r| r.hybrid_cold_p50_ms),
+        hybrid_cold_p95_ms: pick(|r| r.hybrid_cold_p95_ms),
+        quality: base.quality,
+    })
 }
 
 fn markdown(reports: &[RunReport], runs: usize) -> String {
     let mut out = format!(
-        "# Benchmark Engramma v0.1.1\n\nGenerato da `engramma-bench` (seme fisso, corpus sintetico italiano; macchina: vedi REPORT.md). \
-         Ogni riga è la **mediana di {runs} giri**. Obiettivi del §11 del documento di progetto in fondo.\n\n\
+        "# Benchmark Engramma v0.2\n\nGenerato da `engramma-bench` (seme fisso, corpus sintetico italiano; macchina: vedi REPORT.md). \
+         Ogni riga è la **mediana di {runs} giri**. Le righe `sem-*` misurano il ramo vettoriale (corpus vivo). \
+         Obiettivi del §11 del documento di progetto in fondo.\n\n\
          | corpus | note | inserimento (note/s) | apertura cella (ms) | ricerca p50 (ms) | ricerca p95 (ms) | solo testo p50 (ms) | richiamo@5 | MRR | domande | file (MB) |\n\
          |---|---|---|---|---|---|---|---|---|---|---|\n"
     );
@@ -674,6 +933,72 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
             r.questions,
             r.file_bytes as f64 / 1e6,
         ));
+    }
+    // semantic table
+    let sem: Vec<&SemanticReport> = reports.iter().filter_map(|r| r.semantic.as_ref()).collect();
+    if !sem.is_empty() {
+        out.push_str(
+            "\n## Ramo vettoriale (v0.2)\n\n\
+             | modello | note | embedding (note/s) | costruzione indice (ms) | memoria indice (MB) | vettori p50 (ms) | vettori p95 (ms) | ibrido caldo p50 (ms) | ibrido caldo p95 (ms) | ibrido con embedding p50 (ms) | ibrido con embedding p95 (ms) |\n\
+             |---|---|---|---|---|---|---|---|---|---|---|\n",
+        );
+        for r in reports {
+            let Some(sr) = &r.semantic else { continue };
+            out.push_str(&format!(
+                "| {} | {} | {:.0} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |\n",
+                sr.model,
+                r.notes,
+                sr.embed_notes_per_s,
+                sr.index_build_ms,
+                sr.index_mem_mb,
+                sr.vector_p50_ms,
+                sr.vector_p95_ms,
+                sr.hybrid_warm_p50_ms,
+                sr.hybrid_warm_p95_ms,
+                sr.hybrid_cold_p50_ms,
+                sr.hybrid_cold_p95_ms,
+            ));
+        }
+        // per-mode quality (first semantic report per size)
+        out.push_str(
+            "\nRichiamo@5 / MRR per modalità e categoria (domande generatrici, mediana dei giri):\n\n\
+             | note | modalità | fattuali | parafrasi | multi-salto | inglese |\n\
+             |---|---|---|---|---|---|\n",
+        );
+        let mut seen_sizes: Vec<usize> = Vec::new();
+        for r in reports {
+            let Some(sr) = &r.semantic else { continue };
+            if seen_sizes.contains(&r.notes) {
+                continue;
+            }
+            seen_sizes.push(r.notes);
+            let modes = [
+                "testo",
+                "vettori",
+                "rrf",
+                "convex-0.3",
+                "convex-0.5",
+                "convex-0.7",
+            ];
+            for m in modes {
+                let mut cells = Vec::new();
+                for cat in ["fattuali", "parafrasi", "multi-salto", "inglese"] {
+                    let cell = sr
+                        .quality
+                        .iter()
+                        .find(|(mode, c, _, _, _)| mode == m && c == cat)
+                        .map(|(_, _, r5, mrr, n)| format!("{r5:.3}/{mrr:.3} ({n})"))
+                        .unwrap_or_else(|| "—".into());
+                    cells.push(cell);
+                }
+                out.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    r.notes,
+                    m,
+                    cells.join(" | ")
+                ));
+            }
+        }
     }
     out.push_str(
         "\nDue varianti per dimensione: **viva** — i fatti correnti hanno `updated_at` recente (ottobre 2026, come una memoria viva) e i riempitivi datano 2025, quindi il peso di recenza lavora; **uniform** — lo stesso `updated_at` per ogni nota, così il ranking è solo testo+grafo (quanto del richiamo dipendeva dalla recenza si vede dal confronto). \
@@ -721,6 +1046,26 @@ fn parse_args(args: impl Iterator<Item = String>) -> Args {
     a
 }
 
+fn load_model(name: &str) -> Option<std::sync::Arc<dyn Embedder>> {
+    if std::env::var("ENGRAMMA_SKIP_MODEL_TESTS")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        eprintln!("ENGRAMMA_SKIP_MODEL_TESTS=1: niente benchmark semantico");
+        return None;
+    }
+    match engramma_embed::Builtin::load_named(&engramma_embed::spec::model_root(), name) {
+        Ok(b) => {
+            eprintln!("modello {name} caricato");
+            Some(std::sync::Arc::new(b))
+        }
+        Err(e) => {
+            eprintln!("modello {name} non disponibile ({e}): salto le sue misure");
+            None
+        }
+    }
+}
+
 fn main() {
     let args = parse_args(std::env::args().skip(1));
     let mut targets = args.targets;
@@ -746,12 +1091,47 @@ fn main() {
                 &runs,
             ));
         }
+        // ------------------------------------------------------------------
+        // v0.2 semantic runs (live corpus; the uniform corpus only moves the
+        // recency weight, which the semantic rerank no longer applies)
+        // ------------------------------------------------------------------
+        let m97 = load_model("granite-embedding-97m-multilingual-r2");
+        if let Some(e) = &m97 {
+            let mut runs: Vec<RunReport> = Vec::with_capacity(args.runs);
+            for i in 1..=args.runs {
+                eprintln!("benchmark semantico 97M {t} note, giro {i}/{}…", args.runs);
+                runs.push(run_semantic(*t, &dir, false, Some(e)));
+            }
+            let mut r = median_report("sem-97M", &runs);
+            if let Some(s) = &mut r.semantic {
+                s.model = "97M".into();
+            }
+            reports.push(r);
+        }
+        // the 311M at 100k would take too long on this machine: 10k only,
+        // declared here (prompt §5)
+        if *t <= 10_000 {
+            let m311 = load_model("granite-embedding-311m-multilingual-r2");
+            if let Some(e) = &m311 {
+                let mut runs: Vec<RunReport> = Vec::with_capacity(args.runs);
+                for i in 1..=args.runs {
+                    eprintln!("benchmark semantico 311M {t} note, giro {i}/{}…", args.runs);
+                    runs.push(run_semantic(*t, &dir, false, Some(e)));
+                }
+                let mut r = median_report("sem-311M", &runs);
+                if let Some(s) = &mut r.semantic {
+                    s.model = "311M".into();
+                }
+                reports.push(r);
+            }
+        }
     }
     let md = markdown(&reports, args.runs);
     print!("{md}");
     // --out writes only there; without it the report lands in bench/RESULTS.md
     let out = args
         .out
+        .clone()
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("RESULTS.md"));
     std::fs::write(&out, &md).expect(/* target dir is writable */ "write report");
     eprintln!("scritto {}", out.display());
