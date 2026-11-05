@@ -196,6 +196,29 @@ fn rel(root: &Path, p: &Path) -> String {
         .to_string()
 }
 
+/// Close the validity of superseded notes left open: `valid_to` becomes the
+/// `valid_from` of the first note that cites them in `supersedes` (spec §1.8).
+/// Notes without a citing note stay open (the warning already said it).
+fn close_superseded_validity(notes: &mut [&mut Note]) {
+    let mut closing: std::collections::HashMap<ulid::Ulid, crate::format::Validity> =
+        std::collections::HashMap::new();
+    for n in notes.iter() {
+        if let Some(vf) = n.valid_from {
+            for old in &n.supersedes {
+                closing.entry(*old).or_insert(vf);
+            }
+        }
+    }
+    for n in notes.iter_mut() {
+        if n.status == Status::Superseded
+            && n.valid_to.is_none()
+            && let Some(vf) = closing.get(&n.id)
+        {
+            n.valid_to = Some(*vf);
+        }
+    }
+}
+
 /// Import an Engramma export folder into a cell: the same notes and the same
 /// relations come out (used by the export→import property test).
 ///
@@ -217,6 +240,9 @@ pub fn import_cell(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSummary
         warnings: Vec::new(),
     };
     let files = walk_markdown(dir, &mut summary.skipped)?;
+    // Phase 1: parse everything (the note that closes a superseded one may
+    // come later in the walk).
+    let mut parsed_notes: Vec<(Note, Vec<String>, String)> = Vec::new();
     for f in files {
         let text = fs::read_to_string(&f.path)?;
         match format::parse(&text, ParseMode::Strict) {
@@ -225,29 +251,36 @@ pub fn import_cell(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSummary
                     summary.skipped.push(format!("{}: tombstone", f.relative));
                     continue;
                 }
-                let mut note = parsed.note.clone();
-                // `put_note` always births `external` notes in quarantine;
-                // a file with `external` + another status describes a note
-                // that was confirmed later: rebuild that with `confirm` so the
-                // log keeps the invariant.
-                let needs_confirm = note.confidence == crate::format::Confidence::External
-                    && note.status != Status::Quarantined;
-                if note.confidence == crate::format::Confidence::External {
-                    note.status = Status::Quarantined;
-                }
-                match cell.put_note(&note, actor) {
-                    Ok(()) => {
-                        if needs_confirm && let Err(e) = cell.confirm(&note.id, actor) {
-                            summary.errors.push(format!("{}: {e}", f.relative));
-                            continue;
-                        }
-                        summary.imported += 1;
-                    }
-                    Err(e) => summary.errors.push(format!("{}: {e}", f.relative)),
-                }
-                summary.warnings.extend(parsed.warnings);
+                summary.warnings.extend(parsed.warnings.clone());
+                parsed_notes.push((parsed.note, parsed.warnings, f.relative));
             }
             Err(e) => summary.errors.push(format!("{}: {e}", f.relative)),
+        }
+    }
+    // Phase 2: close open superseded validities, then write.
+    {
+        let mut notes: Vec<&mut Note> = parsed_notes.iter_mut().map(|(n, _, _)| n).collect();
+        close_superseded_validity(&mut notes);
+    }
+    for (mut note, _warnings, relative) in parsed_notes {
+        // `put_note` always births `external` notes in quarantine; a file
+        // with `external` + another status describes a note that was
+        // confirmed later: rebuild that with `confirm` so the log keeps the
+        // invariant.
+        let needs_confirm = note.confidence == crate::format::Confidence::External
+            && note.status != Status::Quarantined;
+        if note.confidence == crate::format::Confidence::External {
+            note.status = Status::Quarantined;
+        }
+        match cell.put_note(&note, actor) {
+            Ok(()) => {
+                if needs_confirm && let Err(e) = cell.confirm(&note.id, actor) {
+                    summary.errors.push(format!("{relative}: {e}"));
+                    continue;
+                }
+                summary.imported += 1;
+            }
+            Err(e) => summary.errors.push(format!("{relative}: {e}")),
         }
     }
     Ok(summary)
@@ -268,6 +301,9 @@ pub fn import_obsidian(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSum
         warnings: Vec::new(),
     };
     let files = walk_markdown(dir, &mut summary.skipped)?;
+    // Phase 1: parse everything (an Engramma-headed note may supersede one
+    // parsed earlier).
+    let mut notes: Vec<(Note, String)> = Vec::new();
     for f in files {
         let text = fs::read_to_string(&f.path)?;
         let mtime = fs::metadata(&f.path)?
@@ -281,7 +317,10 @@ pub fn import_obsidian(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSum
         let mtime = mtime.replace_millisecond(0).unwrap_or(mtime);
         let parsed = format::parse(&text, ParseMode::Import);
         let note = match parsed {
-            Ok(p) => p.note,
+            Ok(p) => {
+                summary.warnings.extend(p.warnings);
+                p.note
+            }
             Err(FormatError::NoFrontmatter) | Err(FormatError::MissingField(_)) => Note {
                 id: crate::id::new_ulid().map_err(PortError::Cell)?,
                 note_type: crate::format::NoteType::Note,
@@ -305,9 +344,17 @@ pub fn import_obsidian(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSum
                 continue;
             }
         };
+        notes.push((note, f.relative));
+    }
+    // Phase 2: close open superseded validities, then write.
+    {
+        let mut refs: Vec<&mut Note> = notes.iter_mut().map(|(n, _)| n).collect();
+        close_superseded_validity(&mut refs);
+    }
+    for (note, relative) in notes {
         match cell.put_note(&note, actor) {
             Ok(()) => summary.imported += 1,
-            Err(e) => summary.errors.push(format!("{}: {e}", f.relative)),
+            Err(e) => summary.errors.push(format!("{relative}: {e}")),
         }
     }
     Ok(summary)
@@ -408,6 +455,66 @@ mod tests {
             })
             .unwrap(/* test-only */);
         rows.flatten().collect()
+    }
+
+    #[test]
+    fn import_closes_superseded_validity_at_the_citing_note() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let src = dir.path().join("vault");
+        fs::create_dir_all(&src).unwrap(/* test-only */);
+        // an old superseded note left open…
+        let old = b"---\nid: 01AAAAAAAAAAAAAAAAAAAAAAAA\ntype: preference\n\
+                    title: Fabio vegetariano\nlang: it\nsource: user\n\
+                    confidence: stated\nstatus: superseded\nvalid_from: 2020-01-06\n\
+                    created_at: 2026-01-12T08:00:00Z\nupdated_at: 2026-01-12T08:00:00Z\n\
+                    ---\n[[Fabio]] era vegetariano.\n";
+        // …and the note that replaced it, starting 2026-10-01 (parsed after:
+        // the closing note may come later in the walk)
+        let new = b"---\nid: 01BBBBBBBBBBBBBBBBBBBBBBBB\ntype: preference\n\
+                    title: Fabio onnivoro\nlang: it\nsource: user\n\
+                    confidence: stated\nstatus: active\nvalid_from: 2026-10-01\n\
+                    supersedes: [01AAAAAAAAAAAAAAAAAAAAAAAA]\n\
+                    created_at: 2026-10-01T22:00:00Z\nupdated_at: 2026-10-01T22:00:00Z\n\
+                    ---\n[[Fabio]] mangia di nuovo carne.\n";
+        fs::write(src.join("zz-old.md"), old).unwrap(/* t */);
+        fs::write(src.join("new.md"), new).unwrap(/* t */);
+
+        let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t")
+            .unwrap(/* test-only */);
+        let s = import_obsidian(&cell, &src, "t").unwrap(/* test-only */);
+        assert_eq!(s.imported, 2, "{s:?}");
+        assert!(
+            s.warnings
+                .iter()
+                .any(|w| w.contains("superseded") && w.contains("valid_to")),
+            "the open validity must be a warning: {s:?}"
+        );
+        let old_id = ulid::Ulid::from_string("01AAAAAAAAAAAAAAAAAAAAAAAA")
+            .unwrap(/* test-only */);
+        let back = cell.get(&old_id).unwrap(/* test-only */);
+        assert_eq!(
+            back.valid_to.map(|v| v.to_db_string()),
+            Some("2026-10-01".to_string()),
+            "validity must close where the citing note begins"
+        );
+        // an Engramma folder (strict) refuses the same file instead
+        let exp = dir.path().join("exp");
+        fs::create_dir_all(exp.join("preference")).unwrap(/* test-only */);
+        fs::write(exp.join("preference").join("old.md"), old).unwrap(/* t */);
+        fs::write(
+            exp.join("engramma.json"),
+            r#"{"format_version":0,"cell":"t","exported_at":"2026-11-05T00:00:00Z","note_count":1}"#,
+        )
+        .unwrap(/* t */);
+        let cell2 = Cell::create(&dir.path().join("c2.sqlite"), "t", "t")
+            .unwrap(/* test-only */);
+        let s2 = import_cell(&cell2, &exp, "t").unwrap(/* test-only */);
+        assert!(
+            s2.errors
+                .iter()
+                .any(|e| e.contains("superseded") && e.contains("valid_to")),
+            "strict import must reject it: {s2:?}"
+        );
     }
 
     #[test]

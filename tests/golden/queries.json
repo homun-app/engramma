@@ -255,5 +255,18 @@
     "category": "quarantena",
     "q": "Foster Londra",
     "expect_empty": true
+  },
+  {
+    "id": 34,
+    "category": "temporale",
+    "q": "cosa mangia Fabio",
+    "as_of": "2026-10-15",
+    "k": 10,
+    "expect": [
+      "onnivoro"
+    ],
+    "expect_not": [
+      "vegetariano"
+    ]
   }
 ]

@@ -65,6 +65,11 @@ Validation rules (each violation is a readable error):
    `/`; each segment starts with a letter, digit or `_` (Unicode letters
    allowed) and continues with letters, digits, `_` or `-`. No empty segment.
    `casa/milano` declares `casa` as parent of `casa/milano`.
+8. `status: superseded` requires `valid_to`: the replaced fact must say when
+   it stopped being true, or two "current" facts about the same subject would
+   coexist. Strict mode makes it an error; import mode a warning — the
+   importer then closes the validity at the `valid_from` of the note that
+   cites it in `supersedes`, when there is one.
 
 ## 2. Body: links
 

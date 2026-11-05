@@ -27,6 +27,9 @@ struct GoldenQuery {
     expect_empty: bool,
     #[serde(default)]
     as_of: Option<String>,
+    /// Result-set size for this question (default 5).
+    #[serde(default)]
+    k: Option<usize>,
 }
 
 fn golden_dir() -> PathBuf {
@@ -137,7 +140,7 @@ fn golden_queries() {
 
     let mut failures: Vec<String> = Vec::new();
     for gq in &queries {
-        let mut q = Query::text(&gq.q).k(5).graph_hops(2);
+        let mut q = Query::text(&gq.q).k(gq.k.unwrap_or(5)).graph_hops(2);
         q.lang = Some(Lang::It);
         if let Some(a) = &gq.as_of {
             let v = engramma_core::Validity::parse(a).unwrap_or_else(|e| panic!("{}: {e}", gq.q));
@@ -247,6 +250,19 @@ fn golden_story_invariants() {
         )
         .unwrap(/* test-only */);
     assert_eq!(active_external[0], "0");
+
+    // every superseded note carries a closed validity: two "current" facts
+    // about the same subject must never coexist
+    let open_superseded = cell
+        .debug_column(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM notes
+             WHERE status = 'superseded' AND valid_to IS NULL",
+        )
+        .unwrap(/* test-only */);
+    assert_eq!(
+        open_superseded[0], "0",
+        "a superseded note must have valid_to"
+    );
 
     // confirm one quarantined note, then it appears
     let qid = cell

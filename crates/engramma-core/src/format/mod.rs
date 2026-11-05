@@ -913,6 +913,18 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
     for tag in &analysis.tags {
         validate_tag_name(tag)?;
     }
+    // A superseded note must carry a closed validity: without `valid_to` the
+    // replaced fact would still look true "now" (two current facts about the
+    // same subject). Strict refuses; imports warn and the importer closes the
+    // validity where the citing note begins, when there is one.
+    if note.status == Status::Superseded && note.valid_to.is_none() {
+        let msg = "`status: superseded` requires `valid_to` (when did the \
+                   replaced fact stop being true?)";
+        match mode {
+            ParseMode::Strict => return Err(bad_field("valid_to", msg)),
+            ParseMode::Import => warnings.push(msg.to_string()),
+        }
+    }
     Ok(ParsedNote {
         note,
         analysis,
@@ -1125,5 +1137,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn superseded_requires_valid_to() {
+        // superseded without valid_to: strict refuses, import warns (and the
+        // importer closes the validity, see port)
+        let text = minimal_text()
+            .replace("status: active", "status: superseded")
+            .replace(
+                "created_at: 2026-09-03T10:12:00Z",
+                "valid_from: 2020-01-06\ncreated_at: 2026-09-03T10:12:00Z",
+            );
+        assert!(
+            parse(&text, ParseMode::Strict).is_err(),
+            "strict must reject a superseded note with open validity"
+        );
+        let p = parse(&text, ParseMode::Import).unwrap(/* test-only */);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("superseded") && w.contains("valid_to"))
+        );
+        // with valid_to both modes accept it
+        let closed = text.replace(
+            "created_at: 2026-09-03T10:12:00Z",
+            "valid_to: 2026-09-30\ncreated_at: 2026-09-03T10:12:00Z",
+        );
+        assert!(parse(&closed, ParseMode::Strict).is_ok());
     }
 }
