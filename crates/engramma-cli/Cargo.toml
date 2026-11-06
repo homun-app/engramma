@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 engramma-embed.workspace = true
 engramma-core.workspace = true
+engramma-vault.workspace = true
 engramma-mcp = { path = "../engramma-mcp", version = "0.1.0-dev" }
 clap.workspace = true
 anyhow.workspace = true

@@ -15,7 +15,7 @@ pub mod search;
 pub mod text;
 pub mod vector;
 
-pub use cell::{Cell, NotePatch, VerifyReport};
+pub use cell::{Cell, NotePatch, VaultFile, VerifyReport};
 pub use cell::{EmbedPendingReport, ModelCoverage, ModelRow, ModelState};
 pub use embed::{Embedder, TextKind};
 pub use error::{CellError, EmbedError, FormatError, PortError, SearchError};

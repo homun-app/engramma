@@ -221,12 +221,33 @@ enum Command {
         #[arg(long, default_value_t = 1_000)]
         keep_last: i64,
     },
+    /// The markdown view: two-way sync with a folder of notes (v0.3)
+    Vault {
+        #[command(subcommand)]
+        action: VaultAction,
+    },
     /// Start the MCP server (stdio, read-only)
     Mcp {
         /// Exposed cells (comma-separated; without this flag no cell is exposed)
         #[arg(long, value_delimiter = ',')]
         cells: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum VaultAction {
+    /// Export the cell into the folder and bind every note to its file
+    Init { dir: PathBuf },
+    /// One reconciliation, with the report
+    Sync {
+        dir: PathBuf,
+        /// Proceed even when too many files vanished at once
+        #[arg(long)]
+        allow_deletions: bool,
+    },
+    /// Reconcile on filesystem events (500 ms debounce) and every 60 s;
+    /// Ctrl-C exits
+    Watch { dir: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -1094,6 +1115,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Vault { action } => run_vault(cli, action),
         Command::Mcp { cells } => {
             if cells.is_empty() {
                 return Err(CliError::usage(
@@ -1104,6 +1126,113 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             engramma_mcp::run(root(cli), &names)
                 .map_err(|e| CliError::internal(format!("mcp: {e}")))
         }
+    }
+}
+
+fn open_vault(cli: &Cli, dir: &Path) -> Result<engramma_vault::Vault, CliError> {
+    let cell = open_cell(cli)?;
+    engramma_vault::Vault::open(cell, dir).map_err(|e| CliError::internal(format!("vault: {e}")))
+}
+
+fn run_vault(cli: &Cli, action: &VaultAction) -> Result<(), CliError> {
+    match action {
+        VaultAction::Init { dir } => {
+            let vault = open_vault(cli, dir)?;
+            let report = vault
+                .init()
+                .map_err(|e| CliError::internal(format!("vault init: {e}")))?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "root": vault.root().display().to_string(),
+                    "warnings": report.warnings,
+                }));
+            } else {
+                println!("vault inizializzato: {}", vault.root().display());
+            }
+            Ok(())
+        }
+        VaultAction::Sync {
+            dir,
+            allow_deletions,
+        } => {
+            let vault = open_vault(cli, dir)?;
+            let report = vault
+                .sync_once(*allow_deletions)
+                .map_err(|e| CliError::internal(format!("vault sync: {e}")))?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "created": report.created,
+                    "updated_from_file": report.updated_from_file,
+                    "updated_files": report.updated_files,
+                    "conflicts": report.conflicts,
+                    "deleted": report.deleted,
+                    "moved": report.moved,
+                    "errors": report.errors,
+                    "warnings": report.warnings,
+                }));
+            } else {
+                print_sync_report(&report);
+            }
+            Ok(())
+        }
+        VaultAction::Watch { dir } => {
+            let vault = open_vault(cli, dir)?;
+            let handle = vault
+                .watch(500, std::time::Duration::from_secs(60))
+                .map_err(|e| CliError::internal(format!("vault watch: {e}")))?;
+            if !cli.json {
+                println!(
+                    "in ascolto su {} (debounce 500 ms, scansione ogni 60 s, Ctrl-C per uscire)",
+                    vault.root().display()
+                );
+            }
+            // one reconciliation right away, then wait for Ctrl-C
+            let report = vault
+                .sync_once(false)
+                .map_err(|e| CliError::internal(format!("{e}")))?;
+            if !cli.json && !report.is_noop() {
+                print_sync_report(&report);
+            }
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .map_err(|e| CliError::internal(format!("tokio: {e}")))?;
+            rt.block_on(async {
+                let _ = tokio::signal::ctrl_c().await;
+            });
+            if !cli.json {
+                println!("chiudo");
+            }
+            handle
+                .stop()
+                .map_err(|e| CliError::internal(format!("watch stop: {e}")))?;
+            Ok(())
+        }
+    }
+}
+
+fn print_sync_report(report: &engramma_vault::SyncReport) {
+    let line = |verb: &str, items: &[String]| {
+        if !items.is_empty() {
+            println!("{verb}: {}", items.len());
+            for i in items {
+                println!("  - {i}");
+            }
+        }
+    };
+    line("nuove note da file", &report.created);
+    line("note aggiornate da file", &report.updated_from_file);
+    line("file riscritti dalla cella", &report.updated_files);
+    line(
+        "conflitti (vince la cella, copia .conflitto)",
+        &report.conflicts,
+    );
+    line("note cancellate (file spariti)", &report.deleted);
+    line("file spostati o rinominati", &report.moved);
+    line("errori", &report.errors);
+    line("avvisi", &report.warnings);
+    if report.is_noop() {
+        println!("nulla da fare");
     }
 }
 

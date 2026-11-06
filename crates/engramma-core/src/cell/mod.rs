@@ -135,6 +135,23 @@ impl NotePatch {
     }
 }
 
+/// One row of the markdown view's reconciliation state (DESIGN §4.1, v0.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VaultFile {
+    /// Path relative to the vault folder.
+    pub path: String,
+    /// The note the file is bound to (by the `id` in its header).
+    pub note_id: String,
+    /// blake3 of the file bytes as last seen.
+    pub file_hash: String,
+    /// The note's version as last seen.
+    pub note_version: i64,
+    /// File mtime in whole seconds.
+    pub mtime: i64,
+    /// File size in bytes.
+    pub size: i64,
+}
+
 /// A version entry of a note's history.
 #[derive(Debug, Clone)]
 pub struct VersionEntry {
@@ -990,6 +1007,110 @@ impl Cell {
     pub fn state_digest(&self) -> Result<String, CellError> {
         let inner = self.lock()?;
         state_digest(&inner.conn)
+    }
+
+    /// The markdown view's reconciliation state (last scan).
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_files(&self) -> Result<Vec<VaultFile>, CellError> {
+        let inner = self.lock()?;
+        let mut stmt = inner.conn.prepare(
+            "SELECT path, note_id, file_hash, note_version, mtime, size
+             FROM vault_files ORDER BY path",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(VaultFile {
+                path: r.get(0)?,
+                note_id: r.get(1)?,
+                file_hash: r.get(2)?,
+                note_version: r.get(3)?,
+                mtime: r.get(4)?,
+                size: r.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The ids of the living notes (no tombstones), in id order.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn note_ids(&self) -> Result<Vec<Ulid>, CellError> {
+        let inner = self.lock()?;
+        let mut stmt = inner
+            .conn
+            .prepare("SELECT id FROM notes WHERE status != 'deleted' ORDER BY id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(Ulid::from_string(&row?).map_err(|_| CellError::Db("bad note id".into()))?);
+        }
+        Ok(out)
+    }
+
+    /// The `version` column of a note (how many writes it took).
+    ///
+    /// # Errors
+    /// [`CellError::NoteNotFound`] when the note does not exist.
+    pub fn note_version(&self, id: &Ulid) -> Result<i64, CellError> {
+        let inner = self.lock()?;
+        inner
+            .conn
+            .query_row(
+                "SELECT version FROM notes WHERE id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .map_err(|_| CellError::NoteNotFound(id.to_string()))
+    }
+
+    /// Record (or replace) one row of the markdown view's state — derived
+    /// data, no operation.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_file_put(&self, row: &VaultFile) -> Result<(), CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let inner = self.lock()?;
+        inner.conn.execute(
+            "INSERT INTO vault_files (path, note_id, file_hash, note_version, mtime, size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path) DO UPDATE SET note_id = ?2, file_hash = ?3,
+                                             note_version = ?4, mtime = ?5, size = ?6",
+            rusqlite::params![
+                row.path,
+                row.note_id,
+                row.file_hash,
+                row.note_version,
+                row.mtime,
+                row.size,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Forget one path of the markdown view's state (the file is gone).
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_file_delete(&self, path: &str) -> Result<(), CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let inner = self.lock()?;
+        inner
+            .conn
+            .execute("DELETE FROM vault_files WHERE path = ?1", [path])?;
+        Ok(())
     }
 
     /// The latest compaction snapshot, when any.

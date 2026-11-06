@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 engramma-core.workspace = true
+ulid.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true
 blake3.workspace = true

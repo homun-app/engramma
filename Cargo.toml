@@ -31,7 +31,7 @@ thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rmcp = { version = "3.8", features = ["server", "transport-io", "macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "signal"] }
 schemars = "1"
 proptest = "1"
 tempfile = "3"

@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 6] = [
+pub const MIGRATIONS: [&str; 7] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -89,6 +89,17 @@ CREATE TABLE snapshots (seq INTEGER PRIMARY KEY,
                         state_digest TEXT NOT NULL,
                         file TEXT NOT NULL,          -- file name, next to the cell
                         created_at TEXT NOT NULL);
+"#,
+    r#"
+-- v7 (DESIGN §4.1): the markdown view's reconciliation state — what the last
+-- scan saw on disk, per note. Derived data, outside the log: it describes a
+-- folder the cell does not own.
+CREATE TABLE vault_files (path TEXT PRIMARY KEY,       -- relative to the vault folder
+                          note_id TEXT NOT NULL,
+                          file_hash TEXT NOT NULL,      -- blake3 of the file bytes
+                          note_version INTEGER NOT NULL,
+                          mtime INTEGER NOT NULL,
+                          size INTEGER NOT NULL);
 "#,
 ];
 

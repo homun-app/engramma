@@ -1,0 +1,496 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! The markdown view tests (prompt v0.3, punto 4): every row of the
+//! reconciliation table, the guards, the echo, the fixed-point property and
+//! the watch integration.
+
+use engramma_core::format::{At, Lang, Note, NoteType, ParseMode};
+use engramma_core::{Cell, CellError, Confidence, NotePatch, Status, Validity};
+use engramma_vault::{Vault, VaultError};
+use std::path::Path;
+use time::OffsetDateTime;
+use ulid::Ulid;
+
+fn ts(day: u8) -> At {
+    At(
+        OffsetDateTime::from_unix_timestamp(1_800_000_000 + i64::from(day) * 86_400)
+        .unwrap(/* test-only */)
+        .replace_nanosecond(0)
+        .unwrap(/* test-only */),
+    )
+}
+
+fn note(id: u16, title: &str, body: &str) -> Note {
+    Note {
+        id: Ulid::from_string(&format!("01{:024}", id)).unwrap(/* test-only */),
+        note_type: NoteType::Fact,
+        title: Some(title.into()),
+        body: body.into(),
+        tags: vec![],
+        scope: None,
+        lang: Some(Lang::It),
+        source: "user".into(),
+        confidence: Confidence::Stated,
+        status: Status::Active,
+        valid_from: None,
+        valid_to: None,
+        supersedes: vec![],
+        created_at: ts(1),
+        updated_at: ts(1),
+        extensions: vec![],
+    }
+}
+
+fn setup(dir: &Path) -> Vault {
+    let cell = Cell::create(&dir.join("c.sqlite"), "t", "tester").unwrap(/* test-only */);
+    let vault_dir = dir.join("vault");
+    let vault = Vault::open(cell, &vault_dir).unwrap(/* test-only */);
+    vault.init().unwrap(/* test-only */);
+    vault
+}
+
+fn write(vault: &Vault, rel: &str, text: &str) {
+    let target = vault.root().join(rel);
+    std::fs::create_dir_all(target.parent().unwrap_or(vault.root())).unwrap(/* t */);
+    std::fs::write(target, text).unwrap(/* t */);
+}
+
+fn read(vault: &Vault, rel: &str) -> String {
+    std::fs::read_to_string(vault.root().join(rel)).unwrap(/* test-only */)
+}
+
+/// init exports one file per note; sync is a no-op right after (echo).
+#[test]
+fn init_then_sync_is_a_noop() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    vault.cell().put_note(&note(1, "prima", "corpo [[Milano]]"), "t")
+        .unwrap(/* test-only */);
+    // the note arrived after init: the file gets written by sync
+    let r1 = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r1.updated_files.len(), 1, "{r1:?}");
+    let r2 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r2.is_noop(), "fixed point after one reconciliation: {r2:?}");
+}
+
+/// file changed, note unchanged → the note is updated from the file.
+#[test]
+fn changed_file_updates_the_note() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    let n = note(1, "prima", "corpo iniziale [[Roma]]");
+    vault.cell().put_note(&n, "t").unwrap(/* test-only */);
+    vault.sync_once(false).unwrap(/* t */);
+    let id = n.id.to_string();
+    let files = std::fs::read_dir(vault.root().join("fact")).unwrap(/* t */);
+    let name = files
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .find(|f| f.starts_with("prima"))
+        .unwrap_or_default();
+    let text = read(&vault, &format!("fact/{name}"));
+    let edited = text.replace("corpo iniziale", "corpo modificato a mano");
+    write(&vault, &format!("fact/{name}"), &edited);
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r.updated_from_file, vec![format!("fact/{name}")], "{r:?}");
+    let back = vault.cell().get(&n.id).unwrap(/* test-only */);
+    assert!(back.body.contains("corpo modificato a mano"));
+    assert_eq!(back.id.to_string(), id);
+}
+
+/// note changed from the cell, file untouched → the file is rewritten.
+#[test]
+fn changed_note_rewrites_the_file() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    let n = note(2, "seconda", "corpo [[Milano]]");
+    vault.cell().put_note(&n, "t").unwrap(/* test-only */);
+    vault.sync_once(false).unwrap(/* t */);
+    vault
+        .cell()
+        .patch_note(
+            &n.id,
+            &NotePatch {
+                body: Some("nuovo corpo dalla CLI [[Torino]]".into()),
+                ..Default::default()
+            },
+            "cli",
+        )
+        .unwrap(/* test-only */);
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r.updated_files.len(), 1, "{r:?}");
+    let files = list_md(&vault);
+    let text = std::fs::read_to_string(files[0].clone()).unwrap(/* t */);
+    assert!(text.contains("nuovo corpo dalla CLI"), "{text}");
+    // and the echo: the next sync is a no-op
+    let r2 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r2.is_noop(), "{r2:?}");
+}
+
+/// both changed → conflict: the cell wins, the file's version is a copy.
+#[test]
+fn conflict_cell_wins_with_a_copy() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    let n = note(3, "terza", "versione base [[Roma]]");
+    vault.cell().put_note(&n, "t").unwrap(/* test-only */);
+    vault.sync_once(false).unwrap(/* test-only */);
+    let path = &list_md(&vault)[0];
+    let text = std::fs::read_to_string(path).unwrap(/* t */);
+    std::fs::write(path, text.replace("versione base", "versione dal file"))
+        .unwrap(/* t */);
+    vault
+        .cell()
+        .patch_note(
+            &n.id,
+            &NotePatch {
+                body: Some("versione dalla cella".into()),
+                ..Default::default()
+            },
+            "cli",
+        )
+        .unwrap(/* test-only */);
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r.conflicts.len(), 1, "{r:?}");
+    let after = std::fs::read_to_string(path).unwrap(/* t */);
+    assert!(after.contains("versione dalla cella"), "{after}");
+    let copies: Vec<_> = std::fs::read_dir(path.parent().unwrap(/* t */))
+        .unwrap(/* t */)
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|f| f.contains(".conflitto-"))
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let copy = std::fs::read_to_string(
+        path.parent().unwrap(/* t */).join(&copies[0]),
+    )
+    .unwrap(/* t */);
+    assert!(copy.contains("versione dal file"), "{copy}");
+    // the copy is ignored from now on
+    let r2 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r2.is_noop(), "{r2:?}");
+}
+
+/// a new file without id → a note is created, then the file is rewritten
+/// WITH the id.
+#[test]
+fn file_without_id_becomes_a_note_and_gets_one() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    vault.sync_once(false).unwrap(/* t */); // settle init
+    write(
+        &vault,
+        "appunto.md",
+        "# Idea\n\nUna nota di [[Obsidian]].\n",
+    );
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r.created, vec!["appunto.md".to_string()], "{r:?}");
+    let text = read(&vault, "appunto.md");
+    assert!(
+        text.contains("id: 01"),
+        "the file now carries the id: {text}"
+    );
+    let parsed = engramma_core::format::parse(&text, ParseMode::Strict)
+        .unwrap(/* test-only */)
+        .note;
+    assert_eq!(parsed.source, "import:obsidian/appunto.md");
+    assert_eq!(parsed.note_type, NoteType::Note);
+    let r2 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r2.is_noop(), "{r2:?}");
+}
+
+/// rename and move: same id, new path — no delete, no new note.
+#[test]
+fn moved_file_keeps_its_note() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    let n = note(4, "quarta", "da spostare [[Milano]]");
+    vault.cell().put_note(&n, "t").unwrap(/* test-only */);
+    vault.sync_once(false).unwrap(/* t */);
+    let from = list_md(&vault)[0].clone();
+    let to = from.parent().unwrap(/* t */).join("spostata.md");
+    std::fs::rename(&from, &to).unwrap(/* t */);
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r.moved.len(), 1, "{r:?}");
+    assert!(r.deleted.is_empty(), "{r:?}");
+    let rows = vault.cell().vault_files().unwrap(/* t */);
+    assert!(
+        rows.iter().any(|f| f.path.ends_with("spostata.md")),
+        "{rows:?}"
+    );
+    let r2 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r2.is_noop(), "{r2:?}");
+}
+
+/// a vanished file deletes the note (a tombstone); when too many vanish at
+/// once the guard stops everything until forced.
+#[test]
+fn vanished_file_deletes_the_note_and_the_guard_stops_mass_deletions() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    // a real-sized vault: one deletion is under every threshold
+    let n = note(5, "quinta", "da cancellare [[Roma]]");
+    vault.cell().put_note(&n, "t").unwrap(/* test-only */);
+    for i in 6..=30_u16 {
+        vault
+            .cell()
+            .put_note(&note(i, &format!("guardia {i}"), "corpo"), "t")
+            .unwrap(/* t */);
+    }
+    vault.sync_once(false).unwrap(/* t */); // files written
+    let f = list_md(&vault)
+        .into_iter()
+        .find(|f| f.to_string_lossy().contains("quinta"))
+        .expect(/* test-only */ "the quinta file");
+    std::fs::remove_file(&f).unwrap(/* t */);
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r.deleted.len(), 1, "{r:?}");
+    assert_eq!(
+        vault.cell().get(&n.id).unwrap(/* t */).status,
+        Status::Deleted
+    );
+    assert_eq!(vault.cell().vault_files().unwrap(/* t */).len(), 25);
+
+    // the guard: 25 files vanish together (an unmounted folder)
+    for f in list_md(&vault) {
+        if f.to_string_lossy().contains("guardia") {
+            std::fs::remove_file(&f).unwrap(/* t */);
+        }
+    }
+    let err = vault.sync_once(false).unwrap_err(/* test-only */);
+    assert!(
+        matches!(&err, VaultError::MassDelete { would_delete, .. } if *would_delete == 25),
+        "{err}"
+    );
+    // nothing was deleted
+    let living = vault
+        .cell()
+        .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes WHERE status != 'deleted'")
+        .unwrap(/* t */);
+    assert_eq!(living[0], "25", "the guard deleted nothing");
+    // --allow-deletions goes through
+    let r = vault.sync_once(true).unwrap(/* test-only */);
+    assert_eq!(r.deleted.len(), 25, "{r:?}");
+}
+
+/// a broken header never touches the cell: error in the report, retry later.
+#[test]
+fn broken_header_is_reported_and_leaves_the_cell_alone() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    vault.sync_once(false).unwrap(/* t */);
+    write(&vault, "rotta.md", "---\ntitle: manca tutto\nqualcosa: {[");
+    let before = vault.cell().ops().unwrap(/* t */).len();
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r.errors.iter().any(|e| e.contains("rotta.md")), "{r:?}");
+    assert_eq!(vault.cell().ops().unwrap(/* t */).len(), before);
+    // fixing the file lets the next reconciliation import it
+    write(
+        &vault,
+        "rotta.md",
+        "---\ntitle: manca tutto\nlang: it\nsource: user\nconfidence: stated\nstatus: active\ncreated_at: 2026-11-01T10:00:00Z\nupdated_at: 2026-11-01T10:00:00Z\n---\nAdesso funziona.\n",
+    );
+    let r2 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r2.errors.is_empty(), "{r2:?}");
+}
+
+/// a file cannot promote an external note to active (the cell's rule).
+#[test]
+fn file_cannot_promote_an_external_note() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    let mut n = note(6, "sesta", "voci dal web [[Milano]]");
+    n.confidence = Confidence::External;
+    n.source = "import:web".into();
+    n.status = Status::Quarantined;
+    vault.cell().put_note(&n, "t").unwrap(/* test-only */);
+    vault.sync_once(false).unwrap(/* t */);
+    let f = list_md(&vault)[0].clone();
+    let text = std::fs::read_to_string(&f).unwrap(/* t */);
+    // the hand edit flips the status to active
+    let edited = text
+        .replace("status: quarantined", "status: active")
+        .replace("updated_at:", "x-zz: 1\nupdated_at:");
+    std::fs::write(&f, edited).unwrap(/* t */);
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r.warnings.iter().any(|w| w.contains("quarantena")), "{r:?}");
+    assert_eq!(
+        vault.cell().get(&n.id).unwrap(/* t */).status,
+        Status::Quarantined,
+        "the file cannot promote it"
+    );
+}
+
+/// the purge deletes the note: the next reconciliation removes its file.
+#[test]
+fn purged_note_loses_its_file() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    let n = note(7, "settima", "da purgare [[Roma]]");
+    vault.cell().put_note(&n, "t").unwrap(/* test-only */);
+    vault.sync_once(false).unwrap(/* t */);
+    let f = list_md(&vault)[0].clone();
+    vault.cell().purge(&n.id, "oblio", "tester").unwrap(/* t */);
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(!f.exists(), "the file is gone with the note");
+    assert!(
+        r.deleted
+            .contains(&f.strip_prefix(vault.root()).unwrap(/* t */).to_string_lossy().to_string()),
+        "{r:?}"
+    );
+    assert!(vault.cell().vault_files().unwrap(/* t */).is_empty());
+}
+
+/// the property: random edits from the file side and from the cell, two
+/// reconciliations — the second does nothing, and every living note has its
+/// file with `serialize(note)` as content.
+#[test]
+fn random_edits_converge_to_a_fixed_point() {
+    for seed in 1..=8_u64 {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let vault = setup(dir.path());
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut ids: Vec<Ulid> = Vec::new();
+        for i in 1..=6_u16 {
+            let n = note(i, &format!("nota {i}"), &format!("corpo {i} [[Milano]]"));
+            vault.cell().put_note(&n, "t").unwrap(/* t */);
+            ids.push(n.id);
+        }
+        vault.sync_once(false).unwrap(/* t */); // files exist
+        for round in 0..12 {
+            let pick = ids[(next() % ids.len() as u64) as usize];
+            match next() % 3 {
+                0 => {
+                    // edit the file behind the engine's back
+                    let rows = vault.cell().vault_files().unwrap(/* t */);
+                    let row = rows.iter().find(|r| r.note_id == pick.to_string());
+                    if let Some(row) = row {
+                        let path = vault.root().join(&row.path);
+                        let text = std::fs::read_to_string(&path).unwrap_or_default();
+                        let edited = text.replace(
+                            &format!(
+                                "corpo {}",
+                                ids.iter().position(|i| *i == pick).unwrap_or(0) + 1
+                            ),
+                            &format!("corpo {round} modificato"),
+                        );
+                        if edited != text {
+                            std::fs::write(&path, edited).unwrap(/* t */);
+                        }
+                    }
+                }
+                1 => {
+                    vault
+                        .cell()
+                        .patch_note(
+                            &pick,
+                            &NotePatch {
+                                body: Some(format!("corpo {round} dalla cella [[Roma]]")),
+                                ..Default::default()
+                            },
+                            "cli",
+                        )
+                        .unwrap_or(()); // tombstoned notes reject patches
+                }
+                _ => {}
+            }
+            if next() % 4 == 0 {
+                vault.sync_once(false).unwrap(/* t */);
+            }
+        }
+        let _ = vault.sync_once(false);
+        let r2 = vault.sync_once(false).unwrap(/* test-only */);
+        assert!(
+            r2.is_noop(),
+            "seed {seed}: the second reconciliation must do nothing: {r2:?}"
+        );
+        // every living note has its file, with serialize(note) as content
+        let rows = vault.cell().vault_files().unwrap(/* t */);
+        for row in &rows {
+            let id = Ulid::from_string(&row.note_id).unwrap(/* t */);
+            let note = vault.cell().get(&id).unwrap(/* t */);
+            assert_eq!(note.status, Status::Active, "seed {seed}: {row:?}");
+            let on_disk = std::fs::read_to_string(vault.root().join(&row.path)).unwrap_or_default();
+            assert_eq!(
+                on_disk,
+                note.serialize().unwrap(/* t */),
+                "seed {seed}, {}",
+                row.path
+            );
+        }
+        let living = vault
+            .cell()
+            .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes WHERE status = 'active'")
+            .unwrap(/* t */);
+        assert_eq!(
+            living[0].parse::<usize>().unwrap(/* t */),
+            rows.len(),
+            "seed {seed}: every living note has its file"
+        );
+    }
+}
+
+/// watch: a hand edit becomes a note update within seconds.
+#[test]
+fn watch_updates_the_note_within_three_seconds() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    let n = note(9, "watch", "versione iniziale [[Milano]]");
+    vault.cell().put_note(&n, "t").unwrap(/* test-only */);
+    vault.sync_once(false).unwrap(/* t */);
+    let handle = vault
+        .watch(200, std::time::Duration::from_millis(300))
+        .unwrap(/* test-only */);
+    let f = list_md(&vault)[0].clone();
+    let text = std::fs::read_to_string(&f).unwrap(/* t */);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::fs::write(&f, text.replace("versione iniziale", "versione guardata"))
+        .unwrap(/* t */);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut seen = false;
+    while std::time::Instant::now() < deadline {
+        if vault
+            .cell()
+            .get(&n.id)
+            .is_ok_and(|note| note.body.contains("versione guardata"))
+        {
+            seen = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(seen, "the watch picked the edit up within 3 s");
+    handle.stop().unwrap(/* test-only */);
+}
+
+fn list_md(vault: &Vault) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap(/* t */)
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|e| e == "md") {
+                out.push(p);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(vault.root(), &mut out);
+    out
+}
+
+// keep the unused imports honest across cfg
+#[allow(unused_imports)]
+use CellError as _;
+#[allow(unused_imports)]
+use Validity as _;
