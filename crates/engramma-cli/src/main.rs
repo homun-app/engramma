@@ -933,6 +933,21 @@ fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Verify => {
             let cell = open_cell(cli)?;
             let report = cell.verify()?;
+            // Vector coverage per model (derived data: reported, never a
+            // verification failure) — v0.2.1: the REPORT v0.2 claimed it,
+            // the command never showed it.
+            let coverage: Vec<serde_json::Value> = report
+                .coverage
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "model": c.model,
+                        "state": c.state.as_str(),
+                        "covered": c.covered,
+                        "living": c.living,
+                    })
+                })
+                .collect();
             if cli.json {
                 print_json(&serde_json::json!({
                     "ops": report.ops,
@@ -940,6 +955,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "replay_ok": report.replay_ok,
                     "fts_ok": report.fts_ok,
                     "mismatch": report.mismatch,
+                    "coverage": coverage,
                     "ok": report.ok(),
                 }));
             } else if report.ok() {
@@ -947,6 +963,15 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "registro verificato: {} operazioni, catena hash, ricostruzione e indice FTS a posto",
                     report.ops
                 );
+                for c in &report.coverage {
+                    println!(
+                        "copertura vettori: {} [{}] {}/{} note",
+                        c.model,
+                        c.state.as_str(),
+                        c.covered,
+                        c.living
+                    );
+                }
             } else {
                 return Err(CliError::internal(format!(
                     "verifica fallita: chain={} replay={} {}",

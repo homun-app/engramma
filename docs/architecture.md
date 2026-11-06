@@ -93,6 +93,38 @@ deleted) and promotes the new one; the in-memory index rebuilds on the
 next search. Mid-switch searches answer with the old model end to end
 (tested).
 
+### v0.2.1: the four profile fixes (P0.3)
+
+The profiling probe (`engramma-bench --fake-embedder`, a deterministic
+fake embedder — the engine without the model) attributed the 100k hybrid
+latency to four causes. The fixes:
+
+- **`FlatI8::top_int`** iterates `chunks_exact(dim).zip(inv_scales)` with
+  `chunks_exact(8)` lanes zipped against the query — no per-element
+  indexing — scores once per row through the precomputed reciprocal
+  scale, and selects the top-m with `select_nth_unstable_by`.
+- **Connection pragmas** (`configure()`): `cache_size = −65536` (64 MB of
+  page cache) and `mmap_size = 256 MB`. The exact f32 recomputation reads
+  candidate vectors as BLOBs straight off the pages; with SQLite's
+  default ~2 MB cache every read reached `unixRead`. The mmap is
+  best-effort — a VFS without mmap support refuses the pragma and the
+  engine stays correct, only slower.
+- **Ubiquitous terms leave the FTS MATCH** (never the coverage nor the
+  explain): FTS5 evaluates `bm25()` for every matching row before the
+  `LIMIT`, and a term in a fifth of the notes paid a full-corpus ranking
+  pass. Document frequencies come from the `notes_fts_vocab` view
+  (`fts5vocab`, created with the schema, additive and unversioned like
+  `meta`). A term is dropped only when it exceeds 20% of the corpus AND
+  matches ≥ 1000 documents (below that the pass is not a cost problem and
+  the term is signal — on a 60-note vault a term in a third of the notes
+  is not filler), and only while a term that matches something stays.
+- **One read per candidate set** (`read_candidates`): ids travel in a
+  temp table, one JOIN returns note + `body_norm` + `tags_text`, with the
+  `status`/`type` filters in SQL; the bitemporal validity, tags, scope and
+  confidence stay in `passes_filters`, where their semantics live. Text
+  candidates, vector candidates (chunks of 64) and graph-discovered notes
+  all go through it.
+
 ## A write
 
 ```

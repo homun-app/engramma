@@ -116,12 +116,17 @@ never exported; superseded notes are.
 Recomputes the hash chain, rebuilds the whole state by replaying the log in
 memory, compares every table and runs the FTS integrity-check (the index
 must hold exactly the non-tombstoned notes). JSON: `{ops, hash_chain_ok,
-replay_ok, fts_ok, mismatch, ok}`.
+replay_ok, fts_ok, mismatch, coverage, ok}` — `coverage` lists the vector
+coverage per model (`{model, state, covered, living}`; embeddings are
+derived data, their absence is never a verification failure). The human
+output prints one `copertura vettori` line per model.
 
 ### `search TEXT` (v0.2)
 Options: `--mode text|vector|hybrid` (default: `hybrid` when the cell has a
 `ready` embedding model matching the configured embedder, else `text`),
-`--fusion rrf|convex-0.3|convex-0.5|convex-0.7` (default `convex-0.7`),
+`--fusion rrf|convex-0.3|convex-0.5|convex-0.7` (a `convex-mm-`/`convex-th-`
+prefix picks the cosine normalisation: min-max over the candidates, or the
+theoretical −1..1 limits),
 `--tau` (abstention floor for vector-only results, default 0.30), plus the
 v0.1 options (`--k`, `--hops`, `--as-of`, `--tag`, `--type`,
 `--include-quarantined`, `--lang`).
