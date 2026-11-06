@@ -151,23 +151,24 @@ fn measure(cell: &Cell, sem: &Semantic, categories: &[&str]) -> (f64, f64, usize
 }
 
 fn configurations(embedder: Arc<dyn Embedder>) -> Vec<(&'static str, Semantic)> {
+    use engramma_core::CosNorm;
+    let convex = |alpha: f64, norm: CosNorm| {
+        Semantic::new(embedder.clone()).with_fusion(Fusion::Convex {
+            alpha,
+            cos_norm: norm,
+        })
+    };
     vec![
         (
             "rrf",
             Semantic::new(embedder.clone()).with_fusion(Fusion::Rrf { k: 60 }),
         ),
-        (
-            "convex-0.3",
-            Semantic::new(embedder.clone()).with_fusion(Fusion::Convex { alpha: 0.3 }),
-        ),
-        (
-            "convex-0.5",
-            Semantic::new(embedder.clone()).with_fusion(Fusion::Convex { alpha: 0.5 }),
-        ),
-        (
-            "convex-0.7",
-            Semantic::new(embedder.clone()).with_fusion(Fusion::Convex { alpha: 0.7 }),
-        ),
+        ("mm-0.3", convex(0.3, CosNorm::Candidates)),
+        ("mm-0.5", convex(0.5, CosNorm::Candidates)),
+        ("mm-0.7", convex(0.7, CosNorm::Candidates)),
+        ("th-0.3", convex(0.3, CosNorm::Theoretical)),
+        ("th-0.5", convex(0.5, CosNorm::Theoretical)),
+        ("th-0.7", convex(0.7, CosNorm::Theoretical)),
     ]
 }
 
@@ -185,9 +186,16 @@ fn cell_with_model(embedder: &Builtin) -> (tempfile::TempDir, Cell) {
 
 /// The tuning table: per category, per fusion, recall@5 and MRR; plus the
 /// abstention curve over tau. Printed when `ENGRAMMA_SEMANTIC_REPORT=1`.
-fn report(model_name: &str, embedder: Arc<dyn Embedder>) {
+fn report(model_name: &str) {
+    // The embedder is loaded HERE for the named model: a passed-in one could
+    // belong to another model and silently neuter the vector branch (found
+    // while re-tuning in v0.2.1: a "97M" table that was really the 311M
+    // querying a 97M cell — parafrasi 0.000 in every fusion).
+    let embedder_dyn: Arc<dyn Embedder> = Arc::new(
+        Builtin::load_named(&root(), model_name)
+            .unwrap_or_else(|e| panic!("model missing under {}: {e}", root().display())),
+    );
     let (_d, cell) = cell_with_model(&Builtin::load_named(&root(), model_name).unwrap(/* t */));
-    let embedder_dyn = embedder;
     println!("\n== {model_name}: fusioni × recenza (tau fisso 0.30) ==");
     for (name, sem) in configurations(std::sync::Arc::clone(&embedder_dyn)) {
         for (rname, days) in [("rec180", 180.0_f64), ("rec-off", 1.0e9)] {
@@ -277,10 +285,7 @@ fn golden_semantic_questions_with_the_tuned_defaults() {
         .map(|v| v == "1")
         .unwrap_or(false)
     {
-        report(
-            "granite-embedding-97m-multilingual-r2",
-            std::sync::Arc::clone(&embedder_arc),
-        );
+        report("granite-embedding-97m-multilingual-r2");
         report_311(&root());
     }
     let mut failures: Vec<String> = Vec::new();
@@ -332,11 +337,56 @@ fn golden_semantic_questions_with_the_tuned_defaults() {
 
 fn report_311(root: &Path) {
     match Builtin::load_named(root, "granite-embedding-311m-multilingual-r2") {
-        Ok(b) => {
-            let arc: Arc<dyn Embedder> = Arc::new(b);
-            report("granite-embedding-311m-multilingual-r2", arc);
-        }
+        Ok(_) => report("granite-embedding-311m-multilingual-r2"),
         Err(e) => eprintln!("311M non disponibile, salto: {e}"),
+    }
+}
+
+/// v0.2.1 (P0.1): the two manual queries that exposed the unnormalised
+/// cosine. With the raw cosine summed against min-max'd BM25, «Viaggio a
+/// Torino» (cos 0.822, semantic rank 15) led «Fabio onnivoro» (cos 0.911,
+/// semantic rank 1) on «cosa mangia Fabio adesso», and «Fabio tifa Lazio»
+/// led on «where does Fabio work». With the cosine on BM25's [0, 1] scale,
+/// the semantically-closest note must lead — with the default fusion.
+#[test]
+fn the_two_manual_queries_rank_the_semantic_winner_first() {
+    if skipped() {
+        eprintln!("ENGRAMMA_SKIP_MODEL_TESTS=1: skipping");
+        return;
+    }
+    // 97M: the model the failure was demonstrated with (REPORT §v0.2.1).
+    let embedder = Builtin::load_named(&root(), "granite-embedding-97m-multilingual-r2")
+        .unwrap_or_else(|e| panic!("model missing under {}: {e}", root().display()));
+    let (_d, cell) = cell_with_model(&embedder);
+    let embedder_arc: Arc<dyn Embedder> = Arc::new(embedder);
+    let sem = Semantic::new(std::sync::Arc::clone(&embedder_arc));
+    for (q, want_any) in [
+        ("cosa mangia Fabio adesso", &["Fabio onnivoro"][..]),
+        // "a note about Fabio's work": the work fact or the work-hours fact
+        // (both are about Fabio working at Studio Rossi)
+        (
+            "where does Fabio work",
+            &["Fabio lavora allo Studio Rossi", "L'orario di Fabio"][..],
+        ),
+    ] {
+        let query = Query::text(q).k(5).graph_hops(2);
+        let outcome = cell
+            .search_semantic_with_now(&query, now(), &sem)
+            .unwrap(/* test-only */);
+        let first = outcome
+            .hits
+            .first()
+            .map(|h| h.note.display_title().to_string())
+            .unwrap_or_default();
+        let hit = want_any
+            .iter()
+            .any(|w| first.to_lowercase().contains(&w.to_lowercase()));
+        assert!(
+            hit,
+            "`{q}`: first is «{first}», want one of {want_any:?} ({}/{:?})",
+            outcome.hits.len(),
+            titles(&outcome.hits)
+        );
     }
 }
 

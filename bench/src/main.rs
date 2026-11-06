@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! engramma-bench [--notes 10000] [--notes 100000] [--out PATH.md] [--runs 3]
+//!                [--fake-embedder]
 //! ```
 //!
 //! `--notes` is repeatable (bare numbers also work). Every size runs `--runs`
@@ -14,13 +15,19 @@
 //! **uniform** (the same `updated_at` for every note — pure text+graph
 //! ranking). Without `--out` the report goes to `bench/RESULTS.md`; with it,
 //! only there (RESULTS.md is left alone).
+//!
+//! `--fake-embedder` replaces the whole run with the profiling probe
+//! (`vprof`): a deterministic fake embedder, no model — it measures the
+//! engine without the embedding cost. It times insert, one `embed_pending`
+//! over every note, vector-only and hybrid search, and the raw int8 scan
+//! (`FlatI8::search`) on synthetic vectors.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use engramma_core::format::{At, Lang, Note, NoteType};
 use engramma_core::search::{Fusion, Mode, Query, Semantic};
-use engramma_core::{Cell, Confidence, Embedder, Status};
+use engramma_core::{Cell, Confidence, EmbedError, Embedder, Status, TextKind};
 use time::OffsetDateTime;
 
 /// Fixed seed: same corpus on every run, on every machine.
@@ -37,6 +44,11 @@ impl Rng {
     }
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n
+    }
+    /// A deterministic f32 in [-1, 1) from the top bits (as in the core's
+    /// vector tests).
+    fn next_f32(&mut self) -> f32 {
+        ((self.next() >> 40) as f32 / 16_777_216.0) - 1.0
     }
 }
 
@@ -547,6 +559,246 @@ fn slug(s: &str) -> String {
         .replace('ò', "o")
 }
 
+// ---------------------------------------------------------------------------
+// profiling probe (--fake-embedder): the engine without the model
+// ---------------------------------------------------------------------------
+
+/// The probe's deterministic fake embedder (from `vprof`): an FNV-1a seed
+/// off the text drives a xorshift over the dimensions, then L2. No model is
+/// loaded: what it measures is the vector machinery (storage, index, fusion)
+/// and the text pipeline, never the embedding cost.
+struct FakeEmbedder {
+    dim: usize,
+}
+
+impl Embedder for FakeEmbedder {
+    fn model_id(&self) -> &str {
+        "fake@1"
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn max_tokens(&self) -> usize {
+        512
+    }
+    fn embed(&self, texts: &[&str], _k: TextKind) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|t| {
+                let mut s: u64 = t.bytes().fold(1469598103934665603_u64, |h, b| {
+                    (h ^ u64::from(b)).wrapping_mul(1099511628211)
+                }) | 1;
+                let mut v: Vec<f32> = (0..self.dim)
+                    .map(|_| {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        (s % 2000) as f32 / 1000.0 - 1.0
+                    })
+                    .collect();
+                let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.iter_mut().for_each(|x| *x /= n);
+                v
+            })
+            .collect())
+    }
+}
+
+/// One probe measurement over a fresh cell.
+struct FakeReport {
+    notes: usize,
+    insert_s: f64,
+    embed_s: f64,
+    vector_p50_ms: f64,
+    vector_p95_ms: f64,
+    hybrid_p50_ms: f64,
+    hybrid_p95_ms: f64,
+    /// The raw int8 scan on synthetic vectors (`FlatI8::search`, m = 200).
+    top_int_p50_ms: f64,
+    /// Index build from stored rows (the first search), in ms.
+    index_build_ms: f64,
+}
+
+/// Insert `n` probe notes in a fresh cell, embed them all with one
+/// `embed_pending` call, then measure vector-only and hybrid search. The
+/// corpus is the probe's own (fixed template, deterministic ULIDs), so the
+/// numbers are comparable across runs and phases.
+fn run_fake(n: usize, loops: usize, dir: &std::path::Path) -> FakeReport {
+    let stem = format!("fake-{n}");
+    for suffix in ["", "-wal", "-shm"] {
+        let mut p = dir.to_path_buf();
+        p.set_file_name(format!("{stem}.sqlite{suffix}"));
+        let _ = std::fs::remove_file(&p);
+    }
+    let db = dir.join(format!("{stem}.sqlite"));
+    let cell = Cell::create(&db, "bench", "bench").expect(/* fresh file */ "create cell");
+    let t = At(OffsetDateTime::from_unix_timestamp(1_800_000_000).expect(/* valid */ "ts"));
+    let t0 = Instant::now();
+    for i in 0..n {
+        let note = Note {
+            id: ulid::Ulid::from_parts(1_800_000_000_000, u128::from(i as u64) + 1),
+            note_type: NoteType::Fact,
+            title: Some(format!("nota {i}")),
+            body: format!(
+                "Persona{} lavora a Citta{} sul progetto {} con [[Persona{}]].",
+                i % 997,
+                i % 101,
+                i % 313,
+                (i * 7) % 997
+            ),
+            tags: vec![],
+            scope: None,
+            lang: Some(Lang::It),
+            source: "user".into(),
+            confidence: Confidence::Stated,
+            status: Status::Active,
+            valid_from: None,
+            valid_to: None,
+            supersedes: vec![],
+            created_at: t.clone(),
+            updated_at: t.clone(),
+            extensions: vec![],
+        };
+        cell.put_note(&note, "bench")
+            .expect(/* generated notes are valid */ "put");
+    }
+    let insert_s = t0.elapsed().as_secs_f64();
+
+    cell.add_model("fake@1", 384)
+        .expect(/* bench embedder is valid */ "add model");
+    let emb: std::sync::Arc<dyn Embedder> = std::sync::Arc::new(FakeEmbedder { dim: 384 });
+    let t0 = Instant::now();
+    let report = cell
+        .embed_pending(emb.as_ref(), n + 1)
+        .expect(/* valid notes */ "embed");
+    let embed_s = t0.elapsed().as_secs_f64();
+    assert_eq!(report.remaining, 0, "the probe embeds everything");
+
+    let now = OffsetDateTime::from_unix_timestamp(1_810_000_000).expect(/* fixed */ "ts");
+    let latencies = |mode: Mode, index_build: &mut f64| -> (f64, f64) {
+        let sem = Semantic::new(std::sync::Arc::clone(&emb)).with_mode(mode);
+        let t0 = Instant::now();
+        let _ = cell
+            .search_semantic_with_now(&Query::text("warmup Persona12 Citta3").k(5), now, &sem)
+            .expect(/* valid */ "search");
+        *index_build = t0.elapsed().as_secs_f64() * 1000.0;
+        let mut ts: Vec<f64> = Vec::with_capacity(loops);
+        for i in 0..loops {
+            let q = Query::text(format!(
+                "dove lavora Persona{} progetto {}",
+                i * 13 % 997,
+                i % 313
+            ))
+            .k(5);
+            let t = Instant::now();
+            let _ = cell
+                .search_semantic_with_now(&q, now, &sem)
+                .expect(/* valid */ "search");
+            ts.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        (percentile(ts.clone(), 0.5), percentile(ts, 0.95))
+    };
+    let mut build = 0.0_f64;
+    let (vector_p50, vector_p95) = latencies(Mode::Vector, &mut build);
+    let index_build_ms = build;
+    let (hybrid_p50, hybrid_p95) = latencies(Mode::Hybrid, &mut 0.0_f64);
+
+    FakeReport {
+        notes: n,
+        insert_s,
+        embed_s,
+        vector_p50_ms: vector_p50,
+        vector_p95_ms: vector_p95,
+        hybrid_p50_ms: hybrid_p50,
+        hybrid_p95_ms: hybrid_p95,
+        top_int_p50_ms: fake_top_int_ms(n.max(1000), 384, loops),
+        index_build_ms,
+    }
+}
+
+/// The int8 flat scan in isolation: `n` synthetic unit vectors of `dim`
+/// dimensions, one deterministic query set, `FlatI8::search` with m = 200.
+fn fake_top_int_ms(n: usize, dim: usize, loops: usize) -> f64 {
+    let mut rng = Rng(0x5EED_0F0F_1234_5678);
+    let rows: Vec<engramma_core::IndexRow> = (0..n)
+        .map(|i| {
+            let mut v: Vec<f32> = (0..dim).map(|_| rng.next_f32()).collect();
+            engramma_core::embed::l2_normalize(&mut v);
+            engramma_core::IndexRow {
+                note_id: format!("n{i:06}"),
+                chunk: 0,
+                vec: v,
+            }
+        })
+        .collect();
+    let mut index = engramma_core::FlatI8::new(dim);
+    use engramma_core::VectorIndex as _;
+    index.rebuild(rows);
+    let mut ts: Vec<f64> = Vec::with_capacity(loops);
+    for _ in 0..loops {
+        let mut q: Vec<f32> = (0..dim).map(|_| rng.next_f32()).collect();
+        engramma_core::embed::l2_normalize(&mut q);
+        let t = Instant::now();
+        let hits = index.search(&q, 200);
+        ts.push(t.elapsed().as_secs_f64() * 1000.0);
+        let _ = hits.len();
+    }
+    percentile(ts, 0.5)
+}
+
+/// Median of every probe metric across runs.
+fn median_fake(runs: &[FakeReport]) -> FakeReport {
+    let pick = |f: fn(&FakeReport) -> f64| median(runs.iter().map(f).collect());
+    FakeReport {
+        notes: runs[0].notes,
+        insert_s: pick(|r| r.insert_s),
+        embed_s: pick(|r| r.embed_s),
+        vector_p50_ms: pick(|r| r.vector_p50_ms),
+        vector_p95_ms: pick(|r| r.vector_p95_ms),
+        hybrid_p50_ms: pick(|r| r.hybrid_p50_ms),
+        hybrid_p95_ms: pick(|r| r.hybrid_p95_ms),
+        top_int_p50_ms: pick(|r| r.top_int_p50_ms),
+        index_build_ms: pick(|r| r.index_build_ms),
+    }
+}
+
+fn fake_markdown(reports: &[FakeReport]) -> String {
+    let mut out = String::from(
+        "# Sonda engramma (embedder finto, `--fake-embedder`)\n\n\
+         Il motore senza il modello: inserimento, un `embed_pending` su tutte le\
+         note, ricerca solo-vettori e ibrida, e la scansione int8 isolata\
+         (`FlatI8::search`, m=200, vettori sintetici). Mediana dei giri.\n\n\
+         | note | inserimento (s) | embed_pending (s) | vettori p50 (ms) | vettori p95 (ms) | ibrido p50 (ms) | ibrido p95 (ms) | int8 p50 (ms) | build indice (ms) |\n\
+         |---|---|---|---|---|---|---|---|---|\n",
+    );
+    for r in reports {
+        out.push_str(&format!(
+            "| {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.2} | {:.0} |\n",
+            r.notes,
+            r.insert_s,
+            r.embed_s,
+            r.vector_p50_ms,
+            r.vector_p95_ms,
+            r.hybrid_p50_ms,
+            r.hybrid_p95_ms,
+            r.top_int_p50_ms,
+            r.index_build_ms,
+        ));
+    }
+    if reports.len() >= 2 {
+        let (a, b) = (&reports[0], &reports[reports.len() - 1]);
+        out.push_str(&format!(
+            "\nRapporto embed_pending {}/{}: **{:.1}×** (lineare ≈ {:.0}×; la soglia\
+             della fase è 15).\n",
+            b.notes,
+            a.notes,
+            b.embed_s / a.embed_s.max(1e-9),
+            b.notes as f64 / a.notes as f64,
+        ));
+    }
+    out
+}
+
 fn percentile(mut xs: Vec<f64>, p: f64) -> f64 {
     if xs.is_empty() {
         return 0.0;
@@ -808,9 +1060,42 @@ fn run_semantic(
         score_mode("testo", 't', None);
         score_mode("vettori", 'v', None);
         score_mode("rrf", 'h', Some(Fusion::Rrf { k: 60 }));
-        score_mode("convex-0.3", 'h', Some(Fusion::Convex { alpha: 0.3 }));
-        score_mode("convex-0.5", 'h', Some(Fusion::Convex { alpha: 0.5 }));
-        score_mode("convex-0.7", 'h', Some(Fusion::Convex { alpha: 0.7 }));
+        let convex = |alpha: f64, norm: engramma_core::CosNorm| {
+            Some(Fusion::Convex {
+                alpha,
+                cos_norm: norm,
+            })
+        };
+        score_mode(
+            "mm-0.3",
+            'h',
+            convex(0.3, engramma_core::CosNorm::Candidates),
+        );
+        score_mode(
+            "mm-0.5",
+            'h',
+            convex(0.5, engramma_core::CosNorm::Candidates),
+        );
+        score_mode(
+            "mm-0.7",
+            'h',
+            convex(0.7, engramma_core::CosNorm::Candidates),
+        );
+        score_mode(
+            "th-0.3",
+            'h',
+            convex(0.3, engramma_core::CosNorm::Theoretical),
+        );
+        score_mode(
+            "th-0.5",
+            'h',
+            convex(0.5, engramma_core::CosNorm::Theoretical),
+        );
+        score_mode(
+            "th-0.7",
+            'h',
+            convex(0.7, engramma_core::CosNorm::Theoretical),
+        );
 
         SemanticReport {
             model,
@@ -973,12 +1258,8 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
             }
             seen_sizes.push(r.notes);
             let modes = [
-                "testo",
-                "vettori",
-                "rrf",
-                "convex-0.3",
-                "convex-0.5",
-                "convex-0.7",
+                "testo", "vettori", "rrf", "mm-0.3", "mm-0.5", "mm-0.7", "th-0.3", "th-0.5",
+                "th-0.7",
             ];
             for m in modes {
                 let mut cells = Vec::new();
@@ -1014,6 +1295,9 @@ struct Args {
     /// `None` = default location (`bench/RESULTS.md`).
     out: Option<PathBuf>,
     runs: usize,
+    /// Run the profiling probe (fake embedder, no model) instead of the
+    /// full benchmark.
+    fake_embedder: bool,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Args {
@@ -1021,6 +1305,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Args {
         targets: Vec::new(),
         out: None,
         runs: 3,
+        fake_embedder: false,
     };
     let mut it = args.peekable();
     while let Some(arg) = it.next() {
@@ -1036,6 +1321,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Args {
                     a.runs = r.clamp(1, 9);
                 }
             }
+            "--fake-embedder" => a.fake_embedder = true,
             other => {
                 if let Ok(n) = other.parse::<usize>() {
                     a.targets.push(n);
@@ -1074,6 +1360,28 @@ fn main() {
     }
     let dir = std::env::temp_dir().join("engramma-bench");
     std::fs::create_dir_all(&dir).expect(/* temp dir */ "mkdir");
+    if args.fake_embedder {
+        // The profiling probe: no corpus generator, no model — the engine
+        // alone, one embed pass, vector and hybrid latencies, the int8 scan.
+        let mut reports = Vec::new();
+        for t in &targets {
+            let mut runs: Vec<FakeReport> = Vec::with_capacity(args.runs);
+            for i in 1..=args.runs {
+                eprintln!("sonda {t} note, giro {i}/{}…", args.runs);
+                runs.push(run_fake(*t, 30, &dir));
+            }
+            reports.push(median_fake(&runs));
+        }
+        let md = fake_markdown(&reports);
+        print!("{md}");
+        let out = args
+            .out
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("PROBE.md"));
+        std::fs::write(&out, &md).expect(/* target dir is writable */ "write report");
+        eprintln!("scritto {}", out.display());
+        return;
+    }
     let mut reports = Vec::new();
     for t in &targets {
         for uniform in [false, true] {
@@ -1151,6 +1459,7 @@ mod tests {
         assert_eq!(a.targets, vec![10, 20]);
         assert_eq!(a.out.as_deref(), Some(std::path::Path::new("altrove.md")));
         assert_eq!(a.runs, 3);
+        assert!(!a.fake_embedder);
 
         // bare numbers still work, and no --out means the default location
         let b = parse_args(std::iter::once("100000".to_string()));
@@ -1163,5 +1472,14 @@ mod tests {
                 .into_iter(),
         );
         assert_eq!(c.runs, 1);
+
+        let d = parse_args(
+            ["--fake-embedder", "--notes", "1000", "--runs", "2"]
+                .map(String::from)
+                .into_iter(),
+        );
+        assert!(d.fake_embedder);
+        assert_eq!(d.targets, vec![1000]);
+        assert_eq!(d.runs, 2);
     }
 }

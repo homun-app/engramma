@@ -263,6 +263,23 @@ pub enum Mode {
     Hybrid,
 }
 
+/// How the cosine is put on the same scale as the min-max'd BM25 inside the
+/// convex combination (v0.2.1). Summing the raw cosine let BM25's full [0, 1]
+/// span outweigh a cosine that, between candidates of real embeddings,
+/// moves by ~0.1: α weighted two unrelated scales.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CosNorm {
+    /// Min-max over the vector candidates of this query: best candidate 1,
+    /// worst 0. Uses the whole available cosine range; unstable on few or
+    /// very similar candidates (one outlier stretches everyone else).
+    Candidates,
+    /// Theoretical min-max with fixed limits: for the cosine of L2 unit
+    /// vectors the limits are −1 and +1 (fusion-function analysis for hybrid
+    /// retrieval, ACM TOIS 2023). Stable by construction, at the price of a
+    /// compressed cosine span (the natural width stays ~0.1).
+    Theoretical,
+}
+
 /// How the text and vector lists combine (§4; the default is chosen on the
 /// golden set and the benchmark, see REPORT).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -272,21 +289,28 @@ pub enum Fusion {
         /// Rank dampening (60 in the literature).
         k: u64,
     },
-    /// Convex combination: `alpha·cos + (1−alpha)·bm25_minmax` with BM25
-    /// min-max normalised over the candidates; a note missing from one list
-    /// scores 0 for it.
+    /// Convex combination: `alpha·cos_norm(cos) + (1−alpha)·bm25_minmax`,
+    /// both terms min-max normalised (BM25 and, with
+    /// [`CosNorm::Candidates`], the cosine over the candidates); a note
+    /// missing from one list scores 0 for it.
     Convex {
         /// Weight of the cosine (0–1).
         alpha: f64,
+        /// How the cosine is normalised.
+        cos_norm: CosNorm,
     },
 }
 
 impl Default for Fusion {
     fn default() -> Self {
-        // Measured on the golden vault (REPORT §v0.2): the convex combination
-        // with α = 0.7 beats RRF on paraphrases (0.867 vs 0.733 recall@5 with
-        // the 311M; 0.800 vs 0.733 with the 97M) at equal factual recall.
-        Fusion::Convex { alpha: 0.7 }
+        // Measured on the golden vault and the 10k/100k benchmark (REPORT
+        // §v0.2.1): the convex combination with the cosine min-max'd over the
+        // candidates and α = 0.7 — the cosine rides on BM25's [0, 1] scale,
+        // so α means what it says.
+        Fusion::Convex {
+            alpha: 0.7,
+            cos_norm: CosNorm::Candidates,
+        }
     }
 }
 
@@ -308,8 +332,9 @@ pub struct Semantic {
 }
 
 impl Semantic {
-    /// Defaults: hybrid, RRF k=60 and tau = 0.30 (tuned on the golden vault,
-    /// REPORT).
+    /// Defaults: hybrid, [`Fusion::default()`] (see there — it is a
+    /// measured choice, not a literature default) and tau = 0.30 (tuned on
+    /// the golden vault, REPORT).
     #[must_use]
     pub fn new(embedder: std::sync::Arc<dyn crate::embed::Embedder>) -> Self {
         Self {
@@ -1034,7 +1059,7 @@ fn fuse(
                 *out.entry(v.id.clone()).or_default() += 1.0 / (k as f64 + v.rank as f64);
             }
         }
-        Fusion::Convex { alpha } => {
+        Fusion::Convex { alpha, cos_norm } => {
             // BM25 min-max over the union's present values
             let mut min = f64::INFINITY;
             let mut max = f64::NEG_INFINITY;
@@ -1050,11 +1075,34 @@ fn fuse(
                     1.0
                 }
             };
+            // The cosine on the same [0, 1] scale (v0.2.1): min-max over the
+            // vector candidates, or the theoretical −1..1 limits of the
+            // cosine between L2 unit vectors — never the raw value, whose
+            // ~0.1 span let the min-max'd BM25 outweigh it at every α.
+            let (cmin, cmax) = match cos_norm {
+                CosNorm::Candidates => {
+                    let mut lo = f64::INFINITY;
+                    let mut hi = f64::NEG_INFINITY;
+                    for v in vecs {
+                        lo = lo.min(v.cosine);
+                        hi = hi.max(v.cosine);
+                    }
+                    (lo, hi)
+                }
+                CosNorm::Theoretical => (-1.0, 1.0),
+            };
+            let cos_norm_of = |c: f64| -> f64 {
+                if cmax > cmin {
+                    ((c - cmin) / (cmax - cmin)).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                }
+            };
             for (id, bm25, _, _) in text {
                 *out.entry(id.clone()).or_default() += (1.0 - alpha) * norm(*bm25);
             }
             for v in vecs {
-                *out.entry(v.id.clone()).or_default() += alpha * v.cosine.max(0.0);
+                *out.entry(v.id.clone()).or_default() += alpha * cos_norm_of(v.cosine);
             }
         }
     }
@@ -2700,12 +2748,93 @@ mod semantic_tests {
             .search_semantic_with_now(&q, now(), &sem().with_fusion(Fusion::Rrf { k: 60 }))
             .unwrap(/* test-only */);
         let conv = cell
-            .search_semantic_with_now(&q, now(), &sem().with_fusion(Fusion::Convex { alpha: 0.5 }))
+            .search_semantic_with_now(
+                &q,
+                now(),
+                &sem().with_fusion(Fusion::Convex {
+                    alpha: 0.5,
+                    cos_norm: CosNorm::Candidates,
+                }),
+            )
             .unwrap(/* test-only */);
         assert!(!rrf.hits.is_empty() && !conv.hits.is_empty());
         // both contain the text match; scores are recomputed, not shared
         let rrf_top = rrf.hits[0].note.display_title().to_string();
         let conv_top = conv.hits[0].note.display_title().to_string();
         let _ = (rrf_top, conv_top);
+    }
+
+    #[test]
+    fn convex_fusion_normalises_the_cosine_scale() {
+        // v0.2.1: the convex combination normalises BM25 with min-max over
+        // [0, 1] but summed the RAW cosine — among candidates the cosine of
+        // real embeddings spans ~0.1 while BM25 spans 1.0, so α = 0.7 could
+        // not rescue a much-closer vector match from a slightly-better text
+        // match. Here B loses BM25 by 1% but wins the cosine by 0.11: with
+        // the cosine on the same [0, 1] scale as BM25, B must fuse higher.
+        let n = |id: u16| note(id, "titolo", "corpo");
+        let text = vec![
+            ("a".to_string(), 10.0, 1, n(1)),
+            ("b".to_string(), 9.9, 2, n(2)),
+        ];
+        let vecs = vec![
+            VecCand {
+                id: "b".to_string(),
+                cosine: 0.91,
+                rank: 1,
+                note: n(2),
+                chunk: 0,
+            },
+            VecCand {
+                id: "a".to_string(),
+                cosine: 0.80,
+                rank: 2,
+                note: n(1),
+                chunk: 0,
+            },
+        ];
+        let fused = fuse(
+            &text,
+            &vecs,
+            &Fusion::Convex {
+                alpha: 0.7,
+                cos_norm: CosNorm::Candidates,
+            },
+        );
+        assert!(
+            fused["b"] > fused["a"],
+            "the cosine must be on BM25's scale: {fused:?}"
+        );
+        // flat BM25 (a single text candidate): the fused order follows the
+        // cosine alone — min-max'd BM25 contributes the same constant.
+        let text_flat = vec![("a".to_string(), 10.0, 1, n(1))];
+        let fused = fuse(
+            &text_flat,
+            &vecs,
+            &Fusion::Convex {
+                alpha: 0.7,
+                cos_norm: CosNorm::Candidates,
+            },
+        );
+        assert!(
+            fused["b"] > fused["a"],
+            "flat BM25, cosine order: {fused:?}"
+        );
+        // the theoretical normalisation (−1..1) keeps the raw span: the
+        // 0.11 cosine gap maps to 0.055, less than BM25's 0.3·(1−α) gap of
+        // the first case — there A still fuses higher, which is exactly
+        // what the measurement of this phase had to decide between.
+        let fused = fuse(
+            &text,
+            &vecs,
+            &Fusion::Convex {
+                alpha: 0.7,
+                cos_norm: CosNorm::Theoretical,
+            },
+        );
+        assert!(
+            fused["a"] > fused["b"],
+            "the theoretical limits keep the raw-cosine behaviour: {fused:?}"
+        );
     }
 }

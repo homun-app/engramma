@@ -1238,15 +1238,70 @@ fn run_model(cli: &Cli, action: &ModelAction) -> Result<(), CliError> {
     }
 }
 
-/// Parse `--fusion rrf|convex-0.3|convex-0.5|convex-0.7`.
+/// Parse `--fusion`: `rrf`, or the convex combination as
+/// `convex[-mm|-th]-α` — `mm` min-maxes the cosine over the candidates
+/// (the default), `th` uses the theoretical −1..1 limits.
 fn parse_fusion(s: &str) -> Result<engramma_core::search::Fusion, CliError> {
-    match s {
-        "rrf" => Ok(engramma_core::search::Fusion::Rrf { k: 60 }),
-        "convex-0.3" | "convex-0,3" => Ok(engramma_core::search::Fusion::Convex { alpha: 0.3 }),
-        "convex-0.5" | "convex-0,5" => Ok(engramma_core::search::Fusion::Convex { alpha: 0.5 }),
-        "convex-0.7" | "convex-0,7" => Ok(engramma_core::search::Fusion::Convex { alpha: 0.7 }),
-        other => Err(CliError::usage(format!(
-            "unknown --fusion `{other}` (rrf, convex-0.3, convex-0.5, convex-0.7)"
-        ))),
+    use engramma_core::search::{CosNorm, Fusion};
+    if s == "rrf" {
+        return Ok(Fusion::Rrf { k: 60 });
+    }
+    let (alpha_str, norm) = if let Some(a) = s.strip_prefix("convex-th-") {
+        (a, CosNorm::Theoretical)
+    } else if let Some(a) = s
+        .strip_prefix("convex-mm-")
+        .or_else(|| s.strip_prefix("convex-"))
+    {
+        (a, CosNorm::Candidates)
+    } else {
+        return Err(CliError::usage(fusion_usage(s)));
+    };
+    let alpha = match alpha_str.replace(',', ".").as_str() {
+        "0.3" => 0.3,
+        "0.5" => 0.5,
+        "0.7" => 0.7,
+        _ => return Err(CliError::usage(fusion_usage(s))),
+    };
+    Ok(Fusion::Convex {
+        alpha,
+        cos_norm: norm,
+    })
+}
+
+fn fusion_usage(s: &str) -> String {
+    format!("unknown --fusion `{s}` (rrf, convex-0.3, convex-mm-0.5, convex-th-0.7, …)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engramma_core::search::{CosNorm, Fusion};
+
+    #[test]
+    fn fusion_parsing_covers_norms_and_comma_decimals() {
+        assert!(matches!(parse_fusion("rrf"), Ok(Fusion::Rrf { k: 60 })));
+        assert_eq!(
+            parse_fusion("convex-0,7").ok(),
+            Some(Fusion::Convex {
+                alpha: 0.7,
+                cos_norm: CosNorm::Candidates
+            })
+        );
+        assert_eq!(
+            parse_fusion("convex-mm-0.5").ok(),
+            Some(Fusion::Convex {
+                alpha: 0.5,
+                cos_norm: CosNorm::Candidates
+            })
+        );
+        assert_eq!(
+            parse_fusion("convex-th-0.3").ok(),
+            Some(Fusion::Convex {
+                alpha: 0.3,
+                cos_norm: CosNorm::Theoretical
+            })
+        );
+        assert!(parse_fusion("convex-0.9").is_err());
+        assert!(parse_fusion("bm25").is_err());
     }
 }
