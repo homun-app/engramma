@@ -1225,7 +1225,7 @@ struct VecCand {
 /// Returns `(model, dim)` or `None` when no model is ready (the caller
 /// degrades to text-only). A `data_version` change (another process wrote)
 /// triggers a rebuild; this cell's own writes update the index in place.
-fn ensure_index(inner: &mut Inner) -> Result<Option<(String, usize)>, SearchError> {
+pub(crate) fn ensure_index(inner: &mut Inner) -> Result<Option<(String, usize)>, SearchError> {
     let Some(ready) = VectorTx { conn: &inner.conn }
         .ready_model()
         .map_err(|e| SearchError::Db(e.to_string()))?

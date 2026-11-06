@@ -221,6 +221,13 @@ enum Command {
         #[arg(long, default_value_t = 1_000)]
         keep_last: i64,
     },
+    /// Consolidation candidates: near duplicates and probable
+    /// contradictions — the engine proposes, the application decides (v0.3)
+    Consolidate {
+        /// Max candidates per kind
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// The markdown view: two-way sync with a folder of notes (v0.3)
     Vault {
         #[command(subcommand)]
@@ -1112,6 +1119,47 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     report.replay_ok,
                     report.mismatch.unwrap_or_default()
                 )));
+            }
+            Ok(())
+        }
+        Command::Consolidate { limit } => {
+            let cell = open_cell(cli)?;
+            let out =
+                cell.consolidation_candidates(*limit, &engramma_core::Consolidation::default())?;
+            if cli.json {
+                let arr: Vec<serde_json::Value> = out
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "kind": c.kind.as_str(),
+                            "a": c.a.to_string(),
+                            "b": c.b.to_string(),
+                            "detail": c.detail,
+                        })
+                    })
+                    .collect();
+                print_json(&serde_json::json!({ "candidates": arr }));
+            } else {
+                for c in &out {
+                    let (ta, tb) = (cell.get(&c.a), cell.get(&c.b));
+                    let title = |r: Result<engramma_core::Note, _>| {
+                        r.map(|n| n.display_title().to_string())
+                            .unwrap_or_else(|_| "?".into())
+                    };
+                    println!(
+                        "[{}] {} ({}) ↔ {} ({})
+  {}",
+                        c.kind.as_str(),
+                        title(ta),
+                        engramma_core::id::id8(&c.a),
+                        title(tb),
+                        engramma_core::id::id8(&c.b),
+                        c.detail
+                    );
+                }
+                if out.is_empty() {
+                    println!("nessun candidato");
+                }
             }
             Ok(())
         }

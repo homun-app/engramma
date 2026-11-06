@@ -13,4 +13,5 @@ updated_at: 2026-01-15T18:00:00Z
 Luca Ferrari, amico di [[Fabio]] dai tempi dell'università, vive a [[Torino]] e insegna matematica.
 
 ## Relations
-- lives_in:: [[Torino]]
+- lives_in:: [[Torino]] (from 2024-01-01)
+- lives_in:: [[Roma]] (from 2026-09-01)

@@ -4,6 +4,7 @@
 //! contract (v0.2).
 
 pub mod cell;
+pub mod consolidation;
 pub mod embed;
 pub mod error;
 pub mod format;
@@ -17,6 +18,7 @@ pub mod vector;
 
 pub use cell::{Cell, NotePatch, VaultFile, VerifyReport};
 pub use cell::{EmbedPendingReport, ModelCoverage, ModelRow, ModelState};
+pub use consolidation::{Candidate, CandidateKind, Consolidation};
 pub use embed::{Embedder, TextKind};
 pub use error::{CellError, EmbedError, FormatError, PortError, SearchError};
 pub use format::{Confidence, Lang, Note, NoteType, ParseMode, Status, Validity};
