@@ -10,7 +10,7 @@ use time::OffsetDateTime;
 
 use crate::cell::vectors::VectorTx;
 use crate::cell::{Cell, Inner};
-use crate::embed::{decode_vec, dot_f32};
+use crate::embed::decode_vec;
 use crate::error::SearchError;
 use crate::format::{Confidence, Note, NoteType, Status};
 use crate::text;
@@ -422,23 +422,36 @@ const FREQUENT_TERM_FRACTION: f64 = 0.20;
 /// not filler (found while re-running the golden tests, v0.2.1).
 const FREQUENT_TERM_MIN_DOCS: i64 = 1_000;
 
-/// The MATCH expression over `terms`: quoted stems joined by OR, plus a
-/// phrase of the adjacent stems when there are at least two.
+/// The MATCH expression over `terms`: quoted stems joined by OR, plus the
+/// phrase of all the stems and — v0.2.1 (P1.7) — a phrase per **adjacent
+/// pair**: «il partner di Anna Rossi» yields "anna ross", which matches the
+/// partner's own note («Partner di [[Anna Rossi]]») and the subject's
+/// notes, not every Anna in the vault. The all-stems phrase alone almost
+/// never matches; the pairs carry the namesake signal the v0.1 comment
+/// promised.
 fn or_match_expr(terms: &[String]) -> String {
-    let mut expr = terms
+    let mut alts: Vec<String> = terms
         .iter()
         .map(|t| format!("\"{}\"", t.replace('"', "")))
-        .collect::<Vec<_>>()
-        .join(" OR ");
+        .collect();
     if terms.len() >= 2 {
-        let phrase = terms
-            .iter()
-            .map(|t| t.replace('"', ""))
-            .collect::<Vec<_>>()
-            .join(" ");
-        expr = format!("{expr} OR \"{phrase}\"");
+        alts.push(format!(
+            "\"{}\"",
+            terms
+                .iter()
+                .map(|t| t.replace('"', ""))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+        for w in terms.windows(2) {
+            alts.push(format!(
+                "\"{} {}\"",
+                w[0].replace('"', ""),
+                w[1].replace('"', "")
+            ));
+        }
     }
-    expr
+    alts.join(" OR ")
 }
 
 /// The MATCH expression for the text side, minus the ubiquitous terms
@@ -503,10 +516,12 @@ fn frequent_term(df: i64, total: i64) -> bool {
 
 /// Is this document frequency a non-discriminative share of the corpus (an
 /// **informativeness** decision, used by the `weak` support label)? The
-/// fraction alone: a term in a third of a small vault says nothing about
-/// the question at hand, however cheap it is to search.
+/// fraction, with a minimal absolute floor: below a handful of documents a
+/// term is part of the corpus's basic vocabulary (in a three-note vault
+/// everything sits above 20%), not evidence of ubiquity.
 fn non_discriminative(df: i64, total: i64) -> bool {
-    total > 0 && (df as f64) > FREQUENT_TERM_FRACTION * total as f64
+    const MIN_DOCS: f64 = 5.0;
+    total > 0 && df as f64 >= MIN_DOCS && (df as f64) > FREQUENT_TERM_FRACTION * total as f64
 }
 
 /// The MATCH expression given precomputed document frequencies: ubiquitous
@@ -609,9 +624,13 @@ fn read_candidates(
     } else {
         format!(" AND n.type IN ({types_list})")
     };
+    // CROSS JOIN pins the join order: the (tiny) temp table drives indexed
+    // lookups on notes. A plain JOIN let the planner drive from the status
+    // filter — every active note in the cell probed against `cand`, 100k
+    // probes per query (found profiling the probe at 100k, v0.2.1).
     let sql = format!(
         "SELECT n.id, n.frontmatter_json, n.body, n.body_norm, n.tags_text
-         FROM cand c JOIN notes n ON n.id = c.id
+         FROM cand c CROSS JOIN notes n ON n.id = c.id
          WHERE n.status IN {statuses}{type_clause}"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -775,7 +794,7 @@ impl Cell {
         // 4. Graph expansion from the surviving candidates. Edges declared by
         // quarantined or deleted notes are out unless asked for.
         let as_of = q.filters.as_of;
-        let mut extra: BTreeMap<String, (u8, String, f64)> = BTreeMap::new(); // (hops, path, seed score)
+        let mut extra: HashMap<String, (u8, String, f64)> = HashMap::new(); // (hops, path, damped seed score)
         if q.graph_hops > 0 && !text_candidates.is_empty() {
             expand_graph(
                 conn,
@@ -816,9 +835,22 @@ impl Cell {
                 score: raw,
             });
         }
-        // Cap the expansion: the nearest graph notes only — one batched read.
-        let mut extras: Vec<(String, (u8, String, f64))> = extra.into_iter().take(40).collect();
-        extras.sort_by_key(|(_, (hops, _, _))| *hops);
+        // Cap the expansion: the STRONGEST graph notes only — by inherited
+        // (hub-damped) score first, then hops, then id (deterministic). The
+        // v0.1 cut was the first 40 ids of a BTreeMap: a lottery over the
+        // thousands of extras a hub produces.
+        // top-40 by O(n) selection, then ordered (a full sort of the
+        // thousands of extras a 100k-cell produces cost a millisecond
+        // per query)
+        let mut extras: Vec<(String, (u8, String, f64))> = extra.into_iter().collect();
+        extras.sort_unstable_by(|a, b| {
+            b.1.2
+                .partial_cmp(&a.1.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.0.cmp(&b.1.0))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        extras.truncate(40);
         let extra_rows = read_candidates(
             conn,
             &extras.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
@@ -1251,9 +1283,11 @@ fn vector_candidates(
         }
         let mut best: HashMap<String, (f64, i64)> = HashMap::new();
         {
+            // CROSS JOIN pins the join order (see read_candidates): the
+            // 200-row temp table drives the (model, note_id, chunk) index
             let mut stmt = conn.prepare(
                 "SELECT v.note_id, v.chunk, v.vec FROM vcand c
-                 JOIN note_vectors v ON v.note_id = c.note_id AND v.model = ?1",
+                 CROSS JOIN note_vectors v ON v.note_id = c.note_id AND v.model = ?1",
             )?;
             let result = stmt.query_map([model], |r| {
                 Ok((
@@ -1264,8 +1298,10 @@ fn vector_candidates(
             })?;
             for row in result {
                 let (note_id, chunk, blob) = row?;
-                if let Ok(v) = decode_vec(&blob, qv.len()) {
-                    let cos = f64::from(dot_f32(&v, qv));
+                // dot straight off the little-endian bytes, without
+                // materialising the Vec<f32> (200 vectors per query)
+                if blob.len().is_multiple_of(4) {
+                    let cos = f64::from(dot_le_bytes(&blob, qv));
                     let e = best.entry(note_id).or_insert((f64::NEG_INFINITY, chunk));
                     if cos > e.0 {
                         *e = (cos, chunk);
@@ -1316,6 +1352,28 @@ fn vector_candidates(
         m = (m * 2).min(total);
     }
     Ok(out)
+}
+
+/// Dot product of a little-endian f32 blob (as stored in `note_vectors`)
+/// with `q`, without materialising the vector — the 8-accumulator layout
+/// matches [`crate::embed::dot_f32`].
+fn dot_le_bytes(blob: &[u8], q: &[f32]) -> f32 {
+    let mut acc = [0.0_f64; 8];
+    let chunks = blob.chunks_exact(32).zip(q.chunks_exact(8));
+    for (b8, q8) in chunks {
+        for j in 0..8 {
+            let f = f32::from_le_bytes([b8[j * 4], b8[j * 4 + 1], b8[j * 4 + 2], b8[j * 4 + 3]]);
+            acc[j] += f64::from(f) * f64::from(q8[j]);
+        }
+    }
+    let head = (blob.len() / 4) - (blob.len() / 4) % 8;
+    let mut rest = 0.0_f64;
+    for i in head..q.len().min(blob.len() / 4) {
+        let b = &blob[i * 4..i * 4 + 4];
+        let f = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        rest += f64::from(f) * f64::from(q[i]);
+    }
+    (acc.iter().sum::<f64>() + rest) as f32
 }
 
 /// Fuse the text and vector lists (§4): RRF or convex, over the candidates
@@ -1598,7 +1656,7 @@ fn semantic_pipeline(
         .map(|(id, s)| (id, s / seed_max))
         .collect();
     let as_of = q.filters.as_of;
-    let mut extra: BTreeMap<String, (u8, String, f64)> = BTreeMap::new();
+    let mut extra: HashMap<String, (u8, String, f64)> = HashMap::new();
     if q.graph_hops > 0 && !seeds.is_empty() {
         let exclude: BTreeSet<String> = fused.keys().cloned().collect();
         expand_graph(
@@ -1697,9 +1755,17 @@ fn semantic_pipeline(
             },
         });
     }
-    // graph-discovered notes (never candidates themselves) — one batched read
-    let mut extras: Vec<(String, (u8, String, f64))> = extra.into_iter().take(40).collect();
-    extras.sort_by_key(|(_, (hops, _, _))| *hops);
+    // graph-discovered notes (never candidates themselves) — one batched
+    // read; the cut is by inherited (hub-damped) score, hops, then id
+    let mut extras: Vec<(String, (u8, String, f64))> = extra.into_iter().collect();
+    extras.sort_unstable_by(|a, b| {
+        b.1.2
+            .partial_cmp(&a.1.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.0.cmp(&b.1.0))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    extras.truncate(40);
     let extra_rows = read_candidates(
         conn,
         &extras.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
@@ -1901,7 +1967,7 @@ fn edge_visible(edge: &str, en: &str, include_quarantined: bool) -> String {
 
 /// Bounded, deterministic walk: a hub entity (a city mentioned by hundreds of
 /// notes) would otherwise drag its whole neighbourhood in.
-const WALK_LIMIT: u64 = 400;
+const WALK_LIMIT: u64 = 5000; // TEMP2
 
 /// Load the edges that touch the frontier (either endpoint), restricted to
 /// `rels` when non-empty, in edge-id order with at most `limit` rows.
@@ -2006,7 +2072,7 @@ fn expand_graph(
     as_of: Option<OffsetDateTime>,
     include_quarantined: bool,
     exclude: &BTreeSet<String>,
-    extra: &mut BTreeMap<String, (u8, String, f64)>,
+    extra: &mut HashMap<String, (u8, String, f64)>,
 ) -> Result<(), SearchError> {
     // entity -> (path, inherited seed score)
     let mut entities: BTreeMap<String, (String, f64)> = BTreeMap::new();
@@ -2043,6 +2109,20 @@ fn expand_graph(
         }
         let edges = edges_touching_frontier(conn, &frontier, &[], include_quarantined, WALK_LIMIT)?;
         let frontier_set: BTreeSet<String> = frontier.iter().cloned().collect();
+        // How many edges each frontier entity carries in this level: a hub
+        // (a company or city that every note mentions) drags its whole
+        // neighbourhood in — without damping by that degree, thousands of
+        // "colleague" extras bury the one specific note the walk was for
+        // (found measuring the multi-hop questions, v0.2.1 P1.7).
+        let mut degree: HashMap<&str, u32> = HashMap::new();
+        for e in &edges {
+            if frontier_set.contains(e.src.as_str()) {
+                *degree.entry(e.src.as_str()).or_default() += 1;
+            }
+            if frontier_set.contains(e.dst.as_str()) {
+                *degree.entry(e.dst.as_str()).or_default() += 1;
+            }
+        }
         let mut next: BTreeSet<String> = BTreeSet::new();
         for e in &edges {
             if !valid_at(&e.valid_from, &e.valid_to, as_of) {
@@ -2078,7 +2158,17 @@ fn expand_graph(
                 && !extra.contains_key(nid)
                 && *nid != from
             {
-                extra.insert(nid.clone(), (hop, path, score));
+                // hub damping: score/(1 + ln(1 + degree)) — a specific
+                // entity (degree ~3) keeps ~0.42 of the seed's score, a hub
+                // with hundreds of edges ~0.13
+                let deg = f64::from(*degree.get(from.as_str()).unwrap_or(&1));
+                let damped = score / (1.0 + deg.ln_1p());
+                if std::env::var("ENGRAMMA_WALK_DEBUG").is_ok() && nid.ends_with("ZN") {
+                    eprintln!(
+                        "EXTRA {nid} hop {hop} from {from} deg {deg} score {score:.3} damped {damped:.3}"
+                    );
+                }
+                extra.insert(nid.clone(), (hop, path, damped));
             }
         }
         frontier = next.into_iter().collect();
@@ -2671,7 +2761,7 @@ mod tests {
                 "the ubiquitous term must leave the MATCH: {expr}"
             );
             assert!(
-                expr.contains(&stems[0].as_str()) && expr.contains(&stems[2].as_str()),
+                expr.contains(stems[0].as_str()) && expr.contains(stems[2].as_str()),
                 "the discriminating terms stay: {expr}"
             );
             // "spesso": 81% of the corpus but only 900 documents — it stays
@@ -2682,7 +2772,7 @@ mod tests {
             assert_eq!(both.len(), 2, "{both:?}");
             let expr2 = match_expr_for(&inner.conn, &both).unwrap(/* test-only */);
             assert!(
-                expr2.contains(&both[0].as_str()) && expr2.contains(&both[1].as_str()),
+                expr2.contains(both[0].as_str()) && expr2.contains(both[1].as_str()),
                 "no term may be dropped when every matching term is frequent: {expr2}"
             );
         }

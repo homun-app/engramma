@@ -403,13 +403,6 @@ fn strict_support_drops_the_semantic_abstentions() {
         .unwrap_or_else(|e| panic!("model missing under {}: {e}", root().display()));
     let (_d, cell) = cell_with_model(&embedder);
     let embedder_arc: Arc<dyn Embedder> = Arc::new(embedder);
-    let strict = |sem: &Semantic, hits: &[engramma_core::search::Hit]| {
-        hits.iter()
-            .filter(|h| sem.mode == Mode::Hybrid && h.explain.support == Some("weak") && false)
-            .count()
-            == usize::MAX
-    };
-    let _ = strict; // (the filter is one retain away — see the CLI)
     for q in ["campione", "che auto guida Giulia"] {
         let query = Query::text(q).k(5).graph_hops(2);
         let outcome = cell

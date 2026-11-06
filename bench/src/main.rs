@@ -206,7 +206,11 @@ fn build_corpus(target: usize, uniform_updated_at: bool) -> Corpus {
     };
 
     let n_people = (target / 20).clamp(50, 3_000);
-    // person index -> (name, city_current, company, partner_idx)
+    // person index -> (name, city_current, company, partner_idx).
+    // v0.2.1 (P1.7): partners are MUTUAL (a real vault writes the relation
+    // on both pages). The one-sided v0.2 draw made "il partner di X" a
+    // question whose answer-note never named X, so no text signal could
+    // find it and the graph route drowned in coincidental surname matches.
     let mut people: Vec<(String, usize, usize, Option<usize>)> = Vec::new();
     for i in 0..n_people {
         // Unique names: combos cycle, then a generation number is appended,
@@ -226,12 +230,23 @@ fn build_corpus(target: usize, uniform_updated_at: bool) -> Corpus {
             name,
             rng.below(CITIES.len() as u64) as usize,
             rng.below(COMPANIES.len() as u64) as usize,
-            if rng.below(3) == 0 {
-                Some(rng.below(n_people as u64) as usize)
-            } else {
-                None
-            },
+            None,
         ));
+    }
+    for i in 0..n_people {
+        if people[i].3.is_none() && rng.below(3) == 0 {
+            // a mutual pair with a random unpaired person (not oneself)
+            let mut j = rng.below(n_people as u64) as usize;
+            let mut tries = 0;
+            while (j == i || people[j].3.is_some()) && tries < 8 {
+                j = rng.below(n_people as u64) as usize;
+                tries += 1;
+            }
+            if j != i && people[j].3.is_none() {
+                people[i].3 = Some(j);
+                people[j].3 = Some(i);
+            }
+        }
     }
 
     // Person notes (with relations) and their histories.
@@ -248,7 +263,7 @@ fn build_corpus(target: usize, uniform_updated_at: bool) -> Corpus {
         if let Some(p) = partner {
             body.push_str(&format!("- partner_of:: [[{}]]\n", people[*p].0));
         }
-        let person_note = base_note(
+        let mut person_note = base_note(
             person_id,
             NoteType::Person,
             name.clone(),
@@ -259,6 +274,12 @@ fn build_corpus(target: usize, uniform_updated_at: bool) -> Corpus {
             vec![],
             ts(2024, 1, 1),
         );
+        // v0.2.1 (P1.7): a person page is living memory — the vault's other
+        // current facts carry a recent `updated_at` and the person note did
+        // not, which the multi-hop diagnosis pinned as the reason the
+        // partner's note (a text match on «partner», dated 2024) sank below
+        // six-month-old fillers under the 180-day recency half-life.
+        person_note.updated_at = ts(2026, 10, 1 + (rng.below(27) as u8));
         notes.push(person_note);
 
         // Residence history: 2020–2023 in another city, superseded.
@@ -495,10 +516,15 @@ fn build_corpus(target: usize, uniform_updated_at: bool) -> Corpus {
             ),
         };
         let id = nid();
+        // v0.2.1 (P1.7): the filler title keeps the month, the NAME stays in
+        // the body — with the name in the title, twenty-odd fillers per
+        // person crowded the BM25 window on every name query and pushed the
+        // notes that actually answer relationship questions out of the
+        // candidates.
         notes.push(base_note(
             id,
             NoteType::Fact,
-            format!("Appunto {m} su {name}"),
+            format!("Appunto di {m}"),
             body,
             vec![format!("casa/{}", slug(CITIES[*city]))],
             Some(validity(
@@ -626,9 +652,7 @@ struct FakeReport {
 fn run_fake(n: usize, loops: usize, dir: &std::path::Path) -> FakeReport {
     let stem = format!("fake-{n}");
     for suffix in ["", "-wal", "-shm"] {
-        let mut p = dir.to_path_buf();
-        p.set_file_name(format!("{stem}.sqlite{suffix}"));
-        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(dir.join(format!("{stem}.sqlite{suffix}")));
     }
     let db = dir.join(format!("{stem}.sqlite"));
     let cell = Cell::create(&db, "bench", "bench").expect(/* fresh file */ "create cell");
@@ -655,8 +679,8 @@ fn run_fake(n: usize, loops: usize, dir: &std::path::Path) -> FakeReport {
             valid_from: None,
             valid_to: None,
             supersedes: vec![],
-            created_at: t.clone(),
-            updated_at: t.clone(),
+            created_at: t,
+            updated_at: t,
             extensions: vec![],
         };
         cell.put_note(&note, "bench")
@@ -744,6 +768,72 @@ fn fake_top_int_ms(n: usize, dim: usize, loops: usize) -> f64 {
         let _ = hits.len();
     }
     percentile(ts, 0.5)
+}
+
+/// Where the expected note of a multi-hop question ends up (P1.7): the
+/// position in a wide result list, its score, the terms it matched and the
+/// graph path that led there — and the same numbers for whatever beat it.
+/// Run with `--multihop-debug [--notes N]`; five questions, text pipeline.
+fn multihop_debug(target: usize, how_many: usize, dir: &std::path::Path) {
+    let corpus = build_corpus(target, false);
+    let db = dir.join(format!("mh-{target}.sqlite"));
+    let _ = std::fs::remove_file(&db);
+    let cell = Cell::create(&db, "bench", "bench").expect(/* fresh */ "create cell");
+    for note in &corpus.notes {
+        cell.put_note(note, "bench").expect(/* valid */ "put");
+    }
+    let now = OffsetDateTime::from_unix_timestamp(1_810_000_000).expect(/* fixed */ "ts");
+    for (qi, q) in corpus
+        .questions
+        .iter()
+        .filter(|q| q.category == "multi-salto")
+        .take(how_many)
+        .enumerate()
+    {
+        let mut query = Query::text(&q.text).k(100).graph_hops(2);
+        query.lang = Some(Lang::It);
+        if let Some(a) = q.as_of {
+            query.filters.as_of = Some(a);
+        }
+        let hits = cell
+            .search_with_now(&query, now)
+            .expect(/* valid */ "search");
+        let expected_rank = hits
+            .iter()
+            .position(|h| q.expect_ids.contains(&h.note.id.to_string()));
+        println!("\n[{}] `{}`", qi + 1, q.text);
+        match expected_rank {
+            Some(r) => {
+                let h = &hits[r];
+                println!(
+                    "  attesa al rango {} di {}: punteggio {:.4}, termini {:?}, liste {:?}, via {:?}",
+                    r + 1,
+                    hits.len(),
+                    h.raw_score,
+                    h.explain.matched_terms,
+                    h.explain.lists,
+                    h.explain.via
+                );
+            }
+            None => println!("  attesa ASSENTE dai primi {}", hits.len()),
+        }
+        for (r, h) in hits.iter().enumerate().take(6) {
+            println!(
+                "  {}. {:.4} {} [{}] {:?}{}",
+                r + 1,
+                h.raw_score,
+                h.note.display_title(),
+                h.explain.lists.to_vec().join("+"),
+                h.explain.matched_terms,
+                h.explain
+                    .via
+                    .as_deref()
+                    .map(|v| format!(" via {v}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&db);
 }
 
 /// Median of every probe metric across runs.
@@ -1298,6 +1388,9 @@ struct Args {
     /// Run the profiling probe (fake embedder, no model) instead of the
     /// full benchmark.
     fake_embedder: bool,
+    /// Diagnose the multi-hop questions (v0.2.1 P1.7): where the expected
+    /// note ends up, its score and its graph path.
+    multihop_debug: bool,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Args {
@@ -1306,6 +1399,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Args {
         out: None,
         runs: 3,
         fake_embedder: false,
+        multihop_debug: false,
     };
     let mut it = args.peekable();
     while let Some(arg) = it.next() {
@@ -1322,6 +1416,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Args {
                 }
             }
             "--fake-embedder" => a.fake_embedder = true,
+            "--multihop-debug" => a.multihop_debug = true,
             other => {
                 if let Ok(n) = other.parse::<usize>() {
                     a.targets.push(n);
@@ -1360,6 +1455,17 @@ fn main() {
     }
     let dir = std::env::temp_dir().join("engramma-bench");
     std::fs::create_dir_all(&dir).expect(/* temp dir */ "mkdir");
+    if args.multihop_debug {
+        let mut sizes = targets.clone();
+        if sizes.is_empty() {
+            sizes = vec![10_000];
+        }
+        for t in &sizes {
+            eprintln!("diagnosi multi-salto su {t} note…");
+            multihop_debug(*t, 5, &dir);
+        }
+        return;
+    }
     if args.fake_embedder {
         // The profiling probe: no corpus generator, no model — the engine
         // alone, one embed pass, vector and hybrid latencies, the int8 scan.
@@ -1481,5 +1587,13 @@ mod tests {
         assert!(d.fake_embedder);
         assert_eq!(d.targets, vec![1000]);
         assert_eq!(d.runs, 2);
+
+        let e = parse_args(
+            ["--multihop-debug", "--notes", "10000"]
+                .map(String::from)
+                .into_iter(),
+        );
+        assert!(e.multihop_debug);
+        assert_eq!(e.targets, vec![10_000]);
     }
 }
