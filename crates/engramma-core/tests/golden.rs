@@ -351,3 +351,39 @@ fn golden_files_are_canonical() {
         assert_eq!(text, again, "{} is not canonical", f.display());
     }
 }
+
+/// v0.3: a multi-hop question is only real when the text branch alone cannot
+/// see the answer — with `graph_hops = 0` the expected note must stay out of
+/// the top 5. Questions failing this are not multi-hop: they get corrected in
+/// the vault/queries, not tolerated here (prompt v0.3, punto 0).
+#[test]
+fn multihop_questions_need_the_graph() {
+    let (_d, cell) = golden_cell();
+    let raw = std::fs::read_to_string(golden_dir().join("queries.json")).unwrap(/* test-only */);
+    let queries: Vec<GoldenQuery> = serde_json::from_str(&raw).unwrap(/* test-only */);
+    let multihop: Vec<&GoldenQuery> = queries
+        .iter()
+        .filter(|q| q.category == "multi-salto")
+        .collect();
+    assert!(
+        multihop.len() >= 5,
+        "want at least 5 true multi-hop questions, got {}",
+        multihop.len()
+    );
+    for gq in &multihop {
+        let mut q = Query::text(&gq.q).k(5).graph_hops(0);
+        q.lang = Some(Lang::It);
+        let hits = cell.search_with_now(&q, golden_now()).unwrap(/* test-only */);
+        let top = titles(&hits);
+        let leaked = gq.expect.iter().any(|wanted| {
+            top.iter()
+                .any(|t| t.to_lowercase().contains(&wanted.to_lowercase()))
+        });
+        assert!(
+            !leaked,
+            "[{}] `{}` is answered by text alone (top 5 {top:?}): \
+             not a real multi-hop question — fix the story",
+            gq.category, gq.q
+        );
+    }
+}

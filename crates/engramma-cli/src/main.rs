@@ -215,6 +215,12 @@ enum Command {
     },
     /// Verify the log (hash chain + replay)
     Verify,
+    /// Compact the log: snapshot the cell and forget the old payloads
+    Compact {
+        /// Keep the last N operations uncompacted (default 1000)
+        #[arg(long, default_value_t = 1_000)]
+        keep_last: i64,
+    },
     /// Start the MCP server (stdio, read-only)
     Mcp {
         /// Exposed cells (comma-separated; without this flag no cell is exposed)
@@ -989,6 +995,50 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 if let Some(p) = promoted {
                     println!("modello pronto: {p}");
                 }
+            }
+            Ok(())
+        }
+        Command::Compact { keep_last } => {
+            let cell = open_cell(cli)?;
+            let head: i64 = cell
+                .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
+                .ok()
+                .and_then(|v| v.first().and_then(|s| s.parse().ok()))
+                .unwrap_or(0);
+            let target = head - keep_last;
+            if target >= 1 {
+                // the snapshot is taken at the live head; the payloads up to
+                // `target` are forgotten, the last `keep_last` stay replayable
+                let bytes_before = std::fs::metadata(cell.file_path())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let snap = cell.compact(target)?;
+                let bytes_after = std::fs::metadata(cell.file_path())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if cli.json {
+                    print_json(&serde_json::json!({
+                        "snapshot": snap.display().to_string(),
+                        "seq": target,
+                        "head": head,
+                        "bytes_before": bytes_before,
+                        "bytes_after": bytes_after,
+                    }));
+                } else {
+                    println!(
+                        "compattata fino a seq {target} (testa {head}): {} (file {} → {} byte)",
+                        snap.display(),
+                        bytes_before,
+                        bytes_after
+                    );
+                }
+            } else if cli.json {
+                print_json(&serde_json::json!({ "compacted": false, "seq": head }));
+            } else {
+                println!(
+                    "niente da compattare: {} operazioni, ne tengo {keep_last}",
+                    head
+                );
             }
             Ok(())
         }

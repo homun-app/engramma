@@ -1026,9 +1026,9 @@ impl Cell {
             .conn
             .query_row("SELECT COALESCE(MAX(seq), 0) FROM ops", [], |r| r.get(0))
             .unwrap_or(0);
-        if head_seq == 0 || up_to_seq != head_seq {
+        if head_seq == 0 || up_to_seq < 1 || up_to_seq > head_seq {
             return Err(CellError::Invalid(format!(
-                "compact wants the current head seq ({head_seq}), got {up_to_seq}:                  snapshot the cell exactly as it stands"
+                "compact wants a seq within the live log (1..={head_seq}), got {up_to_seq}"
             )));
         }
         let head_hash: String = inner
@@ -1069,12 +1069,12 @@ impl Cell {
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(seq) DO UPDATE SET head_hash = ?2, state_digest = ?3,
                                             file = ?4, created_at = ?5",
-            rusqlite::params![head_seq, head_hash, digest, file, created],
+            rusqlite::params![up_to_seq, head_hash, digest, file, created],
         )?;
         tx.execute(
             "DELETE FROM op_payloads WHERE op_id IN (
                  SELECT op_id FROM ops WHERE seq <= ?1)",
-            [head_seq],
+            [up_to_seq],
         )?;
         tx.commit()?;
         Ok(target)
@@ -1320,12 +1320,14 @@ impl Cell {
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 Ok((snap, d))
             });
-            let head_matches = source_ops
+            // the snapshot was taken at the op whose hash it records; the
+            // payloads up to `snap_seq` (≤ that head) were forgotten after it
+            let snap_head = source_ops
                 .iter()
-                .find(|o| o.seq == *snap_seq)
-                .is_some_and(|o| &o.hash == head_hash);
-            match (head_matches, checks) {
-                (true, Ok((snap_conn, d))) if &d == digest => {
+                .find(|o| &o.hash == head_hash)
+                .map(|o| o.seq);
+            match (snap_head, checks) {
+                (Some(snap_head_seq), Ok((snap_conn, d))) if &d == digest => {
                     let tx = rebuild_conn.transaction()?;
                     tx.execute_batch("DROP TABLE IF EXISTS snapshots;")?;
                     tx.commit()?;
@@ -1351,7 +1353,7 @@ impl Cell {
                     }
                     let from = source_ops
                         .iter()
-                        .position(|o| o.seq > *snap_seq)
+                        .position(|o| o.seq > snap_head_seq)
                         .unwrap_or(source_ops.len());
                     tail = &source_ops[from..];
                 }
@@ -2494,16 +2496,25 @@ mod tests {
             cell.put_note(&note(i, &format!("nota {i} [[Milano]]")), "t")
                 .unwrap(/* test-only */);
         }
-        let head = cell
+        let head: i64 = cell
             .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
             .unwrap(/* test-only */)[0]
-            .parse::<i64>()
+            .parse()
             .unwrap(/* test-only */);
-        let snap = cell.compact(head).unwrap(/* test-only */);
+        // compact up to one before the head: the last op stays replayable
+        let snap = cell.compact(head - 1).unwrap(/* test-only */);
         assert!(snap.is_file(), "{}", snap.display());
-        // the payloads up to the head are skeletons
         let ops = cell.ops().unwrap(/* test-only */);
-        assert!(ops.iter().all(|o| o.seq == head || o.body.is_none()));
+        assert!(ops.iter().all(|o| o.seq > head - 1 || o.body.is_none()));
+        assert!(
+            ops.iter()
+                .find(|o| o.seq == head)
+                .is_some_and(|o| o.body.is_some())
+        );
+        // changes_since under the cut is compacted, from the cut is fine
+        let err = cell.changes_since(head - 2).unwrap_err(/* t */);
+        assert!(matches!(err, CellError::Compacted { snapshot_seq } if snapshot_seq == head - 1));
+        assert!(cell.changes_since(head - 1).is_ok());
         // more writes after the compaction
         cell.put_note(&note(9, "dopo la compattazione [[Roma]]"), "t")
             .unwrap(/* test-only */);
@@ -2513,12 +2524,9 @@ mod tests {
             "verify after compaction: {:?}",
             report.mismatch
         );
-        // changes_since under the snapshot is a typed error
-        let err = cell.changes_since(1).unwrap_err(/* test-only */);
-        assert!(matches!(err, CellError::Compacted { snapshot_seq } if snapshot_seq == head));
-        assert!(cell.changes_since(head).is_ok());
-        // compacting again at a stale seq is refused
-        assert!(cell.compact(head).is_err());
+        // compacting outside the live log is refused
+        assert!(cell.compact(head + 5).is_err());
+        assert!(cell.compact(0).is_err());
     }
 
     /// v0.3 (P3): a tampered snapshot fails verification (the recorded
