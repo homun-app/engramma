@@ -191,6 +191,21 @@ fn mcp_stdio_roundtrip_and_isolation() {
         note.id.to_string()
     );
     assert!(hits[0]["explain"]["source"].as_str().is_some());
+    // v0.2.1: every search hit carries support ("strong" here: a text match
+    // confirms it); the tool description tells the model what "weak" means
+    assert_eq!(hits[0]["explain"]["support"].as_str(), Some("strong"));
+    let search_desc = list["result"]["tools"]
+        .as_array()
+        .unwrap(/* t */)
+        .iter()
+        .find(|t| t["name"] == "memory_search")
+        .and_then(|t| t["description"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        search_desc.contains("weak") && search_desc.contains("verify"),
+        "the description must explain the weak signal: {search_desc}"
+    );
 
     // an unexposed cell is unreachable even when named explicitly
     let call = serde_json::json!({

@@ -143,6 +143,7 @@ fn hit_json(h: &Hit) -> serde_json::Value {
             "cosine": h.explain.cosine,
             "fused_score": h.explain.fused_score,
             "lists": h.explain.lists,
+            "support": h.explain.support,
             "winning_chunk": h.explain.winning_chunk,
             "via": h.explain.via,
             "confidence": h.explain.confidence.as_str(),
@@ -245,11 +246,14 @@ impl MemoryServer {
     /// about the query: each result carries the note text, where it came from
     /// (`source`), when it was true (`valid_from`/`valid_to`) and why it
     /// matched (`explain`: terms, semantic rank and cosine when the meaning
-    /// branch is active, graph path). Paraphrases work: ask with different
-    /// words than the note uses. Facts that changed over time are linked by
-    /// `supersedes`: for "what is true now" rely on notes whose `valid_to` is
-    /// empty; use `as_of` for questions about the past ("where did they live
-    /// in August?"). Quarantined notes — unconfirmed content from third
+    /// branch is active, graph path). When `explain.support` is "weak" the
+    /// result is close in meaning but not confirmed by any text match —
+    /// verify it (ask again with other words, or read the note) before
+    /// asserting it as fact. Paraphrases work: ask with different words than
+    /// the note uses. Facts that changed over time are linked by `supersedes`:
+    /// for "what is true now" rely on notes whose `valid_to` is empty; use
+    /// `as_of` for questions about the past ("where did they live in
+    /// August?"). Quarantined notes — unconfirmed content from third
     /// parties — never appear in these results: the memory engine hides them
     /// until a human confirms them, so do not treat their absence as a
     /// denial.

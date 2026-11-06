@@ -106,6 +106,7 @@ pub fn hit_json(h: &Hit) -> serde_json::Value {
             "cosine": h.explain.cosine,
             "fused_score": h.explain.fused_score,
             "lists": h.explain.lists,
+            "support": h.explain.support,
             "winning_chunk": h.explain.winning_chunk,
             "via": h.explain.via,
             "confidence": h.explain.confidence.as_str(),
@@ -147,6 +148,9 @@ pub fn hit_human(h: &Hit, index: usize) -> String {
     }
     if let Some(c) = h.explain.cosine {
         out.push_str(&format!("\n   coseno: {c:.4}"));
+    }
+    if let Some(sup) = h.explain.support {
+        out.push_str(&format!("\n   supporto: {sup}"));
     }
     if let Some(chunk) = h.explain.winning_chunk {
         out.push_str(&format!("\n   blocco vincente: {chunk}"));

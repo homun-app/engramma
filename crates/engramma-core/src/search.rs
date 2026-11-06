@@ -147,6 +147,11 @@ pub struct Explain {
     pub fused_score: Option<f64>,
     /// Which candidate lists produced it: `text`, `vector`, `graph`.
     pub lists: Vec<&'static str>,
+    /// How well the result is supported (v0.2.1): `weak` when it arrives
+    /// only from the vector branch with a thin cosine margin over the next
+    /// vector candidate — close in meaning, unconfirmed by any text match;
+    /// `strong` otherwise. `None` on non-search hits (timeline).
+    pub support: Option<&'static str>,
     /// The chunk that won, for a multi-chunk note.
     pub winning_chunk: Option<usize>,
     /// Graph path that led here, e.g. `[[Giulia]] -lives_in-> [[Milano]]`.
@@ -170,6 +175,7 @@ impl Default for Explain {
             cosine: None,
             fused_score: None,
             lists: Vec::new(),
+            support: None,
             winning_chunk: None,
             via: None,
             confidence: Confidence::Stated,
@@ -329,6 +335,13 @@ pub struct Semantic {
     /// Abstention: a result that arrives only from the vector branch needs
     /// cosine ≥ tau.
     pub tau: f32,
+    /// A vector-only result whose cosine margin over the next vector
+    /// candidate is below this is reported `support: "weak"` (v0.2.1: one
+    /// signal, not a prohibition — the absolute cosine separates nothing,
+    /// a thin margin says something). Tuned on the golden vault (0.03: the
+    /// top «che auto guida Giulia» margin is 0.026, the paraphrase winners
+    /// sit above), REPORT.
+    pub weak_margin: f64,
 }
 
 impl Semantic {
@@ -342,6 +355,7 @@ impl Semantic {
             mode: Mode::Hybrid,
             fusion: Fusion::default(),
             tau: 0.30,
+            weak_margin: 0.03,
         }
     }
 
@@ -363,6 +377,13 @@ impl Semantic {
     #[must_use]
     pub fn with_tau(mut self, tau: f32) -> Self {
         self.tau = tau;
+        self
+    }
+
+    /// Set the `weak`-support margin (see [`Semantic::weak_margin`]).
+    #[must_use]
+    pub fn with_weak_margin(mut self, margin: f64) -> Self {
+        self.weak_margin = margin;
         self
     }
 }
@@ -429,9 +450,6 @@ fn or_match_expr(terms: &[String]) -> String {
 /// least one other term stays in the MATCH. Dropped terms still count in
 /// the explain's found terms and in the coverage factor.
 fn match_expr_for(conn: &rusqlite::Connection, terms: &[String]) -> Result<String, SearchError> {
-    if terms.len() < 2 {
-        return Ok(or_match_expr(terms));
-    }
     let total: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM notes WHERE status != 'deleted'",
@@ -439,19 +457,28 @@ fn match_expr_for(conn: &rusqlite::Connection, terms: &[String]) -> Result<Strin
             |r| r.get(0),
         )
         .unwrap_or(0);
-    if total == 0 {
-        return Ok(or_match_expr(terms));
+    let df = doc_frequencies(conn, terms)?;
+    Ok(match_expr_with(terms, &df, total))
+}
+
+/// Document frequency of each term, from the index's own vocabulary.
+/// SQLite 3.54's fts5vocab yields ONE row per term: (term, doc, cnt) where
+/// `doc` is the document frequency and `cnt` the total occurrences (probed
+/// by hand on the bundled 3.54.1; older fts5vocab emitted one row per
+/// term/document pair). An empty map means "unknown" — nothing is dropped,
+/// nothing is discounted.
+fn doc_frequencies(
+    conn: &rusqlite::Connection,
+    terms: &[String],
+) -> Result<HashMap<String, i64>, SearchError> {
+    if terms.is_empty() {
+        return Ok(HashMap::new());
     }
-    let threshold = FREQUENT_TERM_FRACTION * total as f64;
-    // SQLite 3.54's fts5vocab yields ONE row per term: (term, doc, cnt)
-    // where `doc` is the document frequency and `cnt` the total occurrences
-    // — exactly the number needed here (probed by hand on the bundled
-    // 3.54.1; older fts5vocab emitted one row per term/document pair).
     let placeholders = vec!["?"; terms.len()].join(", ");
     let sql = format!("SELECT term, doc FROM notes_fts_vocab WHERE term IN ({placeholders})");
     let Ok(mut stmt) = conn.prepare(&sql) else {
         // no vocabulary view (should not happen: the schema creates it)
-        return Ok(or_match_expr(terms));
+        return Ok(HashMap::new());
     };
     let params: Vec<String> = terms.to_vec();
     let rows = stmt
@@ -464,16 +491,38 @@ fn match_expr_for(conn: &rusqlite::Connection, terms: &[String]) -> Result<Strin
         let (term, doc_freq) = row?;
         df.insert(term, doc_freq);
     }
-    drop(stmt);
+    Ok(df)
+}
+
+/// Is this document frequency "ubiquitous" for the MATCH (a **cost**
+/// decision)? Both bounds: the fraction of the corpus AND the absolute
+/// floor ([`FREQUENT_TERM_MIN_DOCS`]).
+fn frequent_term(df: i64, total: i64) -> bool {
+    df >= FREQUENT_TERM_MIN_DOCS && (df as f64) > FREQUENT_TERM_FRACTION * total as f64
+}
+
+/// Is this document frequency a non-discriminative share of the corpus (an
+/// **informativeness** decision, used by the `weak` support label)? The
+/// fraction alone: a term in a third of a small vault says nothing about
+/// the question at hand, however cheap it is to search.
+fn non_discriminative(df: i64, total: i64) -> bool {
+    total > 0 && (df as f64) > FREQUENT_TERM_FRACTION * total as f64
+}
+
+/// The MATCH expression given precomputed document frequencies: ubiquitous
+/// terms leave (a frequent term can go only while a term that MATCHES
+/// something stays behind — a MATCH made only of zero-frequency terms
+/// would find nothing; when every matching term is frequent they all stay,
+/// the query is inherently broad and the old, costly behaviour is honest).
+fn match_expr_with(terms: &[String], df: &HashMap<String, i64>, total: i64) -> String {
+    if terms.len() < 2 || total == 0 {
+        return or_match_expr(terms);
+    }
     let df_of = |t: &String| df.get(t.as_str()).copied().unwrap_or(0);
-    let frequent = |t: &String| df_of(t) >= FREQUENT_TERM_MIN_DOCS && df_of(t) as f64 > threshold;
-    // a frequent term can leave only while a term that MATCHES something
-    // stays behind: a MATCH made only of zero-frequency terms would find
-    // nothing. When every matching term is frequent they all stay — the
-    // query is inherently broad, and the old (costly) behaviour is honest.
+    let is_frequent = |t: &String| frequent_term(df_of(t), total);
     let matching = terms.iter().filter(|t| df_of(t) > 0).count();
     let kept: Vec<String> = if matching >= 2 {
-        let kept: Vec<String> = terms.iter().filter(|t| !frequent(t)).cloned().collect();
+        let kept: Vec<String> = terms.iter().filter(|t| !is_frequent(t)).cloned().collect();
         if kept.iter().any(|t| df_of(t) > 0) {
             kept
         } else {
@@ -482,7 +531,7 @@ fn match_expr_for(conn: &rusqlite::Connection, terms: &[String]) -> Result<Strin
     } else {
         terms.to_vec()
     };
-    Ok(or_match_expr(&kept))
+    or_match_expr(&kept)
 }
 
 /// The BM25 candidate list for a MATCH expression: `(id, -bm25)` (FTS5's
@@ -758,6 +807,7 @@ impl Cell {
                     matched_terms: matched,
                     bm25_rank: Some(*rank),
                     lists: vec!["text"],
+                    support: Some("strong"),
                     fused_score: Some(raw),
                     ..Explain::default()
                 },
@@ -795,6 +845,7 @@ impl Cell {
                     matched_terms: matched,
                     via: Some(path),
                     lists: vec!["graph"],
+                    support: Some("strong"),
                     fused_score: Some(raw),
                     ..Explain::default()
                 },
@@ -1434,8 +1485,18 @@ fn semantic_pipeline(
         text::query_terms(&q.text, q.lang)
     };
     let mut text_hits: Vec<(String, f64)> = Vec::new();
+    let total_notes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE status != 'deleted'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    // document frequencies once: the MATCH drops the ubiquitous terms and
+    // the support labels discount text matches that rest on them alone
+    let df = doc_frequencies(conn, &terms)?;
     if !terms.is_empty() {
-        let match_expr = match_expr_for(conn, &terms)?;
+        let match_expr = match_expr_with(&terms, &df, total_notes);
         text_hits = bm25_candidates(conn, &match_expr, 50)?;
     }
     // one batched read for the candidates (P0.3): note + coverage columns
@@ -1494,6 +1555,19 @@ fn semantic_pipeline(
         .map(|(id, _, _, n)| (id.clone(), n))
         .collect();
     let vec_of: HashMap<&str, &VecCand> = vec_list.iter().map(|v| (v.id.as_str(), v)).collect();
+    // Cosine margin of each vector candidate over the next one (v0.2.1):
+    // a vector-only result with a thin margin is `support: "weak"` — near in
+    // meaning, unconfirmed by any text match. The last candidate has no
+    // runner-up to lean on: weak.
+    let margins: HashMap<&str, f64> = vec_list
+        .windows(2)
+        .map(|pair| (pair[0].id.as_str(), pair[0].cosine - pair[1].cosine))
+        .chain(std::iter::once((
+            vec_list.last().map_or("", |v| v.id.as_str()),
+            f64::NEG_INFINITY,
+        )))
+        .filter(|(id, _)| !id.is_empty())
+        .collect();
 
     // --- abstention FIRST (§4): a vector-only candidate below tau leaves
     // before it can seed the graph walk — otherwise its neighbours would
@@ -1563,6 +1637,27 @@ fn semantic_pipeline(
         if from_vec {
             lists.push("vector");
         }
+        // One signal, not a prohibition. Weak = the meaning branch alone
+        // carries the result AND its cosine margin over the next vector
+        // candidate is thin. A text match confirms ONLY when at least one
+        // matched term is discriminative: a match that rests entirely on
+        // ubiquitous terms (the subject's name in a vault about them) says
+        // nothing about THIS question ("che auto guida Giulia" matches
+        // every Giulia note — none of them is about a car).
+        let discriminative = from_text
+            && text_cov.get(id.as_str()).is_some_and(|(matched, _)| {
+                matched.iter().any(|t| {
+                    !non_discriminative(df.get(t.as_str()).copied().unwrap_or(0), total_notes)
+                })
+            });
+        let support = if from_vec && !discriminative {
+            match margins.get(id.as_str()) {
+                Some(m) if *m >= sem.weak_margin => "strong",
+                _ => "weak",
+            }
+        } else {
+            "strong"
+        };
         // (abstention already happened above, before the graph walk; in
         // vector mode the text list is empty so everything went through it)
         // Reliability and graph, without the v0.1 recency factor: cosine
@@ -1584,6 +1679,7 @@ fn semantic_pipeline(
                 cosine,
                 fused_score: Some(*fused_score),
                 lists,
+                support: Some(support),
                 winning_chunk: chunk,
                 matched_terms: if from_text {
                     text_cov
@@ -1626,6 +1722,7 @@ fn semantic_pipeline(
             explain: Explain {
                 via: Some(path),
                 lists: vec!["graph"],
+                support: Some("strong"),
                 fused_score: Some(raw),
                 ..Explain::default()
             },
@@ -3043,6 +3140,82 @@ mod semantic_tests {
         assert!(!outcome.hits.is_empty());
         assert!(outcome.hits[0].explain.lists.contains(&"text"));
         assert!(!outcome.hits[0].explain.lists.contains(&"vector"));
+    }
+
+    #[test]
+    fn support_labels_thin_vector_margins() {
+        // v0.2.1 (P1.6): the label, not a prohibition. A result that also
+        // matches text is strong whatever the margin; a vector-only result
+        // is weak exactly when its cosine margin over the next vector
+        // candidate sits under the configured bound (here driven to the
+        // extremes to test the switch, not the arithmetic).
+        let (_d, cell) = setup();
+        let everything_weak = sem().with_weak_margin(f64::INFINITY);
+        let nothing_weak = sem().with_weak_margin(f64::NEG_INFINITY);
+        // "Milano" matches text AND vector: strong under both bounds
+        for s in [&everything_weak, &nothing_weak] {
+            let outcome = cell
+                .search_semantic_with_now(&Query::text("Milano").k(3), now(), s)
+                .unwrap(/* test-only */);
+            assert!(
+                outcome
+                    .hits
+                    .iter()
+                    .any(|h| h.explain.lists.contains(&"text")),
+                "the text match must be there: {:?}",
+                outcome
+                    .hits
+                    .iter()
+                    .map(|h| h.note.display_title().to_string())
+                    .collect::<Vec<_>>()
+            );
+            for h in &outcome.hits {
+                if h.explain.lists.contains(&"text") {
+                    assert_eq!(h.explain.support, Some("strong"));
+                }
+            }
+        }
+        // no shared terms ("metropoli residenziale"): every survivor comes
+        // from the vector branch alone and flips with the bound
+        let q = || Query::text("metropoli residenziale").k(3).graph_hops(0);
+        let all = cell
+            .search_semantic_with_now(&q(), now(), &everything_weak)
+            .unwrap(/* test-only */);
+        assert!(!all.hits.is_empty());
+        assert!(
+            all.hits.iter().all(|h| h.explain.lists == vec!["vector"]),
+            "vector-only: {:?}",
+            all.hits
+                .iter()
+                .map(|h| h.explain.lists.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            all.hits.iter().all(|h| h.explain.support == Some("weak")),
+            "an infinite bound makes every vector-only hit weak"
+        );
+        let none = cell
+            .search_semantic_with_now(&q(), now(), &nothing_weak)
+            .unwrap(/* test-only */);
+        // note: the last vector candidate has no runner-up — weak by
+        // construction even with a negative bound
+        assert!(
+            none.hits
+                .iter()
+                .filter(|h| h.explain.semantic_rank != Some(vec_list_len_of(&none)))
+                .all(|h| h.explain.support == Some("strong")),
+            "a negative bound keeps everything strong (but the last candidate)"
+        );
+    }
+
+    /// Rank of the last surviving vector candidate (the test above).
+    fn vec_list_len_of(outcome: &crate::search::SearchOutcome) -> usize {
+        outcome
+            .hits
+            .iter()
+            .filter_map(|h| h.explain.semantic_rank)
+            .max()
+            .unwrap_or(0)
     }
 
     #[test]

@@ -119,6 +119,10 @@ enum Command {
         /// Abstention threshold for vector-only results (default 0.30)
         #[arg(long)]
         tau: Option<f32>,
+        /// Drop `support: "weak"` results (vector-only, thin cosine margin:
+        /// near in meaning, unconfirmed by any text match)
+        #[arg(long)]
+        strict: bool,
         #[arg(long, default_value = "10")]
         k: usize,
         /// Graph expansion 0-2
@@ -558,6 +562,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             mode,
             fusion,
             tau,
+            strict,
             k,
             hops,
             as_of,
@@ -634,7 +639,11 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     cell.search_semantic(&q, &sem)?
                 }
             };
-            let hits = outcome.hits;
+            let mut hits = outcome.hits;
+            if *strict {
+                // a weak result is a signal to verify, not an answer
+                hits.retain(|h| h.explain.support != Some("weak"));
+            }
             if cli.json {
                 let arr: Vec<serde_json::Value> = hits.iter().map(hit_json).collect();
                 print_json(&serde_json::json!({
