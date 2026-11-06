@@ -82,6 +82,12 @@ Fabio abita a [[Milano]] con [[Giulia]] dal settembre 2026.
 ### 4.1 Cos'è
 Ogni cella è **un file SQLite** (più, da v0.2, i suoi vettori) e **si basta da sola**: la si copia, la si sposta su un altro nodo o la si replica come un'unità. Un'installazione locale ha poche celle; un server può averne migliaia.
 
+> **Come funziona la vista (v0.3):** una **riconciliazione per scansione** deterministica, con gli eventi del file system (`notify`) solo come innesco: i watcher perdono eventi.
+> - Il file è legato alla nota dall'`id` nell'intestazione, non dal percorso.
+> - Scritture atomiche, soppressione dell'eco tramite hash.
+> - In conflitto vince la cella, e la versione del file diventa una copia di conflitto.
+> - Una guardia blocca le cancellazioni di massa.
+
 > **Decisa con l'utente il 2026-11-05:** la **fonte di verità è la cella, con il suo registro**, non la cartella di markdown. Per replica, sincronizzazione e audit serve un registro ordinato, e una cartella di file non può darlo. La cartella markdown resta una **vista bidirezionale** in modalità locale (v0.3): un controllo dei file trasforma le modifiche fatte a mano, anche da Obsidian, in operazioni del registro. Su server e in cluster i file non esistono: si esportano su richiesta.
 
 ### 4.2 Schema (v0.1)
@@ -120,17 +126,29 @@ Indici: `edges(src)`, `edges(dst)`, `edges(rel)`, `notes(status, valid_to)`, `no
   - un **orologio logico ibrido** (HLC: ordina le modifiche tra macchine con orologi diversi);
   - l'`actor` (chi ha scritto: utente, app, bot, pari);
   - un **hash concatenato** (`prev_hash`), così il registro è a prova di manomissione ed è verificabile.
+- **Registro v2, payload dimenticabili** (*deciso il 2026-11-06, v0.3*):
+  - la catena non copre il payload, ma un suo **digest salato** (`blake3(sale ‖ payload)`, la tecnica di SD-JWT, RFC 9901);
+  - il payload vive in una tabella a parte e si può cancellare senza rompere la catena;
+  - il sale distrutto rende il digest non collegabile al dato: un hash nudo di un dato personale può restare un dato personale, uno salato no;
+  - è la base comune di `purge` (§ 4.4) e della compattazione.
+
+  Si è preferito al crypto-shredding perché cancella davvero il dato e non richiede la gestione di chiavi; il crypto-shredding è contestato come cancellazione in alcune giurisdizioni.
 - **Determinismo (la proprietà più importante):** rigiocando il registro da zero si ottiene **esattamente** lo stesso stato. Va verificato con test di proprietà. La replica (§ 9) e la sincronizzazione (§ 10) si reggono su questo.
 - **Conflitti** (stessa nota cambiata in due posti) in v0.5:
   - sui campi dell'intestazione vince l'HLC più recente;
   - sul corpo, una **copia di conflitto** visibile all'utente, come fanno i sistemi di sincronizzazione maturi.
 
   Una fusione automatica del testo (CRDT) è rimandata e va misurata prima di adottarla.
-- **Compattazione:** le istantanee periodiche permettono di troncare il registro vecchio, conservando gli hash.
+- **Compattazione** (v0.3):
+  - un'istantanea della cella a un `seq` si fa con `VACUUM INTO` ed è registrata con l'hash di testa e un **digest dello stato** (`state_digest`, il dump canonico delle tabelle logiche);
+  - i payload delle operazioni fino a quel `seq` si dimenticano, mentre gli scheletri con gli hash restano: la catena è intera;
+  - `verify` controlla l'istantanea e rigioca solo le operazioni successive;
+  - `changes_since` sotto l'istantanea risponde `Compacted`: la replica parte dall'istantanea (§ 9).
 
 ### 4.4 Versioni e cancellazione
 - Ogni modifica crea una riga in `note_versions`: lo storico è consultabile e ripristinabile.
 - `delete_note` lascia una **lapide** (`status: deleted`), che si propaga alle repliche. La cancellazione definitiva (diritto all'oblio) è un'operazione esplicita, `purge`, che cancella anche le versioni e propaga la lapide.
+- `purge` (v0.3) **dimentica i payload** di tutte le operazioni della nota (registro v2, § 4.3). Toglie anche vettori, righe FTS, archi dichiarati ed entità rimaste orfane, e il file della vista markdown. Il suo payload contiene solo l'id e un motivo. Le menzioni `[[Nome]]` in altre note restano: sono altre note. Le esportazioni già fatte sono fuori dal controllo del motore.
 
 ### 4.5 Lo strato di accesso ai dati
 Il trait `CellStore` isola SQL, FTS e vettori: un'implementazione SQLite oggi, Turso o altro domani. Il resto del motore non contiene SQL.
@@ -186,7 +204,11 @@ query {
 
 1. **Candidati in parallelo:** 50 dal testo (BM25), 50 dal significato (dalla v0.2).
 2. **Fusione RRF** (somma di `1/(60 + posizione)` per ogni elenco): non serve calibrare i punteggi tra loro.
-3. **Allargamento nel grafo:** dalle entità collegate ai primi N risultati si aggiungono le note vicine, a uno o due passi, con un peso che decresce per passo. Si usano query ricorsive, con profondità massima 3.
+3. **Grafo come terza lista** (*rivisto il 2026-11-06, v0.3*): un **PageRank personalizzato a spinta** (Andersen–Chung–Lang) parte dai primi risultati fusi e già filtrati. Corre su un grafo note↔entità **in memoria** (`GraphIndex`: CSR derivato, costruito pigramente, aggiornato dalle scritture) e i suoi punteggi entrano nella fusione come terza lista.
+   - Era: un allargamento a passi fissi (0,6 / 0,36), con gli archi letti da SQLite a ogni domanda.
+   - Motivo, misurato sulla v0.2.1 a 100k: il grafo prendeva il 59% del tempo (p95 ibrido 59,8 ms) e in ibrido il multi-salto crollava a 0,063.
+   - Il prototipo di spinta: con ε = 10⁻³ tocca ~157 archi per domanda anche con hub da 16 741 archi, perché la soglia proporzionale al grado non espande gli hub, e trova la nota a due salti prima in 200 domande su 200.
+   - È la linea di HippoRAG 2.
 4. **Filtri temporali:** con `as_of` vale solo ciò che era valido in quella data. Di norma, solo ciò che vale oggi.
 5. **Riordino:** `punteggio = RRF × peso_affidabilità × peso_recenza × peso_grafo`. I pesi sono configurabili e i valori predefiniti vanno tarati sul benchmark (§ 11).
 6. **Spiegazione per ogni risultato:** `matched_terms`, `semantic_rank`, `via: [[Giulia]] → lives_in`, `confidence`, `valid_from`, `source`.
@@ -319,7 +341,7 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 |---|---|---|
 | **v0.1** | Formato e parser; cella SQLite; registro con HLC e hash; versioni e lapidi; FTS con radici italiano/inglese; entità, relazioni e tag; validità e quarantena; ricerca testo + grafo + tempo con spiegazioni; import/export della cartella; CLI; MCP stdio in sola lettura; benchmark e test di proprietà | — |
 | v0.2 | Embedder (ONNX incorporato via tract, Ollama, HTTP); vettori derivati con indice `FlatI8`; ricerca mista (RRF o convessa, scelta misurando); scelta misurata del modello; cambio di modello blu/verde | v0.1 |
-| v0.3 | Vista markdown bidirezionale con controllo dei file (Obsidian); candidati al consolidamento; `purge`; compattazione del registro | v0.2 |
+| v0.3 | Grafo in memoria con PPR come terza lista (costo e multi-salto); registro v2 con payload dimenticabili; `purge`; compattazione con istantanee; vista markdown bidirezionale (riconciliazione per scansione, `notify` come innesco); candidati al consolidamento | v0.2 |
 | v0.4 | Collegamento Node (napi-rs); **integrazione in Homun**: migrazione, strumenti, `search_history`, sezione Memoria, quarantena dai turni contaminati, audit MCP con ambiti | v0.3 |
 | v0.5 | Identità, abbinamento, sincronizzazione cifrata del registro tra pari, permessi per cella, conflitti | v0.4 |
 | v0.6 | `engramma serve`: API, autenticazione, molte celle | v0.5 |
@@ -390,3 +412,4 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 - EmbeddingGemma: https://developers.googleblog.com/en/introducing-embeddinggemma/ · Granite Embedding R2 (ONNX, terza parte): https://huggingface.co/Hisham480/multilingual-r2-ONNX
 - Memoria portabile: https://github.com/MacPaw/portable-memory · https://portable-ai-memory.org/spec/v1.0/
 - (2026-11-05, v0.2) Rilasci di sqlite-vec (0.1.9 stabile, DiskANN/IVF solo in 0.1.10-alpha): https://github.com/asg017/sqlite-vec/releases · Granite Embedding Multilingual R2: https://huggingface.co/blog/ibm-granite/granite-embedding-multilingual-r2 · Fusione convessa contro RRF (ACM TOIS 2023): https://dl.acm.org/doi/10.1145/3596512 · Le misure di tract, sqlite-vec e scansione int8 sono nostre (prototipi nel commit 90a106e e nel prompt v0.2).
+- (2026-11-06, v0.3) HippoRAG 2 e PPR per la memoria: https://github.com/osu-nlp-group/hipporag · Hub nei grafi di memoria (GAAMA): https://arxiv.org/pdf/2603.27910 · MemGraphRAG: https://arxiv.org/pdf/2606.00610 · Payload dimenticabili e crypto-shredding: https://verraes.net/2019/05/eventsourcing-patterns-forgettable-payloads/ · https://verraes.net/2019/05/eventsourcing-patterns-throw-away-the-key/ · Digest salati (SD-JWT, RFC 9901): https://rfc-editor.org/rfc/rfc9901 · Il prototipo PPR e le misure di latenza a 100k sono nostri (prompt v0.3, allegato `ppr`).
