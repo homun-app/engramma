@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/engramma-core", "crates/engramma-embed", "crates/engramma-cli", "crates/engramma-mcp", "bench"]
+members = ["crates/engramma-core", "crates/engramma-embed", "crates/engramma-vault", "crates/engramma-cli", "crates/engramma-mcp", "bench"]
 
 [workspace.package]
 version = "0.1.0-dev"
@@ -12,6 +12,7 @@ repository = "https://github.com/homun-app/engramma"
 [workspace.dependencies]
 engramma-core = { path = "crates/engramma-core", version = "0.1.0-dev" }
 engramma-embed = { path = "crates/engramma-embed", version = "0.1.0-dev" }
+engramma-vault = { path = "crates/engramma-vault", version = "0.1.0-dev" }
 # `hooks`: query-progress callback, used by the bounded-walk tests (no new
 # crates: the feature only compiles more of rusqlite itself).
 rusqlite = { version = "0.41", features = ["bundled", "hooks"] }
@@ -40,6 +41,9 @@ tract-onnx = "0.23.10"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 # Ollama and external OpenAI-compatible embedding endpoints.
 ureq = { version = "3.5", features = ["json"] }
+# v0.3 markdown view: filesystem events as a hint for the scan-based sync.
+notify = "8.2.1"
+notify-debouncer-full = "0.7.0"
 # sha256 of model files: ring is already in the tree (rustls, via ureq), so
 # declaring it here adds no new crate to Cargo.lock.
 ring = "0.17"
