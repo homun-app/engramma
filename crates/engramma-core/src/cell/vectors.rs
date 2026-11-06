@@ -90,6 +90,19 @@ pub struct EmbedPendingReport {
 /// Notes per embedding batch (one `embed()` call, one transaction).
 pub(crate) const BATCH: usize = 32;
 
+/// Test-only counter of note rows read by the pending scans (v0.2.1: the
+/// proof that a batch reads its own rows, not the whole cell's).
+#[cfg(test)]
+pub(crate) static ROWS_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn count_row() {
+    ROWS_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn count_row() {}
+
 pub(crate) struct VectorTx<'a> {
     pub(crate) conn: &'a Connection,
 }
@@ -207,70 +220,101 @@ impl VectorTx<'_> {
         self.ready_model()
     }
 
-    /// Pending note ids for `model`: living notes with no vector row, or with
-    /// a stale `note_hash`. Also returns how many are pending in total (the
-    /// scan is whole-cell; the batch is the first `max`).
+    /// One positional window of living notes after `after_id`, keyset-paged
+    /// (`WHERE id > ?last ORDER BY id LIMIT ?take`) with the stored chunk-0
+    /// `note_hash` LEFT JOINed in. The hash is computed **only for the rows
+    /// of the window** (v0.2.1: the v0.2 scan re-read every note and every
+    /// vector row per 32-note batch — O(N²/32), 278 s at 100k notes).
+    /// Returns the pending notes of the window, the id of its last row read
+    /// (the next cursor, pending or not), and whether the table ended inside
+    /// the window.
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
-    pub fn pending(
+    pub(crate) fn pending_window(
         &self,
         model: &str,
-        max: usize,
+        after_id: &str,
+        take: usize,
         force: bool,
-        skip: &std::collections::HashSet<String>,
-    ) -> Result<(Vec<PendingNote>, usize), CellError> {
-        // stored note_hash per note for this model
-        let mut stored: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT note_id, note_hash FROM note_vectors WHERE model = ?1")?;
-            let rows = stmt.query_map([model], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            for row in rows {
-                let (id, h) = row?;
-                stored.insert(id, h);
-            }
-        }
-        let mut pending = Vec::new();
-        let mut batch: Vec<PendingNote> = Vec::new();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, title, body FROM notes WHERE status != 'deleted' ORDER BY id")?;
-        let rows = stmt.query_map([], |r| {
+    ) -> Result<(Vec<PendingNote>, Option<String>, bool), CellError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.id, n.title, n.body, v.note_hash
+             FROM notes n
+             LEFT JOIN note_vectors v
+                    ON v.note_id = n.id AND v.model = ?1 AND v.chunk = 0
+             WHERE n.status != 'deleted' AND n.id > ?2
+             ORDER BY n.id
+             LIMIT ?3",
+        )?;
+        let take_i64 = i64::try_from(take.max(1)).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(rusqlite::params![model, after_id, take_i64], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
             ))
         })?;
+        let mut batch = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut read = 0_usize;
         for row in rows {
-            let (id, title, body) = row?;
-            let fresh = stored.get(&id).map(String::as_str)
-                != Some(note_hash(model, title.as_deref(), &body).as_str());
-            if force || fresh {
-                pending.push(PendingNote {
-                    id: id.clone(),
-                    title,
-                    body,
-                });
+            let (id, title, body, stored) = row?;
+            count_row();
+            read += 1;
+            let fresh =
+                stored.as_deref() == Some(note_hash(model, title.as_deref(), &body).as_str());
+            cursor = Some(id.clone()); // the last row read, pending or not
+            if force || !fresh {
+                batch.push(PendingNote { id, title, body });
             }
         }
-        // The batch skips what this call already embedded (with `force`
-        // everything is "pending" forever: without the skip the loop would
-        // re-embed the same notes until the cap).
-        for p in pending.iter() {
-            if !skip.contains(&p.id) && batch.len() < max {
-                batch.push(p.clone());
-            }
-        }
-        Ok((batch, pending.len()))
+        drop(stmt);
+        let exhausted = read < take;
+        Ok((batch, cursor, exhausted))
     }
 
-    /// Coverage per model (verify report; not a verification error).
+    /// The exact number of pending notes for `model`: one streaming pass,
+    /// hashing every living note once. Called once per `embed_pending` (the
+    /// report's `remaining` is this count, decremented per embedded note).
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub(crate) fn pending_count(&self, model: &str) -> Result<usize, CellError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.id, n.title, n.body, v.note_hash
+             FROM notes n
+             LEFT JOIN note_vectors v
+                    ON v.note_id = n.id AND v.model = ?1 AND v.chunk = 0
+             WHERE n.status != 'deleted'
+             ORDER BY n.id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![model], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut n = 0_usize;
+        for row in rows {
+            let (_id, title, body, stored) = row?;
+            count_row();
+            let fresh =
+                stored.as_deref() == Some(note_hash(model, title.as_deref(), &body).as_str());
+            if !fresh {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Coverage per model (verify report; not a verification error): a
+    /// **count query**, not the pending scan — `covered` means "has an
+    /// up-to-date-or-not chunk-0 vector" (presence); staleness is
+    /// `embed_pending`'s business and never a verification failure.
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
@@ -285,10 +329,13 @@ impl VectorTx<'_> {
             let covered = if m.state == ModelState::Retired {
                 0
             } else {
-                living
-                    - self
-                        .pending(&m.model, 0, false, &std::collections::HashSet::new())?
-                        .1
+                self.conn.query_row(
+                    "SELECT COUNT(*) FROM note_vectors v
+                         JOIN notes n ON n.id = v.note_id AND n.status != 'deleted'
+                         WHERE v.model = ?1 AND v.chunk = 0",
+                    [&m.model],
+                    |r| r.get::<_, i64>(0),
+                )? as usize
             };
             out.push(ModelCoverage {
                 model: m.model,
@@ -336,13 +383,13 @@ impl VectorTx<'_> {
 
     /// Blue/green swap: when `model` covers every living note, it becomes the
     /// single `ready` model and the previous one is retired with its vectors
-    /// deleted — all in one transaction. Returns the promoted model.
+    /// deleted — all in one transaction. Returns the promoted model. The
+    /// completeness check is the exact pending count (one pass).
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
-    pub fn promote_if_complete(&self, model: &str) -> Result<Option<String>, CellError> {
-        let (_, remaining) = self.pending(model, 0, false, &std::collections::HashSet::new())?;
-        if remaining > 0 {
+    pub(crate) fn promote_if_complete(&self, model: &str) -> Result<Option<String>, CellError> {
+        if self.pending_count(model)? > 0 {
             return Ok(None);
         }
         let old: Vec<String> = {
@@ -664,9 +711,7 @@ mod tests {
         let remaining = {
             let inner = cell.inner.lock().unwrap(/* test-only */);
             let vx = VectorTx { conn: &inner.conn };
-            vx.pending("fake@1", 0, false, &std::collections::HashSet::new())
-                .unwrap(/* test-only */)
-                .1
+            vx.pending_count("fake@1").unwrap(/* test-only */)
         };
         assert_eq!(remaining, 1);
         let report = cell.embed_pending(&e, 100).unwrap(/* test-only */);
@@ -702,5 +747,107 @@ mod tests {
         cell.embed_pending(&e, 100).unwrap(/* test-only */);
         let report = cell.embed_all(&e, 100).unwrap(/* test-only */);
         assert_eq!(report.done, 5, "force re-embeds every living note");
+    }
+
+    /// The same 300 notes in two identical cells, all pending: a call that
+    /// embeds 192 must read only ~128 more note rows than a call that embeds
+    /// 64 (its own windows) — the v0.2 scan re-read the whole cell per
+    /// 32-note batch, which at these sizes would mean ≥ 2×300 extra rows.
+    #[test]
+    fn embed_pending_reads_rows_per_window_not_per_cell() {
+        let e = FakeEmbedder {
+            id: "fake@1".into(),
+            dim: 8,
+        };
+        let measure = |max: usize| -> (usize, u64) {
+            let dir = tempfile::tempdir().unwrap(/* test-only */);
+            let cell = Cell::create(&dir.path().join("rows.sqlite"), "t", "tester")
+                .unwrap(/* test-only */);
+            let notes: Vec<Note> = (1..=300)
+                .map(|i| note(i as u16, &format!("corpo {i}")))
+                .collect();
+            for n in &notes {
+                cell.put_note(n, "t").unwrap(/* test-only */);
+            }
+            cell.add_model("fake@1", 8).unwrap(/* test-only */);
+            ROWS_READ.store(0, std::sync::atomic::Ordering::Relaxed);
+            let report = cell.embed_pending(&e, max).unwrap(/* test-only */);
+            let rows = ROWS_READ.load(std::sync::atomic::Ordering::Relaxed);
+            (report.done, rows)
+        };
+        let (done64, rows64) = measure(64);
+        let (done192, rows192) = measure(192);
+        assert_eq!((done64, done192), (64, 192));
+        // expected: 300 (initial count) + ~64/192 window rows; the quadratic
+        // scan would add ≥ 300 rows per extra batch of 32
+        assert!(
+            rows192 - rows64 < 200,
+            "rows for 192 vs 64 embedded: {rows192} vs {rows64}"
+        );
+        assert!(rows64 < 500, "one count pass + one window: {rows64}");
+    }
+
+    /// Notes edited or added between calls are picked up again (the cursor
+    /// is per-call: each call re-walks from the first id), and a tombstone
+    /// between calls never re-enters the pending set.
+    #[test]
+    fn edits_between_calls_are_resumed_not_lost() {
+        let (_d, cell, notes) = cell_with_notes();
+        let e = FakeEmbedder {
+            id: "fake@1".into(),
+            dim: 8,
+        };
+        cell.add_model("fake@1", 8).unwrap(/* test-only */);
+        let full = cell.embed_pending(&e, 100).unwrap(/* test-only */);
+        assert_eq!((full.done, full.remaining), (5, 0));
+        // one note already embedded is edited, one new note arrives
+        cell.patch_note(
+            &notes[0].id,
+            &crate::cell::NotePatch {
+                body: Some("un corpo del tutto nuovo".into()),
+                ..Default::default()
+            },
+            "t",
+        )
+        .unwrap(/* test-only */);
+        let extra = note(9, "nuova arrivata");
+        cell.put_note(&extra, "t").unwrap(/* test-only */);
+        let again = cell.embed_pending(&e, 100).unwrap(/* test-only */);
+        assert_eq!((again.done, again.remaining), (2, 0));
+        // and a deleted note does not come back
+        cell.delete_note(&extra.id, "t").unwrap(/* test-only */);
+        let third = cell.embed_pending(&e, 100).unwrap(/* test-only */);
+        assert_eq!((third.done, third.remaining), (0, 0));
+    }
+
+    /// A partial call (max < pending) reports the true tail; the next call
+    /// continues from where the table stands — the keyset cursor must not
+    /// skip or repeat notes across calls.
+    #[test]
+    fn partial_calls_walk_the_whole_table_across_calls() {
+        let (_d, cell, _notes) = cell_with_notes();
+        let e = FakeEmbedder {
+            id: "fake@1".into(),
+            dim: 8,
+        };
+        cell.add_model("fake@1", 8).unwrap(/* test-only */);
+        let mut total = 0_usize;
+        loop {
+            let r = cell.embed_pending(&e, 2).unwrap(/* test-only */);
+            total += r.done;
+            if r.remaining == 0 || r.done == 0 {
+                break;
+            }
+        }
+        assert_eq!(total, 5, "two per call, nothing skipped or doubled");
+        let covered = cell
+            .debug_column(
+                "SELECT CAST(COUNT(*) AS TEXT) FROM note_vectors WHERE model = 'fake@1'",
+            )
+            .unwrap(/* test-only */)
+            .first()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        assert_eq!(covered, 5);
     }
 }

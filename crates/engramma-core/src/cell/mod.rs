@@ -703,98 +703,177 @@ impl Cell {
             .write_lock
             .lock()
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        // Target model, the initial pending count (counted ONCE, then only
+        // decremented — v0.2.1) and the op watermark for the mid-run delta:
+        // notes another process writes while this call runs must be picked
+        // up, not lost.
+        let (target, r0, start_seq) = {
+            let inner = self.lock()?;
+            let vx = vectors::VectorTx { conn: &inner.conn };
+            let Some(target) = vx.embed_target()? else {
+                return Ok(EmbedPendingReport {
+                    done: 0,
+                    remaining: 0,
+                    promoted: None,
+                });
+            };
+            if target.model != embedder.model_id() {
+                return Err(CellError::Invalid(format!(
+                    "the cell wants `{}` but this embedder is `{}` (run `engramma model use {}`)",
+                    target.model,
+                    embedder.model_id(),
+                    embedder.model_id()
+                )));
+            }
+            let r0 = if force {
+                // with force every living note is pending: no hashes needed
+                inner.conn.query_row(
+                    "SELECT COUNT(*) FROM notes WHERE status != 'deleted'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )? as usize
+            } else {
+                vx.pending_count(&target.model)?
+            };
+            let seq: i64 = inner
+                .conn
+                .query_row("SELECT COALESCE(MAX(seq), 0) FROM ops", [], |r| r.get(0))
+                .unwrap_or(0);
+            (target, r0, seq)
+        };
         let mut done = 0_usize;
         let mut promoted: Option<String> = None;
-        let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
-        loop {
-            if done >= max {
-                break;
-            }
-            // Pick the batch and drop the lock before the (slow) embedding.
-            let batch = {
-                let inner = self.lock()?;
-                let vx = vectors::VectorTx { conn: &inner.conn };
-                let Some(target) = vx.embed_target()? else {
+        let mut remaining = r0;
+        if r0 > 0 {
+            // Windows walk the table by key (`id > ?cursor`), hashing only
+            // the rows of each window; embedding stays outside every lock.
+            let mut cursor = String::new();
+            'walk: loop {
+                if done >= max {
                     break;
-                };
-                if target.model != embedder.model_id() {
-                    return Err(CellError::Invalid(format!(
-                        "the cell wants `{}` but this embedder is `{}` (run `engramma model use {}`)",
-                        target.model,
-                        embedder.model_id(),
-                        embedder.model_id()
-                    )));
                 }
                 let take = vectors::BATCH.min(max - done);
-                let (batch, _remaining) = vx.pending(&target.model, take, force, &processed)?;
-                batch
-            };
-            if batch.is_empty() {
-                break;
-            }
-            let embedded = vectors::embed_notes(embedder, &batch)?;
-            {
-                let mut inner = self.lock()?;
-                let tx = inner.conn.transaction()?;
-                let vx = vectors::VectorTx { conn: &tx };
-                for (id, chunks) in &embedded {
-                    let note = batch
-                        .iter()
-                        .find(|n| n.id == *id)
-                        .ok_or_else(|| CellError::Db("batch mismatch".into()))?;
-                    vx.write_note_vectors(
-                        embedder.model_id(),
-                        id,
-                        note.title.as_deref(),
-                        &note.body,
-                        chunks,
-                    )?;
+                let (batch, last_id, exhausted) = {
+                    let inner = self.lock()?;
+                    vectors::VectorTx { conn: &inner.conn }.pending_window(
+                        &target.model,
+                        &cursor,
+                        take,
+                        force,
+                    )?
+                };
+                if let Some(id) = last_id {
+                    cursor = id;
                 }
-                tx.commit()?;
-            }
-            // This cell's own writes update the in-memory index in place
-            // (another process's writes are caught by `data_version`).
-            {
-                let mut inner = self.lock()?;
-                if let Some(st) = &mut inner.index
-                    && st.model == embedder.model_id()
-                {
-                    for (id, chunks) in &embedded {
-                        if chunks.is_empty() {
-                            st.idx.remove(id);
-                        } else {
-                            let rows: Vec<(i64, Vec<f32>)> = chunks
+                if !batch.is_empty() {
+                    let embedded = vectors::embed_notes(embedder, &batch)?;
+                    {
+                        let mut inner = self.lock()?;
+                        let tx = inner.conn.transaction()?;
+                        let vx = vectors::VectorTx { conn: &tx };
+                        for (id, chunks) in &embedded {
+                            let note = batch
                                 .iter()
-                                .enumerate()
-                                .map(|(i, (_, v))| (i64::try_from(i).unwrap_or(0), v.clone()))
-                                .collect();
-                            st.idx.upsert(id, &rows);
+                                .find(|n| n.id == *id)
+                                .ok_or_else(|| CellError::Db("batch mismatch".into()))?;
+                            vx.write_note_vectors(
+                                embedder.model_id(),
+                                id,
+                                note.title.as_deref(),
+                                &note.body,
+                                chunks,
+                            )?;
+                        }
+                        tx.commit()?;
+                    }
+                    // This cell's own writes update the in-memory index in
+                    // place (another process's writes: `data_version`).
+                    {
+                        let mut inner = self.lock()?;
+                        if let Some(st) = &mut inner.index
+                            && st.model == embedder.model_id()
+                        {
+                            for (id, chunks) in &embedded {
+                                if chunks.is_empty() {
+                                    st.idx.remove(id);
+                                } else {
+                                    let rows: Vec<(i64, Vec<f32>)> = chunks
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, (_, v))| {
+                                            (i64::try_from(i).unwrap_or(0), v.clone())
+                                        })
+                                        .collect();
+                                    st.idx.upsert(id, &rows);
+                                }
+                            }
+                        }
+                    }
+                    done += embedded.len();
+                    remaining = remaining.saturating_sub(embedded.len());
+                }
+                if exhausted {
+                    break 'walk;
+                }
+            }
+        }
+        // Notes touched by another writer while this call ran: re-check their
+        // staleness and count the newly-pending ones (they may sit behind the
+        // cursor — they are reported, and the next call re-walks from the
+        // start and embeds them).
+        {
+            let inner = self.lock()?;
+            let touched: Vec<String> = {
+                let mut stmt = inner.conn.prepare(
+                    "SELECT DISTINCT note_id FROM ops WHERE seq > ?1 AND note_id IS NOT NULL",
+                )?;
+                let rows = stmt.query_map([start_seq], |r| r.get::<_, String>(0))?;
+                rows.flatten().collect()
+            };
+            if !touched.is_empty() {
+                let mut stmt = inner.conn.prepare(
+                    "SELECT n.id, n.title, n.body, v.note_hash
+                     FROM notes n
+                     LEFT JOIN note_vectors v
+                            ON v.note_id = n.id AND v.model = ?1 AND v.chunk = 0
+                     WHERE n.status != 'deleted' AND n.id = ?2",
+                )?;
+                for id in &touched {
+                    let row = stmt.query_row(rusqlite::params![embedder.model_id(), id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ))
+                    });
+                    if let Ok((_, title, body, stored)) = row {
+                        let fresh = stored.as_deref()
+                            == Some(
+                                crate::embed::note_hash(
+                                    embedder.model_id(),
+                                    title.as_deref(),
+                                    &body,
+                                )
+                                .as_str(),
+                            );
+                        if !fresh {
+                            remaining += 1;
                         }
                     }
                 }
             }
-            for (id, _) in &embedded {
-                processed.insert(id.clone());
-            }
-            done += embedded.len();
         }
         // Blue/green: a building model with full coverage becomes ready, the
-        // old ready model retires with its vectors — one transaction.
-        {
+        // old ready model retires with its vectors — one transaction. The
+        // exact recount inside runs only at completion (`remaining == 0`),
+        // never as a per-call tax.
+        if remaining == 0 && target.state == ModelState::Building {
             let mut inner = self.lock()?;
             let swapped = {
                 let vx = vectors::VectorTx { conn: &inner.conn };
                 match vx.embed_target() {
-                    Ok(Some(target))
-                        if target.state == ModelState::Building
-                            && target.model == embedder.model_id() =>
-                    {
-                        match vx.promote_if_complete(&target.model) {
-                            Ok(Some(p)) => Some(p),
-                            Ok(None) => None,
-                            Err(e) => return Err(e),
-                        }
-                    }
+                    Ok(Some(t)) if t.model == target.model => vx.promote_if_complete(&t.model)?,
                     Ok(_) => None,
                     Err(e) => return Err(e),
                 }
@@ -807,17 +886,6 @@ impl Cell {
                 promoted = Some(p);
             }
         }
-        let remaining = {
-            let inner = self.lock()?;
-            let vx = vectors::VectorTx { conn: &inner.conn };
-            match vx.embed_target()? {
-                Some(t) if t.model == embedder.model_id() => {
-                    vx.pending(&t.model, 0, false, &std::collections::HashSet::new())?
-                        .1
-                }
-                _ => 0,
-            }
-        };
         Ok(EmbedPendingReport {
             done,
             remaining,
