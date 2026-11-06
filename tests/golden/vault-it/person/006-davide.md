@@ -10,7 +10,7 @@ status: active
 created_at: 2026-02-01T12:05:00Z
 updated_at: 2026-02-01T12:05:00Z
 ---
-Davide Ferri, marito di [[Sara]], cuoco.
+Davide Ferri, cuoco. Sposato con [[Sara]].
 
 ## Relations
 - married_to:: [[Sara]]

@@ -103,6 +103,7 @@ pub fn hit_json(h: &Hit) -> serde_json::Value {
             "matched_terms": h.explain.matched_terms,
             "bm25_rank": h.explain.bm25_rank,
             "semantic_rank": h.explain.semantic_rank,
+            "graph_rank": h.explain.graph_rank,
             "cosine": h.explain.cosine,
             "fused_score": h.explain.fused_score,
             "lists": h.explain.lists,
@@ -145,6 +146,9 @@ pub fn hit_human(h: &Hit, index: usize) -> String {
     }
     if let Some(r) = h.explain.semantic_rank {
         out.push_str(&format!("\n   rango semantico: {r}"));
+    }
+    if let Some(r) = h.explain.graph_rank {
+        out.push_str(&format!("\n   rango grafo: {r}"));
     }
     if let Some(c) = h.explain.cosine {
         out.push_str(&format!("\n   coseno: {c:.4}"));

@@ -113,7 +113,7 @@
     "q": "cosa è successo a giugno",
     "as_of": "2026-06-30",
     "expect": [
-      "Matrimonio di Sara"
+      "Matrimonio a Villa Doria"
     ]
   },
   {
@@ -145,8 +145,9 @@
     "category": "multi-salto",
     "q": "dove lavora il partner di Fabio",
     "expect": [
-      "Studio Rossi"
-    ]
+      "Giulia lavora allo Studio Rossi"
+    ],
+    "mode": "hybrid"
   },
   {
     "id": 19,
@@ -154,15 +155,18 @@
     "q": "chi è la sorella della partner di Fabio",
     "expect": [
       "Sara"
-    ]
+    ],
+    "mode": "hybrid"
   },
   {
     "id": 20,
     "category": "multi-salto",
-    "q": "chi è il capoprogetto di Fabio",
+    "q": "chi è il marito della sorella di Giulia",
     "expect": [
-      "Marco Rossi"
-    ]
+      "Sara",
+      "Matrimonio a Villa Doria"
+    ],
+    "mode": "hybrid"
   },
   {
     "id": 21,
@@ -463,5 +467,24 @@
     "q": "quando si sono sposati Fabio e Giulia?",
     "expect": [],
     "expect_empty": true
+  },
+  {
+    "id": 57,
+    "category": "multi-salto",
+    "q": "dove lavora la sorella di Giulia",
+    "expect": [
+      "Biblioteca Angelica",
+      "Sara"
+    ],
+    "mode": "hybrid"
+  },
+  {
+    "id": 58,
+    "category": "multi-salto",
+    "q": "dove vive la sorella di Giulia",
+    "expect": [
+      "Sara"
+    ],
+    "mode": "hybrid"
   }
 ]

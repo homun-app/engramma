@@ -7,12 +7,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use time::OffsetDateTime;
+use ulid::Ulid;
 
 use crate::cell::vectors::VectorTx;
 use crate::cell::{Cell, Inner};
 use crate::embed::decode_vec;
 use crate::error::SearchError;
 use crate::format::{Confidence, Note, NoteType, Status};
+use crate::graph::GraphIndex;
 use crate::text;
 use crate::vector::{FlatI8, IndexRow, VectorIndex};
 
@@ -56,8 +58,23 @@ pub struct Weights {
     pub external: f64,
     /// Recency half-life in days.
     pub recency_half_life_days: f64,
-    /// Per-hop decay in graph expansion (one hop = `hop_decay`, two = `hop_decay`²).
-    pub hop_decay: f64,
+    /// Weight of the graph list in the fusion (v0.3): `0` turns it off, and
+    /// `graph_hops = 0` keeps it off regardless. 0.40 by the declared
+    /// criterion (weighted MRR at 100k: 0.8551 vs 0.8529 at 0.35 and 0.8386
+    /// for the v0.2.1 expansion), and it is the only value that clears the
+    /// multi-hop target (hybrid 0.949 vs text 0.916 at 100k).
+    pub graph_weight: f64,
+    /// Teleport share of the personalised-PageRank push (§6.3.3).
+    pub ppr_alpha: f64,
+    /// Residual threshold of the push, as a fraction of a node's degree: a
+    /// node expands only while its residual clears `ε·deg`. This is what
+    /// keeps hubs with tens of thousands of edges out of the walk. 10⁻⁴, not
+    /// the prototype's 10⁻³: the seeds here share their mass ten ways, and
+    /// at 10⁻³ the two-hop answer notes fell under the threshold and never
+    /// settled (measured on the 10k multi-hop diagnostics).
+    pub ppr_epsilon: f64,
+    /// Degree above which a node's outflow is damped (`θ/deg`), GAAMA-style.
+    pub hub_theta: f64,
 }
 
 impl Default for Weights {
@@ -67,7 +84,10 @@ impl Default for Weights {
             inferred: 0.8,
             external: 0.5,
             recency_half_life_days: 180.0,
-            hop_decay: 0.6,
+            graph_weight: 0.4,
+            ppr_alpha: 0.25,
+            ppr_epsilon: 1e-4,
+            hub_theta: 50.0,
         }
     }
 }
@@ -140,6 +160,8 @@ pub struct Explain {
     pub bm25_rank: Option<usize>,
     /// Position in the vector candidate list (1-based, v0.2).
     pub semantic_rank: Option<usize>,
+    /// Position in the graph (personalised-PageRank) list, 1-based (v0.3).
+    pub graph_rank: Option<usize>,
     /// Cosine with the query embedding (best chunk), when the vector branch
     /// produced this result.
     pub cosine: Option<f64>,
@@ -172,6 +194,7 @@ impl Default for Explain {
             matched_terms: Vec::new(),
             bm25_rank: None,
             semantic_rank: None,
+            graph_rank: None,
             cosine: None,
             fused_score: None,
             lists: Vec::new(),
@@ -399,6 +422,10 @@ pub struct SearchOutcome {
     pub embed_ms: f64,
     /// Milliseconds spent searching (index build included, when it happens).
     pub search_ms: f64,
+    /// Edges the personalised-PageRank push touched (v0.3 diagnostics: the
+    /// whole point of the push is that this stays in the hundreds at 100k
+    /// notes, hubs included).
+    pub graph_pushed_edges: usize,
 }
 
 /// Reciprocal-rank fusion (§6.3.2): score = Σ 1/(k + rank), ranks from 1.
@@ -682,34 +709,6 @@ fn coverage_of(body_norm: &str, tags_text: &str, terms: &[String]) -> (Vec<Strin
     (matched, coverage)
 }
 
-/// Base score for graph-discovered notes (below any real text match, above
-/// nothing: multi-hop answers with no shared terms still rank).
-const GRAPH_FLOOR: f64 = 0.05;
-
-/// One graph edge as stored (endpoints are entity names or `note:<id>`).
-#[derive(Debug, Clone)]
-struct EdgeRow {
-    src: String,
-    rel: String,
-    dst: String,
-    note_id: Option<String>,
-    valid_from: Option<String>,
-    valid_to: Option<String>,
-}
-
-fn valid_at(from: &Option<String>, to: &Option<String>, t: Option<OffsetDateTime>) -> bool {
-    let Some(t) = t else { return true };
-    let from_ok = from
-        .as_deref()
-        .and_then(|s| crate::format::Validity::parse(s).ok())
-        .is_none_or(|v| v.covers_from(t));
-    let to_ok = to
-        .as_deref()
-        .and_then(|s| crate::format::Validity::parse(s).ok())
-        .is_none_or(|v| v.covers_to(t));
-    from_ok && to_ok
-}
-
 impl Cell {
     /// Search with the wall clock as `now` (recency).
     ///
@@ -728,10 +727,14 @@ impl Cell {
         if q.text.trim().is_empty() {
             return Err(SearchError::Invalid("empty query text".into()));
         }
-        let inner = self
+        let guard = self
             .inner
             .lock()
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
+        let mut inner = guard;
+        if q.graph_hops > 0 && q.weights.graph_weight > 0.0 {
+            ensure_graph(&mut inner)?;
+        }
         let conn = &inner.conn;
 
         // 1. BM25 candidates (up to 50), with the ubiquitous terms out of
@@ -776,10 +779,8 @@ impl Cell {
             ));
         }
 
-        // 3. Normalised seed scores for the graph expansion (§6.3.3: the added
-        // notes keep a weight that decays per hop from the seed they came
-        // from). RRF fusion over the single ranked list arrives with the
-        // semantic list in v0.2; the rerank below uses bm25_norm.
+        // 3. Seeds for the graph push: the strongest filtered candidates,
+        // normalised (mass ∝ bm25_norm).
         let max_bm25 = text_candidates
             .iter()
             .map(|(_, b, _, _)| *b)
@@ -787,45 +788,53 @@ impl Cell {
             .max(f64::EPSILON);
         let seeds: Vec<(String, f64)> = text_candidates
             .iter()
-            .take(10)
+            .take(GRAPH_SEEDS)
             .map(|(id, b, _, _)| (id.clone(), *b / max_bm25))
             .collect();
 
-        // 4. Graph expansion from the surviving candidates. Edges declared by
-        // quarantined or deleted notes are out unless asked for.
-        let as_of = q.filters.as_of;
-        let mut extra: HashMap<String, (u8, String, f64)> = HashMap::new(); // (hops, path, damped seed score)
-        if q.graph_hops > 0 && !text_candidates.is_empty() {
-            expand_graph(
-                conn,
-                &seeds,
-                q.graph_hops,
-                as_of,
-                q.filters.include_quarantined,
-                &text_hits.iter().map(|(i, _)| i.clone()).collect(),
-                &mut extra,
-            )?;
-        }
+        // 4. The graph list: a personalised-PageRank push from the seeds over
+        // the in-memory CSR (§6.3.3). Edges declared by quarantined or
+        // deleted notes never carry mass unless asked for; `as_of` skips
+        // edges that were not valid then.
+        let (glist, _pushed) = if q.graph_hops > 0 && !seeds.is_empty() {
+            graph_list(&inner, q, &seeds)?
+        } else {
+            (Vec::new(), 0)
+        };
+        let g_of: HashMap<&str, &GraphEntry> = glist.iter().map(|e| (e.id.as_str(), e)).collect();
+        let w_g = q.weights.graph_weight.clamp(0.0, 1.0);
 
-        // 5. Rerank (§13.4): bm25_norm × coverage × confidence × recency ×
-        // graph. Graph-discovered notes keep a decaying share of the seed's
-        // score (with a floor for pure multi-hop answers); the coverage factor
-        // halves notes that share none of the query terms, so pure graph
-        // neighbours support — never replace — real text matches.
+        // 5. Rerank: the convex three-weight fusion (text, graph — the vector
+        // list joins in hybrid) × coverage × confidence × recency.
         // body_norm already holds the stemmed title+body (computed at write
         // time): reuse it instead of re-stemming per candidate.
         let mut hits: Vec<Hit> = Vec::new();
-        for (_id, bm25, rank, row) in &text_candidates {
+        for (id, bm25, rank, row) in &text_candidates {
             let (matched, coverage) = coverage_of(&row.body_norm, &row.tags_text, &terms);
-            let raw = (bm25 / max_bm25)
+            let g = g_of.get(id.as_str()).map(|e| e.score).unwrap_or(0.0);
+            // Text mode keeps the v0.2.1 discipline: the graph list only
+            // SUPPORTS (graph-discovered notes below, candidates unboosted —
+            // measured both in v0.2.1 and again in v0.3, where boosting
+            // one-term hub neighbours displaced real answers). The multi-hop
+            // lift lives in hybrid, where the vector branch widens the score
+            // gaps and the third list can weigh in.
+            let _ = (w_g, g);
+            let raw = (1.0 - w_g)
+                * (bm25 / max_bm25)
                 * coverage
-                * q.weights.confidence(row.note.confidence)
-                * recency_factor(q, now, &row.note);
+                * recency_factor(q, now, &row.note)
+                * q.weights.confidence(row.note.confidence);
+            let in_graph = g_of.get(id.as_str());
+            let mut lists = vec!["text"];
+            if in_graph.is_some() {
+                lists.push("graph");
+            }
             hits.push(Hit {
                 explain: Explain {
                     matched_terms: matched,
                     bm25_rank: Some(*rank),
-                    lists: vec!["text"],
+                    graph_rank: in_graph.map(|e| e.rank),
+                    lists,
                     support: Some("strong"),
                     fused_score: Some(raw),
                     ..Explain::default()
@@ -835,50 +844,51 @@ impl Cell {
                 score: raw,
             });
         }
-        // Cap the expansion: the STRONGEST graph notes only — by inherited
-        // (hub-damped) score first, then hops, then id (deterministic). The
-        // v0.1 cut was the first 40 ids of a BTreeMap: a lottery over the
-        // thousands of extras a hub produces.
-        // top-40 by O(n) selection, then ordered (a full sort of the
-        // thousands of extras a 100k-cell produces cost a millisecond
-        // per query)
-        let mut extras: Vec<(String, (u8, String, f64))> = extra.into_iter().collect();
-        extras.sort_unstable_by(|a, b| {
-            b.1.2
-                .partial_cmp(&a.1.2)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.0.cmp(&b.1.0))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        extras.truncate(40);
-        let extra_rows = read_candidates(
+        // Graph-discovered notes that are not candidates themselves (the
+        // multi-hop answers no term shared): one batched read, then the same
+        // rerank with their normalised mass.
+        let cand_ids: BTreeSet<&str> = text_candidates
+            .iter()
+            .map(|(id, _, _, _)| id.as_str())
+            .collect();
+        let g_only: Vec<&GraphEntry> = glist
+            .iter()
+            .filter(|e| !cand_ids.contains(e.id.as_str()))
+            .collect();
+        let g_rows = read_candidates(
             conn,
-            &extras.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            &g_only.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
             q.filters.include_quarantined,
             &q.filters.types,
         )?;
-        for (id, (hops, path, seed)) in extras {
-            let Some(row) = extra_rows.get(&id) else {
+        for e in g_only {
+            let Some(row) = g_rows.get(&e.id) else {
                 continue;
             };
             if !passes_filters(&row.note, &q.filters, now) {
                 continue;
             }
-            let (matched, coverage) = coverage_of(&row.body_norm, &row.tags_text, &terms);
-            // one extra decay step: no text match is one hop less evidence
-            let w_graph = q.weights.hop_decay.powi(i32::from(hops) + 1);
-            let raw = GRAPH_FLOOR.max(seed)
+            // Graph-discovered notes support, never replace text matches
+            // (the v0.2.1 rule, measured again in v0.3: without the coverage
+            // and recency discipline the graph-only entries displaced
+            // paraphrase winners whose only fault was a weak recency).
+            let (_, coverage) = coverage_of(&row.body_norm, &row.tags_text, &terms);
+            let raw = w_g
+                * e.score
                 * coverage
                 * q.weights.confidence(row.note.confidence)
-                * recency_factor(q, now, &row.note)
-                * w_graph;
+                * recency_factor(q, now, &row.note);
             hits.push(Hit {
                 explain: Explain {
-                    matched_terms: matched,
-                    via: Some(path),
+                    via: e.via.clone(),
+                    graph_rank: Some(e.rank),
                     lists: vec!["graph"],
                     support: Some("strong"),
                     fused_score: Some(raw),
+                    confidence: row.note.confidence,
+                    valid_from: row.note.valid_from.as_ref().map(|v| v.to_db_string()),
+                    valid_to: row.note.valid_to.as_ref().map(|v| v.to_db_string()),
+                    source: row.note.source.clone(),
                     ..Explain::default()
                 },
                 note: row.note.clone(),
@@ -905,13 +915,13 @@ impl Cell {
     }
 
     /// Neighbours of an entity (or `note:<id>`), BFS up to `depth`, optionally
-    /// restricted to some relations. Edges declared by quarantined or deleted
-    /// notes are excluded unless `include_quarantined`; manual edges (no
-    /// declaring note) always stay. One indexed frontier query per level (at
-    /// most [`WALK_LIMIT`] edges each, in id order); returns nearest first.
+    /// restricted to some relations, over the in-memory graph index (v0.3:
+    /// no SQL per level). Edges declared by quarantined or deleted notes are
+    /// excluded unless `include_quarantined`; manual edges (no declaring
+    /// note) always stay. Returns nearest first.
     ///
     /// # Errors
-    /// [`SearchError`] on SQL failures.
+    /// [`SearchError`] on SQL failures (building the index).
     pub fn neighbors(
         &self,
         start: &str,
@@ -919,45 +929,55 @@ impl Cell {
         rels: &[&str],
         include_quarantined: bool,
     ) -> Result<Vec<Neighbor>, SearchError> {
-        let inner = self
+        let guard = self
             .inner
             .lock()
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
-        let conn = &inner.conn;
+        let mut inner = guard;
+        ensure_graph(&mut inner)?;
+        let Some(g) = inner.graph.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let gi = &g.index;
+        let start_node = match start.strip_prefix("note:") {
+            Some(id) => Ulid::from_string(id).ok().and_then(|u| gi.node_of_note(&u)),
+            None => gi.node_of_entity(start),
+        };
+        let Some(start_node) = start_node else {
+            return Ok(Vec::new());
+        };
         let mut out: Vec<Neighbor> = Vec::new();
-        let mut seen_entities: BTreeSet<String> = BTreeSet::from([start.to_string()]);
-        let mut frontier: Vec<String> = vec![start.to_string()];
+        let mut seen: BTreeSet<u32> = BTreeSet::from([start_node]);
+        let mut frontier: Vec<u32> = vec![start_node];
         for d in 1..=depth {
             if frontier.is_empty() {
                 break;
             }
-            let edges =
-                edges_touching_frontier(conn, &frontier, rels, include_quarantined, WALK_LIMIT)?;
-            let frontier_set: BTreeSet<&str> = frontier.iter().map(String::as_str).collect();
-            let mut next: Vec<String> = Vec::new();
-            for e in &edges {
-                let (other, direction) = if frontier_set.contains(e.src.as_str()) {
-                    (e.dst.as_str(), "->")
-                } else {
-                    (e.src.as_str(), "<-")
-                };
-                let hop = Neighbor {
-                    depth: d,
-                    entity: other.to_string(),
-                    rel: e.rel.clone(),
-                    direction: direction.to_string(),
-                    note_id: e.note_id.clone(),
-                    valid_from: e.valid_from.clone(),
-                    valid_to: e.valid_to.clone(),
-                };
-                if !out
-                    .iter()
-                    .any(|n| n.entity == hop.entity && n.rel == hop.rel && n.depth == hop.depth)
-                {
-                    out.push(hop);
-                }
-                if seen_entities.insert(other.to_string()) {
-                    next.push(other.to_string());
+            let mut next: Vec<u32> = Vec::new();
+            for &node in &frontier {
+                for step in gi.steps(node, None, include_quarantined, rels, false) {
+                    let (vf, vt) = gi.valid_strings(step.validity);
+                    let hop = Neighbor {
+                        depth: d,
+                        entity: gi.display_of(step.node).to_string(),
+                        rel: step.rel.to_string(),
+                        direction: if step.forward { "->" } else { "<-" }.into(),
+                        note_id: step
+                            .note
+                            .and_then(|n| gi.note_of_node(n))
+                            .map(|id| id.to_string()),
+                        valid_from: vf.map(String::from),
+                        valid_to: vt.map(String::from),
+                    };
+                    if !out
+                        .iter()
+                        .any(|n| n.entity == hop.entity && n.rel == hop.rel && n.depth == hop.depth)
+                    {
+                        out.push(hop);
+                    }
+                    if seen.insert(step.node) {
+                        next.push(step.node);
+                    }
                 }
             }
             frontier = next;
@@ -965,51 +985,59 @@ impl Cell {
         Ok(out)
     }
 
-    /// Shortest path between two entities, depth ≤ 4. The cap applies **while
-    /// visiting**: levels beyond it are never expanded (the walk touches only
-    /// the edges adjacent to the frontier, never the whole table). Edges
-    /// declared by quarantined or deleted notes are excluded unless
-    /// `include_quarantined`.
+    /// Shortest path between two entities, depth ≤ 4, over the in-memory
+    /// graph index. The cap applies **while visiting**: levels beyond it are
+    /// never expanded. Edges declared by quarantined or deleted notes are
+    /// excluded unless `include_quarantined`.
     ///
     /// # Errors
-    /// [`SearchError`] on SQL failures.
+    /// [`SearchError`] on SQL failures (building the index).
     pub fn path(
         &self,
         a: &str,
         b: &str,
         include_quarantined: bool,
     ) -> Result<Option<Vec<PathStep>>, SearchError> {
-        let inner = self
+        let guard = self
             .inner
             .lock()
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
-        let conn = &inner.conn;
-        if a == b {
+        let mut inner = guard;
+        ensure_graph(&mut inner)?;
+        let Some(g) = inner.graph.as_ref() else {
+            return Ok(None);
+        };
+        let gi = &g.index;
+        let node_of = |name: &str| match name.strip_prefix("note:") {
+            Some(id) => Ulid::from_string(id).ok().and_then(|u| gi.node_of_note(&u)),
+            None => gi.node_of_entity(name),
+        };
+        let (Some(a_node), Some(b_node)) = (node_of(a), node_of(b)) else {
+            return Ok(None);
+        };
+        if a_node == b_node {
             return Ok(Some(Vec::new()));
         }
         // Level-order BFS with parent tracking.
-        let mut parents: HashMap<String, (String, String)> = HashMap::new(); // node -> (parent, rel)
-        let mut discovered: BTreeSet<String> = BTreeSet::from([a.to_string()]);
-        let mut frontier: Vec<String> = vec![a.to_string()];
+        let mut parents: HashMap<u32, (u32, u32)> = HashMap::new(); // node -> (parent, rel)
+        let mut discovered: BTreeSet<u32> = BTreeSet::from([a_node]);
+        let mut frontier: Vec<u32> = vec![a_node];
         let mut found = false;
         for _ in 0..4 {
-            let edges =
-                edges_touching_frontier(conn, &frontier, &[], include_quarantined, WALK_LIMIT)?;
-            let frontier_set: BTreeSet<&str> = frontier.iter().map(String::as_str).collect();
-            let mut next: Vec<String> = Vec::new();
-            for e in &edges {
-                let (from, to) = if frontier_set.contains(e.src.as_str()) {
-                    (e.src.as_str(), e.dst.as_str())
-                } else {
-                    (e.dst.as_str(), e.src.as_str())
-                };
-                if discovered.insert(to.to_string()) {
-                    parents.insert(to.to_string(), (from.to_string(), e.rel.clone()));
-                    if to == b {
-                        found = true;
-                        break;
+            let mut next: Vec<u32> = Vec::new();
+            for &node in &frontier {
+                for step in gi.steps(node, None, include_quarantined, &[], false) {
+                    if discovered.insert(step.node) {
+                        parents.insert(step.node, (node, gi.rel_id(step.rel).unwrap_or(0)));
+                        if step.node == b_node {
+                            found = true;
+                            break;
+                        }
+                        next.push(step.node);
                     }
-                    next.push(to.to_string());
+                }
+                if found {
+                    break;
                 }
             }
             if found || next.is_empty() {
@@ -1022,17 +1050,20 @@ impl Cell {
         }
         // Reconstruct from the parents.
         let mut steps: Vec<PathStep> = Vec::new();
-        let mut cur = b.to_string();
-        while cur != a {
-            let Some((parent, rel)) = parents.get(&cur) else {
+        let mut cur = b_node;
+        for _ in 0..16 {
+            if cur == a_node {
+                break;
+            }
+            let Some((parent, rel)) = parents.get(&cur).copied() else {
                 return Ok(None);
             };
             steps.push(PathStep {
-                from: parent.clone(),
-                rel: rel.clone(),
-                to: cur.clone(),
+                from: gi.display_of(parent).to_string(),
+                rel: gi.rel_of(rel).to_string(),
+                to: gi.display_of(cur).to_string(),
             });
-            cur = parent.clone();
+            cur = parent;
         }
         steps.reverse();
         Ok(Some(steps))
@@ -1246,6 +1277,211 @@ fn ensure_index(inner: &mut Inner) -> Result<Option<(String, usize)>, SearchErro
         });
     }
     Ok(Some((ready.model, dim)))
+}
+
+/// Build or reuse the in-memory graph index (v0.3). Own writes patch their
+/// notes into an overlay over the frozen CSR (or trigger a rebuild when they
+/// were manual-edge/purge-shaped); a `data_version` change (another process
+/// wrote) always rebuilds.
+pub(crate) fn ensure_graph(inner: &mut Inner) -> Result<(), SearchError> {
+    let data_version: i64 = inner
+        .conn
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    let rebuild = inner.graph_dirt.global
+        || inner
+            .graph
+            .as_ref()
+            .is_none_or(|g| g.data_version != data_version);
+    if rebuild {
+        let index = GraphIndex::build(&inner.conn)?;
+        inner.graph = Some(crate::cell::GraphState {
+            data_version,
+            index,
+        });
+        inner.graph_dirt = crate::cell::GraphDirt::default();
+        return Ok(());
+    }
+    if !inner.graph_dirt.notes.is_empty() {
+        let notes = std::mem::take(&mut inner.graph_dirt.notes);
+        let rebuild_after;
+        {
+            let Inner {
+                conn,
+                graph,
+                graph_dirt: _,
+                ..
+            } = inner;
+            let Some(g) = graph.as_mut() else {
+                return Ok(());
+            };
+            for id in &notes {
+                g.index.patch_note(conn, id)?;
+            }
+            rebuild_after = g.index.wants_rebuild();
+        }
+        if rebuild_after {
+            let index = GraphIndex::build(&inner.conn)?;
+            inner.graph = Some(crate::cell::GraphState {
+                data_version,
+                index,
+            });
+            inner.graph_dirt = crate::cell::GraphDirt::default();
+        }
+    }
+    Ok(())
+}
+
+/// One entry of the graph list (§6.3.3): a note the push reached, its
+/// min-max-normalised mass and the path that carried it.
+struct GraphEntry {
+    id: String,
+    /// Min-max normalised PPR mass over the list.
+    score: f64,
+    /// Rank in the list (1-based).
+    rank: usize,
+    /// The path from a seed, for the explain.
+    via: Option<String>,
+}
+
+/// How many graph-discovered notes enter the fusion.
+const GRAPH_LIST_LEN: usize = 50;
+
+/// How many fused candidates seed the push. Few, strong seeds: the v0.2 walk
+/// used ten, but ten hybrid seeds are mostly same-neighbourhood noise, and
+/// every extra seed spends its mass on its own neighbourhood — the wrong
+/// partners of same-surname people surfaced above the right one (measured on
+/// the 10k multi-hop diagnostics).
+const GRAPH_SEEDS: usize = 3;
+
+/// Run the personalised-PageRank push from the fused seeds and build the
+/// third list. Seeds are `(note id, fused score)` with scores normalised to
+/// sum ~1 — the mass a seed carries into the walk.
+fn graph_list(
+    inner: &Inner,
+    q: &Query,
+    seeds: &[(String, f64)],
+) -> Result<(Vec<GraphEntry>, usize), SearchError> {
+    let w = &q.weights;
+    if w.graph_weight <= 0.0 {
+        return Ok((Vec::new(), 0));
+    }
+    let Some(g) = inner.graph.as_ref() else {
+        return Ok((Vec::new(), 0));
+    };
+    let gi = &g.index;
+    let mass_sum: f64 = seeds.iter().map(|(_, s)| *s).sum::<f64>().max(f64::EPSILON);
+    let seed_nodes: Vec<(u32, f64)> = seeds
+        .iter()
+        .filter_map(|(id, s)| {
+            gi.node_of_note(&Ulid::from_string(id).ok()?)
+                .map(|n| (n, s / mass_sum))
+        })
+        .collect();
+    if seed_nodes.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let push = gi.ppr(
+        &seed_nodes,
+        w.ppr_alpha,
+        w.ppr_epsilon,
+        w.hub_theta,
+        q.filters.as_of,
+        q.filters.include_quarantined,
+    );
+    let pushed_edges = push.pushed_edges;
+    let top = push.notes.iter().take(GRAPH_LIST_LEN).collect::<Vec<_>>();
+    if top.is_empty() {
+        return Ok((Vec::new(), pushed_edges));
+    }
+    // Scaled to [0, 1] by the list maximum — the convex fusion normalises
+    // every list the same way. The minimum is NOT subtracted: min-max would
+    // score the weakest member of the list exactly 0 and silently drop it
+    // (found when the Zoro test lost the answer note it was built around).
+    let max = top
+        .iter()
+        .map(|(_, m)| *m)
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(f64::EPSILON);
+    if let Ok(tag) = std::env::var("ENGRAMMA_PPR_DEBUG") {
+        let rank_of = |want: &str| {
+            push.notes
+                .iter()
+                .position(|(n, _)| {
+                    gi.note_of_node(*n)
+                        .is_some_and(|id| id.to_string().ends_with(want))
+                })
+                .map(|r| (r + 1, push.notes[r].1))
+        };
+        if tag == "all" {
+            for (i, (n, m)) in push.notes.iter().enumerate() {
+                if let Some(id) = gi.note_of_node(*n) {
+                    eprintln!("PPR[{:3}] {} {:.6}", i + 1, crate::id::id8(&id), m);
+                }
+            }
+            eprintln!(
+                "PPR push: {} notes settled, {} edges",
+                push.notes.len(),
+                pushed_edges
+            );
+        } else {
+            eprintln!(
+                "PPR push: {} notes settled, {} edges; target {tag:?} -> {:?}; top5 {:?}",
+                push.notes.len(),
+                pushed_edges,
+                rank_of(&tag),
+                push.notes
+                    .iter()
+                    .take(5)
+                    .map(|(n, m)| (gi.display_of(*n).to_string(), *m))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+    let entries = top
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, (node, mass))| {
+            let id = gi.note_of_node(*node)?.to_string();
+            let score = (mass / max).clamp(0.0, 1.0);
+            Some(GraphEntry {
+                id,
+                score,
+                rank: i + 1,
+                via: render_path(gi, &push.pred, *node),
+            })
+        })
+        .collect();
+    Ok((entries, pushed_edges))
+}
+
+/// Reconstruct the walk that carried mass to `node`: follow the predecessor
+/// of maximum mass back to a seed, then render it as
+/// `[[Fabio]] -partner_of-> [[Giulia]] -works_at-> (nota 00000082)`.
+fn render_path(gi: &GraphIndex, pred: &HashMap<u32, (u32, u32, f64)>, node: u32) -> Option<String> {
+    let mut chain: Vec<(u32, u32, u32)> = Vec::new(); // (from, rel, to)
+    let mut cur = node;
+    for _ in 0..32 {
+        let Some(&(from, rel, _)) = pred.get(&cur) else {
+            break;
+        };
+        chain.push((from, rel, cur));
+        cur = from;
+    }
+    if chain.is_empty() {
+        return None;
+    }
+    chain.reverse();
+    let mut out = format!("[[{}]]", gi.display_of(chain[0].0));
+    for (from, rel, to) in chain {
+        let dest = match gi.note_of_node(to) {
+            Some(id) => format!("(nota {})", crate::id::id8(&id)),
+            None => format!("[[{}]]", gi.display_of(to)),
+        };
+        let _ = from;
+        out.push_str(&format!(" -{}-> {dest}", gi.rel_of(rel)));
+    }
+    Some(out)
 }
 
 /// Vector candidates for one query: int8 top-`m` → exact f32 recomputation
@@ -1476,10 +1712,11 @@ impl Cell {
                 .inner
                 .lock()
                 .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
+            let cap = inner.query_cache_cap;
             inner
                 .query_cache
                 .entry(model.clone())
-                .or_insert_with(|| LruCache::new(256))
+                .or_insert_with(|| LruCache::new(cap))
                 .get(&q.text)
                 .cloned()
         };
@@ -1495,10 +1732,11 @@ impl Cell {
                     .inner
                     .lock()
                     .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
+                let cap = inner.query_cache_cap;
                 inner
                     .query_cache
                     .entry(model.clone())
-                    .or_insert_with(|| LruCache::new(256))
+                    .or_insert_with(|| LruCache::new(cap))
                     .put(q.text.clone(), v.clone());
                 v
             }
@@ -1507,7 +1745,7 @@ impl Cell {
 
         // 2. Search under the lock.
         let search_started = std::time::Instant::now();
-        let hits = {
+        let (hits, graph_pushed_edges) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -1518,6 +1756,7 @@ impl Cell {
             hits,
             embed_ms,
             search_ms: search_started.elapsed().as_secs_f64() * 1000.0,
+            graph_pushed_edges,
         })
     }
 }
@@ -1531,8 +1770,13 @@ fn semantic_pipeline(
     sem: &Semantic,
     qv: &[f32],
     model: &str,
-) -> Result<Vec<Hit>, SearchError> {
+) -> Result<(Vec<Hit>, usize), SearchError> {
     let dim = ensure_index(inner)?;
+    // The graph index joins the walk lazily, before `conn` is borrowed for
+    // the rest of the pipeline (own writes patch into it here).
+    if q.graph_hops > 0 && q.weights.graph_weight > 0.0 {
+        ensure_graph(inner)?;
+    }
     let conn = &inner.conn;
 
     // --- text list (BM25, as in v0.1; skipped in vector mode). Ubiquitous
@@ -1641,42 +1885,49 @@ fn semantic_pipeline(
         })
         .collect();
 
-    // --- graph expansion from the fused seeds
+    // --- graph list: the third list, a PPR push from the fused seeds over
+    // the in-memory CSR (§6.3.3, v0.3). The push replaces the per-question
+    // SQL expansion: ~157 pushed edges per question at 100k notes.
     let mut seeds: Vec<(String, f64)> = fused.iter().map(|(id, s)| (id.clone(), *s)).collect();
     seeds.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let seeds: Vec<(String, f64)> = seeds.into_iter().take(10).collect();
-    // normalise seed scores for the walk
-    let seed_max = seeds
-        .iter()
-        .map(|(_, s)| *s)
-        .fold(0.0_f64, f64::max)
-        .max(f64::EPSILON);
-    let seeds: Vec<(String, f64)> = seeds
-        .into_iter()
-        .map(|(id, s)| (id, s / seed_max))
-        .collect();
-    let as_of = q.filters.as_of;
-    let mut extra: HashMap<String, (u8, String, f64)> = HashMap::new();
-    if q.graph_hops > 0 && !seeds.is_empty() {
-        let exclude: BTreeSet<String> = fused.keys().cloned().collect();
-        expand_graph(
-            conn,
-            &seeds,
-            q.graph_hops,
-            as_of,
-            q.filters.include_quarantined,
-            &exclude,
-            &mut extra,
-        )?;
-    }
+    let seeds: Vec<(String, f64)> = seeds.into_iter().take(GRAPH_SEEDS).collect();
+    let (glist, pushed_edges): (Vec<GraphEntry>, usize) = if q.graph_hops > 0 && !seeds.is_empty() {
+        graph_list(inner, q, &seeds)?
+    } else {
+        (Vec::new(), 0)
+    };
+    let g_of: HashMap<&str, &GraphEntry> = glist.iter().map(|e| (e.id.as_str(), e)).collect();
+    let w_g = q.weights.graph_weight.clamp(0.0, 1.0);
+    // How the graph list joins the fusion: RRF adds a weighted rank
+    // reciprocal (in the same [0, 1] scale the fused scores were renormalised
+    // to — the best graph note adds `w`, the 50th about `w·(k+1)/(k+50)`),
+    // the convex combination is the literal three-weight form.
+    let graph_boost = |id: &str| -> f64 {
+        match g_of.get(id) {
+            Some(e) => match sem.fusion {
+                Fusion::Rrf { k } => {
+                    let k = k as f64;
+                    w_g * ((k + 1.0) / (k + e.rank as f64))
+                }
+                Fusion::Convex { .. } => w_g * e.score,
+            },
+            None => 0.0,
+        }
+    };
+    let scale_base = |_id: &str, fused_score: f64| -> f64 {
+        match sem.fusion {
+            Fusion::Rrf { .. } => fused_score,
+            Fusion::Convex { .. } => (1.0 - w_g) * fused_score,
+        }
+    };
 
-    // --- rerank: fused × confidence × recency (§4.5: reliability, recency,
-    // graph — as in v0.1; term coverage is not applied to semantic hits, a
-    // paraphrase legitimately shares no term with the note).
+    // --- rerank: fused × confidence (§4.5; term coverage is not applied to
+    // semantic hits, a paraphrase legitimately shares no term with the note).
     let mut hits: Vec<Hit> = Vec::new();
     for (id, fused_score) in &fused {
         let from_text = note_of_text.contains_key(id);
         let from_vec = vec_of.contains_key(id.as_str());
+        let in_graph = g_of.get(id.as_str());
         let note: &Note = match (note_of_text.get(id), vec_of.get(id.as_str())) {
             (Some(n), _) => n,
             (None, Some(v)) => &v.note,
@@ -1694,6 +1945,9 @@ fn semantic_pipeline(
         }
         if from_vec {
             lists.push("vector");
+        }
+        if in_graph.is_some() {
+            lists.push("graph");
         }
         // One signal, not a prohibition. Weak = the meaning branch alone
         // carries the result AND its cosine margin over the next vector
@@ -1722,7 +1976,8 @@ fn semantic_pipeline(
         // differences are hundredths, and a 180-day half-life (tuned for the
         // wide score gaps of BM25) shuffled them — measured, REPORT §v0.2.
         // Text-only searches keep the full v0.1 formula.
-        let raw = fused_score * q.weights.confidence(note.confidence);
+        let base = scale_base(id, *fused_score);
+        let raw = (base + graph_boost(id)) * q.weights.confidence(note.confidence);
         hits.push(Hit {
             note: (*note).clone(),
             raw_score: raw,
@@ -1734,6 +1989,8 @@ fn semantic_pipeline(
                 semantic_rank: from_vec
                     .then(|| vec_of.get(id.as_str()).map(|v| v.rank))
                     .flatten(),
+                graph_rank: in_graph.map(|e| e.rank),
+                via: in_graph.and_then(|e| e.via.clone()),
                 cosine,
                 fused_score: Some(*fused_score),
                 lists,
@@ -1751,45 +2008,44 @@ fn semantic_pipeline(
                 valid_from: note.valid_from.as_ref().map(|v| v.to_db_string()),
                 valid_to: note.valid_to.as_ref().map(|v| v.to_db_string()),
                 source: note.source.clone(),
-                ..Explain::default()
             },
         });
     }
-    // graph-discovered notes (never candidates themselves) — one batched
-    // read; the cut is by inherited (hub-damped) score, hops, then id
-    let mut extras: Vec<(String, (u8, String, f64))> = extra.into_iter().collect();
-    extras.sort_unstable_by(|a, b| {
-        b.1.2
-            .partial_cmp(&a.1.2)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.0.cmp(&b.1.0))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    extras.truncate(40);
-    let extra_rows = read_candidates(
+    // Graph-discovered notes (never candidates themselves): one batched read,
+    // then the same rerank on their normalised mass alone.
+    let cand_ids: BTreeSet<&str> = fused.keys().map(String::as_str).collect();
+    let g_only: Vec<&GraphEntry> = glist
+        .iter()
+        .filter(|e| !cand_ids.contains(e.id.as_str()))
+        .collect();
+    let g_rows = read_candidates(
         conn,
-        &extras.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        &g_only.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
         q.filters.include_quarantined,
         &q.filters.types,
     )?;
-    for (id, (hops, path, seed)) in extras {
-        let Some(row) = extra_rows.get(&id) else {
+    for e in g_only {
+        let Some(row) = g_rows.get(&e.id) else {
             continue;
         };
         if !passes_filters(&row.note, &q.filters, now) {
             continue;
         }
-        let w_graph = q.weights.hop_decay.powi(i32::from(hops) + 1);
-        let raw = GRAPH_FLOOR.max(seed) * q.weights.confidence(row.note.confidence) * w_graph;
+        let raw = graph_boost(&e.id) * q.weights.confidence(row.note.confidence);
         hits.push(Hit {
             note: row.note.clone(),
             raw_score: raw,
             score: raw,
             explain: Explain {
-                via: Some(path),
+                via: e.via.clone(),
+                graph_rank: Some(e.rank),
                 lists: vec!["graph"],
                 support: Some("strong"),
                 fused_score: Some(raw),
+                confidence: row.note.confidence,
+                valid_from: row.note.valid_from.as_ref().map(|v| v.to_db_string()),
+                valid_to: row.note.valid_to.as_ref().map(|v| v.to_db_string()),
+                source: row.note.source.clone(),
                 ..Explain::default()
             },
         });
@@ -1809,7 +2065,7 @@ fn semantic_pipeline(
             h.score = h.raw_score / max_raw;
         }
     }
-    Ok(hits)
+    Ok((hits, pushed_edges))
 }
 
 /// A neighbour in the graph.
@@ -1965,94 +2221,6 @@ fn edge_visible(edge: &str, en: &str, include_quarantined: bool) -> String {
     }
 }
 
-/// Bounded, deterministic walk. v0.2.1: 5000 edges per level (was 400) —
-/// with the extras hub-damped and cut by score, a wider walk finds the
-/// specific chains (partner → employer) that the old 400-edge id-order
-/// window could cut by lottery; the flood it lets in is damped away
-/// (measured: the multi-hop questions, P1.7).
-const WALK_LIMIT: u64 = 5_000;
-
-/// Load the edges that touch the frontier (either endpoint), restricted to
-/// `rels` when non-empty, in edge-id order with at most `limit` rows.
-///
-/// The frontier travels in a temp table and the relations as `?` parameters:
-/// values are never spliced into the statement, and no IN list can outgrow
-/// SQLite's variable limit. Two indexed branches (one per endpoint) united:
-/// an edge with both endpoints in the frontier comes out once.
-fn edges_touching_frontier(
-    conn: &rusqlite::Connection,
-    frontier: &[String],
-    rels: &[&str],
-    include_quarantined: bool,
-    limit: u64,
-) -> Result<Vec<EdgeRow>, SearchError> {
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS frontier (id TEXT PRIMARY KEY) WITHOUT ROWID;",
-    )?;
-    conn.execute("DELETE FROM frontier", [])?;
-    {
-        let mut ins = conn.prepare("INSERT OR IGNORE INTO frontier (id) VALUES (?1)")?;
-        for id in frontier {
-            ins.execute([id])?;
-        }
-    }
-    // `edges.status` mirrors the declaring note at write time (derived edges
-    // are rewritten on every note write), so visibility needs no join — a
-    // join over notes doubled the 100k search p95. A manual edge with a
-    // note_id keeps the status it was created with.
-    let vis = if include_quarantined {
-        "(e.note_id IS NULL OR e.status != 'deleted')"
-    } else {
-        "(e.note_id IS NULL OR e.status NOT IN ('quarantined', 'deleted'))"
-    };
-    let rel_clause = if rels.is_empty() {
-        String::new()
-    } else {
-        format!(" AND e.rel IN ({})", vec!["?"; rels.len()].join(", "))
-    };
-    let branch = |endpoint: &str| {
-        // CROSS JOIN pins the join order: the (tiny) frontier drives indexed
-        // lookups on edges. A plain JOIN lets the planner scan `edges` whole
-        // to keep the ORDER BY cheap (checked with EXPLAIN QUERY PLAN).
-        format!(
-            "SELECT e.id AS eid, e.src, e.rel, e.dst, e.note_id, e.valid_from, e.valid_to
-             FROM frontier f CROSS JOIN edges e ON e.{endpoint} = f.id
-             WHERE {vis}{rel_clause}"
-        )
-    };
-    let sql = format!(
-        "SELECT eid, src, rel, dst, note_id, valid_from, valid_to FROM ({}
-         UNION {})
-         ORDER BY eid LIMIT ?",
-        branch("src"),
-        branch("dst")
-    );
-    // The branches each bind the rel list, then the LIMIT.
-    let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(2 * rels.len() + 1);
-    for r in rels.iter().chain(rels.iter()) {
-        params.push(rusqlite::types::Value::Text((*r).to_string()));
-    }
-    params.push(rusqlite::types::Value::Integer(
-        i64::try_from(limit).unwrap_or(i64::MAX),
-    ));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
-        Ok(EdgeRow {
-            src: r.get(1)?,
-            rel: r.get(2)?,
-            dst: r.get(3)?,
-            note_id: r.get(4)?,
-            valid_from: r.get(5)?,
-            valid_to: r.get(6)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
 /// Recency weight: exponential decay with the configured half-life (days).
 fn recency_of(now: OffsetDateTime, note: &Note, half_life_days: f64) -> f64 {
     let age_days = (now - note.updated_at.get()).whole_seconds() as f64 / 86_400.0;
@@ -2072,126 +2240,6 @@ fn recency_factor(q: &Query, now: OffsetDateTime, note: &Note) -> f64 {
     } else {
         recency_of(now, note, q.weights.recency_half_life_days)
     }
-}
-
-/// Graph expansion (§6.3.3): from the seed notes (already filtered by the
-/// query), walk the entity graph (edges valid at `as_of`) up to `max_hops`
-/// note-hops; collect newly discovered notes with the path that led to them
-/// and the seed score they inherit (decaying per hop in the rerank).
-///
-/// Seeds come from the notes' own bodies (links, relations, subject), so the
-/// walk only needs edges adjacent to the frontier — the indexed `src`/`dst`
-/// columns — never the whole edge table.
-#[allow(clippy::too_many_arguments)]
-fn expand_graph(
-    conn: &rusqlite::Connection,
-    seeds: &[(String, f64)],
-    max_hops: u8,
-    as_of: Option<OffsetDateTime>,
-    include_quarantined: bool,
-    exclude: &BTreeSet<String>,
-    extra: &mut HashMap<String, (u8, String, f64)>,
-) -> Result<(), SearchError> {
-    // entity -> (path, inherited seed score)
-    let mut entities: BTreeMap<String, (String, f64)> = BTreeMap::new();
-    for (seed_id, score) in seeds {
-        let Ok(note) = read_note_by_id(conn, seed_id) else {
-            continue;
-        };
-        let Ok(analysis) = crate::format::body::analyze(&note.body) else {
-            continue;
-        };
-        let mut names: Vec<String> = analysis.links.clone();
-        for r in &analysis.relations {
-            if !names.contains(&r.dst) {
-                names.push(r.dst.clone());
-            }
-        }
-        if let Some(subject) = note.subject_entity()
-            && !names.contains(&subject)
-        {
-            names.push(subject);
-        }
-        for name in &names {
-            entities
-                .entry(name.clone())
-                .or_insert_with(|| (format!("[[{name}]]"), *score));
-        }
-    }
-
-    // BFS over entity adjacency, one indexed frontier query per level.
-    let mut frontier: Vec<String> = entities.keys().cloned().collect();
-    for hop in 1..=max_hops {
-        if frontier.is_empty() {
-            break;
-        }
-        let edges = edges_touching_frontier(conn, &frontier, &[], include_quarantined, WALK_LIMIT)?;
-        let frontier_set: BTreeSet<String> = frontier.iter().cloned().collect();
-        // How many edges each frontier entity carries in this level: a hub
-        // (a company or city that every note mentions) drags its whole
-        // neighbourhood in — without damping by that degree, thousands of
-        // "colleague" extras bury the one specific note the walk was for
-        // (found measuring the multi-hop questions, v0.2.1 P1.7).
-        let mut degree: HashMap<&str, u32> = HashMap::new();
-        for e in &edges {
-            if frontier_set.contains(e.src.as_str()) {
-                *degree.entry(e.src.as_str()).or_default() += 1;
-            }
-            if frontier_set.contains(e.dst.as_str()) {
-                *degree.entry(e.dst.as_str()).or_default() += 1;
-            }
-        }
-        let mut next: BTreeSet<String> = BTreeSet::new();
-        for e in &edges {
-            if !valid_at(&e.valid_from, &e.valid_to, as_of) {
-                continue;
-            }
-            // Which endpoint is in the frontier, and what lies on the other side?
-            let (from, to) = if frontier_set.contains(&e.src) && !e.src.starts_with("note:") {
-                (e.src.clone(), e.dst.clone())
-            } else if frontier_set.contains(&e.dst) && !e.dst.starts_with("note:") {
-                (e.dst.clone(), e.src.clone())
-            } else {
-                continue;
-            };
-            let note_like = to.starts_with("note:");
-            let (base, score) = entities.get(&from).cloned().unwrap_or_default();
-            let dest = if note_like {
-                format!(
-                    "(nota {})",
-                    to.get(5..)
-                        .and_then(|id| id.get(id.len().saturating_sub(8)..))
-                        .unwrap_or("?")
-                )
-            } else {
-                format!("[[{to}]]")
-            };
-            let path = format!("{base} -{}-> {dest}", e.rel);
-            if !note_like {
-                entities.entry(to.clone()).or_insert((path.clone(), score));
-                next.insert(to.clone());
-            }
-            if let Some(nid) = &e.note_id
-                && !exclude.contains(nid)
-                && !extra.contains_key(nid)
-                && *nid != from
-            {
-                // hub damping: score/(1 + ln(1 + degree)) — a specific
-                // entity (degree ~3) keeps ~0.42 of the seed's score, a hub
-                // with hundreds of edges ~0.13
-                let deg = f64::from(*degree.get(from.as_str()).unwrap_or(&1));
-                let damped = score / (1.0 + deg.ln_1p());
-                if std::env::var("ENGRAMMA_WALK_DEBUG").is_ok() && nid.ends_with("ZN") {
-                    eprintln!(
-                        "EXTRA {nid} hop {hop} from {from} deg {deg} score {score:.3} damped {damped:.3}"
-                    );
-                }
-                extra.insert(nid.clone(), (hop, path, damped));
-            }
-        }
-        frontier = next.into_iter().collect();
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2678,8 +2726,12 @@ mod tests {
                     .unwrap(/* test-only */);
             }
         }
-        // count the work: any full-table scan crosses the blob (20k rows ≥
-        // ~200k VDBE steps); the bounded walk stays far below
+        // count the work: any SQL during the walk crosses the blob (20k rows
+        // ≥ ~200k VDBE steps). v0.3: the walk runs entirely on the in-memory
+        // CSR — the only SQL left is the freshness pragma, so build the index
+        // first, then measure.
+        let warm = cell.path("Nodo3", "Fabio", false).unwrap(/* test-only */);
+        assert_eq!(warm.expect("4 hops").len(), 4);
         let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         {
             let mut inner = cell.inner.lock().unwrap(/* test-only */);
@@ -2699,9 +2751,9 @@ mod tests {
         assert_eq!(short.expect("4 hops").len(), 4);
         let used = steps.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
-            used < 100_000,
-            "the walk scanned the whole edge table ({used} VDBE steps; the \
-             blob alone is 20 000 rows)"
+            used < 1_000,
+            "the walk is in-memory: 2 path() calls must not touch the edge \
+             table ({used} VDBE steps; the blob alone is 20 000 rows)"
         );
     }
 

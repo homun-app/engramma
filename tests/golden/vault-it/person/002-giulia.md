@@ -17,3 +17,4 @@ Giulia Serra, partner di [[Fabio]], architetta. Suona il pianoforte. Nata il 9 l
 - lives_in:: [[Milano]] (from 2026-09-01)
 - works_at:: [[Studio Rossi]] (from 2023-02-01)
 - sister_of:: [[Sara]]
+- treated_by:: [[Dott.ssa Conti]] (from 2024-01-01)

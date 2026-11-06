@@ -1,7 +1,7 @@
 ---
 id: 01GD0000000000000000000083
 type: fact
-title: Il ruolo di Marco Rossi
+title: Il capo dei progetti dello Studio Rossi
 tags: [lavoro/studio-rossi]
 lang: it
 source: user
@@ -10,4 +10,4 @@ status: active
 created_at: 2026-09-07T09:00:00Z
 updated_at: 2026-09-07T09:00:00Z
 ---
-[[Marco Rossi]] è il capoprogetto di [[Fabio]] allo [[Studio Rossi]]: riunione di squadra ogni lunedì mattina.
+[[Marco Rossi]] coordina la squadra di [[Fabio]] allo [[Studio Rossi]]: riunione ogni lunedì mattina.

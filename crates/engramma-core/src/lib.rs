@@ -7,6 +7,7 @@ pub mod cell;
 pub mod embed;
 pub mod error;
 pub mod format;
+pub mod graph;
 pub mod hlc;
 pub mod id;
 pub mod port;

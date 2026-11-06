@@ -782,6 +782,22 @@ fn multihop_debug(target: usize, how_many: usize, dir: &std::path::Path) {
     for note in &corpus.notes {
         cell.put_note(note, "bench").expect(/* valid */ "put");
     }
+    // v0.3: the multi-hop battle is in hybrid (the text branch alone finds the
+    // partner note); embed with the 97M when present and diagnose both modes.
+    let embedder = load_model("granite-embedding-97m-multilingual-r2");
+    let sem = embedder.as_ref().map(|e| {
+        cell.add_model(e.model_id(), e.dim())
+            .expect(/* bench embedder is valid */ "add model");
+        loop {
+            let r = cell
+                .embed_pending(e.as_ref(), 256)
+                .expect(/* valid notes */ "embed");
+            if r.done == 0 || r.remaining == 0 {
+                break;
+            }
+        }
+        Semantic::new(std::sync::Arc::clone(e))
+    });
     let now = OffsetDateTime::from_unix_timestamp(1_810_000_000).expect(/* fixed */ "ts");
     // document frequencies of the corpus's most query-visible stems
     let dfs = cell
@@ -802,47 +818,94 @@ fn multihop_debug(target: usize, how_many: usize, dir: &std::path::Path) {
         .take(how_many)
         .enumerate()
     {
-        let mut query = Query::text(&q.text).k(100).graph_hops(2);
+        let mut query = Query::text(&q.text).k(20).graph_hops(2);
         query.lang = Some(Lang::It);
         if let Some(a) = q.as_of {
             query.filters.as_of = Some(a);
         }
-        let hits = cell
+        let text_hits = cell
             .search_with_now(&query, now)
             .expect(/* valid */ "search");
-        let expected_rank = hits
-            .iter()
-            .position(|h| q.expect_ids.contains(&h.note.id.to_string()));
-        println!("\n[{}] `{}`", qi + 1, q.text);
-        match expected_rank {
-            Some(r) => {
-                let h = &hits[r];
+        println!("\n[{}] `{}` attese {:?}", qi + 1, q.text, {
+            let mut v: Vec<String> = q
+                .expect_ids
+                .iter()
+                .map(|id| id[id.len().saturating_sub(8)..].to_string())
+                .collect();
+            v.sort();
+            v
+        });
+        for (label, hits) in [("testo", &text_hits)] {
+            let expected_rank = hits
+                .iter()
+                .position(|h| q.expect_ids.contains(&h.note.id.to_string()));
+            match expected_rank {
+                Some(r) => {
+                    let h = &hits[r];
+                    println!(
+                        "  [{label}] attesa al rango {} di {}: punteggio {:.4}, liste {:?}, via {:?}",
+                        r + 1,
+                        hits.len(),
+                        h.raw_score,
+                        h.explain.lists,
+                        h.explain.via
+                    );
+                }
+                None => println!("  [{label}] attesa ASSENTE dai primi {}", hits.len()),
+            }
+            for (r, h) in hits.iter().enumerate().take(6) {
                 println!(
-                    "  attesa al rango {} di {}: punteggio {:.4}, termini {:?}, liste {:?}, via {:?}",
+                    "  {}. {:.4} {} [{}] {:?}{}",
                     r + 1,
-                    hits.len(),
                     h.raw_score,
+                    h.note.display_title(),
+                    h.explain.lists.to_vec().join("+"),
                     h.explain.matched_terms,
-                    h.explain.lists,
-                    h.explain.via
+                    h.explain
+                        .via
+                        .as_deref()
+                        .map(|v| format!(" via {v}"))
+                        .unwrap_or_default()
                 );
             }
-            None => println!("  attesa ASSENTE dai primi {}", hits.len()),
         }
-        for (r, h) in hits.iter().enumerate().take(6) {
-            println!(
-                "  {}. {:.4} {} [{}] {:?}{}",
-                r + 1,
-                h.raw_score,
-                h.note.display_title(),
-                h.explain.lists.to_vec().join("+"),
-                h.explain.matched_terms,
-                h.explain
-                    .via
-                    .as_deref()
-                    .map(|v| format!(" via {v}"))
-                    .unwrap_or_default()
-            );
+        if let Some(sem) = &sem {
+            let outcome = cell
+                .search_semantic_with_now(&query, now, sem)
+                .expect(/* valid */ "search");
+            let hits = &outcome.hits;
+            let expected_rank = hits
+                .iter()
+                .position(|h| q.expect_ids.contains(&h.note.id.to_string()));
+            match expected_rank {
+                Some(r) => {
+                    let h = &hits[r];
+                    println!(
+                        "  [ibrido] attesa al rango {} di {}: punteggio {:.4}, liste {:?}, via {:?}",
+                        r + 1,
+                        hits.len(),
+                        h.raw_score,
+                        h.explain.lists,
+                        h.explain.via
+                    );
+                }
+                None => println!("  [ibrido] attesa ASSENTE dai primi {}", hits.len()),
+            }
+            for (r, h) in hits.iter().enumerate().take(8) {
+                println!(
+                    "  {}. {:.4} {} [{}] cos {:?}{}",
+                    r + 1,
+                    h.raw_score,
+                    h.note.display_title(),
+                    h.explain.lists.to_vec().join("+"),
+                    h.explain.cosine.map(|c| format!("{c:.3}")),
+                    h.explain
+                        .via
+                        .as_deref()
+                        .map(|v| format!(" via {v}"))
+                        .unwrap_or_default()
+                );
+            }
         }
     }
     let _ = std::fs::remove_file(&db);
@@ -1102,66 +1165,84 @@ fn run_semantic(
             vlat.push(t.elapsed().as_secs_f64() * 1000.0);
         }
 
-        // per-mode quality by category
+        // per-mode quality by category; `graph_w` overrides the default
+        // graph-list weight (v0.3 tuning: the third list must lift multi-salto
+        // without displacing real text matches).
         let mut quality: Vec<(String, String, f64, f64, usize)> = Vec::new();
-        let mut score_mode = |name: &str, mode: char, fusion: Option<Fusion>| {
-            let categories = ["fattuali", "parafrasi", "multi-salto", "inglese"];
-            for cat in categories {
-                let (recall, mrr, n) = {
-                    let mut hits5 = 0_usize;
-                    let mut mrr_sum = 0.0_f64;
-                    let mut answered = 0_usize;
-                    for q in &corpus.questions {
-                        if q.expect_ids.is_empty() || q.category != cat {
-                            continue;
-                        }
-                        let results = match mode {
-                            't' => cell
-                                .search_with_now(&mk_query(q), now)
-                                .expect(/* valid */ "search"),
-                            'v' => {
-                                cell.search_semantic_with_now(&mk_query(q), now, &sem_vec)
-                                    .expect(/* valid */ "search")
-                                    .hits
+        let mut score_mode =
+            |name: &str, mode: char, fusion: Option<Fusion>, graph_w: Option<f64>| {
+                let categories = ["fattuali", "parafrasi", "multi-salto", "inglese"];
+                for cat in categories {
+                    let (recall, mrr, n) = {
+                        let mut hits5 = 0_usize;
+                        let mut mrr_sum = 0.0_f64;
+                        let mut answered = 0_usize;
+                        for q in &corpus.questions {
+                            if q.expect_ids.is_empty() || q.category != cat {
+                                continue;
                             }
-                            _ => {
-                                let s = match fusion {
-                                    Some(f) => sem.clone().with_fusion(f),
-                                    None => sem.clone(),
-                                };
-                                cell.search_semantic_with_now(&mk_query(q), now, &s)
-                                    .expect(/* valid */ "search")
-                                    .hits
+                            let query = {
+                                let mut query = mk_query(q);
+                                if let Some(g) = graph_w {
+                                    query.weights.graph_weight = g;
+                                }
+                                query
+                            };
+                            let results = match mode {
+                                't' => cell
+                                    .search_with_now(&query, now)
+                                    .expect(/* valid */ "search"),
+                                'v' => {
+                                    cell.search_semantic_with_now(&query, now, &sem_vec)
+                                        .expect(/* valid */ "search")
+                                        .hits
+                                }
+                                _ => {
+                                    let s = match fusion {
+                                        Some(f) => sem.clone().with_fusion(f),
+                                        None => sem.clone(),
+                                    };
+                                    cell.search_semantic_with_now(&query, now, &s)
+                                        .expect(/* valid */ "search")
+                                        .hits
+                                }
+                            };
+                            let ids: Vec<String> =
+                                results.iter().map(|h| h.note.id.to_string()).collect();
+                            if let Some(rank) = ids.iter().position(|i| q.expect_ids.contains(i)) {
+                                hits5 += 1;
+                                mrr_sum += 1.0 / (rank + 1) as f64;
                             }
-                        };
-                        let ids: Vec<String> =
-                            results.iter().map(|h| h.note.id.to_string()).collect();
-                        if let Some(rank) = ids.iter().position(|i| q.expect_ids.contains(i)) {
-                            hits5 += 1;
-                            mrr_sum += 1.0 / (rank + 1) as f64;
+                            answered += 1;
                         }
-                        answered += 1;
-                    }
-                    (
-                        if answered == 0 {
-                            0.0
-                        } else {
-                            hits5 as f64 / answered as f64
-                        },
-                        if answered == 0 {
-                            0.0
-                        } else {
-                            mrr_sum / answered as f64
-                        },
-                        answered,
-                    )
-                };
-                quality.push((name.to_string(), cat.to_string(), recall, mrr, n));
-            }
-        };
-        score_mode("testo", 't', None);
-        score_mode("vettori", 'v', None);
-        score_mode("rrf", 'h', Some(Fusion::Rrf { k: 60 }));
+                        (
+                            if answered == 0 {
+                                0.0
+                            } else {
+                                hits5 as f64 / answered as f64
+                            },
+                            if answered == 0 {
+                                0.0
+                            } else {
+                                mrr_sum / answered as f64
+                            },
+                            answered,
+                        )
+                    };
+                    quality.push((name.to_string(), cat.to_string(), recall, mrr, n));
+                }
+            };
+        score_mode("testo", 't', None, None);
+        // text mode with the graph list off/on (what the third list costs and
+        // buys where no vector can help)
+        score_mode("testo-g0", 't', None, Some(0.0));
+        score_mode("vettori", 'v', None, None);
+        score_mode("rrf", 'h', Some(Fusion::Rrf { k: 60 }), None);
+        // v0.3: the graph-weight sweep on the default fusion (and text mode)
+        for gw in [0.15_f64, 0.2, 0.25, 0.35] {
+            let tag = format!("testo-g{gw:.2}");
+            score_mode(&tag, 't', None, Some(gw));
+        }
         let convex = |alpha: f64, norm: engramma_core::CosNorm| {
             Some(Fusion::Convex {
                 alpha,
@@ -1172,31 +1253,50 @@ fn run_semantic(
             "mm-0.3",
             'h',
             convex(0.3, engramma_core::CosNorm::Candidates),
+            None,
         );
         score_mode(
             "mm-0.5",
             'h',
             convex(0.5, engramma_core::CosNorm::Candidates),
+            None,
         );
         score_mode(
             "mm-0.7",
             'h',
             convex(0.7, engramma_core::CosNorm::Candidates),
+            None,
         );
+        for gw in [0.15_f64, 0.2, 0.25, 0.3, 0.4] {
+            let tag = format!("mm-0.7-g{gw:.2}");
+            score_mode(
+                &tag,
+                'h',
+                convex(0.7, engramma_core::CosNorm::Candidates),
+                Some(gw),
+            );
+        }
+        for gw in [0.2_f64, 0.3] {
+            let tag = format!("rrf-g{gw:.2}");
+            score_mode(&tag, 'h', Some(Fusion::Rrf { k: 60 }), Some(gw));
+        }
         score_mode(
             "th-0.3",
             'h',
             convex(0.3, engramma_core::CosNorm::Theoretical),
+            None,
         );
         score_mode(
             "th-0.5",
             'h',
             convex(0.5, engramma_core::CosNorm::Theoretical),
+            None,
         );
         score_mode(
             "th-0.7",
             'h',
             convex(0.7, engramma_core::CosNorm::Theoretical),
+            None,
         );
 
         SemanticReport {
@@ -1356,7 +1456,26 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
         for r in reports {
             let Some(sr) = &r.semantic else { continue };
             let modes = [
-                "testo", "vettori", "rrf", "mm-0.3", "mm-0.5", "mm-0.7", "th-0.3", "th-0.5",
+                "testo",
+                "testo-g0",
+                "testo-g0.15",
+                "testo-g0.20",
+                "testo-g0.25",
+                "testo-g0.35",
+                "vettori",
+                "rrf",
+                "rrf-g0.20",
+                "rrf-g0.30",
+                "mm-0.3",
+                "mm-0.5",
+                "mm-0.7",
+                "mm-0.7-g0.15",
+                "mm-0.7-g0.20",
+                "mm-0.7-g0.25",
+                "mm-0.7-g0.30",
+                "mm-0.7-g0.40",
+                "th-0.3",
+                "th-0.5",
                 "th-0.7",
             ];
             for m in modes {
