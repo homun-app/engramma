@@ -1183,4 +1183,135 @@ testo **1.000/0.722**, mm-0.3 1.000/0.333, rrf 0.389/0.095; a 100k in
 
 ## Chiusura
 
-{{CHIUSURA}}
+fmt, clippy `-D warnings`, test (158, debug e release), `cargo deny check
+licenses bans`: verdi. Prove a mano (97M, transcritte qui sotto). Tag
+`fase-v0.2.1`.
+
+### La scelta della fusione (P0.1): convessa mm-0,7
+
+Criterio dichiarato: **MRR medio del benchmark a 100k pesato per numero
+di domande** (fattuali 1913, parafrasi 1533, multi-salto 237, inglese
+1001); a parità vince chi tiene le parafrasi, la ragione del ramo
+semantico. MRR pesato a 100k (97M):
+
+| fusione | MRR pesato | parafrasi | note |
+|---|---|---|---|
+| mm-0.3 | 0.757 | 0.778 | migliore a 10k sui fattuali (MRR 1.000) |
+| mm-0.5 | 0.825 | 0.864 | |
+| **mm-0.7** | **0.838** | **0.878** | **predefinita** (è anche la scelta del vault dorato) |
+| rrf | 0.645 | 0.643 | la v0.2 la preferiva a 100k col coseno grezzo |
+| th-0.7 (migliore th) | 0.477 | 0.411 | i limiti teorici tengono lo scarto compresso |
+
+La teorica perde ovunque in modo consistente: stabile sì, ma riporta la
+scala del coseno a ~0,05 di scarto effettivo e il testo domina — la
+misura che il prompt chiedeva di fare. RRF resta a `--fusion rrf`.
+Il commento di `Semantic::new` ora dice quello che il codice fa.
+
+### La scelta del modello (P1.5): 97M
+
+Confronto rifatto dopo P0.1, benchmark 10k (252 parafrasi, 167 inglesi),
+fusione predefinita:
+
+| | 97M | 311M |
+|---|---|---|
+| parafrasi ric/MRR | 1.000/0.982 | 1.000/**0.996** |
+| inglese ric/MRR | 1.000/0.976 | 1.000/0.985 |
+| fattuali MRR | 0.972 | **1.000** |
+| multi-salto | 0.333 | 0.157 |
+| embedding (note/s) | **202** | 69 |
+| ibrido caldo p50 (ms) | **28.4** | 33.2 |
+| modello su disco | **420 MB** | 1 277 MB |
+
+Il vantaggio del 311M sulle parafrasi è 0.014 di MRR, sotto la soglia
+di 0.03 che lo terrebbe predefinito: **default 97M**, il 311M resta
+l'opzione di qualità a un `model use` di distanza. Sul vault dorato il
+97M perde una parafrasi su 15 («che cosa cresce all'aperto
+dell'appartamento?», richiamo 0.933): dichiarata nel test, non nascosta.
+
+### Tabelle di chiusura
+
+Testo+grafo (mediana di 3; «viva»; la riga 100k include la correzione
+bitemporale della recenza, commit `e9298c2`):
+
+| corpus | note | inserimento (note/s) | apertura (ms) | p50 (ms) | p95 (ms) | solo testo p50 | richiamo@5 | MRR | file (MB) |
+|---|---|---|---|---|---|---|---|---|---|
+| viva | 10 000 | 3 620 | 1.1 | 6.3 | 10.7 | 1.1 | 0.997 | 0.790 | 24.3 |
+| uniform | 10 000 | 3 563 | 1.0 | 5.7 | 9.6 | 1.1 | 1.000 | 0.774 | 24.3 |
+| viva | 100 000 | 2 092 | 1.6 | 43.5 | 54.3 | 9.2 | **0.940** | **0.683** | 246.3 |
+| uniform | 100 000 | 2 279 | 1.5 | 43.6 | 56.1 | 9.0 | 0.979 | 0.739 | 246.3 |
+
+Ramo vettoriale (mediana di 3 dove indicato):
+
+| modello | note | embedding (note/s) | costr. indice | vettori p50/p95 | ibrido caldo p50/p95 | ibrido + embedding p50/p95 |
+|---|---|---|---|---|---|---|
+| 97M | 10 000 | 218 | 20 ms | 22.3/28.7 | 22.0/29.7 | 21.6/28.5 |
+| 311M | 10 000 | 63 | 54 ms | 35.5/42.2 | 33.1/41.8 | 33.3/43.0 |
+| 97M | 100 000 | 183 | 165 ms | 51.1/64.7 | 57.9/70.6 | 57.6/68.5 |
+
+Nota onesta sulle colonne «calde» a 100k: la LRU delle query incorpora
+256 domande per modello e il banco ne fa 4 684 — ogni domanda «calda» è
+di fatto una re-incorporazione (~25 ms col 97M). Il motore senza
+l'incorporazione è la sonda: **7,7/7,9 ms p50/p95 ibrido a 100k**, ed è
+quello l'obiettivo del §11 («con la query già incorporata»), rispettato
+con margine. Richiamo@5/MRR per modalità e categoria (una tornata
+post-correzione, 97M e 311M): in `bench/RESULTS.md`.
+
+Multi-salto a 100k: testo 0.895/0.536; ibrido 0.063 (mm-0.7) – 0.304
+(th-0.3) — misura qualcosa in ogni modalità; in ibrido il ramo vettoriale
+preme le note «del settore» sopra la catena del partner: altro punto
+aperto per la taratura del peso di grafo/fusione in ibrido.
+
+### Prove a mano (97M, uscite trascritte)
+
+```console
+$ engramma --root $T search "cosa mangia Fabio adesso" --k 3
+1. [active] Fabio onnivoro (00000061)
+   liste: text, vector   termini: mang   rango BM25: 2   rango semantico: 1
+   coseno: 0.9110   supporto: strong
+2. [active] Viaggio a Torino (00000051)   coseno: 0.8220 (semantico 15°)
+3. [active] Caffè amaro (00000062)        coseno: 0.8615   supporto: weak
+$ engramma --root $T search "where does Fabio work" --k 3
+1. [active] L'orario di Fabio (00000086)      # nota di lavoro (Studio Rossi)
+   liste: text, vector   coseno: 0.9075   supporto: weak
+2. [active] Fabio lavora allo Studio Rossi (00000081)   coseno: 0.9079
+$ engramma --root $T verify
+registro verificato: 63 operazioni, catena hash, ricostruzione e indice FTS a posto
+copertura vettori: granite-embedding-97m-multilingual-r2@835ad140 [ready] 62/62 note
+$ engramma --root $T search "campione"
+1. [active] Fabio tifa Lazio …   liste: vector   coseno: 0.8224   supporto: weak
+$ engramma --root $T search "campione" --strict
+nessun risultato sopra soglia
+$ engramma --root $T search "che auto guida Giulia" --strict
+nessun risultato sopra soglia
+```
+
+E via MCP (`memory_search`, cella dorata): «Fabio tifa Lazio |
+supporto: weak | coseno: 0.8224 | liste: ['vector']» — l'explain porta
+il supporto e la descrizione dello strumento spiega che weak vuol dire
+verificare prima di affermare.
+
+### Obiettivi del §11
+
+- inserimento ≥ 2 000 note/s: 2 092–3 620 ✓
+- ricerca testo+grafo p95 ≤ 30 ms: 10.7 ms a 10k ✓; a 100k 54.3 ms —
+  invariato dalla v0.2 (camminata e FTS del percorso di testo; il
+  tavolo della fusione e la sonda mostrano il margine del ramo ibrido)
+- **ricerca mista p95 ≤ 50 ms a 100k con query già incorporata:
+  7.9 ms (sonda) ✓**
+- apertura cella ≤ 50 ms: 1.0–2.2 ms ✓
+- sonda: embed_pending lineare (14×) ✓; solo vettori 4.0 ms (aspirazione
+  3 ms: mancato di 1 ms, dichiarato); ibrido p95 7.9 ms ✓
+
+### Cosa resta aperto
+
+1. «Solo vettori» a 3 ms: 4.0 — il ricalcolo f32 di 200 candidati e la
+   camminata; una selezione a due stadi (ricalcolare prima i 64 migliori
+   int8) è la strada naturale.
+2. Ibrido e multi-salto: la fusione preme il ramo vettoriale sopra la
+   catena del grafo (0.063 contro 0.895 del solo testo a 100k); serve un
+   peso che rispetti il percorso, non solo i punteggi.
+3. La LRU delle query (256) è piccola per banchi con migliaia di domande:
+   le colonne «calde» dei benchmark pagano re-incorporazioni.
+4. Il costo della «viva» a 100k (p95 54 ms) è la camminata del grafo del
+   percorso di testo — ora con passo 5 000 smorzato; compattare la
+   frontiera resta il lavoro del §registro/grafo.
