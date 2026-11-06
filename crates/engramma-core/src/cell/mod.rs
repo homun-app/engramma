@@ -157,6 +157,9 @@ pub struct VerifyReport {
     pub replay_ok: bool,
     /// The FTS index matches its content table (integrity-check).
     pub fts_ok: bool,
+    /// The compaction snapshot (when any) matched its recorded head hash and
+    /// state digest (v0.3).
+    pub snapshot_ok: bool,
     /// First mismatch, when something failed.
     pub mismatch: Option<String>,
     /// Vector coverage per model, reported separately: embeddings are
@@ -167,7 +170,7 @@ pub struct VerifyReport {
 impl VerifyReport {
     /// Everything passed.
     pub fn ok(&self) -> bool {
-        self.hash_chain_ok && self.replay_ok && self.fts_ok
+        self.hash_chain_ok && self.replay_ok && self.fts_ok && self.snapshot_ok
     }
 }
 
@@ -209,13 +212,42 @@ pub(crate) struct IndexState {
     pub(crate) idx: crate::vector::FlatI8,
 }
 
+/// The in-memory graph index and its freshness bookkeeping (v0.3).
+pub(crate) struct GraphState {
+    /// `PRAGMA data_version` at build time: another process writing the cell
+    /// bumps it, and the next graph walk rebuilds.
+    pub(crate) data_version: i64,
+    /// The CSR index.
+    pub(crate) index: crate::graph::GraphIndex,
+}
+
+/// What this cell's own writes did to the graph since the last use: the
+/// touched notes (their declared edges are patched into an overlay) and
+/// whether something global happened (manual edges, purge) that only a full
+/// rebuild can absorb.
+#[derive(Default)]
+pub(crate) struct GraphDirt {
+    /// Notes whose declared edges may have changed.
+    pub(crate) notes: Vec<ulid::Ulid>,
+    /// A rebuild-only change happened.
+    pub(crate) global: bool,
+}
+
 pub(crate) struct Inner {
     pub(crate) conn: Connection,
     clock: HlcClock,
     /// Lazily built on the first semantic search (opening a cell stays ≤ 50 ms).
     pub(crate) index: Option<IndexState>,
-    /// LRU cache of embedded queries, per model (256 entries each).
+    /// Lazily built on the first graph walk (same reason).
+    pub(crate) graph: Option<GraphState>,
+    /// Own writes since the graph index was last used.
+    pub(crate) graph_dirt: GraphDirt,
+    /// LRU cache of embedded queries, per model (default 4 096 entries,
+    /// v0.3: the v0.2.1 256-slot cache made every "warm" benchmark question
+    /// a re-embedding).
     pub(crate) query_cache: std::collections::HashMap<String, crate::search::LruCache>,
+    /// Capacity of each per-model query LRU.
+    pub(crate) query_cache_cap: usize,
 }
 
 /// An open cell. Cheap to clone; one process-wide write lock per file.
@@ -333,7 +365,10 @@ impl Cell {
                 conn,
                 clock,
                 index: None,
+                graph: None,
+                graph_dirt: GraphDirt::default(),
                 query_cache: std::collections::HashMap::new(),
+                query_cache_cap: crate::graph::QUERY_CACHE_CAPACITY,
             })),
             write_lock: per_cell_lock(path),
         })
@@ -354,6 +389,37 @@ impl Cell {
             .conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
+    }
+
+    /// Capacity of the embedded-query LRU (one per model). The default is
+    /// [`crate::graph::QUERY_CACHE_CAPACITY`]; benchmarks sizing a
+    /// truly-warm cache set it to their question count. Clears the caches.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] when the cell lock is poisoned.
+    pub fn set_query_cache_capacity(&self, cap: usize) -> Result<(), CellError> {
+        let mut inner = self.lock()?;
+        inner.query_cache.clear();
+        inner.query_cache_cap = cap.max(1);
+        Ok(())
+    }
+
+    /// Build (or patch) the in-memory graph index now and report how long it
+    /// took with its stats — `(nodes, live edges, ~heap bytes)`. The first
+    /// graph search does this lazily; the benchmark calls it explicitly.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn build_graph(&self) -> Result<(f64, (usize, usize, usize)), CellError> {
+        let mut inner = self.lock()?;
+        let started = std::time::Instant::now();
+        crate::search::ensure_graph(&mut inner).map_err(|e| CellError::Db(e.to_string()))?;
+        let stats = inner
+            .graph
+            .as_ref()
+            .map(|g| g.index.stats())
+            .unwrap_or((0, 0, 0));
+        Ok((started.elapsed().as_secs_f64() * 1000.0, stats))
     }
 
     /// Run a **read-only** query returning one TEXT column per row. Meant for
@@ -417,7 +483,7 @@ impl Cell {
     }
 
     /// Build and append an operation, then apply it, in one transaction.
-    #[allow(clippy::too_many_arguments)]
+    /// The caller holds the per-cell write lock.
     fn execute(
         &self,
         kind: OpKind,
@@ -430,49 +496,65 @@ impl Cell {
             .lock()
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
         let mut inner = self.lock()?;
-        let op_id = crate::id::new_ulid()?;
-        let Inner {
-            conn,
-            clock,
-            index: _,
-            query_cache: _,
-        } = &mut *inner;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Inside the write transaction: align with the newest HLC in the log
-        // before ticking. Another process may have written since we opened
-        // (the daemon and the CLI share a cell); without this, an operation
-        // could receive an HLC lower than its predecessor's in the log.
-        let logged: Option<String> = tx
-            .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
-            .optional()?;
-        if let Some(s) = logged
-            && let Ok(h) = Hlc::parse(&s)
-        {
-            clock.observe(&h);
-        }
-        let hlc = clock.tick();
-        let (prev_seq, prev_hash): (i64, String) = tx
-            .query_row(
-                "SELECT seq, hash FROM ops ORDER BY seq DESC LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap_or((0, ops::GENESIS_HASH.to_string()));
-        let mut op = ops::make_op(op_id, hlc.clone(), actor, kind, note_id, payload)?;
-        op.seq = prev_seq + 1;
-        op.prev_hash = prev_hash;
-        op.hash = ops::op_hash(&op.prev_hash, &ops::canonical_json(&op.payload));
-        ops::apply(&tx, &op)?;
-        tx.commit()?;
-        // A tombstone leaves the index immediately (its vectors were deleted
-        // inside the op). The guard is the one this method already holds.
-        if kind == OpKind::DeleteNote
-            && let Some(id) = note_id
-            && let Some(st) = &mut inner.index
-        {
+        execute_op(&mut inner, kind, note_id, actor, payload)?;
+        Ok(())
+    }
+
+    /// Right to be forgotten (DESIGN §4.4, v0.3): the note, its versions,
+    /// its edges, vectors, FTS row and orphaned entities go, and the
+    /// payloads of its operations are forgotten — the chain stays whole
+    /// (log v2). `secure_delete` zeroes the freed pages and the `VACUUM`
+    /// rebuilds the file, so no byte of the body survives in the file.
+    /// Returns how many payload rows were forgotten.
+    ///
+    /// The markdown view (v0.3) deletes the file of a purged note too;
+    /// exports made before the purge are outside the engine's control (the
+    /// CLI says so). `[[Mentions]]` of this note in other notes remain:
+    /// they are other notes.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL or I/O failures.
+    pub fn purge(&self, id: &Ulid, reason: &str, actor: &str) -> Result<usize, CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let mut inner = self.lock()?;
+        let payloads_before: i64 = inner
+            .conn
+            .query_row("SELECT COUNT(*) FROM op_payloads", [], |r| r.get(0))
+            .unwrap_or(0);
+        let secure_before: String = inner
+            .conn
+            .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+            .unwrap_or_else(|_| "0".into());
+        let _ = inner.conn.pragma_update(None, "secure_delete", "ON");
+        execute_op(
+            &mut inner,
+            OpKind::Purge,
+            Some(*id),
+            actor,
+            serde_json::json!({ "reason": reason }),
+        )?;
+        // the in-memory vector index drops the note with its vectors
+        if let Some(st) = &mut inner.index {
             st.idx.remove(&id.to_string());
         }
-        Ok(())
+        let _ = inner
+            .conn
+            .pragma_update(None, "secure_delete", secure_before);
+        let payloads_after: i64 = inner
+            .conn
+            .query_row("SELECT COUNT(*) FROM op_payloads", [], |r| r.get(0))
+            .unwrap_or(0);
+        // no byte of the body left in the file: rebuild it
+        inner
+            .conn
+            .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        // the purge itself wrote one payload: the forgotten rows are the drop
+        // net of it
+        let forgotten = payloads_before + 1 - payloads_after;
+        Ok(usize::try_from(forgotten.max(0)).unwrap_or(0))
     }
 
     // ------------------------------------------------------------------
@@ -901,6 +983,103 @@ impl Cell {
         })
     }
 
+    /// The [`state_digest`] of this cell as it stands.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn state_digest(&self) -> Result<String, CellError> {
+        let inner = self.lock()?;
+        state_digest(&inner.conn)
+    }
+
+    /// The latest compaction snapshot, when any.
+    fn last_snapshot(&self) -> Result<Option<(i64, String, String, String)>, CellError> {
+        let inner = self.lock()?;
+        inner
+            .conn
+            .query_row(
+                "SELECT seq, head_hash, state_digest, file FROM snapshots ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()
+            .map_err(CellError::from)
+    }
+
+    /// Compact the log (DESIGN §4.3, v0.3): `VACUUM INTO` a snapshot of the
+    /// cell **exactly as it stands** (`up_to_seq` must be the current head —
+    /// the point of compacting is now), register it with its head hash and
+    /// its [`state_digest`], then forget the payloads of every op up to
+    /// `seq`: the skeletons and the chain stay whole. Returns the snapshot
+    /// path.
+    ///
+    /// # Errors
+    /// [`CellError::Invalid`] when `up_to_seq` is not the live head;
+    /// [`CellError::Db`] on SQL or I/O failures.
+    pub fn compact(&self, up_to_seq: i64) -> Result<PathBuf, CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let mut inner = self.lock()?;
+        let head_seq: i64 = inner
+            .conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM ops", [], |r| r.get(0))
+            .unwrap_or(0);
+        if head_seq == 0 || up_to_seq != head_seq {
+            return Err(CellError::Invalid(format!(
+                "compact wants the current head seq ({head_seq}), got {up_to_seq}:                  snapshot the cell exactly as it stands"
+            )));
+        }
+        let head_hash: String = inner
+            .conn
+            .query_row("SELECT hash FROM ops WHERE seq = ?1", [head_seq], |r| {
+                r.get(0)
+            })
+            .unwrap_or_default();
+        let digest = state_digest(&inner.conn)?;
+        let file = format!(
+            "{}-snap-{head_seq}.sqlite",
+            self.path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "cell".into())
+                .trim_end_matches(".sqlite")
+        );
+        let target = self
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(&file);
+        inner.conn.execute_batch(&format!(
+            "VACUUM INTO '{}'",
+            target.display().to_string().replace('\'', "''")
+        ))?;
+        let created = OffsetDateTime::now_utc()
+            .replace_millisecond(0)
+            .unwrap_or(OffsetDateTime::now_utc())
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let tx = inner
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO snapshots (seq, head_hash, state_digest, file, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(seq) DO UPDATE SET head_hash = ?2, state_digest = ?3,
+                                            file = ?4, created_at = ?5",
+            rusqlite::params![head_seq, head_hash, digest, file, created],
+        )?;
+        tx.execute(
+            "DELETE FROM op_payloads WHERE op_id IN (
+                 SELECT op_id FROM ops WHERE seq <= ?1)",
+            [head_seq],
+        )?;
+        tx.commit()?;
+        Ok(target)
+    }
+
     // ------------------------------------------------------------------
     // reads
     // ------------------------------------------------------------------
@@ -1019,10 +1198,19 @@ impl Cell {
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
     pub fn changes_since(&self, seq: i64) -> Result<Vec<Op>, CellError> {
+        if let Some((snap_seq, _, _, _)) = self.last_snapshot()?
+            && seq < snap_seq
+        {
+            return Err(CellError::Compacted {
+                snapshot_seq: snap_seq,
+            });
+        }
         let inner = self.lock()?;
         let mut stmt = inner.conn.prepare(
-            "SELECT seq, op_id, hlc, actor, kind, note_id, payload_json, prev_hash, hash
-             FROM ops WHERE seq > ?1 ORDER BY seq",
+            "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.payload_digest,
+                    p.salt, p.body, o.prev_hash, o.hash
+             FROM ops o LEFT JOIN op_payloads p ON p.op_id = o.op_id
+             WHERE o.seq > ?1 ORDER BY o.seq",
         )?;
         let rows = stmt.query_map([seq], |r| {
             Ok(ops::op_from_row(ops::OpRow {
@@ -1032,9 +1220,11 @@ impl Cell {
                 actor: &r.get::<_, String>(3)?,
                 kind: &r.get::<_, String>(4)?,
                 note_id: r.get::<_, Option<String>>(5)?.as_deref(),
-                payload_json: &r.get::<_, String>(6)?,
-                prev_hash: &r.get::<_, String>(7)?,
-                hash: &r.get::<_, String>(8)?,
+                payload_digest: &r.get::<_, String>(6)?,
+                salt: r.get::<_, Option<Vec<u8>>>(7)?.as_deref(),
+                body_json: r.get::<_, Option<String>>(8)?.as_deref(),
+                prev_hash: &r.get::<_, String>(9)?,
+                hash: &r.get::<_, String>(10)?,
             }))
         })?;
         let mut out = Vec::new();
@@ -1074,6 +1264,7 @@ impl Cell {
                     hash_chain_ok: false,
                     replay_ok: false,
                     fts_ok: false,
+                    snapshot_ok: false,
                     mismatch: Some(format!("unreadable log: {e}")),
                     coverage: Vec::new(),
                 });
@@ -1082,21 +1273,102 @@ impl Cell {
         let mut chain_ok = true;
         let mut prev = ops::GENESIS_HASH.to_string();
         for op in &source_ops {
-            let expect = ops::op_hash(&prev, &ops::canonical_json(&op.payload));
-            if op.prev_hash != prev || op.hash != expect {
+            let mut sealed = op.clone();
+            sealed.seal(&prev);
+            if op.prev_hash != prev || op.hash != sealed.hash {
+                chain_ok = false;
+                break;
+            }
+            // When the payload lives on, its salted digest must still match
+            // the body: this is what catches a changed byte (with the salt)
+            // under an otherwise intact chain.
+            if let (Some(salt), Some(body)) = (&op.salt, &op.body)
+                && ops::payload_digest(salt, body) != op.payload_digest
+            {
                 chain_ok = false;
                 break;
             }
             prev = op.hash.clone();
         }
-        // Rebuild in memory.
+        // Compaction (v0.3): the payloads up to the snapshot are forgotten,
+        // so a from-zero replay is impossible — restore the snapshot into
+        // memory (checking its recorded head hash and state digest) and
+        // replay only the tail.
+        let mut snapshot_ok = true;
         let mut rebuild_conn = Connection::open_in_memory()?;
         configure(&rebuild_conn)?;
+        let mut tail: &[Op] = &source_ops;
+        // (read inline: the cell lock is already held)
+        let snapshot: Option<(i64, String, String, String)> = inner
+            .conn
+            .query_row(
+                "SELECT seq, head_hash, state_digest, file FROM snapshots
+                 ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        if let Some((snap_seq, head_hash, digest, file)) = snapshot.as_ref() {
+            let snap_path = self
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(file);
+            let checks = Connection::open(&snap_path).and_then(|snap| {
+                let d = state_digest(&snap)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                Ok((snap, d))
+            });
+            let head_matches = source_ops
+                .iter()
+                .find(|o| o.seq == *snap_seq)
+                .is_some_and(|o| &o.hash == head_hash);
+            match (head_matches, checks) {
+                (true, Ok((snap_conn, d))) if &d == digest => {
+                    let tx = rebuild_conn.transaction()?;
+                    tx.execute_batch("DROP TABLE IF EXISTS snapshots;")?;
+                    tx.commit()?;
+                    {
+                        let backup =
+                            rusqlite::backup::Backup::new(&snap_conn, &mut rebuild_conn)
+                                .map_err(|e| CellError::Db(format!("snapshot restore: {e}")))?;
+                        backup
+                            .run_to_completion(128, std::time::Duration::from_millis(0), None)
+                            .map_err(|e| CellError::Db(format!("snapshot restore: {e}")))?;
+                    }
+                    // the snapshot was taken BEFORE the forgetting: apply the
+                    // same compaction cut to the restored copy, or the
+                    // comparison sees payload rows the live cell dropped
+                    {
+                        let tx = rebuild_conn.transaction()?;
+                        tx.execute(
+                            "DELETE FROM op_payloads WHERE op_id IN (
+                                 SELECT op_id FROM ops WHERE seq <= ?1)",
+                            [*snap_seq],
+                        )?;
+                        tx.commit()?;
+                    }
+                    let from = source_ops
+                        .iter()
+                        .position(|o| o.seq > *snap_seq)
+                        .unwrap_or(source_ops.len());
+                    tail = &source_ops[from..];
+                }
+                _ => snapshot_ok = false,
+            }
+        } else {
+            let tx = rebuild_conn.transaction()?;
+            schema::migrate(&tx)?;
+            tx.commit()?;
+        }
+        let mut mismatch: Option<String> =
+            (!snapshot_ok).then(|| "the compaction snapshot does not match its record".to_string());
+        // Replay: the tail on the snapshot, or everything from zero.
         let mut replay_err: Option<String> = None;
         {
             let tx = rebuild_conn.transaction()?;
-            schema::migrate(&tx)?;
-            for op in &source_ops {
+            for op in tail {
                 if let Err(e) = ops::apply(&tx, op) {
                     replay_err = Some(e.to_string());
                     break;
@@ -1112,11 +1384,14 @@ impl Cell {
                 hash_chain_ok: chain_ok,
                 replay_ok: false,
                 fts_ok: false,
-                mismatch: Some(format!("replay failed: {e}")),
+                snapshot_ok,
+                mismatch: Some(mismatch.unwrap_or_else(|| format!("replay failed: {e}"))),
                 coverage: Vec::new(),
             });
         }
-        let mut mismatch = compare_states(&inner.conn, &rebuild_conn)?;
+        if mismatch.is_none() {
+            mismatch = compare_states(&inner.conn, &rebuild_conn)?;
+        }
         // The FTS index is not part of the logical replay: check it against
         // its content table, on the live cell and on the rebuild alike.
         let fts_ok = match fts_integrity_check(&inner.conn)
@@ -1138,6 +1413,7 @@ impl Cell {
             hash_chain_ok: chain_ok,
             replay_ok: mismatch.is_none(),
             fts_ok,
+            snapshot_ok,
             mismatch,
             coverage,
         })
@@ -1153,6 +1429,80 @@ impl Cell {
                 CellError::Invalid(format!("clock out of range: {e}"))
             })?))
     }
+}
+
+/// Build, seal and apply one operation inside one immediate transaction.
+/// The caller holds the write lock and passes the locked `Inner`.
+fn execute_op(
+    inner: &mut Inner,
+    kind: OpKind,
+    note_id: Option<Ulid>,
+    actor: &str,
+    payload: Value,
+) -> Result<(), CellError> {
+    let op_id = crate::id::new_ulid()?;
+    let tx = inner
+        .conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Inside the write transaction: align with the newest HLC in the log
+    // before ticking. Another process may have written since we opened
+    // (the daemon and the CLI share a cell); without this, an operation
+    // could receive an HLC lower than its predecessor's in the log.
+    let logged: Option<String> = tx
+        .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
+        .optional()?;
+    if let Some(s) = logged
+        && let Ok(h) = Hlc::parse(&s)
+    {
+        inner.clock.observe(&h);
+    }
+    let hlc = inner.clock.tick();
+    let (prev_seq, prev_hash): (i64, String) = tx
+        .query_row(
+            "SELECT seq, hash FROM ops ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((0, ops::GENESIS_HASH.to_string()));
+    // The salt is minted at creation, like the op id and the HLC: `apply`
+    // stays deterministic and the digest can be recomputed forever.
+    let salt = crate::id::random_salt()?;
+    let mut op = ops::make_op(op_id, hlc, actor, kind, note_id, payload, salt.to_vec())?;
+    op.seq = prev_seq + 1;
+    op.seal(&prev_hash);
+    ops::apply(&tx, &op)?;
+    tx.commit()?;
+    // A tombstone leaves the index immediately (its vectors were deleted
+    // inside the op). The guard is the one the caller holds.
+    if kind == OpKind::DeleteNote
+        && let Some(id) = note_id
+        && let Some(st) = &mut inner.index
+    {
+        st.idx.remove(&id.to_string());
+    }
+    // The graph index follows the same writes (v0.3): manual edges and
+    // anything that reshapes entities need a rebuild, a note write only
+    // patches that note's declared edges into the overlay.
+    match kind {
+        OpKind::Link | OpKind::Unlink | OpKind::Purge => inner.graph_dirt.global = true,
+        _ => {
+            if let Some(id) = note_id {
+                inner.graph_dirt.notes.push(id);
+            }
+            if kind == OpKind::Supersede
+                && let Some(new_id) = op
+                    .body
+                    .as_ref()
+                    .and_then(|b| b.get("note"))
+                    .and_then(|n| n.get("id"))
+                    .and_then(Value::as_str)
+                    .and_then(|s| Ulid::from_string(s).ok())
+            {
+                inner.graph_dirt.notes.push(new_id);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read a note through any transaction-ish handle.
@@ -1178,9 +1528,9 @@ pub(crate) fn get_note_tx(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<N
     Ok(note)
 }
 
-/// Row-by-row comparison of two cell states (ops included; internal FTS
-/// rowids excluded — the index is rebuilt identically by construction).
-fn compare_states(a: &Connection, b: &Connection) -> Result<Option<String>, CellError> {
+/// The canonical dump of the logical tables, row by row (the comparison
+/// basis of [`compare_states`] and the content of [`state_digest`]).
+fn state_dump(conn: &Connection) -> Result<String, CellError> {
     let tables = [
         (
             "notes",
@@ -1195,9 +1545,21 @@ fn compare_states(a: &Connection, b: &Connection) -> Result<Option<String>, Cell
             "note_tags",
             "SELECT note_id, tag FROM note_tags ORDER BY note_id, tag",
         ),
+        // The logical entity set is DERIVED: the edge endpoints plus the
+        // subjects of the alive notes. The raw `entities` table is an index
+        // over exactly that (claims are last-writer-wins by title, purges
+        // prune orphans), and its history can legitimately differ between
+        // the live cell and a replay of a redacted log — the derived set
+        // cannot (v0.3, found by the purge property tests).
         (
             "entities",
-            "SELECT id, name, type, note_id FROM entities ORDER BY id",
+            "SELECT DISTINCT lower(name) FROM (
+                 SELECT src AS name FROM edges
+                 UNION SELECT dst FROM edges
+                 UNION SELECT trim(title) FROM notes
+                 WHERE status != 'deleted' AND title IS NOT NULL
+                   AND type IN ('person', 'place', 'project', 'event', 'preference')
+             ) ORDER BY 1",
         ),
         (
             "edges",
@@ -1209,61 +1571,85 @@ fn compare_states(a: &Connection, b: &Connection) -> Result<Option<String>, Cell
         ),
         (
             "ops",
-            "SELECT seq, op_id, hlc, actor, kind, note_id, payload_json, prev_hash, hash FROM ops ORDER BY seq",
+            "SELECT seq, op_id, hlc, actor, kind, note_id, payload_digest, prev_hash, hash FROM ops ORDER BY seq",
         ),
-        ("meta", "SELECT key, value FROM meta ORDER BY key"),
+        (
+            "op_payloads",
+            "SELECT op_id, salt, body FROM op_payloads ORDER BY op_id",
+        ),
+        // The migration bookmarks are not replayable state: no op writes
+        // them, so a from-zero rebuild never has them.
+        (
+            "meta",
+            "SELECT key, value FROM meta
+             WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq') ORDER BY key",
+        ),
     ];
-    for (name, sql) in tables {
-        let render = |v: rusqlite::types::Value| -> String {
-            use rusqlite::types::Value as V;
-            match v {
-                V::Null => "\u{0}".into(),
-                V::Integer(i) => i.to_string(),
-                V::Real(f) => f.to_string(),
-                V::Text(t) => t,
-                V::Blob(b) => format!("{:x?}", b),
-            }
-        };
-        let dump = |conn: &Connection, out: &mut String| -> Result<(), CellError> {
-            let mut stmt = conn.prepare(sql)?;
-            let ncols = stmt.column_count();
-            let mut rows = stmt.query([])?;
-            while let Some(row) = rows.next().map_err(CellError::from)? {
-                for i in 0..ncols {
-                    let v: rusqlite::types::Value = row.get(i)?;
-                    out.push_str(&render(v));
-                    out.push('\u{1}');
-                }
-                out.push('\n');
-            }
-            Ok(())
-        };
-        let mut sa = String::new();
-        dump(a, &mut sa)?;
-        let mut sb = String::new();
-        dump(b, &mut sb)?;
-        if sa != sb {
-            // Find the first differing line for the report.
-            let la: Vec<&str> = sa.lines().collect();
-            let lb: Vec<&str> = sb.lines().collect();
-            let first = la
-                .iter()
-                .zip(lb.iter())
-                .enumerate()
-                .find(|(i, (x, y))| {
-                    let _ = i;
-                    x != y
-                })
-                .map(|(_, (x, _))| x.to_string())
-                .unwrap_or_else(|| {
-                    if la.len() > lb.len() {
-                        la[lb.len()].to_string()
-                    } else {
-                        lb[la.len()].to_string()
-                    }
-                });
-            return Ok(Some(format!("table {name} differs around: {first}")));
+    let render = |v: rusqlite::types::Value| -> String {
+        use rusqlite::types::Value as V;
+        match v {
+            V::Null => "\u{0}".into(),
+            V::Integer(i) => i.to_string(),
+            V::Real(f) => f.to_string(),
+            V::Text(t) => t,
+            V::Blob(b) => format!("{b:x?}"),
         }
+    };
+    let mut out = String::new();
+    for (name, sql) in tables {
+        out.push_str(name);
+        out.push('\n');
+        let mut stmt = conn.prepare(sql)?;
+        let ncols = stmt.column_count();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next().map_err(CellError::from)? {
+            for i in 0..ncols {
+                let v: rusqlite::types::Value = row.get(i)?;
+                out.push_str(&render(v));
+                out.push('\u{1}');
+            }
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+/// blake3 of the canonical dump of the logical tables — the digest a
+/// compaction snapshot records and `verify` re-checks (DESIGN §4.3, v0.3).
+///
+/// # Errors
+/// [`CellError::Db`] on SQL failure.
+pub fn state_digest(conn: &Connection) -> Result<String, CellError> {
+    Ok(blake3::hash(state_dump(conn)?.as_bytes())
+        .to_hex()
+        .to_string())
+}
+
+/// Row-by-row comparison of two cell states.
+fn compare_states(a: &Connection, b: &Connection) -> Result<Option<String>, CellError> {
+    let sa = state_dump(a)?;
+    let sb = state_dump(b)?;
+    if sa != sb {
+        // Find the first differing line for the report.
+        let la: Vec<&str> = sa.lines().collect();
+        let lb: Vec<&str> = sb.lines().collect();
+        let first = la
+            .iter()
+            .zip(lb.iter())
+            .enumerate()
+            .find(|(i, (x, y))| {
+                let _ = i;
+                x != y
+            })
+            .map(|(_, (x, _))| x.to_string())
+            .unwrap_or_else(|| {
+                if la.len() > lb.len() {
+                    la[lb.len()].to_string()
+                } else {
+                    lb[la.len()].to_string()
+                }
+            });
+        return Ok(Some(format!("state differs around: {first}")));
     }
     Ok(None)
 }
@@ -1687,13 +2073,11 @@ mod tests {
             !report.ok(),
             "a swapped column must fail verification: {report:?}"
         );
+        // v2: the columns ARE the hashed envelope, so the swap breaks the
+        // chain itself (in v1 it only disagreed with the payload envelope).
         assert!(
-            report
-                .mismatch
-                .as_deref()
-                .is_some_and(|m| m.contains("note_id")),
-            "the mismatch should point at the column: {:?}",
-            report.mismatch
+            !report.hash_chain_ok,
+            "the chain must catch a tampered column: {report:?}"
         );
     }
 
@@ -1803,6 +2187,367 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// v0.3 (P1): forgetting a payload leaves the chain whole — the skeleton
+    /// hashes cover the digest, not the body. (A full `verify` after a bare
+    /// forget would rightly diverge: the redacted replay skips the state
+    /// change. It passes end to end with `purge`, which removes the note too.)
+    #[test]
+    fn forgetting_a_payload_keeps_the_chain() {
+        let (_d, cell) = test_cell();
+        let n1 = note(1, "prima versione");
+        cell.put_note(&n1, "t").unwrap(/* test-only */);
+        let mut n2 = note(1, "seconda versione [[Milano]]");
+        n2.title = Some("v2".into());
+        cell.put_note(&n2, "t").unwrap(/* test-only */);
+        // forget the FIRST put: its effect is fully replaced by the second
+        {
+            let inner = cell.lock().unwrap(/* test-only */);
+            inner
+                .conn
+                .execute(
+                    "DELETE FROM op_payloads WHERE op_id = (
+                         SELECT op_id FROM ops WHERE kind = 'put_note' ORDER BY seq LIMIT 1)",
+                    [],
+                )
+                .unwrap(/* test-only */);
+        }
+        let report = cell.verify().unwrap(/* test-only */);
+        assert!(report.hash_chain_ok, "chain must survive a forgotten body");
+        // and the redacted op reads back with no body
+        let ops = cell.ops().unwrap(/* test-only */);
+        assert!(
+            ops.iter()
+                .any(|o| o.body.is_none() && o.salt.is_none() && o.kind == OpKind::PutNote)
+        );
+    }
+
+    /// v0.3 (P1): a changed byte of a live payload breaks the digest check.
+    #[test]
+    fn tampering_the_payload_body_breaks_verify() {
+        let (_d, cell) = test_cell();
+        cell.put_note(&note(1, "corpo segreto [[Milano]]"), "t")
+            .unwrap(/* test-only */);
+        {
+            let inner = cell.lock().unwrap(/* test-only */);
+            inner
+                .conn
+                .execute(
+                    "UPDATE op_payloads SET body = replace(body, 'segreto', 'pubblico')",
+                    [],
+                )
+                .unwrap(/* test-only */);
+        }
+        let report = cell.verify().unwrap(/* test-only */);
+        assert!(!report.ok(), "a changed body byte must fail: {report:?}");
+        assert!(!report.hash_chain_ok, "{report:?}");
+    }
+
+    /// v0.3 (P1): changing only the salt breaks the digest too — that is the
+    /// point of the salt.
+    #[test]
+    fn tampering_the_salt_breaks_verify() {
+        let (_d, cell) = test_cell();
+        cell.put_note(&note(1, "corpo segreto [[Milano]]"), "t")
+            .unwrap(/* test-only */);
+        {
+            let inner = cell.lock().unwrap(/* test-only */);
+            inner
+                .conn
+                .execute("UPDATE op_payloads SET salt = x'00000000000000000000000000000000'", [])
+                .unwrap(/* test-only */);
+        }
+        let report = cell.verify().unwrap(/* test-only */);
+        assert!(!report.ok(), "a changed salt must fail: {report:?}");
+        assert!(!report.hash_chain_ok, "{report:?}");
+    }
+
+    /// v0.3 (P1): a v0.2.1 cell (log v1) migrates to v2 on open — same state,
+    /// verify ok, bookmark written, every payload re-salted. The v1 file is
+    /// built by copying the state of a real cell and rewriting its log in the
+    /// frozen v1 form (envelope inside the payload, v1 hashes).
+    #[test]
+    fn migration_v1_to_v2_preserves_state_and_verifies() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let n = note(1, "nota vecchia [[Roma]]");
+        // 1. a real (v2) cell with one note — the reference state
+        let v2path = dir.path().join("ref.sqlite");
+        let cell = Cell::create(&v2path, "famiglia", "v1-writer").unwrap(/* test-only */);
+        cell.put_note(&n, "v1-writer").unwrap(/* test-only */);
+        let reference_ops = cell.ops().unwrap(/* test-only */);
+        // 2. the v0.2.1 file: schema 1–4, same state, log in v1 form
+        let v1path = dir.path().join("v1.sqlite");
+        {
+            let mut conn = Connection::open(&v1path).unwrap(/* test-only */);
+            conn.execute(
+                "ATTACH DATABASE ?1 AS src",
+                [v2path.to_string_lossy().to_string()],
+            )
+            .unwrap(/* test-only */);
+            let tx = conn.transaction().unwrap(/* test-only */);
+            tx.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);",
+            )
+            .unwrap(/* test-only */);
+            for sql in schema::MIGRATIONS.iter().take(4) {
+                tx.execute_batch(sql).unwrap(/* test-only */);
+            }
+            for table in [
+                "notes",
+                "note_versions",
+                "tags",
+                "note_tags",
+                "entities",
+                "edges",
+                "supersedes",
+            ] {
+                tx.execute(&format!("INSERT INTO {table} SELECT * FROM src.{table}"), [])
+                    .unwrap(/* test-only */);
+            }
+            tx.execute(
+                "INSERT INTO meta SELECT * FROM src.meta WHERE key != 'schema_version'",
+                [],
+            )
+            .unwrap(/* test-only */);
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', '4')",
+                [],
+            )
+            .unwrap(/* test-only */);
+            // the FTS index is not a table to copy: rebuild it from notes
+            tx.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')", [])
+                .unwrap(/* test-only */);
+            let mut prev = ops::GENESIS_HASH.to_string();
+            for op in &reference_ops {
+                let payload = op.payload().to_string();
+                let hash = ops::op_hash_v1(&prev, &payload);
+                tx.execute(
+                    "INSERT INTO ops (seq, op_id, hlc, actor, kind, note_id, payload_json, prev_hash, hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        op.seq,
+                        op.op_id.to_string(),
+                        op.hlc.to_string(),
+                        op.actor,
+                        op.kind.as_str(),
+                        op.note_id.map(|u| u.to_string()),
+                        payload,
+                        prev,
+                        hash,
+                    ],
+                )
+                .unwrap(/* test-only */);
+                prev = hash;
+            }
+            tx.commit().unwrap(/* test-only */);
+        }
+        // 3. open: the v5 migration runs
+        let migrated = Cell::open(&v1path).unwrap(/* test-only */);
+        let report = migrated.verify().unwrap(/* test-only */);
+        assert!(report.ok(), "verify after migration: {:?}", report.mismatch);
+        assert_eq!(migrated.get(&n.id).unwrap(/* test-only */), n);
+        let meta = migrated.meta().unwrap(/* test-only */);
+        assert_eq!(meta.get("cell_name").map(String::as_str), Some("famiglia"));
+        assert!(
+            meta.get("log_v1_head").is_some_and(|h| h.len() == 64),
+            "{meta:?}"
+        );
+        assert_eq!(meta.get("log_v2_from_seq").map(String::as_str), Some("1"));
+        for op in migrated.ops().unwrap(/* test-only */) {
+            assert!(op.salt.is_some() && op.body.is_some(), "{op:?}");
+        }
+        // 4. a broken v1 chain refuses to migrate
+        let broken = dir.path().join("v1-broken.sqlite");
+        std::fs::copy(&v1path, &broken).unwrap(/* test-only */);
+        {
+            let conn = Connection::open(&broken).unwrap(/* test-only */);
+            conn.execute(
+                "UPDATE ops SET payload_json = replace(payload_json, 'famiglia', 'x') WHERE seq = 1",
+                [],
+            )
+            .unwrap(/* test-only */);
+            conn.execute(
+                "UPDATE meta SET value = '4' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap(/* test-only */);
+        }
+        let err = Cell::open(&broken);
+        assert!(
+            err.as_ref()
+                .is_err_and(|e| e.to_string().contains("broken")),
+            "a broken v1 chain must refuse the migration: {}",
+            err.err()
+                .map_or_else(|| "opened!".into(), |e| e.to_string())
+        );
+    }
+
+    /// v0.3 (P2): purge — no byte of the body survives in the file, the
+    /// chain verifies, the replay agrees, and the note is unfindable.
+    #[test]
+    fn purge_forgets_the_note_end_to_end() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let path = dir.path().join("purge.sqlite");
+        let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
+        let secret = "il codice segreto di Sofia e la parola d'ordine zanzara";
+        let mut n = note(1, secret);
+        n.body = format!("Sofia scrive: {secret}. Vive a [[Roma]].");
+        cell.put_note(&n, "t").unwrap(/* test-only */);
+        let other = note(2, "una nota che resta [[Roma]]");
+        cell.put_note(&other, "t").unwrap(/* test-only */);
+        let forgotten = cell.purge(&n.id, "diritto all'oblio", "cli-user")
+            .unwrap(/* test-only */);
+        assert!(forgotten >= 1, "at least the creating put is forgotten");
+        // 1. no byte of the body in the raw file (VACUUM ran inside purge)
+        cell.checkpoint().unwrap(/* test-only */);
+        drop(cell);
+        let raw = std::fs::read(&path).unwrap(/* test-only */);
+        for needle in ["zanzara", "codice segreto"] {
+            assert!(
+                !raw.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                "`{needle}` is still in the cell file"
+            );
+        }
+        // 2. verify: chain whole, replay equal (the redacted creating ops
+        //    skip their state change; the purge removed the live note too)
+        let cell = Cell::open(&path).unwrap(/* test-only */);
+        let report = cell.verify().unwrap(/* test-only */);
+        assert!(report.ok(), "verify after purge: {:?}", report.mismatch);
+        // 3. the note is gone, the other one stays
+        assert!(matches!(cell.get(&n.id), Err(CellError::NoteNotFound(_))));
+        assert_eq!(cell.get(&other.id).unwrap(/* test-only */).body, other.body);
+        // history: not found (the row is gone, not tombstoned)
+        assert!(matches!(
+            cell.history(&n.id),
+            Err(CellError::NoteNotFound(_))
+        ));
+        // 4. the payloads of its ops are skeletons, the chain covers them
+        let ops = cell.ops().unwrap(/* test-only */);
+        assert!(
+            ops.iter()
+                .filter(|o| o.note_id == Some(n.id) && o.kind != OpKind::Purge)
+                .all(|o| o.body.is_none())
+        );
+        assert!(
+            ops.iter()
+                .any(|o| o.kind == OpKind::Purge && o.body.is_some())
+        );
+        // a second purge is an idempotent no-op
+        cell.purge(&n.id, "di nuovo", "cli-user").unwrap(/* t */);
+        assert!(cell.verify().unwrap(/* test-only */).ok());
+    }
+
+    /// v0.3 (P2): a purge censors the supersede payloads where the note was
+    /// the NEW note (content out, closing of the old note replayable), and
+    /// the chain is recomputed over the censored digests.
+    #[test]
+    fn purge_censors_supersede_payloads_and_rehashes() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let path = dir.path().join("sup.sqlite");
+        let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
+        let mut old = note(1, "Sofia abitava a [[Roma]]");
+        old.valid_from = Some(Validity(
+            time::Date::from_calendar_date(2020, time::Month::January, 1)
+                .unwrap(/* test-only */),
+            None,
+        ));
+        cell.put_note(&old, "t").unwrap(/* test-only */);
+        let mut new = note(2, "Sofia vive a [[Roma]]");
+        new.valid_from = Some(Validity(
+            time::Date::from_calendar_date(2026, time::Month::September, 1)
+                .unwrap(/* test-only */),
+            None,
+        ));
+        cell.supersede(&old.id, &new, None, "t").unwrap(/* t */);
+        cell.purge(&new.id, "oblio", "t").unwrap(/* test-only */);
+        let ops = cell.ops().unwrap(/* test-only */);
+        // the supersede op (note_id = old) had `new` in its payload: the
+        // content is gone, the closing of `old` stays replayable
+        let sup = ops
+            .iter()
+            .find(|o| o.kind == OpKind::Supersede)
+            .expect(/* test-only */ "the supersede op is still there");
+        assert!(sup.body.is_some());
+        assert_eq!(
+            sup.body.as_ref().and_then(|b| b.get("note")),
+            Some(&serde_json::Value::Null),
+            "the new note's content must be censored out"
+        );
+        assert!(cell.verify().unwrap(/* test-only */).ok());
+        // the old note stays closed: the censored supersede still replays it
+        let back = cell.get(&old.id).unwrap(/* test-only */);
+        assert_eq!(back.status, Status::Superseded);
+        assert!(back.valid_to.is_some());
+        // and the new note is gone
+        assert!(matches!(cell.get(&new.id), Err(CellError::NoteNotFound(_))));
+    }
+
+    /// v0.3 (P3): compact, write more, verify — the chain is whole, the
+    /// payloads up to the snapshot are gone, the tail replays on it.
+    #[test]
+    fn compact_then_write_then_verify() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let path = dir.path().join("c.sqlite");
+        let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
+        for i in 1..=5_u16 {
+            cell.put_note(&note(i, &format!("nota {i} [[Milano]]")), "t")
+                .unwrap(/* test-only */);
+        }
+        let head = cell
+            .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+            .unwrap(/* test-only */)[0]
+            .parse::<i64>()
+            .unwrap(/* test-only */);
+        let snap = cell.compact(head).unwrap(/* test-only */);
+        assert!(snap.is_file(), "{}", snap.display());
+        // the payloads up to the head are skeletons
+        let ops = cell.ops().unwrap(/* test-only */);
+        assert!(ops.iter().all(|o| o.seq == head || o.body.is_none()));
+        // more writes after the compaction
+        cell.put_note(&note(9, "dopo la compattazione [[Roma]]"), "t")
+            .unwrap(/* test-only */);
+        let report = cell.verify().unwrap(/* test-only */);
+        assert!(
+            report.ok(),
+            "verify after compaction: {:?}",
+            report.mismatch
+        );
+        // changes_since under the snapshot is a typed error
+        let err = cell.changes_since(1).unwrap_err(/* test-only */);
+        assert!(matches!(err, CellError::Compacted { snapshot_seq } if snapshot_seq == head));
+        assert!(cell.changes_since(head).is_ok());
+        // compacting again at a stale seq is refused
+        assert!(cell.compact(head).is_err());
+    }
+
+    /// v0.3 (P3): a tampered snapshot fails verification (the recorded
+    /// state digest no longer matches the file).
+    #[test]
+    fn tampered_snapshot_fails_verify() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let path = dir.path().join("c.sqlite");
+        let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
+        cell.put_note(&note(1, "da compattare [[Milano]]"), "t")
+            .unwrap(/* test-only */);
+        let head = cell
+            .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+            .unwrap(/* test-only */)[0]
+            .parse::<i64>()
+            .unwrap(/* test-only */);
+        let snap = cell.compact(head).unwrap(/* test-only */);
+        drop(cell);
+        {
+            let conn = Connection::open(&snap).unwrap(/* test-only */);
+            conn.execute("UPDATE notes SET title = 'manomesso' WHERE id LIKE '%'", [])
+                .unwrap(/* test-only */);
+        }
+        let cell = Cell::open(&path).unwrap(/* test-only */);
+        let report = cell.verify().unwrap(/* test-only */);
+        assert!(
+            !report.ok() && !report.snapshot_ok,
+            "a tampered snapshot must fail: {report:?}"
+        );
     }
 
     #[test]

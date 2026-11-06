@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 4] = [
+pub const MIGRATIONS: [&str; 6] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -69,6 +69,27 @@ CREATE TABLE note_vectors (note_id TEXT, chunk INTEGER, model TEXT, content_hash
                            PRIMARY KEY (model, note_id, chunk));
 CREATE INDEX idx_note_vectors_note ON note_vectors(note_id);
 "#,
+    r#"
+-- v5 (DESIGN §4.3, log v2): forgettable payloads. The chain covers a salted
+-- digest, not the payload; the body lives apart and can be deleted (purge,
+-- compaction) without breaking the chain. The columns of `ops` are now the
+-- envelope the hash covers. The Rust side of this migration verifies the v1
+-- chain, rewrites every row with fresh salts and records the v1 head.
+ALTER TABLE ops RENAME COLUMN payload_json TO payload_digest;
+CREATE TABLE op_payloads (op_id TEXT PRIMARY KEY,
+                          salt BLOB NOT NULL,    -- 16 bytes, generated at op creation
+                          body TEXT NOT NULL);   -- canonical JSON of the payload body
+"#,
+    r#"
+-- v6 (DESIGN §4.3): compaction snapshots. `VACUUM INTO` copies the cell at a
+-- seq; the payloads up to that seq are then forgotten and `verify` replays
+-- only the tail on a copy of the snapshot.
+CREATE TABLE snapshots (seq INTEGER PRIMARY KEY,
+                        head_hash TEXT NOT NULL,
+                        state_digest TEXT NOT NULL,
+                        file TEXT NOT NULL,          -- file name, next to the cell
+                        created_at TEXT NOT NULL);
+"#,
 ];
 
 /// Rust-side migration steps, run right after the SQL of version `v`.
@@ -95,6 +116,115 @@ fn migrate_rust(tx: &rusqlite::Transaction<'_>, v: i64) -> Result<(), crate::err
         }
         tx.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')", [])?;
     }
+    if v == 5 {
+        migrate_log_v2(tx)?;
+    }
+    Ok(())
+}
+
+/// The Rust side of migration v5: verify the v1 chain, then rewrite every op
+/// in the v2 form with fresh salts (the format of the log is declared
+/// unstable in 0.x). `ops.payload_digest` still holds the v1 payload JSON
+/// when this runs — the SQL migration only renamed the column.
+fn migrate_log_v2(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
+    use super::ops;
+    use crate::error::CellError;
+    struct V1Row {
+        seq: i64,
+        op_id: String,
+        hlc: String,
+        actor: String,
+        kind: String,
+        note_id: Option<String>,
+        payload: String,
+        prev_hash: String,
+        hash: String,
+    }
+    let rows: Vec<V1Row> = {
+        let mut stmt = tx.prepare(
+            "SELECT seq, op_id, hlc, actor, kind, note_id, payload_digest, prev_hash, hash
+             FROM ops ORDER BY seq",
+        )?;
+        stmt.query_map([], |r| {
+            Ok(V1Row {
+                seq: r.get(0)?,
+                op_id: r.get(1)?,
+                hlc: r.get(2)?,
+                actor: r.get(3)?,
+                kind: r.get(4)?,
+                note_id: r.get(5)?,
+                payload: r.get(6)?,
+                prev_hash: r.get(7)?,
+                hash: r.get(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    // 1. the v1 chain must verify first: a broken log is never rewritten.
+    let mut prev = ops::GENESIS_HASH.to_string();
+    for r in &rows {
+        let expect = ops::op_hash_v1(&prev, &r.payload);
+        if r.prev_hash != prev || r.hash != expect {
+            return Err(CellError::Invalid(format!(
+                "the v1 log chain is broken at seq {} ({}): refusing to migrate to v2",
+                r.seq, r.op_id
+            )));
+        }
+        prev = r.hash.clone();
+    }
+    let v1_head = prev;
+    // 2. rewrite every op: body = payload minus the envelope, fresh salt,
+    //    salted digest, chain recomputed in the v2 form.
+    let mut prev = ops::GENESIS_HASH.to_string();
+    for r in &rows {
+        let payload: serde_json::Value = serde_json::from_str(&r.payload).map_err(|e| {
+            CellError::Invalid(format!("op {}: unreadable v1 payload: {e}", r.op_id))
+        })?;
+        let mut body = serde_json::Map::new();
+        if let serde_json::Value::Object(fields) = &payload {
+            for (k, v) in fields {
+                if !matches!(k.as_str(), "op_id" | "hlc" | "actor" | "kind" | "note_id") {
+                    body.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let salt = crate::id::random_salt()?;
+        let body = serde_json::Value::Object(body);
+        let digest = ops::payload_digest(&salt, &body);
+        let hash = ops::op_hash(
+            &prev,
+            &serde_json::json!({
+                "actor": r.actor,
+                "hlc": r.hlc,
+                "kind": r.kind,
+                "note_id": r.note_id,
+                "op_id": r.op_id,
+                "payload_digest": digest,
+            })
+            .to_string(),
+        );
+        tx.execute(
+            "INSERT INTO op_payloads (op_id, salt, body) VALUES (?1, ?2, ?3)
+             ON CONFLICT(op_id) DO UPDATE SET salt = ?2, body = ?3",
+            rusqlite::params![r.op_id, salt, &body.to_string()],
+        )?;
+        tx.execute(
+            "UPDATE ops SET payload_digest = ?2, prev_hash = ?3, hash = ?4 WHERE seq = ?1",
+            rusqlite::params![r.seq, digest, prev, hash],
+        )?;
+        prev = hash;
+    }
+    // 3. the bookmark: where the v1 log ended and where the v2 form begins.
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('log_v1_head', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        [v1_head],
+    )?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('log_v2_from_seq', '1')
+         ON CONFLICT(key) DO UPDATE SET value = '1'",
+        [],
+    )?;
     Ok(())
 }
 

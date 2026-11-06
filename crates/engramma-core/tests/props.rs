@@ -195,6 +195,40 @@ proptest! {
         prop_assert!(report.ok(), "verify failed: {:?}", report.mismatch);
     }
 
+    /// v0.3 (P3): random ops, compaction, more ops — the full replay before
+    /// compacting equals the live state (verify), the snapshot records that
+    /// very digest, and after the extra ops verify passes from the snapshot.
+    #[test]
+    fn compaction_keeps_verify_and_state(seed in any::<u64>()) {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let path = dir.path().join("c.sqlite");
+        let cell = Cell::create(&path, "p", "prop").unwrap(/* test-only */);
+        run_random_ops(&cell, seed, ops_count(seed));
+        // the full replay, before any compaction: verify compares it with
+        // the live state, and the digest of that state is the reference
+        let before = cell.verify().unwrap(/* test-only */);
+        prop_assert!(before.ok(), "pre-compaction verify: {:?}", before.mismatch);
+        let digest_before = cell.state_digest().unwrap(/* test-only */);
+        let head: i64 = cell
+            .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+            .unwrap(/* test-only */)[0]
+            .parse()
+            .unwrap(/* test-only */);
+        let snap = cell.compact(head).unwrap(/* test-only */);
+        // the snapshot records exactly the pre-compaction state
+        let recorded = cell
+            .debug_column(&format!(
+                "SELECT state_digest FROM snapshots WHERE seq = {head}"
+            ))
+            .unwrap(/* test-only */);
+        prop_assert_eq!(recorded.first().map(String::as_str), Some(digest_before.as_str()));
+        prop_assert!(snap.is_file());
+        // more ops, then verify replays the tail on the snapshot
+        run_random_ops(&cell, seed.wrapping_mul(3) | 1, 8);
+        let report = cell.verify().unwrap(/* test-only */);
+        prop_assert!(report.ok(), "verify after compaction: {:?}", report.mismatch);
+    }
+
     /// Export then import into a fresh cell gives the same notes and edges.
     #[test]
     fn export_import_equality(seed in any::<u64>()) {
@@ -301,7 +335,7 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) -> std::collections::HashMap<O
         }
     };
     for i in 0..n {
-        let choice = next() % 11;
+        let choice = next() % 12;
         let fresh = any_note_of(next(), i);
         match choice {
             0..=2 => {
@@ -378,6 +412,17 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) -> std::collections::HashMap<O
                     if cell.restore(&id, v, "prop").is_ok() {
                         *counts.entry(OpKind::Restore).or_insert(0) += 1;
                     }
+                }
+            }
+            10 => {
+                // v0.3: purge a random note — its payloads are forgotten, the
+                // replay of the redacted log must still equal the state
+                if let Some(id) = draw(&notes, next())
+                    && cell.purge(&id, "prop", "prop").is_ok()
+                {
+                    notes.retain(|n| n != &id);
+                    quarantined.retain(|n| n != &id);
+                    *counts.entry(OpKind::Purge).or_insert(0) += 1;
                 }
             }
             9 => {

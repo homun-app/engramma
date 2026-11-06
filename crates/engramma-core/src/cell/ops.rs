@@ -1,12 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The change log: operation model, canonical JSON, deterministic `apply`.
+//! The change log, version 2: forgettable payloads (DESIGN §4.3, v0.3).
 //!
-//! `apply(state, op)` reads no clock, no randomness, no I/O: every ID, HLC and
-//! timestamp is generated when the operation is **created** and travels inside
-//! the payload (DESIGN §4.3). The hash chain is
-//! `hash = blake3(prev_hash || payload_json_canonical)` with ASCII-hex
-//! encoding and 64 `0`s as the genesis `prev_hash`.
+//! `apply(state, op)` reads no clock, no randomness, no I/O: every ID, HLC,
+//! timestamp and **salt** is generated when the operation is **created** and
+//! travels with it. The chain no longer covers the payload itself but its
+//! **salted digest** — the SD-JWT technique (RFC 9901): a naked hash of
+//! personal data can still be personal data, a salted one whose salt is
+//! destroyed cannot be linked back. The payload body lives in `op_payloads`
+//! and can be forgotten (`purge`, compaction) without breaking the chain.
+//!
+//! ```text
+//! payload_digest = blake3(salt ‖ canonical JSON of the body)
+//! hash           = blake3(prev_hash ‖ canonical JSON of
+//!                         {actor, hlc, kind, note_id, op_id, payload_digest})
+//! ```
+//!
+//! A **redacted** operation (body forgotten) applies as a no-op: only its
+//! skeleton row and the HLC tick are replayed. This can only happen for
+//! notes later removed by `purge` or under a compaction snapshot; in both
+//! cases the live state agrees with the redacted replay, and the spec says
+//! exactly that.
+//!
+//! The v1 rule (`hash = blake3(prev_hash ‖ canonical payload with the
+//! envelope inside)`) is kept for the v5 migration, which verifies the old
+//! chain before rewriting it.
 
 use rusqlite::{Connection, Transaction};
 use serde_json::Value;
@@ -40,11 +58,14 @@ pub enum OpKind {
     Unlink,
     /// Promote a quarantined note to `active`.
     Confirm,
+    /// Right to be forgotten (v0.3): remove the note and everything derived
+    /// from it, and forget the payloads of its operations.
+    Purge,
 }
 
 impl OpKind {
     /// Every kind, in declaration order (tests count coverage).
-    pub const ALL: [OpKind; 10] = [
+    pub const ALL: [OpKind; 11] = [
         OpKind::Init,
         OpKind::PutNote,
         OpKind::PatchNote,
@@ -55,6 +76,7 @@ impl OpKind {
         OpKind::Link,
         OpKind::Unlink,
         OpKind::Confirm,
+        OpKind::Purge,
     ];
 
     /// Wire name.
@@ -70,6 +92,7 @@ impl OpKind {
             OpKind::Link => "link",
             OpKind::Unlink => "unlink",
             OpKind::Confirm => "confirm",
+            OpKind::Purge => "purge",
         }
     }
 
@@ -89,12 +112,15 @@ impl OpKind {
             "link" => OpKind::Link,
             "unlink" => OpKind::Unlink,
             "confirm" => OpKind::Confirm,
+            "purge" => OpKind::Purge,
             other => return Err(CellError::Invalid(format!("unknown op kind `{other}`"))),
         })
     }
 }
 
-/// One row of the change log.
+/// One row of the change log. The payload body and its salt are `None` for a
+/// redacted operation (forgotten by `purge` or compaction); the skeleton —
+/// columns and hashes — is always whole.
 #[derive(Debug, Clone)]
 pub struct Op {
     /// Sequence number (insert order).
@@ -109,134 +135,150 @@ pub struct Op {
     pub kind: OpKind,
     /// Note involved, when applicable.
     pub note_id: Option<Ulid>,
-    /// Canonical JSON payload (keys sorted at every level, no whitespace).
-    pub payload: Value,
+    /// The payload body — everything but the envelope fields — when present.
+    pub body: Option<Value>,
+    /// The 16-byte salt of the digest, when the payload lives on.
+    pub salt: Option<Vec<u8>>,
+    /// `blake3(salt ‖ canonical body)`; the chain covers this, not the body.
+    pub payload_digest: String,
     /// Previous op hash (genesis: 64 `0`s).
     pub prev_hash: String,
     /// This op hash.
     pub hash: String,
 }
 
+impl Op {
+    /// The envelope this op hashes over: the `ops` columns themselves plus
+    /// the payload digest, as canonical JSON with sorted keys.
+    fn envelope_json(&self) -> String {
+        let note_id = self
+            .note_id
+            .map(|u| Value::String(u.to_string()))
+            .unwrap_or(Value::Null);
+        serde_json::json!({
+            "actor": self.actor,
+            "hlc": self.hlc.to_string(),
+            "kind": self.kind.as_str(),
+            "note_id": note_id,
+            "op_id": self.op_id.to_string(),
+            "payload_digest": self.payload_digest,
+        })
+        .to_string()
+    }
+
+    /// Seal the op against its predecessor: sets `prev_hash` and `hash`.
+    pub fn seal(&mut self, prev_hash: &str) {
+        self.prev_hash = prev_hash.to_string();
+        self.hash = op_hash(prev_hash, &self.envelope_json());
+    }
+
+    /// The merged payload (envelope + body) — the reader's view, v1 shape.
+    #[must_use]
+    pub fn payload(&self) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("op_id".into(), self.op_id.to_string().into());
+        m.insert("hlc".into(), self.hlc.to_string().into());
+        m.insert("actor".into(), self.actor.clone().into());
+        m.insert("kind".into(), self.kind.as_str().into());
+        m.insert(
+            "note_id".into(),
+            self.note_id
+                .map(|u| Value::String(u.to_string()))
+                .unwrap_or(Value::Null),
+        );
+        if let Some(body) = &self.body
+            && let Value::Object(fields) = body
+        {
+            for (k, v) in fields {
+                m.insert(k.clone(), v.clone());
+            }
+        }
+        Value::Object(m)
+    }
+}
+
 /// Genesis `prev_hash`.
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-/// Canonical payload string (serde_json maps are BTreeMaps: keys sorted at
-/// every level, no spaces).
+/// Canonical JSON (serde_json maps are BTreeMaps: keys sorted at every
+/// level, no spaces).
 pub fn canonical_json(v: &Value) -> String {
     v.to_string()
 }
 
-/// Compute an op hash.
-pub fn op_hash(prev_hash: &str, payload_json: &str) -> String {
+/// The salted payload digest (SD-JWT technique, RFC 9901).
+pub fn payload_digest(salt: &[u8], body: &Value) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(salt);
+    hasher.update(canonical_json(body).as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Compute a v2 op hash over the predecessor and the envelope.
+pub fn op_hash(prev_hash: &str, envelope_json: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prev_hash.as_bytes());
+    hasher.update(envelope_json.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// The v1 rule (`hash = blake3(prev_hash ‖ canonical payload)`), kept for the
+/// v5 migration: it must verify the old chain before rewriting it.
+pub fn op_hash_v1(prev_hash: &str, payload_json: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(prev_hash.as_bytes());
     hasher.update(payload_json.as_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
-/// Build the payload skeleton common to every op: the envelope travels inside
-/// the hashed payload, so the hash binds `op_id`, `hlc`, `actor`, `kind` and
-/// `note_id` — the columns of `ops` are an index over it.
-fn envelope(
-    op_id: &Ulid,
-    hlc: &crate::hlc::Hlc,
-    actor: &str,
-    kind: OpKind,
-    note_id: Option<Ulid>,
-) -> Value {
-    let mut m = serde_json::Map::new();
-    m.insert("op_id".into(), op_id.to_string().into());
-    m.insert("hlc".into(), hlc.to_string().into());
-    m.insert("actor".into(), actor.into());
-    m.insert("kind".into(), kind.as_str().into());
-    m.insert(
-        "note_id".into(),
-        note_id
-            .map(|u| Value::String(u.to_string()))
-            .unwrap_or(Value::Null),
-    );
-    Value::Object(m)
-}
-
-/// The columns of an op row must agree with the payload envelope on every
-/// field. The chain hash covers the payload only: without this check a
-/// tampered column (say, `kind`) would leave the chain — and possibly the
-/// replay — looking valid.
-fn check_envelope(op: &Op) -> Result<(), CellError> {
-    let mismatch = |field: &'static str| {
-        CellError::Invalid(format!(
-            "op {}: the `{field}` column disagrees with the payload envelope",
-            op.op_id
-        ))
-    };
-    let get = |k: &str| op.payload.get(k);
-    if get("op_id").and_then(Value::as_str) != Some(op.op_id.to_string().as_str()) {
-        return Err(mismatch("op_id"));
-    }
-    if get("hlc").and_then(Value::as_str) != Some(op.hlc.to_string().as_str()) {
-        return Err(mismatch("hlc"));
-    }
-    if get("actor").and_then(Value::as_str) != Some(op.actor.as_str()) {
-        return Err(mismatch("actor"));
-    }
-    if get("kind").and_then(Value::as_str) != Some(op.kind.as_str()) {
-        return Err(mismatch("kind"));
-    }
-    let column = op.note_id.map(|u| u.to_string());
-    let envelope_ok = match get("note_id") {
-        Some(Value::Null) => column.is_none(),
-        Some(Value::String(s)) => column.as_deref() == Some(s.as_str()),
-        _ => false,
-    };
-    if !envelope_ok {
-        return Err(mismatch("note_id"));
-    }
-    Ok(())
-}
-
-/// Assemble a complete [`Op`] (without seq/hash) from a payload.
+/// Build an operation from its parts. The salt is generated by the caller at
+/// creation time (like the op id and the HLC) so `apply` stays deterministic.
 ///
 /// # Errors
-/// [`CellError::Invalid`] when the payload does not carry the envelope fields.
+/// [`CellError::Invalid`] when the body is not an object or smuggles an
+/// envelope field.
 pub fn make_op(
     op_id: Ulid,
     hlc: crate::hlc::Hlc,
     actor: &str,
     kind: OpKind,
     note_id: Option<Ulid>,
-    mut payload: Value,
+    body: Value,
+    salt: Vec<u8>,
 ) -> Result<Op, CellError> {
-    let Value::Object(fields) = &mut payload else {
-        return Err(CellError::Invalid("op payload must be an object".into()));
+    let Value::Object(fields) = &body else {
+        return Err(CellError::Invalid(
+            "op payload body must be an object".into(),
+        ));
     };
-    let mut env = match envelope(&op_id, &hlc, actor, kind, note_id) {
-        Value::Object(m) => m,
-        _ => unreachable!("envelope is always an object"),
-    };
-    for (k, v) in fields.iter() {
-        if matches!(k.as_str(), "op_id" | "hlc" | "actor" | "kind" | "note_id") {
+    for k in fields.keys() {
+        if matches!(
+            k.as_str(),
+            "op_id" | "hlc" | "actor" | "kind" | "note_id" | "payload_digest"
+        ) {
             return Err(CellError::Invalid(format!(
-                "op payload must not override the envelope field `{k}`"
+                "op payload body must not carry the envelope field `{k}`"
             )));
         }
-        env.insert(k.clone(), v.clone());
     }
-    let op = Op {
+    let digest = payload_digest(&salt, &body);
+    Ok(Op {
         seq: 0,
         op_id,
         hlc,
         actor: actor.to_string(),
         kind,
         note_id,
-        payload: Value::Object(env),
+        body: Some(body),
+        salt: Some(salt),
+        payload_digest: digest,
         prev_hash: String::new(),
         hash: String::new(),
-    };
-    check_envelope(&op)?;
-    Ok(op)
+    })
 }
 
-/// The raw fields of a stored `ops` row (one per column).
+/// The raw fields of a stored `ops` row (one per column) with its joined
+/// payload, when present.
 #[allow(missing_docs)]
 pub struct OpRow<'a> {
     pub seq: i64,
@@ -245,18 +287,33 @@ pub struct OpRow<'a> {
     pub actor: &'a str,
     pub kind: &'a str,
     pub note_id: Option<&'a str>,
-    pub payload_json: &'a str,
+    pub payload_digest: &'a str,
+    pub salt: Option<&'a [u8]>,
+    pub body_json: Option<&'a str>,
     pub prev_hash: &'a str,
     pub hash: &'a str,
 }
 
-/// Rebuild an [`Op`] from a stored `ops` row.
+/// Rebuild an [`Op`] from a stored row.
 ///
 /// # Errors
-/// [`CellError::Invalid`] on malformed rows — including columns that disagree
-/// with the payload envelope.
+/// [`CellError::Invalid`] on malformed rows or a body/salt disagreement
+/// (both must be present, or both forgotten).
 pub fn op_from_row(r: OpRow<'_>) -> Result<Op, CellError> {
-    let op = Op {
+    if r.salt.is_some() != r.body_json.is_some() {
+        return Err(CellError::Invalid(format!(
+            "op {}: payload body and salt disagree (one forgotten, one present)",
+            r.op_id
+        )));
+    }
+    let body = r
+        .body_json
+        .map(|b| {
+            serde_json::from_str::<Value>(b)
+                .map_err(|e| CellError::Invalid(format!("bad payload in op {}: {e}", r.op_id)))
+        })
+        .transpose()?;
+    Ok(Op {
         seq: r.seq,
         op_id: Ulid::from_string(r.op_id)
             .map_err(|_| CellError::Invalid(format!("bad op_id `{}`", r.op_id)))?,
@@ -268,13 +325,12 @@ pub fn op_from_row(r: OpRow<'_>) -> Result<Op, CellError> {
             .map(Ulid::from_string)
             .transpose()
             .map_err(|_| CellError::Invalid(format!("bad note_id in op {}", r.op_id)))?,
-        payload: serde_json::from_str(r.payload_json)
-            .map_err(|e| CellError::Invalid(format!("bad payload in op {}: {e}", r.op_id)))?,
+        body,
+        salt: r.salt.map(<[u8]>::to_vec),
+        payload_digest: r.payload_digest.to_string(),
         prev_hash: r.prev_hash.to_string(),
         hash: r.hash.to_string(),
-    };
-    check_envelope(&op)?;
-    Ok(op)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -282,19 +338,17 @@ pub fn op_from_row(r: OpRow<'_>) -> Result<Op, CellError> {
 // ---------------------------------------------------------------------------
 
 /// Apply one operation inside an open transaction. Deterministic: the payload
-/// carries everything; nothing is read from the environment. The row's
-/// columns must agree with the payload envelope — `apply` follows the
-/// envelope, the columns are only an index.
+/// carries everything; nothing is read from the environment. A **redacted**
+/// op (no body) writes only its skeleton row and the HLC tick — its state
+/// change is gone with the payload, which is only ever correct for purged
+/// notes or ops under a compaction snapshot.
 ///
 /// # Errors
 /// [`CellError`] on invariant violations (missing note, illegal transition,
 /// malformed payload) or SQL failures.
 pub fn apply(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
-    check_envelope(op)?;
-    // The row in `ops` and the state change live in the same transaction, and
-    // replay inserts them identically (explicit seq keeps the numbering).
     tx.execute(
-        "INSERT INTO ops (seq, op_id, hlc, actor, kind, note_id, payload_json, prev_hash, hash)
+        "INSERT INTO ops (seq, op_id, hlc, actor, kind, note_id, payload_digest, prev_hash, hash)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             op.seq,
@@ -303,22 +357,32 @@ pub fn apply(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
             op.actor,
             op.kind.as_str(),
             op.note_id.map(|u| u.to_string()),
-            canonical_json(&op.payload),
+            op.payload_digest,
             op.prev_hash,
             op.hash,
         ],
     )?;
-    match op.kind {
-        OpKind::Init => apply_init(tx, op)?,
-        OpKind::PutNote => apply_put(tx, op, &note_from_payload(op, "note")?)?,
-        OpKind::PatchNote => apply_patch(tx, op)?,
-        OpKind::SetStatus => apply_set_status(tx, op)?,
-        OpKind::Supersede => apply_supersede(tx, op)?,
-        OpKind::DeleteNote => apply_delete(tx, op)?,
-        OpKind::Restore => apply_restore(tx, op)?,
-        OpKind::Link => apply_link(tx, op)?,
-        OpKind::Unlink => apply_unlink(tx, op)?,
-        OpKind::Confirm => apply_confirm(tx, op)?,
+    if let (Some(salt), Some(body)) = (&op.salt, &op.body) {
+        tx.execute(
+            "INSERT INTO op_payloads (op_id, salt, body) VALUES (?1, ?2, ?3)
+             ON CONFLICT(op_id) DO UPDATE SET salt = ?2, body = ?3",
+            rusqlite::params![op.op_id.to_string(), salt, canonical_json(body)],
+        )?;
+    }
+    if op.body.is_some() {
+        match op.kind {
+            OpKind::Init => apply_init(tx, op)?,
+            OpKind::PutNote => apply_put(tx, op, &note_from_body(op, "note")?)?,
+            OpKind::PatchNote => apply_patch(tx, op)?,
+            OpKind::SetStatus => apply_set_status(tx, op)?,
+            OpKind::Supersede => apply_supersede(tx, op)?,
+            OpKind::DeleteNote => apply_delete(tx, op)?,
+            OpKind::Restore => apply_restore(tx, op)?,
+            OpKind::Link => apply_link(tx, op)?,
+            OpKind::Unlink => apply_unlink(tx, op)?,
+            OpKind::Confirm => apply_confirm(tx, op)?,
+            OpKind::Purge => apply_purge(tx, op)?,
+        }
     }
     // The cell HLC always advances to the op's HLC (ops apply in order).
     tx.execute(
@@ -329,23 +393,30 @@ pub fn apply(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     Ok(())
 }
 
-fn payload_str(op: &Op, key: &str) -> Result<String, CellError> {
-    op.payload
-        .get(key)
+/// Read a required string field of the op body.
+fn body_str(op: &Op, key: &str) -> Result<String, CellError> {
+    op.body
+        .as_ref()
+        .and_then(|b| b.get(key))
         .and_then(Value::as_str)
         .map(String::from)
         .ok_or_else(|| CellError::Invalid(format!("op {} misses `{key}`", op.op_id)))
 }
 
-fn note_from_payload(op: &Op, key: &str) -> Result<Note, CellError> {
-    let n = Note::from_json(op.payload.get(key).unwrap_or(&Value::Null))
-        .map_err(|e| CellError::Invalid(format!("op {} carries a bad note: {e}", op.op_id)))?;
+fn note_from_body(op: &Op, key: &str) -> Result<Note, CellError> {
+    let n = Note::from_json(
+        op.body
+            .as_ref()
+            .and_then(|b| b.get(key))
+            .unwrap_or(&Value::Null),
+    )
+    .map_err(|e| CellError::Invalid(format!("op {} carries a bad note: {e}", op.op_id)))?;
     Ok(n)
 }
 
 fn apply_init(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
-    let cell_id = payload_str(op, "cell_id")?;
-    let name = payload_str(op, "name")?;
+    let cell_id = body_str(op, "cell_id")?;
+    let name = body_str(op, "name")?;
     for (k, v) in [("cell_id", cell_id), ("cell_name", name)] {
         tx.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
@@ -768,15 +839,16 @@ fn apply_put(tx: &Transaction<'_>, op: &Op, note: &Note) -> Result<(), CellError
 }
 
 fn apply_patch(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
-    let id = Ulid::from_string(&payload_str(op, "id")?)
+    let id = Ulid::from_string(&body_str(op, "id")?)
         .map_err(|_| CellError::Invalid(format!("op {}: bad id", op.op_id)))?;
     let Some(old) = read_note(tx, &id)? else {
         return Err(CellError::NoteNotFound(id.to_string()));
     };
     snapshot(tx, &id, old.version, &op.op_id)?;
     let set = op
-        .payload
-        .get("set")
+        .body
+        .as_ref()
+        .and_then(|b| b.get("set"))
         .and_then(Value::as_object)
         .ok_or_else(|| CellError::Invalid(format!("op {} misses `set`", op.op_id)))?;
     let get_s = |k: &str| set.get(k).and_then(Value::as_str);
@@ -850,7 +922,7 @@ fn apply_patch(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
                 })
                 .collect::<Result<Vec<_>, CellError>>()?;
     }
-    note.updated_at = crate::format::At::parse(&payload_str(op, "updated_at")?)
+    note.updated_at = crate::format::At::parse(&body_str(op, "updated_at")?)
         .map_err(|e| CellError::Invalid(format!("bad `updated_at`: {e}")))?;
     write_note(tx, &note, true, false)?;
     reindex_note(tx, &id, Some(&old))?;
@@ -858,11 +930,11 @@ fn apply_patch(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
 }
 
 fn apply_set_status(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
-    let id = Ulid::from_string(&payload_str(op, "id")?)
+    let id = Ulid::from_string(&body_str(op, "id")?)
         .map_err(|_| CellError::Invalid(format!("op {}: bad id", op.op_id)))?;
-    let status = Status::parse(&payload_str(op, "status")?)
+    let status = Status::parse(&body_str(op, "status")?)
         .map_err(|e| CellError::Invalid(format!("bad `status`: {e}")))?;
-    let updated_at = crate::format::At::parse(&payload_str(op, "updated_at")?)
+    let updated_at = crate::format::At::parse(&body_str(op, "updated_at")?)
         .map_err(|e| CellError::Invalid(format!("bad `updated_at`: {e}")))?;
     let Some(old) = read_note(tx, &id)? else {
         return Err(CellError::NoteNotFound(id.to_string()));
@@ -895,15 +967,48 @@ fn apply_set_status(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
 }
 
 fn apply_supersede(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
-    let old_id = Ulid::from_string(&payload_str(op, "old_id")?)
+    let old_id = Ulid::from_string(&body_str(op, "old_id")?)
         .map_err(|_| CellError::Invalid(format!("op {}: bad old_id", op.op_id)))?;
-    let new = note_from_payload(op, "note")?;
-    let valid_to = Validity::parse(&payload_str(op, "valid_to")?)
+    // A `purge` of the new note censors this body: the new note's content is
+    // gone, the closing of the old note's validity stays replayable.
+    if op
+        .body
+        .as_ref()
+        .is_some_and(|b| b.get("note") == Some(&Value::Null))
+    {
+        let valid_to = Validity::parse(&body_str(op, "valid_to")?)
+            .map_err(|e| CellError::Invalid(format!("bad `valid_to`: {e}")))?;
+        let old_updated_at = crate::format::At::parse(&body_str(op, "old_updated_at")?)
+            .map_err(|e| CellError::Invalid(format!("bad `old_updated_at`: {e}")))?;
+        let Some(old_row) = read_note(tx, &old_id)? else {
+            return Ok(()); // the old note is gone too (both purged)
+        };
+        snapshot(tx, &old_id, old_row.version, &op.op_id)?;
+        let mut old = old_row.note.clone();
+        old.status = Status::Superseded;
+        old.valid_to = Some(valid_to);
+        old.updated_at = old_updated_at;
+        write_note(tx, &old, true, false)?;
+        reindex_note(tx, &old_id, Some(&old_row))?;
+        return Ok(());
+    }
+    let new = note_from_body(op, "note")?;
+    let valid_to = Validity::parse(&body_str(op, "valid_to")?)
         .map_err(|e| CellError::Invalid(format!("bad `valid_to`: {e}")))?;
-    let old_updated_at = crate::format::At::parse(&payload_str(op, "old_updated_at")?)
+    let old_updated_at = crate::format::At::parse(&body_str(op, "old_updated_at")?)
         .map_err(|e| CellError::Invalid(format!("bad `old_updated_at`: {e}")))?;
+    // The old note may be absent on a replay of a redacted log (its ops were
+    // forgotten with its purge): the new note still exists in the live state,
+    // so create it — without the closure and without the supersedes row,
+    // which the purge removed in the live state too.
     let Some(old_row) = read_note(tx, &old_id)? else {
-        return Err(CellError::NoteNotFound(old_id.to_string()));
+        let new_old = read_note(tx, &new.id)?;
+        if let Some(r) = &new_old {
+            snapshot(tx, &new.id, r.version, &op.op_id)?;
+        }
+        write_note(tx, &new, new_old.is_some(), false)?;
+        reindex_note(tx, &new.id, new_old.as_ref())?;
+        return Ok(());
     };
     if new.id == old_id {
         return Err(CellError::Invalid("a note cannot supersede itself".into()));
@@ -932,9 +1037,9 @@ fn apply_supersede(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
 }
 
 fn apply_delete(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
-    let id = Ulid::from_string(&payload_str(op, "id")?)
+    let id = Ulid::from_string(&body_str(op, "id")?)
         .map_err(|_| CellError::Invalid(format!("op {}: bad id", op.op_id)))?;
-    let updated_at = crate::format::At::parse(&payload_str(op, "updated_at")?)
+    let updated_at = crate::format::At::parse(&body_str(op, "updated_at")?)
         .map_err(|e| CellError::Invalid(format!("bad `updated_at`: {e}")))?;
     let Some(old) = read_note(tx, &id)? else {
         return Err(CellError::NoteNotFound(id.to_string()));
@@ -952,14 +1057,15 @@ fn apply_delete(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
 }
 
 fn apply_restore(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
-    let id = Ulid::from_string(&payload_str(op, "id")?)
+    let id = Ulid::from_string(&body_str(op, "id")?)
         .map_err(|_| CellError::Invalid(format!("op {}: bad id", op.op_id)))?;
     let version: i64 = op
-        .payload
-        .get("version")
+        .body
+        .as_ref()
+        .and_then(|b| b.get("version"))
         .and_then(Value::as_i64)
         .ok_or_else(|| CellError::Invalid(format!("op {} misses `version`", op.op_id)))?;
-    let updated_at = crate::format::At::parse(&payload_str(op, "updated_at")?)
+    let updated_at = crate::format::At::parse(&body_str(op, "updated_at")?)
         .map_err(|e| CellError::Invalid(format!("bad `updated_at`: {e}")))?;
     let snap: String = tx
         .query_row(
@@ -986,8 +1092,9 @@ fn apply_restore(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
 
 fn apply_link(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     let e = op
-        .payload
-        .get("edge")
+        .body
+        .as_ref()
+        .and_then(|b| b.get("edge"))
         .ok_or_else(|| CellError::Invalid(format!("op {} misses `edge`", op.op_id)))?;
     let get_s = |k: &str| -> Result<String, CellError> {
         e.get(k)
@@ -1046,7 +1153,7 @@ fn apply_link(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
 }
 
 fn apply_unlink(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
-    let id = payload_str(op, "edge_id")?;
+    let id = body_str(op, "edge_id")?;
     let n = tx.execute("DELETE FROM edges WHERE id = ?1", [&id])?;
     if n == 0 {
         return Err(CellError::Invalid(format!("edge `{id}` not found")));
@@ -1054,10 +1161,235 @@ fn apply_unlink(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     Ok(())
 }
 
+/// The right to be forgotten (DESIGN §4.4). Removes the note, its versions,
+/// the edges it declares, its vectors and FTS row, the entities left with no
+/// references, and **forgets the payloads** of every operation about the
+/// note — including the `supersede` ops where it appeared as the new note.
+/// The purge's own payload stays (it holds only the id and a reason).
+///
+/// A purge of a note that is not there is a no-op: on the live cell it makes
+/// `purge` idempotent, and on a replay of a redacted log (the creating ops
+/// are already forgotten) it is what keeps the replay equal to the live
+/// state. The `[[Mentions]]` of the purged note in OTHER notes stay: they are
+/// other notes (documented in the CLI help).
+fn apply_purge(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
+    let Some(id) = op.note_id else {
+        return Err(CellError::Invalid(format!(
+            "op {}: purge needs `note_id`",
+            op.op_id
+        )));
+    };
+    let id_str = id.to_string();
+    // 1. everything the note touched, when it is still there
+    if let Some(row) = read_note(tx, &id)?
+        && row.note.status != Status::Deleted
+    {
+        fts_delete(
+            tx,
+            row.rowid,
+            row.note.title.as_deref().unwrap_or(""),
+            &row.body_norm,
+            &row.tags_text,
+        )?;
+    }
+    tx.execute("DELETE FROM notes WHERE id = ?1", [&id_str])?;
+    tx.execute("DELETE FROM note_versions WHERE note_id = ?1", [&id_str])?;
+    tx.execute("DELETE FROM note_tags WHERE note_id = ?1", [&id_str])?;
+    // tags no note carries anymore (directly or through a descendant): the
+    // redacted replay never creates them, so the live state must not keep
+    // them either
+    tx.execute(
+        "DELETE FROM tags WHERE NOT EXISTS (
+             SELECT 1 FROM note_tags nt
+             WHERE nt.tag = tags.name OR nt.tag LIKE tags.name || '/%'
+         )",
+        [],
+    )?;
+    tx.execute(
+        "DELETE FROM supersedes WHERE new_id = ?1 OR old_id = ?1",
+        [&id_str],
+    )?;
+    // the edges the note declares (derived and manual alike)
+    tx.execute("DELETE FROM edges WHERE note_id = ?1", [&id_str])?;
+    // The purged note's subject entity: unhook it, then RE-DERIVE the claim
+    // (an alive note with the same title) and only then delete the entities
+    // left with no claim and no references. The re-derivation is what keeps
+    // a replay of the redacted log equal: there, the last surviving claim
+    // still points at the alive note — without it the purge would delete an
+    // entity the replay keeps (found by the compaction property tests).
+    tx.execute(
+        "UPDATE entities SET note_id = NULL WHERE note_id = ?1",
+        [&id_str],
+    )?;
+    tx.execute(
+        "UPDATE entities SET note_id = (
+             SELECT n.id FROM notes n
+             WHERE n.title IS entities.name COLLATE NOCASE
+               AND n.status != 'deleted'
+             ORDER BY n.updated_at DESC, n.id LIMIT 1
+         )
+         WHERE note_id IS NULL
+           AND EXISTS (SELECT 1 FROM notes n
+                       WHERE n.title IS entities.name COLLATE NOCASE
+                         AND n.status != 'deleted')",
+        [],
+    )?;
+    // delete the entities with no references at all — where "reference"
+    // means an edge, or the claim of an ALIVE note with that title: a claim
+    // held by a tombstone is stale (the redacted replay keeps its claim on
+    // the tombstone, the live side unhooks at the purge — only an
+    // alive-note claim is identical on both sides)
+    tx.execute(
+        "DELETE FROM entities WHERE id NOT IN (
+             SELECT e.id FROM entities e
+             JOIN edges ed ON ed.src = e.name OR ed.dst = e.name
+         )
+         AND NOT EXISTS (
+             SELECT 1 FROM notes n
+             WHERE n.id = entities.note_id
+               AND n.status != 'deleted'
+               AND n.title IS entities.name COLLATE NOCASE
+         )",
+        [],
+    )?;
+    super::vectors::delete_note_vectors(tx, &id)?;
+    // 2. forget the payloads: every op about the note, and the supersede ops
+    //    where it appeared as the NEW note (their note_id column is the old
+    //    one, the new id only ever lived in the payload)
+    let mut victims: Vec<String> = Vec::new();
+    {
+        // supersede ops (note_id = the old note) carry the OTHER note's
+        // content: they are censored below when this note was the new one,
+        // and left whole when it was the old one — forgetting them would
+        // erase the surviving note from every replay
+        let mut stmt = tx.prepare(
+            "SELECT op_id FROM ops
+             WHERE note_id = ?1 AND kind NOT IN ('purge', 'supersede')",
+        )?;
+        for row in stmt.query_map([&id_str], |r| r.get::<_, String>(0))? {
+            victims.push(row?);
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "SELECT o.op_id, p.body FROM ops o JOIN op_payloads p ON p.op_id = o.op_id
+             WHERE o.kind = 'supersede'",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .flatten()
+            .collect();
+        let mut censored: Vec<(i64, String, String, String)> = Vec::new(); // (seq, op_id, body, new note)
+        for (op_id, body) in rows {
+            let parsed = serde_json::from_str::<Value>(&body).ok();
+            let new_id = parsed
+                .as_ref()
+                .and_then(|b| b.get("note"))
+                .and_then(|n| n.get("id"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            if new_id.as_deref() != Some(id_str.as_str()) {
+                continue;
+            }
+            // Censor, do not forget: the new note's content goes, the closing
+            // of the OLD note's validity must stay replayable — forgetting
+            // the whole body would leave the old note un-superseded in a
+            // replay of the redacted log.
+            let mut kept = serde_json::Map::new();
+            for k in ["old_id", "valid_to", "old_updated_at"] {
+                if let Some(v) = parsed.as_ref().and_then(|b| b.get(k)) {
+                    kept.insert(k.into(), v.clone());
+                }
+            }
+            kept.insert("note".into(), Value::Null);
+            let seq: i64 = tx
+                .query_row("SELECT seq FROM ops WHERE op_id = ?1", [&op_id], |r| {
+                    r.get(0)
+                })
+                .unwrap_or(0);
+            censored.push((seq, op_id, Value::Object(kept).to_string(), body));
+        }
+        drop(stmt);
+        for (seq, op_id, censored_body, _) in &censored {
+            let salt = crate::id::random_salt()?;
+            let digest = payload_digest(
+                &salt,
+                &serde_json::from_str::<Value>(censored_body)
+                    .map_err(|e| CellError::Db(format!("censored body: {e}")))?,
+            );
+            tx.execute(
+                "UPDATE op_payloads SET salt = ?2, body = ?3 WHERE op_id = ?1",
+                rusqlite::params![op_id, salt, censored_body],
+            )?;
+            tx.execute(
+                "UPDATE ops SET payload_digest = ?2 WHERE op_id = ?1",
+                rusqlite::params![op_id, digest],
+            )?;
+            rehash_tail(tx, *seq)?;
+        }
+    }
+    for op_id in &victims {
+        tx.execute("DELETE FROM op_payloads WHERE op_id = ?1", [op_id])?;
+    }
+    Ok(())
+}
+
+/// Recompute the chain from `from_seq` to the head: a censored op changes its
+/// payload digest, and every later hash covers it as `prev_hash`.
+fn rehash_tail(tx: &Transaction<'_>, from_seq: i64) -> Result<(), CellError> {
+    let prev: String = if from_seq <= 1 {
+        GENESIS_HASH.to_string()
+    } else {
+        tx.query_row("SELECT hash FROM ops WHERE seq = ?1", [from_seq - 1], |r| {
+            r.get(0)
+        })
+        .unwrap_or_else(|_| GENESIS_HASH.to_string())
+    };
+    /// One ops row as read for the rehash: the envelope columns.
+    type OpsRow = (i64, String, String, String, String, Option<String>, String);
+    let rows: Vec<OpsRow> = {
+        let mut stmt = tx.prepare(
+            "SELECT seq, op_id, hlc, actor, kind, note_id, payload_digest
+             FROM ops WHERE seq >= ?1 ORDER BY seq",
+        )?;
+        stmt.query_map([from_seq], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut prev = prev;
+    for (seq, op_id, hlc, actor, kind, note_id, digest) in rows {
+        let envelope = serde_json::json!({
+            "actor": actor,
+            "hlc": hlc,
+            "kind": kind,
+            "note_id": note_id,
+            "op_id": op_id,
+            "payload_digest": digest,
+        })
+        .to_string();
+        let hash = op_hash(&prev, &envelope);
+        tx.execute(
+            "UPDATE ops SET prev_hash = ?2, hash = ?3 WHERE seq = ?1",
+            rusqlite::params![seq, prev, hash],
+        )?;
+        prev = hash;
+    }
+    Ok(())
+}
+
 fn apply_confirm(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
-    let id = Ulid::from_string(&payload_str(op, "id")?)
+    let id = Ulid::from_string(&body_str(op, "id")?)
         .map_err(|_| CellError::Invalid(format!("op {}: bad id", op.op_id)))?;
-    let updated_at = crate::format::At::parse(&payload_str(op, "updated_at")?)
+    let updated_at = crate::format::At::parse(&body_str(op, "updated_at")?)
         .map_err(|e| CellError::Invalid(format!("bad `updated_at`: {e}")))?;
     let Some(old) = read_note(tx, &id)? else {
         return Err(CellError::NoteNotFound(id.to_string()));
@@ -1076,14 +1408,17 @@ fn apply_confirm(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     Ok(())
 }
 
-/// Read every op row in sequence order (for replay and verification).
+/// Read every op row in sequence order (for replay and verification), with
+/// the joined payload when it still exists.
 ///
 /// # Errors
 /// [`CellError::Db`] on SQL failure or malformed rows.
 pub fn read_ops(conn: &Connection) -> Result<Vec<Op>, CellError> {
     let mut stmt = conn.prepare(
-        "SELECT seq, op_id, hlc, actor, kind, note_id, payload_json, prev_hash, hash
-         FROM ops ORDER BY seq",
+        "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.payload_digest,
+                p.salt, p.body, o.prev_hash, o.hash
+         FROM ops o LEFT JOIN op_payloads p ON p.op_id = o.op_id
+         ORDER BY o.seq",
     )?;
     let ops = stmt
         .query_map([], |r| {
@@ -1094,9 +1429,11 @@ pub fn read_ops(conn: &Connection) -> Result<Vec<Op>, CellError> {
                 actor: &r.get::<_, String>(3)?,
                 kind: &r.get::<_, String>(4)?,
                 note_id: r.get::<_, Option<String>>(5)?.as_deref(),
-                payload_json: &r.get::<_, String>(6)?,
-                prev_hash: &r.get::<_, String>(7)?,
-                hash: &r.get::<_, String>(8)?,
+                payload_digest: &r.get::<_, String>(6)?,
+                salt: r.get::<_, Option<Vec<u8>>>(7)?.as_deref(),
+                body_json: r.get::<_, Option<String>>(8)?.as_deref(),
+                prev_hash: &r.get::<_, String>(9)?,
+                hash: &r.get::<_, String>(10)?,
             }))
         })?
         .collect::<Result<Result<Vec<_>, _>, _>>()??;
@@ -1107,13 +1444,46 @@ pub fn read_ops(conn: &Connection) -> Result<Vec<Op>, CellError> {
 mod tests {
     use super::*;
 
-    /// The golden vector of spec §6.1: a fixed payload with its expected
-    /// hash. Any silent change of the canonical JSON (e.g. a dependency
-    /// enabling serde_json's `preserve_order`) breaks this test before it
-    /// breaks every cell ever written.
+    /// The v2 golden vector: a fixed salt, a known body, the digest and the
+    /// chain hash that must come out. Any silent change of the canonical JSON
+    /// or of the envelope shape breaks this before it breaks a cell.
     #[test]
-    fn hash_golden_vector() {
-        // keys inserted in scrambled order: the canonical form must sort them
+    fn hash_golden_vector_v2() {
+        let salt = [7_u8; 16];
+        let body: Value = serde_json::json!({ "note": { "body": "corpo", "x": 1 } });
+        let digest = payload_digest(&salt, &body);
+        assert_eq!(
+            digest,
+            "aeff683a134c22f54b920c36db80d1f730083f862962decd73876ac533fb34d3"
+        );
+        // keys sorted, no spaces: the envelope is the row, not the payload
+        let mut op = make_op(
+            Ulid::from_string("01F7ZQ6VTSATW2BQ5Z9R0P1S8T").unwrap(/* test-only */),
+            crate::hlc::Hlc::parse("01a17720ca0000000007.0123456789ab").unwrap(/* t */),
+            "engramma",
+            OpKind::PutNote,
+            Some(Ulid::from_string("01F7ZQ6VTSATW2BQ5Z9R0P1S8T").unwrap(/* t */)),
+            body,
+            salt.to_vec(),
+        )
+        .unwrap(/* test-only */);
+        op.seal(GENESIS_HASH);
+        assert_eq!(
+            op.envelope_json(),
+            "{\"actor\":\"engramma\",\"hlc\":\"01a17720ca0000000007.0123456789ab\",\
+             \"kind\":\"put_note\",\"note_id\":\"01F7ZQ6VTSATW2BQ5Z9R0P1S8T\",\
+             \"op_id\":\"01F7ZQ6VTSATW2BQ5Z9R0P1S8T\",\
+             \"payload_digest\":\"aeff683a134c22f54b920c36db80d1f730083f862962decd73876ac533fb34d3\"}"
+        );
+        assert_eq!(
+            op.hash,
+            "13c81593af51e2faf2f301fdf1a2c85172048bc25c5cec2bb12411e974849418"
+        );
+    }
+
+    /// The v1 rule stays frozen for the migration.
+    #[test]
+    fn hash_golden_vector_v1() {
         let mut m = serde_json::Map::new();
         m.insert("x".into(), serde_json::json!(1));
         m.insert("kind".into(), serde_json::json!("init"));
@@ -1129,71 +1499,35 @@ mod tests {
         m.insert("actor".into(), serde_json::json!("engramma"));
         let canonical = serde_json::Value::Object(m).to_string();
         assert_eq!(
-            canonical,
-            "{\"actor\":\"engramma\",\"hlc\":\"01a17720ca0000000007.0123456789ab\",\
-             \"kind\":\"init\",\"note_id\":null,\"op_id\":\"01F7ZQ6VTSATW2BQ5Z9R0P1S8T\",\"x\":1}"
-        );
-        assert_eq!(
-            op_hash(GENESIS_HASH, &canonical),
+            op_hash_v1(GENESIS_HASH, &canonical),
             "a217239290ba91e17196ab1812bd01a1e3d05e71f6048387017212636c555d46"
         );
     }
 
     #[test]
-    fn envelope_covers_the_whole_row() {
-        let at = crate::format::At::parse("2026-11-05T10:00:00Z").unwrap(/* test-only */);
-        let base = crate::Note {
-            id: Ulid::from_string("01F7ZQ6VTSATW2BQ5Z9R0P1S8T")
-                .unwrap(/* test-only: valid ULID */),
-            note_type: crate::format::NoteType::Fact,
-            title: None,
-            body: "corpo".into(),
-            tags: vec![],
-            scope: None,
-            lang: None,
-            source: "test".into(),
-            confidence: crate::format::Confidence::Stated,
-            status: crate::format::Status::Active,
-            valid_from: None,
-            valid_to: None,
-            supersedes: vec![],
-            created_at: at,
-            updated_at: at,
-            extensions: vec![],
-        };
-        let hlc = crate::hlc::Hlc::parse("01a17720ca0000000007.0123456789ab")
-            .unwrap(/* test-only */);
-        let op = make_op(
-            base.id,
-            hlc.clone(),
-            "engramma",
-            OpKind::PutNote,
-            Some(base.id),
-            serde_json::json!({ "note": base.to_json() }),
-        )
-        .unwrap(/* test-only */);
-        // the envelope carries note_id too
-        assert_eq!(
-            op.payload.get("note_id").and_then(Value::as_str),
-            Some("01F7ZQ6VTSATW2BQ5Z9R0P1S8T")
-        );
-        check_envelope(&op).unwrap(/* test-only */);
-        // a disagreeing column is caught
-        let mut tampered = op.clone();
-        tampered.kind = OpKind::Confirm;
-        assert!(check_envelope(&tampered).is_err());
-        let mut tampered_null = op.clone();
-        tampered_null.note_id = None;
-        assert!(check_envelope(&tampered_null).is_err());
-        // payloads cannot smuggle envelope keys
+    fn body_cannot_smuggle_envelope_keys() {
+        let hlc = crate::hlc::Hlc::parse("01a17720ca0000000007.0123456789ab").unwrap(/* t */);
         assert!(
             make_op(
-                base.id,
+                Ulid::nil(),
                 hlc.clone(),
                 "engramma",
                 OpKind::Init,
                 None,
                 serde_json::json!({ "kind": "confirm" }),
+                vec![0; 16],
+            )
+            .is_err()
+        );
+        assert!(
+            make_op(
+                Ulid::nil(),
+                hlc.clone(),
+                "engramma",
+                OpKind::Init,
+                None,
+                serde_json::json!([]),
+                vec![0; 16]
             )
             .is_err()
         );

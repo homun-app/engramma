@@ -67,6 +67,10 @@ pub enum CellError {
     /// Replaying the log produced a different state.
     #[error("replay mismatch: {0}")]
     ReplayMismatch(String),
+    /// The requested changes sit under the latest compaction snapshot: the
+    /// payloads are gone, a replica restarts from the snapshot (DESIGN §4.3).
+    #[error("ops below seq {snapshot_seq} were compacted: restart from the snapshot")]
+    Compacted { snapshot_seq: i64 },
 }
 
 /// Errors returned by import/export.
