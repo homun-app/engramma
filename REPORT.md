@@ -565,3 +565,445 @@ maniera critica dalla recenza (0,896/0,890 a 100k, 0,938 uguale a 10k).
   offline, altre piattaforme.
 - Il benchmark misura la macchina di sviluppo con altri processi utente:
   per questo la mediana di tre giri e l'intervallo dichiarato nella varianza.
+
+---
+
+# REPORT — Engramma v0.2 (significato)
+
+Data: 2026-11-05. Base: `main` @ `35cdb76`. Tutto offline (`cargo --offline`),
+Rust 1.95, macOS arm64. Nessuna crate nuova: l'unica dipendenza diretta
+aggiunta è `ring` 0.17 (sha256 dei modelli) che era **già nell'albero** via
+rustls/ureq — `Cargo.lock` non cambia versione di niente.
+
+## Cosa è stato fatto, punto per punto
+
+### 0. Residui della v0.1.1
+
+- **Archi manuali e quarantena** (`21e530f`, test rosso prima): `write_note`
+  aggiorna lo `status` degli archi manuali che citano la nota nella stessa
+  operazione (deterministica nel rigioco) e `apply_link` fa nascere l'arco con
+  lo stato della nota citata. Test: quarantena → l'arco sparisce da
+  `neighbors`, `confirm` → torna, cancellazione → sparisce per sempre,
+  `verify` ok.
+- **`superseded` senza `valid_to` via API** (`285dd0e`, test rosso prima): la
+  guardia è in `write_note`, quindi copre `patch_note` (azzerare `valid_to`)
+  e `put_note` (replace con stato già `superseded`).
+- **p95 a 100k**: non era obiettivo; il ramo vettoriale non lo tocca (il
+  benchmark lo dimostra: le righe di testo restano quelle della v0.1.1). La
+  «lettura unica per candidato» non è stata fatta: i candidati ibridi leggono
+  per id come in v0.1; rimane aperta.
+
+### 1. `engramma-embed` (`ca62762`)
+
+- Il trait (`TextKind`, `Embedder`, `EmbedError`) sta in `engramma-core`,
+  senza I/O di rete. Aggiunta mia, documentata: un metodo fornito
+  `approx_tokens` (stima caratteri/4) che `Builtin` override con il conto
+  esatto del tokenizer — serve a tagliare i blocchi senza mettere i
+  tokenizer nel core.
+- **`Builtin` (tract)**: carica `onnx/model.onnx` con `tract_onnx`, input i64
+  a dimensioni simboliche (batch e sequenza) prese da `model.symbols` — con
+  uno `SymbolScope` nuovo tract rifiuta l'unificazione delle dimensioni.
+  Output `[batch, seq, dim]`, pooling CLS o mean pesata dalla maschera
+  (letto da `1_Pooling/config.json`), L2. Troncamento e padding sono nostri,
+  non del tokenizer: un tokenizer con truncation interna falsava anche il
+  conto dei token (`approx_tokens` non vedeva mai più di 512). Batch
+  indipendenti in parallelo con `std::thread::scope` fino a
+  `available_parallelism()`.
+- **Fedeltà** (`tests/fidelity.rs`, modelli veri): cos ≥ 0,9999 contro i
+  vettori di riferimento ONNX Runtime 1.31.1 per **97M e 311M**; lo stesso
+  testo da solo e in batch lungo cos ≥ 0,9999 (padding invariante);
+  troncamento a 512 token funzionante e deterministico; batch vuoto vuoto.
+  Senza modoli il test **fallisce** con un messaggio che dice come rimediare;
+  `ENGRAMMA_SKIP_MODEL_TESTS=1` è l'opt-out esplicito per la CI.
+- **`ModelSpec`**: manifest con repo, revisione fissata, sha256 e dimensione
+  dei due file grossi, dim, pooling, max_tokens, prefissi facoltativi.
+  Granite R2 non usa prefissi. EmbeddingGemma: solo cartella utente con
+  `manifest.json` (licenza Gemma); nessun test con i suoi pesi.
+- **Dove stanno i modelli**: `ENGRAMMA_MODEL_DIR` o
+  `~/.cache/engramma/models`; all'apertura si verificano gli sha256 dei due
+  file grossi con **cache dell'esito** invalidata da mtime e dimensione.
+- **`model pull`**: scarica da `huggingface.co/<repo>/resolve/<rev>/<file>`
+  in un file temporaneo, calcola lo sha256 mentre scarica e rinomina solo se
+  combacia; errore = nessun residuo (test).
+- **Ollama** (`/api/embed`) e **Http** (`/v1/embeddings`, bearer da variabile
+  d'ambiente, mai nei log, normalizzazione locale). Tutti e due — e il
+  `pull` — sono provati contro un **server finto su 127.0.0.1**
+  (`TcpListener` in un thread): corpo della richiesta, risposta (incluso
+  l'indice sparso di `/v1/embeddings`), HTTP 500, JSON malformato, timeout,
+  dimensione sbagliata, 404, doppio pull che salta il file già presente.
+- **Configurazione**: `<root>/config.json`; `engramma model use` la scrive
+  per i builtin, i remoti si configurano a mano (schemi in `docs/cli.md`).
+
+### 2. Archiviazione dei vettori (`4bfe2d4`)
+
+- Migrazione v4: `embedding_models (model, dim, state, created_at)` e
+  `note_vectors (note_id, chunk, model, content_hash, note_hash, vec)`.
+  Aggiunta mia rispetto allo schema del prompt: la colonna `note_hash`
+  (blake3 di modello+testo intero) rende la **staleness** verificabile senza
+  tokenizer — per questo `verify` può riportare la copertura senza embedder.
+- Derivate: fuori da `ops`, rigioco, `compare_states` ed export. Test
+  richiesto: due celle con lo stesso contenuto logico, una con vettori e una
+  senza → `verify` ok su entrambe.
+- Testo incorporato: `title + "\n\n" + body`; oltre `max_tokens` blocchi per
+  paragrafo con sovrapposizione di un paragrafo (l'overlap entra solo se
+  lascia spazio al paragrafo in arrivo: un overlap che sfonda il budget è
+  cortesia, il budget è la legge). `content_hash` per blocco, punteggio della
+  nota = massimo dei blocchi.
+- Le scritture non incorporano: le note cambiate restano in attesa;
+  `embed_pending` lavora a lotti (32 note per chiamata `embed`) incorporando
+  **fuori dal lock** e scrivendo in transazioni brevi; le lapidi cancellano i
+  vettori nell'operazione stessa.
+- `verify` riporta la copertura per modello (non è un errore).
+- **Blu/verde**: `model use` crea il `building`; `embed_pending` riempie
+  quello mentre il `ready` serve; a copertura 100% una transazione ritira il
+  vecchio (cancellandone i vettori) e promuove il nuovo. Test: a metà
+  costruzione la ricerca risponde col vecchio modello e mai con un indice
+  misto; terzo modello rifiutato mentre uno costruisce; embedder sbagliato
+  rifiutato.
+
+### 3. Indice vettoriale (`07eb6f5`)
+
+- `trait VectorIndex` (`search/upsert/remove/rebuild/len`) e `FlatI8`:
+  quantizzazione simmetrica per vettore (scala f32 per riga), prodotto
+  scalare intero su tutta la matrice con 8 accumulatori i32 indipendenti,
+  primi m candidati; **ricalcolo esatto in f32** dei candidati rileggendo i
+  vettori da `note_vectors` (tabella temporanea + JOIN); il dot f32 usa gli
+  8 accumulatori `chunks_exact(8)` (quello ingenuo misurato 20× più lento).
+- Ciclo di vita: costruzione **pigramente** alla prima ricerca (apertura
+  cella non misurabile, < 3 ms); aggiornamento incrementale dalle scritture
+  della stessa `Cell`; `PRAGMA data_version` cambiato (altro processo) →
+  ricostruzione. Test due-celle-richiesto: la scrittura di B si vede nella
+  ricerca di A.
+- Filtri: i candidati vettoriali passano dagli stessi filtri del testo
+  **prima** della fusione; se i superstiti sono meno di k, m raddoppia fino
+  alla scansione completa.
+- Test: richiamo@10 ≥ 0,98 contro l'esatta su 10 000 vettori casuali a seme
+  fisso (384 dim) e 5 000 (768 dim); proptest indice incrementale =
+  ricostruito dopo scritture casuali (stessi primi 10 per 30 query);
+  richiamo@10 della pipeline int8+ricalcolo ≥ 0,98 **sui vettori veri del
+  vault dorato** col 97M. Nota onesta: il solo ranking int8 grezzo su quei
+  vettori vale 0,953 — il contratto è la pipeline con ricalcolo, come da
+  prompt.
+- **Quarantena vettoriale**: la nota in quarantena col vettore più vicino
+  non esce e non fa da seme (test dedicato: filtra prima, e l'astensione
+  toglie i candidati prima della camminata).
+
+### 4. Ricerca mista (`e689db1` + `e6ca67f`)
+
+- Pipeline: BM25(50) e vettori(50) → filtri → fusione → allargamento dal
+  grafo sui semi fusi → riordino → explain. La domanda si incorpora fuori
+  dal lock, con **cache LRU scritta a mano** (256 voci per modello; il test
+  conta le chiamate all'embedder, i tempi da soli sono rumore).
+- `Fusion::Rrf { k: 60 }` e `Fusion::Convex { alpha }` (bm25 min-max sui
+  candidati; mancare da una lista vale 0), punteggio fuso riscalato su [0,1]
+  — senza riscala i vicini di grafo (pavimento 0,05) battevano i veri match
+  RRF (~1/61), scoperto a mano.
+- **Explain** esteso: `semantic_rank`, `cosine`, `fused_score`, `lists`
+  (`text`/`vector`/`graph`), blocco vincente; `Hit` espone `raw_score`
+  accanto al punteggio normalizzato per la visualizzazione. In CLI e MCP.
+- **Astensione**: i risultati solo-vettoriali richiedono cos ≥ tau; il
+  filtro corre **prima** della camminata (il primo disegno lasciava
+  rientrare i vicini dei candidati scartati: test e correzione).
+- CLI `search --mode text|vector|hybrid` (ibrido di default con modello
+  ready), `--fusion`, `--tau`; MCP con ramo vettoriale automatico e
+  descrizioni aggiornate.
+
+### 5. Misure e scelta del modello (questo commit + `ba94de0`)
+
+Domande dorate nuove: **15 parafrasi** (test dedicato: nessuna radice condivisa
+con la nota attesa dopo la normalizzazione di `text.rs`), **3 in inglese** su
+note italiane, **2 astensioni semantiche**. Generatore del benchmark:
+parafrasi a modello fisso e domande in inglese, categorie
+fattuali/parafrasi/multi-salto/inglese.
+
+### 6. Documentazione (`651bf25`)
+
+`docs/architecture.md` (ramo vettoriale, dati derivati, blu/verde),
+`docs/cli.md` (`model`, `embed`, `search --mode`, nuovi campi JSON, schemi
+di config per Ollama/Http), `README.md` (scaricare il modello, Ollama,
+licenze, `ENGRAMMA_SKIP_MODEL_TESTS`), `spec/format-v0.md` (una riga: i
+vettori non fanno parte del formato).
+
+## Le tabelle delle misure
+
+### Fedeltà dei vettori (tract contro ONNX Runtime 1.31.1, righe del 2026-11-05)
+
+| modello | frasi | cos minimo |
+|---|---|---|
+| granite-embedding-97m-multilingual-r2 | 4 | ≥ 0,9999 |
+| granite-embedding-311m-multilingual-r2 | 4 | ≥ 0,9999 |
+
+Padding (stesso testo da solo / in batch lungo): cos ≥ 0,9999. Troncamento a
+512 token: riesce, deterministico, L2 intatta.
+
+### Taratura sul vault dorato (richiamo@5 / MRR, 5 risultati, 2 passi)
+
+Convessa = α·cos + (1−α)·bm25_minmax. «recenza» = peso v0.1 (mezza-vita
+180 giorni) nel riordino; «senza» lo toglie dal ramo semantico.
+
+**97M**
+
+| fusione | recenza | fattuali (20) | parafrasi (15) | inglese (3) | multi-salto (3) |
+|---|---|---|---|---|---|
+| RRF k=60 | sì | 0,850/0,575 | 0,333/0,200 | 1,000/0,500 | 0,667/0,167 |
+| RRF k=60 | no | 1,000/0,837 | 0,733/0,469 | 1,000/0,833 | 1,000/0,667 |
+| convessa α=0,3 | no | 1,000/0,900 | 0,533/0,406 | 1,000/0,833 | 1,000/0,556 |
+| convessa α=0,5 | no | 1,000/0,875 | 0,733/0,478 | 1,000/0,833 | 1,000/0,556 |
+| **convessa α=0,7** | no | **1,000/0,875** | **0,800/0,491** | **1,000/0,833** | **1,000/0,556** |
+
+**311M**
+
+| fusione | recenza | fattuali (20) | parafrasi (15) | inglese (3) | multi-salto (3) |
+|---|---|---|---|---|---|
+| RRF k=60 | no | 1,000/0,838 | 0,733/0,432 | 1,000/1,000 | 1,000/0,833 |
+| convessa α=0,3 | no | 1,000/0,900 | 0,600/0,377 | 1,000/1,000 | 1,000/0,556 |
+| convessa α=0,5 | no | 1,000/0,900 | 0,733/0,452 | 1,000/1,000 | 1,000/0,556 |
+| **convessa α=0,7** | no | **1,000/0,875** | **0,867/0,482** | **1,000/1,000** | **1,000/0,556** |
+
+Due decisioni prese su questi numeri:
+
+1. **La recenza esce dal riordino semantico** (resta per intero nel ramo
+   solo-testo). Le differenze di coseno tra un match vero e il rumore sono
+   centesimi; la mezza-vita a 180 giorni, tarata sugli scarti ampi del BM25,
+   li mescolava: toglierla porta i fattuali a 1,000 su entrambi i modelli e
+   le parafrasi da 0,20–0,53 a 0,53–0,87.
+2. **Fusione predefinita: convessa α=0,7.** A parità di fattuali batte RRF
+   sulle parafrasi su entrambi i modelli (0,800 contro 0,733 col 97M; 0,867
+   contro 0,733 col 311M) — la stessa direzione della letteratura (ACM TOIS
+   2023). RRF resta disponibile (`--fusion rrf`) ed è il default giusto
+   senza dati, ma qui i dati ci sono.
+
+### Curva di astensione (tau)
+
+Coseni dei primi risultati per le domande che dovrebbero restare vuote
+(97M / 311M):
+
+| domanda | coseno massimo |
+|---|---|
+| «che auto guida Giulia?» (assente) | 0,878 / 0,872 |
+| «quando si sono sposati…?» (assente) | 0,855 / 0,908 |
+| «campione» (contenuto in quarantena) | 0,810 / 0,858 |
+| «vegetariano» (sostituita) | 0,818 / 0,834 |
+| le altre 8 astensioni testuali | 0,746–0,777 / 0,777–0,815 |
+
+Coseni delle note attese per le parafrasi vincenti: 0,80–0,826 (97M),
+0,81–0,877 (311M). **Le due bande si sovrappongono**: nessun tau assoluto
+lascia vuote le astensioni senza vuotare anche le parafrasi. Punti della
+curva (97M): tau 0,80 → 5/10 astensioni testuali giuste, parafrasi 0,400;
+tau 0,84 → 8/10, parafrasi 0,067; tau 0,88 → le due semantiche si astengono
+ma le parafrasi valgono 0. Con il 311M uguale, spostato di ~+0,02.
+
+Scelta: **tau = 0,30 di default** — un pavimento contro il rumore basso,
+non un rivelatore di menzogne. Le due astensioni semantiche dorate restano
+**il punto aperto dichiarato** di questa fase (v. sotto); le astensioni
+*testuali* continuano a passare nel modo testo, che è quello con cui sono
+sempre state misurate.
+
+## Prove a mano (uscite della CLI, trascritte)
+
+```console
+$ engramma --root $T init
+inizializzato: /var/folders/…/engramma-smoke
+$ engramma --root $T model list          # con ENGRAMMA_MODEL_DIR=~/.cache/engramma/models
+modelli in /Users/<utente>/.cache/engramma/models
+granite-embedding-97m-multilingual-r2  384 dim, 420 MB, scaricato, stato: —
+granite-embedding-311m-multilingual-r2  768 dim, 1277 MB, scaricato, stato: —
+$ engramma --root $T model use granite-embedding-97m-multilingual-r2
+modello granite-embedding-97m-multilingual-r2@835ad140 in costruzione
+(config in …/config.json): `engramma embed` lo riempie, la ricerca continua
+con il modello attuale
+$ engramma --root $T import tests/golden/vault-it --obsidian
+incorporate: 62 (in attesa: 0)
+importate: 62
+saltate: 0 / errori: 0
+$ engramma --root $T embed
+incorporate: 0 note                      # l'import aveva già finito
+$ engramma --root $T verify
+registro verificato: 63 operazioni, catena hash, ricostruzione e indice FTS
+a posto                                # + copertura 62/62 nel --json
+```
+
+La domanda parafrasi, nei due modi (primi 3 risultati):
+
+```console
+$ engramma --root $T search "in che città si è trasferita la coppia" --mode text
+1. [active] Torino (00000022)   … liste: text, termini: citt
+2. [active] Milano (00000021)   …
+3. [active] Il capoluogo di Giulia (00000087) …
+$ engramma --root $T search "in che città si è trasferita la coppia" --mode hybrid
+1. [active] Torino (00000022)   liste: text, vector   coseno: 0,7862
+2. [active] Il capoluogo di Giulia (00000087)  liste: text, vector
+3. [active] Milano (00000021)   liste: text, vector   coseno: 0,7987
+```
+
+Nota: in ibrido le note dei luoghi arrivano dalle due liste insieme; la
+nota «Giulia abita a Milano» (l'attesa della parafrasi dorate) compare al
+posto 6 in ibrido e 3 in `--mode vector` (coseno 0,8268): la recency non
+c'entra più, qui sono i vincoli di quartiere (Torino/Navigli) a pesare nel
+coseno. La versione dorate della domanda (`--mode hybrid` con il 311M, il
+modello predefinito scelto) la vede nelle prime 5.
+
+```console
+$ engramma --root $T search "campione"
+nessun risultato sopra soglia          # modo testo (nessun termine vivo)
+$ engramma --root $T search "campione" --mode hybrid
+1. [active] Fabio (00000001)  liste: vector  coseno: 0,8097 …
+```
+
+L'astensione testuale resta perfetta; quella semantica è il punto aperto
+dichiarato (curva sopra).
+
+Cambio di modello blu/verde al 311M:
+
+```console
+$ engramma --root $T model use granite-embedding-311m-multilingual-r2
+modello granite-embedding-311m-multilingual-r2@44399559 in costruzione …
+$ time engramma --root $T embed
+incorporate: 62 note
+modello pronto: granite-embedding-311m-multilingual-r2@44399559
+  (build di debug: 16,5 s, 561% CPU)
+$ engramma --root $T model list
+granite-embedding-97m-multilingual-r2  … stato: retired
+granite-embedding-311m-multilingual-r2  … stato: ready
+$ engramma --root $T search "in che città si è trasferita la coppia" --mode hybrid --k 3
+1. [active] Torino (00000022)   coseno: 0,8289
+2. [active] Il capoluogo di Giulia (00000087)  coseno: 0,8419
+3. [active] Milano (00000021)   coseno: 0,8694     # servito dal 311M
+```
+
+### Prova MCP a mano
+
+```console
+$ printf '…initialize… …tools/call memory_search "in che città si è trasferita
+  la coppia"…' | engramma --root $T mcp --cells default
+modalità: hybrid
+  'Milano'  liste=['text', 'vector']  coseno=0,8694  rango_semantico=6
+  'Torino'  liste=['text', 'vector']  coseno=0,8289  rango_semantico=23
+  'Roma'    liste=['text', 'vector']  coseno=0,8765  rango_semantico=1
+```
+
+Il server ha preso il ramo vettoriale da solo (la cella aveva il 311M ready
+e `config.json` l'embedder corrispondente) e l'explain porta le liste, il
+coseno e il rango semantico.
+
+## Cosa non ho potuto provare
+
+- **Windows e Linux**: come per v0.1/v0.1.1, compilato e provato solo sul
+  macOS arm64 locale; la CI (mai eseguita) copre le altre piattaforme.
+- **Advisory di cargo-deny**: richiedono rete; eseguito `licenses bans`.
+- **EmbeddingGemma**: nessun test con i suoi pesi (licenza Gemma); la
+  cartella-utente con manifest è provata con un manifest finto.
+- **Il 311M a 100k note**: dichiarato — il costo di incorporazione e giri di
+  qualità sulla macchina di sviluppo sforerebbe ogni tempo ragionevole; le
+  sue misure sono a 10k.
+- **La curva tau completa col 311M a 100k**: per lo stesso motivo.
+
+## Domande aperte per la v0.3
+
+1. **Astensione semantica**: la soglia assoluta non separa (curve nel
+   REPORT). Servono segnali relativi: margine fra il primo e il resto,
+   conformità query-risposta (il coseno fra la domanda *ricalcolata sul
+   testo del risultato* e la domanda stessa), o un classificatore leggero
+   tarato. È il primo candidato della v0.3.
+2. **Recenza**: tolta dal ramo semantico su misura; andrà ritarata una
+   normalizzazione comune (per esempio recenza sul punteggio fuso, con
+   mezza-vita più lunga) invece che rimossa.
+3. **Lettura unica per candidato** (p95 a 100k): i candidati di testo e
+   vettori leggono per id; un JOIN per lotto ridurrebbe il p95 di entrambi
+   i rami. Rimane dal REPORT v0.1.
+4. **Peso del grafo nell'ibrido**: i vicini di grafo entrano con il
+   pavimento 0,05 sul fuso normalizzato; con il vault dorato non ha
+   disturbato, ma una misura dedicata (domande multi-salto ibride) manca.
+5. **Chunking**: i blocchi per paragrafo funzionano per note-verbetto; note
+   con un solo paragrafo enorme vanno spezzate a parole (fatto, ma senza
+   sovrapposizione semantica: la continuità è del tokenizer, non del
+   contenuto).
+6. **Registro a 246 MB/100k**: invariato dalla v0.1; la compattazione
+   resta prevista per la v0.3, e ora ci sono anche i vettori (derivati:
+   ricostruibili, non compattano il registro).
+
+### Benchmark (release, mediana di 3 giri, `bench/RESULTS.md` rigenerato)
+
+Testo+grafo (per confronto con la v0.1.1 — il ramo vettoriale non lo tocca):
+
+| corpus | note | inserimento (note/s) | apertura (ms) | p50 (ms) | p95 (ms) | richiamo@5 | MRR | file (MB) |
+|---|---|---|---|---|---|---|---|---|
+| viva | 10 000 | 3 366 | 0,8 | 4,5 | 6,8 | 0,972 | 0,763 | 24,3 |
+| viva | 100 000 | 2 689 | 2,1 | 43,1 | 72,6 | 0,899 | 0,637 | 247,9 |
+| viva+97M | 100 000 | 2 650 | 2,1 | 43,2 | 73,3 | — | — | 466,7 |
+
+Ramo vettoriale:
+
+| modello | note | embedding (note/s) | costr. indice (ms) | mem. indice (MB) | vettori p50/p95 (ms) | ibrido caldo p50/p95 (ms) | ibrido + embedding query p50/p95 (ms) |
+|---|---|---|---|---|---|---|---|
+| 97M | 10 000 | 187 | 24 | 4,3 | 15,7/17,5 | 17,0/19,2 | 16,8/19,3 |
+| 311M | 10 000 | 49 | 67 | 8,1 | 32,1/33,8 | 33,4/35,0 | 33,5/35,8 |
+| 97M | 100 000 | 110 | 148 | 42,8 | 64,2/80,2 | 78,9/100,5 | 78,7/100,1 |
+
+Richiamo@5/MRR per modalità (estratto: le righe complete in
+`bench/RESULTS.md`; multi-salto v. sotto):
+
+| note | modalità | fattuali | parafrasi | inglese |
+|---|---|---|---|---|
+| 10k | testo | 1,000/0,915 | 1,000/0,648 | 1,000/0,747 |
+| 10k | vettori | 1,000/0,965 | 0,996/0,944 | 1,000/0,991 |
+| 10k | **convex-0,7** | **1,000/1,000** | **1,000/0,984** | **1,000/0,941** |
+| 100k | testo | 0,964/0,817 | 0,908/0,514 | 0,891/0,581 |
+| 100k | vettori | 0,988/0,892 | 0,982/0,872 | 0,987/0,872 |
+| 100k | rrf | 1,000/0,964 | 1,000/0,973 | 0,996/0,884 |
+| 100k | convex-0,7 | 1,000/0,978 | 0,999/0,860 | 0,995/0,789 |
+
+Letture:
+
+- **Il ramo vettoriale non peggiora il testo**: p50/p95 delle ricerche di
+  testo restano 43/73 ms a 100k (v0.1.1: 48/85 sulla stessa macchina).
+- **Obiettivo §11 «ricerca mista ≤ 50 ms a 100k con query già incorporata»:
+  mancato** — 78,9/100,5 ms. Il ramo vettoriale in sé (scansione int8 +
+  ricalcolo f32) costa ~2 ms; il resto è il pipeline completo (BM25 + grafo
+  43 ms) più la lettura dei candidati e i 200 vettori ricalcolati per
+  domanda (~30 ms). Le vie: meno candidati ricalcolati, la lettura unica
+  per candidato già segnata, cache dei vettori ricalcolati. Onestamente
+  dichiarato, con i numeri.
+- **Embedding della query quasi gratis** nel p50 (colonna calda contro
+  fredda: 78,9 contro 78,7 — ~10 ms del 97M si perdono nella varianza;
+  il 311M li si vede: 33,4 → 33,5).
+- **La fusione**: la convessa vince a 10k e sul vault dorato (parafrasi
+  dure), RRF vince l'MRR a 100k sulle parafrasi sintetiche — che però
+  condividono il nome della persona con la nota, quindi sono più facili.
+  Il default resta **convessa α=0,7** perché vince dove la parafrasi è
+  vera (nessuna radice condivisa) e a 10k; RRF resta a un flag di distanza.
+- **Multi-salto del banco: 0,000 in ogni modalità — ed era 0/20 già nella
+  v0.1.1** (verificato ricompilando il bench del tag `fase-v0.1.1`: la
+  nota attesa non entra nei primi 5 contro centinaia di match diretti di
+  «lavora» e il punteggio di grafo decaduto non basta). Non è una
+  regressione di questa fase, ma il banco v0.1.1 non la mostrava perché
+  l'aggregato non separava le categorie. Le multi-salto *dorate* (cella da
+  62 note) funzionano. Da ripensare nel generatore o nel peso del grafo.
+
+### Scelta del modello predefinito
+
+| | 97M | 311M |
+|---|---|---|
+| qualità, parafrasi dorate (richiamo@5/MRR) | 0,800/0,491 | **0,867/0,482** |
+| qualità, inglese dorato | 1,000/0,833 | **1,000/1,000** |
+| qualità, fattuali dorati | 1,000/0,875 | 1,000/0,875 |
+| embedding (note/s) | **110–187** | 49 |
+| query ibrida p50 (10k) | **17 ms** | 33 ms |
+| modello su disco | **420 MB** | 1 277 MB |
+| vettori in cella (10k) | **+22 MB** | +42 MB |
+
+**Predefinito: granite-embedding-311m-multilingual-r2.** Decidono le
+parafrasi vere e l'attraversamento di lingua, che sono la ragione del ramo
+semantico; il 97M resta equivalente sui fatti e costa un terzo, quindi è
+l'opzione consigliata per celle grandi o macchine piccole — la scelta è una
+riga di `config.json`. L'inserimento non cambia (≥ 2 000 note/s senza
+embedding su entrambi).
+
+## Chiusura della fase
+
+- `cargo fmt --check`, `cargo clippy --all-targets --offline -- -D warnings`,
+  `cargo test --offline --workspace` (anche `--release`),
+  `cargo deny check licenses bans`: tutti verdi (uscita sotto).
+- Prove a mano: sopra (init → model use → import → embed → search
+  testo/ibrido → campione → verify → scambio al 311M → MCP).
+- Tag: `fase-v0.2`. Nessun push (repo locale).
