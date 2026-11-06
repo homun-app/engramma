@@ -142,36 +142,55 @@ Round-trip properties (both tested with proptest):
 - `parse(serialize(n)) == n` for every note `n` the library can represent;
 - `serialize(parse(x))` is stable (applying it twice changes nothing).
 
-## 6. Change log: operation and hash rules (informative summary)
+## 6. Change log: operation and hash rules (v2, forgettable payloads)
 
 Every cell mutation is one row in `ops`. The row carries `seq` (insert order),
-`op_id` (ULID), `hlc`, `actor`, `kind`, `note_id` and `payload_json`. The
-canonical payload JSON has **object keys sorted lexicographically at every
+`op_id` (ULID), `hlc`, `actor`, `kind`, `note_id` and `payload_digest`. The
+payload **body** lives in a separate table, `op_payloads(op_id PRIMARY KEY,
+salt BLOB(16), body TEXT)`, and can be **forgotten** without breaking the
+chain. The canonical JSON has **object keys sorted lexicographically at every
 level, no whitespace** (serde_json with BTreeMaps; floats are emitted in Rust's
 shortest round-trip form and are therefore avoided in payloads — timestamps and
 dates are strings).
 
-The payload always carries an **envelope** with `op_id`, `hlc`, `actor`,
-`kind` and `note_id` (`null` when the op has none): these fields are inside
-the hashed bytes, so the hash binds the whole logical row. The columns of
-`ops` are an index over the payload: reading a log, the columns must agree
-with the envelope — a disagreement is a verification error even when the hash
-chain itself recomputes cleanly.
+Hash rules (log v2):
 
-Hash chain: `hash = blake3(prev_hash || payload_json_canonical)` where
-`prev_hash` is the `hash` of the previous op (ASCII lowercase hex, 64 chars) or
-64 `0` chars for the first op. `verify_log` recomputes the whole chain.
+```text
+payload_digest = blake3(salt ‖ canonical JSON of the body)
+hash           = blake3(prev_hash ‖ canonical JSON of
+                        {actor, hlc, kind, note_id, op_id, payload_digest})
+```
 
-`apply(state, op)` is deterministic: IDs, HLC and timestamps are generated when
-the operation is **created** and travel inside the payload; `apply` reads no
-clock, no randomness, no I/O.
+`prev_hash` is the `hash` of the previous op (ASCII lowercase hex, 64 chars)
+or 64 `0` chars for the first op. The columns of `ops` ARE the envelope: the
+hash binds them directly. `verify_log` recomputes the whole chain and, when
+the payload is present, checks that `payload_digest` still matches
+`blake3(salt ‖ body)` — a changed byte, or a changed salt, breaks it.
 
-### 6.1 Golden vector of the hash rule
+The **salt** is 16 random bytes generated when the operation is **created**,
+like the op id and the HLC: `apply` stays deterministic (no clock, no
+randomness, no I/O). A naked hash of personal data can still be personal
+data; with the salt destroyed it cannot be linked back — the SD-JWT
+technique (RFC 9901).
 
-A fixed input with its expected hash, so that any silent change of the
-canonical JSON (for instance a dependency enabling serde_json's
-`preserve_order`, which would stop sorting map keys) breaks a test instead of
-every cell ever written:
+### 6.1 Golden vectors
+
+The v2 rule (salt = 16 × 0x07, body `{"note":{"body":"corpo","x":1}}`,
+op_id and note_id `01F7ZQ6VTSATW2BQ5Z9R0P1S8T`,
+hlc `01a17720ca0000000007.0123456789ab`, actor `engramma`):
+
+```text
+payload_digest = aeff683a134c22f54b920c36db80d1f730083f862962decd73876ac533fb34d3
+envelope       = {"actor":"engramma","hlc":"01a17720ca0000000007.0123456789ab",
+                  "kind":"put_note","note_id":"01F7ZQ6VTSATW2BQ5Z9R0P1S8T",
+                  "op_id":"01F7ZQ6VTSATW2BQ5Z9R0P1S8T",
+                  "payload_digest":"aeff683a134c22f54b920c36db80d1f730083f862962decd73876ac533fb34d3"}
+hash (genesis prev) = 13c81593af51e2faf2f301fdf1a2c85172048bc25c5cec2bb12411e974849418
+```
+
+The v1 rule (`hash = blake3(prev_hash ‖ payload_json_canonical)`, the
+envelope inside the payload) stays frozen for the migration, whose golden
+vector is
 
 ```text
 prev_hash = 0000000000000000000000000000000000000000000000000000000000000000
@@ -180,9 +199,38 @@ payload   = {"actor":"engramma","hlc":"01a17720ca0000000007.0123456789ab",
 hash      = a217239290ba91e17196ab1812bd01a1e3d05e71f6048387017212636c555d46
 ```
 
-The reference implementation builds that object by inserting the keys in a
-different order and serialises with `serde_json` (maps are BTreeMaps: keys
-sorted at every level, no whitespace).
+### 6.2 Redaction
+
+A payload can be forgotten (`purge`, compaction): the `op_payloads` row goes,
+the skeleton and the chain stay. Replaying a redacted operation is a **no-op**
+— only its row and the HLC tick are replayed. This is only ever correct for
+notes removed by `purge` or for ops under a compaction snapshot; in both
+cases the live state agrees with the redacted replay. `purge` additionally
+**censors** the supersede ops where its note was the NEW note: the body keeps
+`old_id`, `valid_to` and `old_updated_at` with `note: null` (fresh salt, the
+chain tail recomputed), so the OLD note's closure stays replayable; a
+supersede whose OLD note is absent (its ops were purged) creates the new note
+without the closure and without the `supersedes` row — exactly what the live
+state looks like after that purge.
+
+### 6.3 Migration v1 → v2 (schema v5)
+
+On opening a v0.2.1 cell: the v1 chain is verified first (a broken log is
+never rewritten), every op is rewritten in the v2 form with fresh salts, and
+`meta` gains `log_v1_head` (the last v1 hash) and `log_v2_from_seq` (= 1).
+The format of the log is declared unstable in 0.x.
+
+### 6.4 Compaction snapshots (schema v6)
+
+`compact(up_to_seq)` takes a `VACUUM INTO` snapshot of the cell **exactly as
+it stands**, registers it in `snapshots(seq, head_hash, state_digest, file,
+created_at)` — `state_digest` is blake3 of the canonical dump of the logical
+tables, the same rendering `verify` compares — and forgets the payloads of
+the ops up to `up_to_seq` (≤ the head: the last ops stay replayable).
+`verify` restores the snapshot into memory, checks its recorded head hash and
+state digest, re-applies the same cut to the restored copy and replays only
+the tail. `changes_since` below the snapshot answers `Compacted
+{ snapshot_seq }`: a replica restarts from the snapshot.
 
 ## 7. Folders
 

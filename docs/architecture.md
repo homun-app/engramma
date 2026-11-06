@@ -1,4 +1,67 @@
-# Architecture (v0.1 + v0.2: semantic branch)
+# Architecture (v0.1 → v0.3)
+
+## v0.3: the in-memory graph, the forgettable log, the markdown view
+
+```
+engramma-core
+├── graph/      GraphIndex: notes and entities as integer nodes, visible
+│               edges as an undirected CSR adjacency, built lazily, patched
+│               by this cell's own writes (an overlay over the frozen CSR),
+│               rebuilt on PRAGMA data_version change. The walk is an
+│               Andersen–Chung–Lang forward push (expand while residual ≥
+│               ε·weighted degree; relations weigh 1, mentions 0.25; the
+│               declared projection links a relation's note to its
+│               endpoints — a relation row does not otherwise touch the
+│               note that states it). neighbors/path run on the same index:
+│               no per-level SQL.
+├── consolidation/  near duplicates (cosine ≥ 0.95 AND entity Jaccard ≥ 0.5)
+│               and probable contradictions (same subject, same functional
+│               relation, two destinations, overlapping validity). Proposals
+│               only — the application decides.
+├── cell/
+│   ├── ops.rs   log v2: hash = blake3(prev ‖ {op_id, hlc, actor, kind,
+│   │            note_id, payload_digest}); payload_digest =
+│   │            blake3(salt ‖ canonical body); the body lives in
+│   │            op_payloads(op_id, salt, body) and can be FORGOTTEN
+│   │            (purge, compaction) without breaking the chain. A redacted
+│   │            op replays as a no-op (skeleton + HLC tick). purge:
+│   │            the note, its versions, edges, vectors, FTS row, orphan
+│   │            entities and tags go; the supersede payloads where the note
+│   │            was the new one are CENSORED (note→null, fresh salt, tail
+│   │            rehash) so the old note's closure stays replayable;
+│   │            secure_delete + VACUUM leave no body byte in the file.
+│   └── schema.rs  v5: op_payloads + the v1→v2 migration (v1 chain verified
+│                first, bookmarked in meta); v6: snapshots; v7: vault_files.
+├── cell/       compact(seq): VACUUM INTO a snapshot of the cell as it
+│               stands, registered with its head hash and state_digest
+│               (blake3 of the canonical dump of the logical tables — the
+│               same rendering verify compares); the payloads ≤ seq are
+│               forgotten. verify restores the snapshot (backup API),
+│               checks its digest, re-applies the cut and replays the tail;
+│               changes_since below the cut is CellError::Compacted.
+└── search/     the graph list as a THIRD list of the fusion: PPR scores of
+                the notes (seeds out), scaled by the list maximum; convex
+                (1−w)·fused + w·g (RRF: weighted rank reciprocal), w = 0.40
+                by weighted MRR at 100k (REPORT §v0.3); explain carries the
+                path (via) and the pushed-edge count. In TEXT mode the graph
+                stays a support (coverage and recency discipline): measured,
+                it never displaced a real match. The query LRU is
+                configurable (default 4096).
+engramma-vault  the markdown view: scan-based reconciliation (sync_once),
+                vault_files state, conflict copies (.conflitto-<ts>.md), the
+                mass-deletion guard, notify+debouncer as a HINT with a
+                periodic full scan (watch).
+```
+
+### The logical state under redaction
+
+`entities.note_id` and the raw `entities`/`tags` rows are an index; the
+state comparison (and `state_digest`) uses what is derivable: entity
+existence as edge endpoints ∪ subjects of living notes. A purge
+re-derives the subject claim (only a living note's claim counts) and
+prunes tag/entity orphans, so a replay of the redacted log equals the
+live state — the property tests with random purges enforce it.
+
 
 ## Modules
 
@@ -38,8 +101,8 @@ engramma-core
 │               i32 accumulators), top-m candidates; exact f32 recomputation
 │               of the candidates against note_vectors (temp table + JOIN).
 └── search/     the mixed pipeline (below), the LRU of embedded queries
-                (256/model, hand-written), Fusion (RRF | convex), abstention
-                tau.
+                (configurable, 4096/model default, hand-written), Fusion
+                (RRF | convex), abstention tau.
 engramma-embed  the embedders: Builtin (ONNX via tract — same vectors as ONNX
                 Runtime, pure Rust), Ollama (/api/embed), OpenAI-compatible
                 HTTP (/v1/embeddings, bearer from an env var, never logged);

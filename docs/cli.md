@@ -195,3 +195,49 @@ text+graph one.
 EmbeddingGemma is supported only as a user folder with its own manifest
 (its Gemma licence forbids bundling or auto-downloading the weights); no
 test runs with it.
+
+## v0.3 commands
+
+### `engramma purge <id> --reason <why> [--yes]`
+
+The right to be forgotten: the note, its versions, the edges it declares,
+its vectors, its FTS row, the entities left with no references and the
+tags no note carries anymore — all gone, plus the **payloads of its
+operations** (log v2: the chain covers salted digests, not the bodies).
+`secure_delete` zeroes the freed pages and a `VACUUM` rebuilds the file:
+no byte of the body survives in the cell. The purge's own payload keeps
+only the id and the reason, never content. `[[Mentions]]` of the note in
+OTHER notes stay (they are other notes); the markdown view deletes the
+note's file at the next `vault sync`. **Exports made before the purge are
+outside the engine's control.**
+
+### `engramma compact [--keep-last N]`
+
+Snapshots the cell exactly as it stands (`VACUUM INTO
+<cella>-snap-<seq>.sqlite`, registered with its head hash and its state
+digest), then forgets the payloads of every operation up to
+`head − N` (default `keep-last` 1000): the skeletons and the hash chain
+stay whole. `verify` restores the snapshot into memory, checks its
+digest and replays only the tail; `changes_since` below the snapshot
+answers `Compacted` (a replica restarts from the snapshot).
+
+### `engramma vault init <dir> | sync [dir] [--allow-deletions] | watch [dir]`
+
+The markdown view: `init` exports the cell into the folder; `sync` runs
+one scan-based reconciliation and prints the report (new notes from
+files, notes updated from files, files rewritten from the cell,
+conflicts — the cell wins and the file's version becomes a
+`<nome>.conflitto-<ts>.md` copy — deletions, moves); `watch` reconciles
+on filesystem events (500 ms debounce) and every 60 s, Ctrl-C exits. A
+file is bound to its note by the `id` in the header, never by its path:
+renaming or moving a file moves the note's binding. More than 20 files
+(or 10% of the notes) vanishing at once stops the sync with an error —
+an unmounted folder — unless `--allow-deletions`.
+
+### `engramma consolidate [--limit N] [--json]`
+
+Near duplicates (cosine ≥ 0.95 on the ready model AND entity Jaccard
+≥ 0.5) and probable contradictions (same subject, same functional
+relation — `lives_in`, `works_at`, `partner_of` — two destinations,
+overlapping validity). Proposals only: the engine never merges. Not
+exposed over MCP.

@@ -161,3 +161,20 @@ are absent; CI without models sets `ENGRAMMA_SKIP_MODEL_TESTS=1`.
 ## License
 
 Apache-2.0 (see `LICENSE`).
+
+
+## v0.3: la vista Obsidian, il diritto all'oblio
+
+- **`engramma vault init <cartella>`** esporta la cella in markdown e
+  lega ogni nota al suo file dall'`id` nell'intestazione; da lì in poi
+  **`engramma vault watch`** riconcilia ciò che cambiate a mano (anche
+  da Obsidian) con ciò che cambia la cella, con le copie di conflitto e
+  la guardia contro le cancellazioni di massa. Rinominare o spostare un
+  file non perde la nota.
+- **`engramma purge <id> --reason …`** dimentica una nota sul serio:
+  contenido, versioni, archi e i payload delle sue operazioni (registro
+  v2 a digest salati); `secure_delete` + `VACUUM` non lasciano byte nel
+  file. Le esportazioni fatte prima restano fuori dal nostro controllo.
+- **`engramma compact`** compatta il registro con un'istantanea;
+  **`engramma consolidate`** propone quasi duplicati e contraddizioni
+  aperte: decide l'applicazione, con l'utente.
