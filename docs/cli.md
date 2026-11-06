@@ -127,13 +127,15 @@ Options: `--mode text|vector|hybrid` (default: `hybrid` when the cell has a
 `--fusion rrf|convex-0.3|convex-0.5|convex-0.7` (a `convex-mm-`/`convex-th-`
 prefix picks the cosine normalisation: min-max over the candidates, or the
 theoretical −1..1 limits),
-`--tau` (abstention floor for vector-only results, default 0.30), plus the
-v0.1 options (`--k`, `--hops`, `--as-of`, `--tag`, `--type`,
-`--include-quarantined`, `--lang`).
+`--tau` (abstention floor for vector-only results, default 0.30),
+`--strict` (drop `support: "weak"` results: vector-only with a thin
+cosine margin — near in meaning, unconfirmed by any discriminative text
+match), plus the v0.1 options (`--k`, `--hops`, `--as-of`, `--tag`,
+`--type`, `--include-quarantined`, `--lang`).
 
 JSON adds `mode`, `embed_ms`, `search_ms`, and per hit: `raw_score` (before
 the display normalisation — the top hit is not always "1.0 of something")
-and the new explain fields:
+and the new explain fields (`support` is `"strong"`/`"weak"`):
 
 ```json
 { "query": "...", "mode": "hybrid", "embed_ms": 8.2, "search_ms": 3.1,

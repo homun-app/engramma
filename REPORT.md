@@ -1007,3 +1007,180 @@ embedding su entrambi).
 - Prove a mano: sopra (init → model use → import → embed → search
   testo/ibrido → campione → verify → scambio al 311M → MCP).
 - Tag: `fase-v0.2`. Nessun push (repo locale).
+
+---
+
+# REPORT — Engramma v0.2.1 (correzioni della verifica v0.2)
+
+Data: 2026-11-06. Base: `main` @ `fc0b48f` (tag `fase-v0.2`). Un commit
+per punto, con il test o la misura che fallisce prima della correzione.
+Tutto offline, Rust 1.95, macOS arm64, nessuna crate nuova (`Cargo.lock`
+invariato).
+
+## P0.1 — la fusione convessa normalizza il coseno
+
+La convessa sommava il coseno grezzo (scarto ~0,1 tra i candidati) contro
+una BM25 min-max su [0,1]: α pesava due scale senza relazione. Test rosso
+prima: `convex_fusion_normalises_the_cosine_scale` dava `{a: 0.86, b:
+0.637}` con BM25 differente per 1% e coseno per 0,11.
+
+- `Fusion::Convex` guadagna `cos_norm`: **Candidates** (min-max sui
+  candidati vettoriali) o **Theoretical** (limiti fissi −1..1 del coseno
+  tra vettori L2, come l'analisi delle funzioni di fusione per hybrid
+  retrieval su ACM TOIS 2023 — stabile ma a scarto compresso: misura alla
+  mano, si comporta quasi come il coseno grezzo).
+- Le due domande del prompt ora mettono primo il vincente semantico
+  (prove a mano sotto; test dorato col 97M).
+- Bug trovato ritmando: l'harness dorato etichettava «97M» una tabella
+  misurata con l'embedder del 311M su una cella 97M — il ramo vettoriale
+  non entrava mai (parafrasi 0.000 in ogni fusione). `report()` ora carica
+  il modello che misura.
+
+Taratura (recenza fuori dal ramo semantico, come v0.2). Vault dorato:
+
+| fusione | 97M parafrasi (15) | 97M fattuali (20) | 311M parafrasi | 311M fattuali |
+|---|---|---|---|---|
+| rrf | 0.867/0.569 | 1.000/0.837 | 0.867/0.532 | 1.000/0.838 |
+| mm-0.3 | 0.667/0.506 | 1.000/0.875 | 0.800/0.499 | 1.000/0.900 |
+| mm-0.5 | 0.933/0.594 | 1.000/0.900 | 1.000/0.591 | 1.000/0.900 |
+| **mm-0.7** | **0.933/0.667** | 1.000/0.875 | **1.000/0.691** | 1.000/0.875 |
+| th-0.3..0.7 | ≤0.867 | 1.000/≤0.900 | ≤0.867 | 1.000/≤0.900 |
+
+Benchmark (nuovo corpus, vedi P1.7): a 10k mm-0.3 porta fattuali a MRR
+1.000 e parafrasi 0.986; a 100k decide il default (criterio: **MRR medio
+pesato per numero di domande sulle quattro categorie del benchmark a
+100k**; a parità vince chi tiene le parafrasi, la ragione del ramo
+semantico). Tabella e scelta in «Chiusura».
+
+## P0.2 — `embed_pending` lineare
+
+`VectorTx::pending()` rileggeva per ogni lotto da 32 tutte le note
+(corpo compreso) e tutti i `note_vectors`, ricalcolando ogni hash:
+O(N²/32). Misure della sonda (sopra) prima della correzione: 2,7 s a
+10k, **279,2 s a 100k** (rapporto 103×).
+
+Ora: finestre posizionali per chiave (`WHERE id > ?last ORDER BY id LIMIT
+?take`, LEFT JOIN sul `note_hash` del blocco 0, hash solo per le righe
+della finestra); `remaining` contato una volta all'inizio e decrementato;
+le note toccate da altri processi durante la chiamata (ops con seq oltre
+il watermark) vengono ricontrollate e riprese dalla chiamata dopo (test:
+edit + nota nuova tra due chiamate → done 2, remaining 0); la copertura
+di `verify` è una query di conteggio; la promozione blu/verde riconta
+esatto solo a completamento. Test col contatore iniettato: la chiamata
+che incorpora 192 note legge ~128 righe in più di quella da 64 (le sue
+finestre), non 2×300.
+
+## P0.3 — ricerca mista a 100k, p95 ≤ 50 ms
+
+Profilo (sonda + `sample`): quattro cause + una quinta trovato rifacendo
+le misure. Prima/dopo, sonda a 100k (mediana di 3; «prima» = tag
+fase-v0.2):
+
+| voce | prima | dopo |
+|---|---|---|
+| `embed_pending` (P0.2) | 279,2 s | **1,4 s** (rapporto 100k/10k = 14) |
+| scansione int8 (`FlatI8::search`, m=200) | 8,61 ms | **1,37 ms** |
+| solo vettori p50/p95 | 17,4/17,8 ms | **4,0/4,2 ms** |
+| ibrido p50/p95 | 58,3/58,7 ms | **7,7/7,9 ms** |
+
+- **top_int** riscritta come chiesto (chunks_exact zip, inverso della
+  scala precalcolato, punteggi in Vec + `select_nth_unstable_by`):
+  8,61 → 1,37 ms (obiettivo ≤ 1,5; prototipo del prompt 0,72).
+- **PRAGMA** `cache_size` −65536 (64 MB) e `mmap_size` 256 MB
+  (best-effort): A/B a mano, il guadagno vero stava altrove (sotto);
+  tenuti perché il ricalcolo legge BLOB a pagina. Documentati in
+  `docs/architecture.md`.
+- **Termini onnipresenti fuori dalla MATCH**: frequenze documentali da
+  `fts5vocab` (vista `notes_fts_vocab` creata con lo schema, additiva
+  come `meta`). Scoperta da dichiarare: la fts5vocab di SQLite 3.54
+  restituisce **una riga per termine** con `doc` = frequenza documentale
+  e `cnt` = occorrenze totali (verificato a mano; le versioni precedenti
+  emettevano una riga per termine/documento — il primo `COUNT(*)` dava
+  sempre 1). Un termine esce solo se supera il 20% **e** almeno 1000
+  documenti, e solo se resta un termine che matcha: su una cella da 6
+  note ogni termine supera il 20% e il test temporale della v0.1 lo
+  dimostrava (rimosso il pavimento, falliva). Sul corpus del benchmark
+  nessun termine delle domande supera il 20% («lavor» e «abit» stanno al
+  6%: l'effetto su richiamo e MRR è nullo per costruzione, il vincolo
+  ≤ 0,01 è rispettato); sul corpus della sonda «lavora» è nel 100% delle
+  note e la regola lavora (le domande diventano selettive sul nome).
+- **Una lettura per candidato** (`read_candidates`): id in tabella
+  temporanea, una query per nota+body_norm+tags_text, filtri
+  status/type in SQL, validità bitemporale in `passes_filters` dove vive
+  la sua semantica. Candidati di testo, vettoriali (blocchi di 64) e
+  note del grafo, in entrambi i percorsi.
+- **Il piano SQL** (la quinta causa, trovata profilando dopo le prime
+  fix: `read_candidates` dominava in `sqlite3BtreeIndexMoveto`): il
+  planner rovesciava il join della tabella temporale contro il filtro di
+  stato — 100k probe per query. `CROSS JOIN` su lettura candidati e
+  ricalcolo f32 (come la camminata dal v0.1.1): ibrido 61 → 8 ms p50.
+  In più il dot del ricalcolo direttamente dai byte little-endian.
+
+Obiettivo §11 (ibrido p95 ≤ 50 ms a 100k con query già incorporata):
+**7,9 ms** con l'embedder finto; col 97M vero in «Chiusura». «Solo
+vettori ≤ 3 ms»: 4,0 ms — mancato di 1 ms (resta il ricalcolo f32 di 200
+candidati + la camminata; dichiarato).
+
+## P1.4 — copertura in `verify`
+
+Test CLI rosso prima (il JSON non aveva `coverage`). Ora: riga umana
+`copertura vettori: <model> [<stato>] <covered>/<living> note` e campo
+JSON `coverage: [{model, state, covered, living}]`. Semantica: presenza
+del vettore (la freschezza è affare di `embed_pending`, mai un errore di
+verifica).
+
+## P1.5 — modello predefinito
+
+Confronto rifatto dopo P0.1, benchmark 10k, parafrasi e inglese (il
+criterio del prompt: il 311M resta default solo se vince di ≥ 0,03 di
+MRR sulle parafrasi). La tabella qualità per modello esce dal benchmark
+rigenerato (patch alla stampa: una riga per variante, prima solo la
+prima per dimensione). Numeri e scelta in «Chiusura».
+
+## P1.6 — support: strong/weak
+
+`explain.support`: «weak» quando il significato da solo porta il
+risultato (nessuna conferma di testo **discriminativa**: un match che
+poggia solo su termini oltre il 20% del corpus — il nome del soggetto in
+un vault su di lui — non conferma nulla) **e** il margine di coseno sul
+candidato vettoriale successivo è sotto `Semantic::weak_margin`
+(default tarato 0,03). MCP: la descrizione di `memory_search` spiega che
+weak vuol dire «vicino per significato, non confermato dal testo:
+verifica prima di affermare»; CLI `--strict` toglie i weak.
+
+Taratura (97M, margini in ordine di coseno): i vincitori parafrasi
+coprono 0,000–0,024, i vertici delle astensioni 0,000–0,024, e si
+intersecano — «che auto guida Giulia» a 0,0239, il vincitore di «quali
+cibi la donna digerisce male?» a 0,0244. A 0,03 le due domande nominate
+escono vuote in `--strict` (test), ma 10/15 vincitori parafrasi cadono:
+il bound ≤ 1 del prompt non è raggiungibile con questo segnale, come non
+lo era la soglia assoluta — curve nel dettaglio qui sopra, `--strict`
+ resta opt-in. L'etichetta non cambia la ricerca.
+
+## P1.7 — il multi-salto misura
+
+Diagnosi (`engramma-bench --multihop-debug`, 5 domande): la nota attesa
+era ASSENTE dai primi ~70-100. Catena di cause, ciascuna corretta:
+
+1. **il taglio degli extra era una lotteria per id** (BTreeMap →
+   take(40)): tra migliaia di extra teneva i 40 con id più basso;
+2. **gli hub allagavano la camminata**: l'azienda citata da ogni nota
+   trascinava dentro i colleghi (5425 extra misurati a 10k per una
+   domanda). Ora il punteggio ereditato è smorzato per grado
+   (score/(1+ln(1+grado))) e il taglio è per punteggio;
+3. **il generatore**: partner asimmetrici (la nota della partner non
+   nomina la persona: nessun testo la trovava) e ~26 riempitivi a persona
+   col nome nel titolo che intasavano i 50 candidati BM25; le note
+   persona datate 2024-01 affogavano nella recenza. Partner reciproci,
+   titoli dei riempitivi senza nome, note persona pagine vive;
+4. **frasi bigramma nella MATCH** («anna ross»): la nota della partner
+   («Partner di [[Anna Rossi]]») matcha con precisione, non tutto ciò che
+   si chiama Anna.
+
+Prima/dopo (benchmark 10k, ric/MRR): 0.000/0.000 in ogni modalità →
+testo **1.000/0.722**, mm-0.3 1.000/0.333, rrf 0.389/0.095; a 100k in
+«Chiusura». Le altre categorie non calano (stessa tabella).
+
+## Chiusura
+
+{{CHIUSURA}}

@@ -783,6 +783,18 @@ fn multihop_debug(target: usize, how_many: usize, dir: &std::path::Path) {
         cell.put_note(note, "bench").expect(/* valid */ "put");
     }
     let now = OffsetDateTime::from_unix_timestamp(1_810_000_000).expect(/* fixed */ "ts");
+    // document frequencies of the corpus's most query-visible stems
+    let dfs = cell
+        .debug_column(
+            "SELECT term || '=' || doc FROM notes_fts_vocab WHERE term IN \
+             ('lavor','lavorav','abit','abitav','partner','citt','resid','mang','viv') \
+             ORDER BY doc DESC",
+        )
+        .unwrap_or_default();
+    let total = cell
+        .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes WHERE status != 'deleted'")
+        .unwrap_or_default();
+    println!("df total={total:?} {dfs:?}");
     for (qi, q) in corpus
         .questions
         .iter()
@@ -1334,19 +1346,15 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
                 sr.hybrid_cold_p95_ms,
             ));
         }
-        // per-mode quality (first semantic report per size)
+        // per-mode quality: one block per variant+size (the model matters
+        // as much as the fusion — the v0.2.1 model choice needed both)
         out.push_str(
             "\nRichiamo@5 / MRR per modalità e categoria (domande generatrici, mediana dei giri):\n\n\
-             | note | modalità | fattuali | parafrasi | multi-salto | inglese |\n\
-             |---|---|---|---|---|---|\n",
+             | corpus | note | modalità | fattuali | parafrasi | multi-salto | inglese |\n\
+             |---|---|---|---|---|---|---|\n",
         );
-        let mut seen_sizes: Vec<usize> = Vec::new();
         for r in reports {
             let Some(sr) = &r.semantic else { continue };
-            if seen_sizes.contains(&r.notes) {
-                continue;
-            }
-            seen_sizes.push(r.notes);
             let modes = [
                 "testo", "vettori", "rrf", "mm-0.3", "mm-0.5", "mm-0.7", "th-0.3", "th-0.5",
                 "th-0.7",
@@ -1363,7 +1371,8 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
                     cells.push(cell);
                 }
                 out.push_str(&format!(
-                    "| {} | {} | {} |\n",
+                    "| {} | {} | {} | {} |\n",
+                    r.variant,
                     r.notes,
                     m,
                     cells.join(" | ")

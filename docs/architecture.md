@@ -123,7 +123,16 @@ latency to four causes. The fixes:
   `status`/`type` filters in SQL; the bitemporal validity, tags, scope and
   confidence stay in `passes_filters`, where their semantics live. Text
   candidates, vector candidates (chunks of 64) and graph-discovered notes
-  all go through it.
+  all go through it. The temp-table JOINs (here and in the f32
+  recomputation) are pinned with `CROSS JOIN` like the graph walk: without
+  it the planner drove from the status filter and probed the temp table
+  once per active note — 100k probes per query, found profiling the probe.
+- **Extras by score, hubs damped** (found measuring the multi-hop
+  questions): an entity mentioned by hundreds of notes dragged its whole
+  neighbourhood into the graph extras — thousands of "colleague" notes —
+  and the cut kept the first 40 by id, a lottery. The inherited extra
+  score is now divided by `1 + ln(1 + degree)` of the frontier entity, and
+  the cut keeps the strongest 40 by that score.
 
 ## A write
 

@@ -820,7 +820,7 @@ impl Cell {
             let raw = (bm25 / max_bm25)
                 * coverage
                 * q.weights.confidence(row.note.confidence)
-                * recency_of(now, &row.note, q.weights.recency_half_life_days);
+                * recency_factor(q, now, &row.note);
             hits.push(Hit {
                 explain: Explain {
                     matched_terms: matched,
@@ -870,7 +870,7 @@ impl Cell {
             let raw = GRAPH_FLOOR.max(seed)
                 * coverage
                 * q.weights.confidence(row.note.confidence)
-                * recency_of(now, &row.note, q.weights.recency_half_life_days)
+                * recency_factor(q, now, &row.note)
                 * w_graph;
             hits.push(Hit {
                 explain: Explain {
@@ -1965,9 +1965,12 @@ fn edge_visible(edge: &str, en: &str, include_quarantined: bool) -> String {
     }
 }
 
-/// Bounded, deterministic walk: a hub entity (a city mentioned by hundreds of
-/// notes) would otherwise drag its whole neighbourhood in.
-const WALK_LIMIT: u64 = 5000; // TEMP2
+/// Bounded, deterministic walk. v0.2.1: 5000 edges per level (was 400) —
+/// with the extras hub-damped and cut by score, a wider walk finds the
+/// specific chains (partner → employer) that the old 400-edge id-order
+/// window could cut by lottery; the flood it lets in is damped away
+/// (measured: the multi-hop questions, P1.7).
+const WALK_LIMIT: u64 = 5_000;
 
 /// Load the edges that touch the frontier (either endpoint), restricted to
 /// `rels` when non-empty, in edge-id order with at most `limit` rows.
@@ -2054,6 +2057,21 @@ fn edges_touching_frontier(
 fn recency_of(now: OffsetDateTime, note: &Note, half_life_days: f64) -> f64 {
     let age_days = (now - note.updated_at.get()).whole_seconds() as f64 / 86_400.0;
     0.5_f64.powf(age_days / half_life_days.max(1.0))
+}
+
+/// v0.2.1: for a bitemporal (`as_of`) question the wall-clock recency says
+/// nothing — a page refreshed today can carry the truth of 2022, and
+/// measuring its age against either `as_of` (negative: a boost) or today
+/// (a fresh page wins) is wrong in both directions (measured at 100k:
+/// today's freshness put fresh name-matching person pages above the 2024
+/// note that WAS the 2022 truth — fattuali 0,899 → 0,717). No recency
+/// there: bm25, coverage, confidence and the graph decide.
+fn recency_factor(q: &Query, now: OffsetDateTime, note: &Note) -> f64 {
+    if q.filters.as_of.is_some() {
+        1.0
+    } else {
+        recency_of(now, note, q.weights.recency_half_life_days)
+    }
 }
 
 /// Graph expansion (§6.3.3): from the seed notes (already filtered by the
