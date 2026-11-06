@@ -985,6 +985,8 @@ struct RunReport {
     mrr: f64,
     questions: usize,
     file_bytes: u64,
+    bytes_after_compact: u64,
+    compacted_ops: i64,
     // v0.2 semantic metrics (None when no embedder ran)
     semantic: Option<SemanticReport>,
 }
@@ -997,6 +999,13 @@ struct SemanticReport {
     embed_notes_per_s: f64,
     index_build_ms: f64,
     index_mem_mb: f64,
+    graph_build_ms: f64,
+    graph_nodes: usize,
+    graph_edges: usize,
+    graph_mem_mb: f64,
+    graph_pushed_edges: f64,
+    text_hops_p50_ms: f64,
+    text_hops_p95_ms: f64,
     vector_p50_ms: f64,
     vector_p95_ms: f64,
     hybrid_warm_p50_ms: f64,
@@ -1041,10 +1050,13 @@ fn run_semantic(
     }
     let open_ms = open_times.iter().sum::<f64>() / open_times.len() as f64;
 
-    // search — full pipeline, and text-only (graph_hops = 0) for profiling
+    // search — full pipeline, text-only (graph_hops = 0) and text+graph
+    // (hops = 2, the §11 "ricerca testo+grafo" row: the PPR replaced the
+    // per-level SQL walk)
     let now =
         OffsetDateTime::from_unix_timestamp(1_810_000_000).expect(/* fixed valid ts */ "ts");
     let mut text_only: Vec<f64> = Vec::new();
+    let mut text_hops: Vec<f64> = Vec::new();
     for q in &corpus.questions {
         if q.expect_ids.is_empty() {
             continue;
@@ -1057,7 +1069,17 @@ fn run_semantic(
         let t = Instant::now();
         let _ = cell.search_with_now(&query, now);
         text_only.push(t.elapsed().as_secs_f64() * 1000.0);
+        let mut query = Query::text(&q.text).k(5).graph_hops(2);
+        query.lang = Some(Lang::It);
+        if let Some(a) = q.as_of {
+            query.filters.as_of = Some(a);
+        }
+        let t = Instant::now();
+        let _ = cell.search_with_now(&query, now);
+        text_hops.push(t.elapsed().as_secs_f64() * 1000.0);
     }
+    let text_hops_p50_ms = percentile(text_hops.clone(), 0.5);
+    let text_hops_p95_ms = percentile(text_hops.clone(), 0.95);
     let mut latencies: Vec<f64> = Vec::new();
     let mut hits_at_5 = 0_usize;
     let mut mrr_sum = 0.0;
@@ -1093,6 +1115,13 @@ fn run_semantic(
         let model = embedder.model_id().to_string();
         cell.add_model(&model, embedder.dim())
             .expect(/* bench embedder is valid */ "add model");
+        // v0.3: true-warm — the LRU holds every question of the corpus, the
+        // "warm" passes re-embed nothing (the v0.2.1 256-slot cache did)
+        cell.set_query_cache_capacity(corpus.questions.len().max(1))
+            .expect(/* bench cell is open */ "lru");
+        // the graph index, built and measured on its own
+        let (graph_build_ms, (graph_nodes, graph_edges, graph_bytes)) =
+            cell.build_graph().expect(/* bench cell is open */ "graph");
         // embedding throughput: batched, threads (the embedder decides)
         let t0 = Instant::now();
         let mut total_done = 0_usize;
@@ -1145,14 +1174,17 @@ fn run_semantic(
         }
         // warm pass: same queries again — pure search, cache hits
         let mut warm: Vec<f64> = Vec::new();
+        let mut pushed: Vec<usize> = Vec::new();
         for q in &corpus.questions {
             if q.expect_ids.is_empty() {
                 continue;
             }
             let t = Instant::now();
-            let _ = cell.search_semantic_with_now(&mk_query(q), now, &sem);
+            let outcome = cell.search_semantic_with_now(&mk_query(q), now, &sem);
             warm.push(t.elapsed().as_secs_f64() * 1000.0);
+            pushed.push(outcome.map(|o| o.graph_pushed_edges).unwrap_or(0));
         }
+        let graph_pushed_edges = pushed.iter().sum::<usize>() as f64 / pushed.len().max(1) as f64;
         // pure vector mode latencies (warm)
         let sem_vec = sem.clone().with_mode(Mode::Vector);
         let mut vlat: Vec<f64> = Vec::new();
@@ -1233,16 +1265,12 @@ fn run_semantic(
                 }
             };
         score_mode("testo", 't', None, None);
-        // text mode with the graph list off/on (what the third list costs and
-        // buys where no vector can help)
+        // text mode with the graph list off: what the third list buys where
+        // no vector can help
         score_mode("testo-g0", 't', None, Some(0.0));
         score_mode("vettori", 'v', None, None);
         score_mode("rrf", 'h', Some(Fusion::Rrf { k: 60 }), None);
-        // v0.3: the graph-weight sweep on the default fusion (and text mode)
-        for gw in [0.15_f64, 0.2, 0.25, 0.35] {
-            let tag = format!("testo-g{gw:.2}");
-            score_mode(&tag, 't', None, Some(gw));
-        }
+        score_mode("rrf-g0.40", 'h', Some(Fusion::Rrf { k: 60 }), Some(0.4));
         let convex = |alpha: f64, norm: engramma_core::CosNorm| {
             Some(Fusion::Convex {
                 alpha,
@@ -1267,7 +1295,8 @@ fn run_semantic(
             convex(0.7, engramma_core::CosNorm::Candidates),
             None,
         );
-        for gw in [0.15_f64, 0.2, 0.25, 0.3, 0.4] {
+        // the tuning references (the full sweep is in REPORT §v0.3)
+        for gw in [0.25_f64, 0.40] {
             let tag = format!("mm-0.7-g{gw:.2}");
             score_mode(
                 &tag,
@@ -1275,10 +1304,6 @@ fn run_semantic(
                 convex(0.7, engramma_core::CosNorm::Candidates),
                 Some(gw),
             );
-        }
-        for gw in [0.2_f64, 0.3] {
-            let tag = format!("rrf-g{gw:.2}");
-            score_mode(&tag, 'h', Some(Fusion::Rrf { k: 60 }), Some(gw));
         }
         score_mode(
             "th-0.3",
@@ -1304,6 +1329,13 @@ fn run_semantic(
             embed_notes_per_s,
             index_build_ms,
             index_mem_mb,
+            graph_build_ms,
+            graph_nodes,
+            graph_edges,
+            graph_mem_mb: graph_bytes as f64 / 1e6,
+            graph_pushed_edges,
+            text_hops_p50_ms,
+            text_hops_p95_ms,
             vector_p50_ms: percentile(vlat.clone(), 0.5),
             vector_p95_ms: percentile(vlat.clone(), 0.95),
             hybrid_warm_p50_ms: percentile(warm.clone(), 0.5),
@@ -1314,12 +1346,27 @@ fn run_semantic(
         }
     });
 
-    // file size (checkpoint the WAL first, like a rest after a bulk load)
+    // file size (checkpoint the WAL first, like a rest after a bulk load),
+    // then again after a compaction (v0.3): the payloads up to head-1000 go
     cell.checkpoint()
         .expect(/* single bench writer */ "checkpoint");
-    drop(cell);
     let file_bytes = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    let head: i64 = cell
+        .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
+        .ok()
+        .and_then(|v| v.first().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    let compacted_ops = (head - 1000).max(0);
+    if compacted_ops >= 1 {
+        let _ = cell.compact(compacted_ops);
+        cell.checkpoint()
+            .expect(/* single bench writer */ "checkpoint");
+    }
+    let bytes_after_compact = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    drop(cell);
     let _ = std::fs::remove_file(&db);
+    let snap = db.with_extension(format!("snap-{head}.sqlite"));
+    let _ = std::fs::remove_file(snap);
 
     RunReport {
         variant: if uniform_updated_at {
@@ -1345,6 +1392,8 @@ fn run_semantic(
         },
         questions: answered,
         file_bytes,
+        bytes_after_compact,
+        compacted_ops,
         semantic,
     }
 }
@@ -1360,6 +1409,12 @@ fn median_report(variant: &'static str, runs: &[RunReport]) -> RunReport {
     RunReport {
         variant,
         notes: runs[0].notes,
+        bytes_after_compact: runs
+            .iter()
+            .map(|r| r.bytes_after_compact)
+            .max()
+            .unwrap_or(0),
+        compacted_ops: runs[0].compacted_ops,
         insert_notes_per_s: pick(|r| r.insert_notes_per_s),
         open_ms: pick(|r| r.open_ms),
         search_p50_ms: pick(|r| r.search_p50_ms),
@@ -1393,6 +1448,13 @@ fn median_semantic(runs: &[RunReport]) -> Option<SemanticReport> {
         hybrid_warm_p95_ms: pick(|r| r.hybrid_warm_p95_ms),
         hybrid_cold_p50_ms: pick(|r| r.hybrid_cold_p50_ms),
         hybrid_cold_p95_ms: pick(|r| r.hybrid_cold_p95_ms),
+        graph_build_ms: pick(|r| r.graph_build_ms),
+        graph_nodes: with_sem[0].graph_nodes,
+        graph_edges: with_sem[0].graph_edges,
+        graph_mem_mb: pick(|r| r.graph_mem_mb),
+        graph_pushed_edges: pick(|r| r.graph_pushed_edges),
+        text_hops_p50_ms: pick(|r| r.text_hops_p50_ms),
+        text_hops_p95_ms: pick(|r| r.text_hops_p95_ms),
         quality: base.quality,
     })
 }
@@ -1402,12 +1464,17 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
         "# Benchmark Engramma v0.2\n\nGenerato da `engramma-bench` (seme fisso, corpus sintetico italiano; macchina: vedi REPORT.md). \
          Ogni riga è la **mediana di {runs} giri**. Le righe `sem-*` misurano il ramo vettoriale (corpus vivo). \
          Obiettivi del §11 del documento di progetto in fondo.\n\n\
-         | corpus | note | inserimento (note/s) | apertura cella (ms) | ricerca p50 (ms) | ricerca p95 (ms) | solo testo p50 (ms) | richiamo@5 | MRR | domande | file (MB) |\n\
-         |---|---|---|---|---|---|---|---|---|---|---|\n"
+         | corpus | note | inserimento (note/s) | apertura cella (ms) | ricerca p50 (ms) | ricerca p95 (ms) | solo testo p50 (ms) | testo+grafo p50 (ms) | testo+grafo p95 (ms) | richiamo@5 | MRR | domande | file (MB) | dopo compattazione (MB) |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
     );
     for r in reports {
+        let (tp50, tp95) = r
+            .semantic
+            .as_ref()
+            .map(|s| (s.text_hops_p50_ms, s.text_hops_p95_ms))
+            .unwrap_or((0.0, 0.0));
         out.push_str(&format!(
-            "| {} | {} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.3} | {:.3} | {} | {:.1} |\n",
+            "| {} | {} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.3} | {:.3} | {} | {:.1} | {:.1} |\n",
             r.variant,
             r.notes,
             r.insert_notes_per_s,
@@ -1415,29 +1482,37 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
             r.search_p50_ms,
             r.search_p95_ms,
             r.text_only_p50_ms,
+            tp50,
+            tp95,
             r.recall_at_5,
             r.mrr,
             r.questions,
             r.file_bytes as f64 / 1e6,
+            r.bytes_after_compact as f64 / 1e6,
         ));
     }
     // semantic table
     let sem: Vec<&SemanticReport> = reports.iter().filter_map(|r| r.semantic.as_ref()).collect();
     if !sem.is_empty() {
         out.push_str(
-            "\n## Ramo vettoriale (v0.2)\n\n\
-             | modello | note | embedding (note/s) | costruzione indice (ms) | memoria indice (MB) | vettori p50 (ms) | vettori p95 (ms) | ibrido caldo p50 (ms) | ibrido caldo p95 (ms) | ibrido con embedding p50 (ms) | ibrido con embedding p95 (ms) |\n\
-             |---|---|---|---|---|---|---|---|---|---|---|\n",
+            "\n## Ramo vettoriale (v0.2) e grafo in memoria (v0.3)\n\n\
+             | modello | note | embedding (note/s) | costruzione indice (ms) | memoria indice (MB) | GraphIndex (ms) | nodi | archi | memoria grafo (MB) | archi spinti/domanda | vettori p50 (ms) | vettori p95 (ms) | ibrido caldo p50 (ms) | ibrido caldo p95 (ms) | ibrido con embedding p50 (ms) | ibrido con embedding p95 (ms) |\n\
+             |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
         );
         for r in reports {
             let Some(sr) = &r.semantic else { continue };
             out.push_str(&format!(
-                "| {} | {} | {:.0} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |\n",
+                "| {} | {} | {:.0} | {:.0} | {:.1} | {:.0} | {} | {} | {:.1} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |\n",
                 sr.model,
                 r.notes,
                 sr.embed_notes_per_s,
                 sr.index_build_ms,
                 sr.index_mem_mb,
+                sr.graph_build_ms,
+                sr.graph_nodes,
+                sr.graph_edges,
+                sr.graph_mem_mb,
+                sr.graph_pushed_edges,
                 sr.vector_p50_ms,
                 sr.vector_p95_ms,
                 sr.hybrid_warm_p50_ms,
@@ -1501,7 +1576,8 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
     }
     out.push_str(
         "\nDue varianti per dimensione: **viva** — i fatti correnti hanno `updated_at` recente (ottobre 2026, come una memoria viva) e i riempitivi datano 2025, quindi il peso di recenza lavora; **uniform** — lo stesso `updated_at` per ogni nota, così il ranking è solo testo+grafo (quanto del richiamo dipendeva dalla recenza si vede dal confronto). \
-         Nota: l'inserimento è una `put_note` per nota (una transazione ciascuna, fsync in WAL/NORMAL). La ricerca è testo+grafo (2 passi, come le domande multi-salto) con 5 risultati. Richiamo@5 e MRR sulle domande generatrici. \
+         Nota: l'inserimento è una `put_note` per nota (una transazione ciascuna, fsync in WAL/NORMAL). La ricerca è testo+grafo (2 passi, come le domande multi-salto) con 5 risultati; «testo+grafo» è la stessa modalità testo con i salti accesi (il PPR ha sostituito la camminata SQL). Richiamo@5 e MRR sulle domande generatrici. \
+         «Ibrido caldo»: la LRU delle domande tiene tutto il corpus (capacità = numero di domande), niente re-incorporazioni. «Dopo compattazione»: payload dimenticati fino a 1000 operazioni dalla fine (v0.3). \
          La varianza tra giri è riportata in REPORT.md (il primo giro a freddo è sempre il più lento: il file nasce e cresce).\n",
     );
     out
