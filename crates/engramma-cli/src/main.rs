@@ -87,6 +87,17 @@ enum Command {
     Rm { id: String },
     /// Promote a quarantined note to active
     Confirm { id: String },
+    /// Right to be forgotten: the note, its versions, its edges and the
+    /// payloads of its operations go, for good (v0.3)
+    Purge {
+        id: String,
+        /// Why (kept in the log; never the content)
+        #[arg(long)]
+        reason: String,
+        /// Skip the interactive confirmation (for scripts)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Close a note and replace it with a new one from a file
     Supersede {
         /// Note to close (id or prefix)
@@ -519,6 +530,46 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             report_ok(cli, "confermata", &id.to_string());
             Ok(())
         }
+        Command::Purge { id, reason, yes } => {
+            let cell = open_cell(cli)?;
+            let note_id = cell.resolve_note_id(id)?;
+            let note = cell.get(&note_id)?;
+            if !*yes {
+                println!(
+                    "stai per purgare «{}» ({}) IRREVERSIBILMENTE:",
+                    note.display_title(),
+                    engramma_core::id::id8(&note_id)
+                );
+                println!("  la nota, le sue versioni, gli archi che dichiara, i vettori");
+                println!("  e i payload delle sue operazioni spariranno dal registro.");
+                println!(
+                    "Le esportazioni fatte prima di ora restano fuori dal controllo del motore."
+                );
+                print!("procedo? [s/N] ");
+                use std::io::Write as _;
+                std::io::stdout().flush().ok();
+                let mut answer = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut answer)
+                    .map_err(|e| CliError::internal(format!("stdin: {e}")))?;
+                if !answer.trim().eq_ignore_ascii_case("s") {
+                    if !cli.json {
+                        println!("annullato");
+                    }
+                    return Ok(());
+                }
+            }
+            let forgotten = cell.purge(&note_id, reason, "cli-user")?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "purged": note_id.to_string(),
+                    "forgotten_payloads": forgotten,
+                }));
+            } else {
+                println!("purgata: {} ({} payload dimenticati)", note_id, forgotten);
+            }
+            Ok(())
+        }
         Command::Supersede {
             old,
             file,
@@ -623,6 +674,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     hits,
                     embed_ms: 0.0,
                     search_ms: 0.0,
+                    graph_pushed_edges: 0,
                 }
             } else {
                 let e = embedder
@@ -651,6 +703,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "mode": chosen,
                     "embed_ms": outcome.embed_ms,
                     "search_ms": outcome.search_ms,
+                    "graph_pushed_edges": outcome.graph_pushed_edges,
                     "hits": arr,
                 }));
             } else {
