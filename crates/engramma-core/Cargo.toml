@@ -19,6 +19,7 @@ regex.workspace = true
 time.workspace = true
 thiserror.workspace = true
 
+tempfile.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
-tempfile.workspace = true

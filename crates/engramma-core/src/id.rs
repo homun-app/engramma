@@ -75,6 +75,21 @@ pub fn node_id() -> &'static str {
     })
 }
 
+/// A fresh 16-byte salt for the payload digest of a new operation (log v2).
+/// Two random ULIDs hashed together: 160 fresh random bits, none of them
+/// timing-derived, regenerated per operation like the op id itself.
+///
+/// # Errors
+/// See [`Ids::next`].
+pub fn random_salt() -> Result<[u8; 16], crate::error::CellError> {
+    let a = shared().next()?;
+    let b = shared().next()?;
+    let h = blake3::hash(format!("{a}{b}").as_bytes());
+    let mut out = [0_u8; 16];
+    out.copy_from_slice(&h.as_bytes()[..16]);
+    Ok(out)
+}
+
 /// The last 8 characters of a ULID (its random part), used wherever a short
 /// id is shown: the first 8 are the timestamp and collide in bulk imports
 /// (every ULID minted within ~256 ms shares them).
