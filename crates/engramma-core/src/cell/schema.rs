@@ -126,6 +126,15 @@ pub fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellE
             )?;
         }
     }
+    // v0.2.1 (P0.3): per-term document frequency of the text index, read by
+    // the search to drop ubiquitous terms from the FTS MATCH. A derived view
+    // over `notes_fts` (never part of `ops`, the replay comparison or the
+    // export); created unversioned like `meta` — idempotent and additive, so
+    // existing cells gain it on their next open. It must follow the
+    // migrations: on a fresh cell `notes_fts` only exists after v1.
+    tx.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts_vocab USING fts5vocab(notes_fts, 'row');",
+    )?;
     Ok(())
 }
 

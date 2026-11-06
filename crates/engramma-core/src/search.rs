@@ -392,6 +392,228 @@ pub fn rrf_fuse(lists: &[Vec<String>], k: u64) -> BTreeMap<String, f64> {
     out
 }
 
+/// Terms matching more than this fraction of the corpus leave the FTS MATCH
+/// (see [`match_expr_for`]).
+const FREQUENT_TERM_FRACTION: f64 = 0.20;
+/// …and only when they match at least this many documents. Below it the
+/// bm25 pass is not a cost problem, and dropping would distort small
+/// corpora: on a 60-note vault a term in a third of the notes is signal,
+/// not filler (found while re-running the golden tests, v0.2.1).
+const FREQUENT_TERM_MIN_DOCS: i64 = 1_000;
+
+/// The MATCH expression over `terms`: quoted stems joined by OR, plus a
+/// phrase of the adjacent stems when there are at least two.
+fn or_match_expr(terms: &[String]) -> String {
+    let mut expr = terms
+        .iter()
+        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    if terms.len() >= 2 {
+        let phrase = terms
+            .iter()
+            .map(|t| t.replace('"', ""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        expr = format!("{expr} OR \"{phrase}\"");
+    }
+    expr
+}
+
+/// The MATCH expression for the text side, minus the ubiquitous terms
+/// (v0.2.1, P0.3): FTS5 evaluates `bm25()` for **every** row a term matches
+/// before the `LIMIT`, so one term present in a fifth of the notes (a filler
+/// verb like «lavora» in a work-heavy corpus) paid a full-corpus ranking
+/// pass. Document frequencies come from the index's own vocabulary
+/// (`fts5vocab`, created with the schema); a term is dropped only while at
+/// least one other term stays in the MATCH. Dropped terms still count in
+/// the explain's found terms and in the coverage factor.
+fn match_expr_for(conn: &rusqlite::Connection, terms: &[String]) -> Result<String, SearchError> {
+    if terms.len() < 2 {
+        return Ok(or_match_expr(terms));
+    }
+    let total: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE status != 'deleted'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if total == 0 {
+        return Ok(or_match_expr(terms));
+    }
+    let threshold = FREQUENT_TERM_FRACTION * total as f64;
+    // SQLite 3.54's fts5vocab yields ONE row per term: (term, doc, cnt)
+    // where `doc` is the document frequency and `cnt` the total occurrences
+    // — exactly the number needed here (probed by hand on the bundled
+    // 3.54.1; older fts5vocab emitted one row per term/document pair).
+    let placeholders = vec!["?"; terms.len()].join(", ");
+    let sql = format!("SELECT term, doc FROM notes_fts_vocab WHERE term IN ({placeholders})");
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        // no vocabulary view (should not happen: the schema creates it)
+        return Ok(or_match_expr(terms));
+    };
+    let params: Vec<String> = terms.to_vec();
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })
+        .map_err(SearchError::from)?;
+    let mut df: HashMap<String, i64> = HashMap::with_capacity(terms.len());
+    for row in rows {
+        let (term, doc_freq) = row?;
+        df.insert(term, doc_freq);
+    }
+    drop(stmt);
+    let df_of = |t: &String| df.get(t.as_str()).copied().unwrap_or(0);
+    let frequent = |t: &String| df_of(t) >= FREQUENT_TERM_MIN_DOCS && df_of(t) as f64 > threshold;
+    // a frequent term can leave only while a term that MATCHES something
+    // stays behind: a MATCH made only of zero-frequency terms would find
+    // nothing. When every matching term is frequent they all stay — the
+    // query is inherently broad, and the old (costly) behaviour is honest.
+    let matching = terms.iter().filter(|t| df_of(t) > 0).count();
+    let kept: Vec<String> = if matching >= 2 {
+        let kept: Vec<String> = terms.iter().filter(|t| !frequent(t)).cloned().collect();
+        if kept.iter().any(|t| df_of(t) > 0) {
+            kept
+        } else {
+            terms.to_vec()
+        }
+    } else {
+        terms.to_vec()
+    };
+    Ok(or_match_expr(&kept))
+}
+
+/// The BM25 candidate list for a MATCH expression: `(id, -bm25)` (FTS5's
+/// bm25() is negative, more negative = better), at most `limit`.
+fn bm25_candidates(
+    conn: &rusqlite::Connection,
+    match_expr: &str,
+    limit: u64,
+) -> Result<Vec<(String, f64)>, SearchError> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare(
+        "SELECT n.id, bm25(notes_fts, 10.0, 3.0, 2.0) FROM notes_fts
+         JOIN notes n ON n.rowid = notes_fts.rowid
+         WHERE notes_fts MATCH ?1
+         ORDER BY bm25(notes_fts, 10.0, 3.0, 2.0) LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![match_expr, limit], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, bm25) = row?;
+        out.push((id, -bm25));
+    }
+    Ok(out)
+}
+
+/// One candidate note with the columns the rerank needs: the parsed note
+/// plus `body_norm`/`tags_text` for the coverage factor.
+struct CandRow {
+    note: Note,
+    body_norm: String,
+    tags_text: String,
+}
+
+/// Read many candidate notes in **one** query (v0.2.1, P0.3): the ids land
+/// in a temp table and a single JOIN returns the note, its body and the
+/// coverage columns — the v0.1 flow paid two queries and a JSON parse per
+/// candidate, plus one more per coverage term set. Filters SQL can express
+/// (`status`, `type`) ride the JOIN; bitemporal validity, tags, scope and
+/// confidence stay in `passes_filters`, where their semantics live.
+fn read_candidates(
+    conn: &rusqlite::Connection,
+    ids: &[String],
+    include_quarantined: bool,
+    types: &[NoteType],
+) -> Result<HashMap<String, CandRow>, SearchError> {
+    let mut out: HashMap<String, CandRow> = HashMap::with_capacity(ids.len());
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS cand (id TEXT PRIMARY KEY) WITHOUT ROWID;",
+    )?;
+    conn.execute("DELETE FROM cand", [])?;
+    {
+        let mut ins = conn.prepare("INSERT OR IGNORE INTO cand (id) VALUES (?1)")?;
+        for id in ids {
+            ins.execute([id])?;
+        }
+    }
+    let statuses = if include_quarantined {
+        "('active', 'superseded', 'quarantined')"
+    } else {
+        "('active', 'superseded')"
+    };
+    // `type` values come from our own enum, never from caller text.
+    let types_list = types
+        .iter()
+        .map(|t| format!("'{}'", t.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let type_clause = if types.is_empty() {
+        String::new()
+    } else {
+        format!(" AND n.type IN ({types_list})")
+    };
+    let sql = format!(
+        "SELECT n.id, n.frontmatter_json, n.body, n.body_norm, n.tags_text
+         FROM cand c JOIN notes n ON n.id = c.id
+         WHERE n.status IN {statuses}{type_clause}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, fm, body, body_norm, tags_text) = row?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&fm)
+            .map_err(|e| SearchError::Db(e.to_string()))
+            .and_then(|v| Note::from_json(&v).map_err(|e| SearchError::Db(e.to_string())));
+        if let Ok(mut note) = parsed {
+            note.body = body;
+            out.insert(
+                id,
+                CandRow {
+                    note,
+                    body_norm,
+                    tags_text,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// Query terms found in a note's indexed text and tags, with the coverage
+/// factor (1.0 every term matches, 0.5 none does) — pure: the columns come
+/// from [`read_candidates`].
+fn coverage_of(body_norm: &str, tags_text: &str, terms: &[String]) -> (Vec<String>, f64) {
+    let words: BTreeSet<&str> = body_norm.split(' ').filter(|w| !w.is_empty()).collect();
+    let tag_words: BTreeSet<&str> = tags_text.split(' ').filter(|w| !w.is_empty()).collect();
+    let matched: Vec<String> = terms
+        .iter()
+        .filter(|t| words.contains(t.as_str()) || tag_words.contains(t.as_str()))
+        .cloned()
+        .collect();
+    let coverage = if terms.is_empty() {
+        1.0
+    } else {
+        0.5 + 0.5 * (matched.len() as f64 / terms.len() as f64)
+    };
+    (matched, coverage)
+}
+
 /// Base score for graph-discovered notes (below any real text match, above
 /// nothing: multi-hop answers with no shared terms still rank).
 const GRAPH_FLOOR: f64 = 0.05;
@@ -444,60 +666,46 @@ impl Cell {
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
         let conn = &inner.conn;
 
-        // 1. BM25 candidates (up to 50).
+        // 1. BM25 candidates (up to 50), with the ubiquitous terms out of
+        // the MATCH (they still count for coverage below).
         let terms = text::query_terms(&q.text, q.lang);
         if terms.is_empty() {
             return Err(SearchError::Invalid("query has no usable terms".into()));
         }
-        let match_expr = terms
-            .iter()
-            .map(|t| format!("\"{}\"", t.replace('"', "")))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        // A phrase for adjacent stem pairs ("bianca bianchi" collapses to one
-        // stem; the phrase still rewards the notes where the two words are
-        // next to each other, i.e. the actual namesake).
-        let phrase = terms
-            .iter()
-            .map(|t| t.replace('"', ""))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let match_expr = if terms.len() >= 2 {
-            format!("{match_expr} OR \"{phrase}\"")
-        } else {
-            match_expr
-        };
-        // Column weights: the title says what a note is about; the body is
-        // longer and noisier; tags are short but precise.
-        let mut stmt = conn.prepare(
-            "SELECT n.id, bm25(notes_fts, 10.0, 3.0, 2.0) FROM notes_fts
-             JOIN notes n ON n.rowid = notes_fts.rowid
-             WHERE notes_fts MATCH ?1
-             ORDER BY bm25(notes_fts, 10.0, 3.0, 2.0) LIMIT 50",
-        )?;
-        let rows = stmt.query_map([&match_expr], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-        })?;
-        let mut text_hits: Vec<(String, f64)> = Vec::new();
-        for row in rows {
-            let (id, bm25) = row?;
-            // FTS5 bm25(): negative, more negative = better.
-            text_hits.push((id, -bm25));
-        }
-        drop(stmt);
+        let match_expr = match_expr_for(conn, &terms)?;
+        let text_hits = bm25_candidates(conn, &match_expr, 50)?;
 
         // 2. Filters come BEFORE the graph expansion: only candidates that
         // pass them (status, quarantine, superseded, `as_of`) can seed the
-        // walk — a quarantined note must not guide the search (§5).
-        let mut text_candidates: Vec<(String, f64, usize, Note)> = Vec::new();
+        // walk — a quarantined note must not guide the search (§5). One
+        // batched read for every candidate (P0.3).
+        let cand_rows = read_candidates(
+            conn,
+            &text_hits
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>(),
+            q.filters.include_quarantined,
+            &q.filters.types,
+        )?;
+        let mut text_candidates: Vec<(String, f64, usize, CandRow)> = Vec::new();
         for (rank, (id, bm25)) in text_hits.iter().enumerate() {
-            let Ok(note) = read_note_by_id(conn, id) else {
+            let Some(row) = cand_rows.get(id) else {
                 continue;
             };
-            if !passes_filters(&note, &q.filters, now) {
+            if !passes_filters(&row.note, &q.filters, now) {
                 continue;
             }
-            text_candidates.push((id.clone(), *bm25, rank + 1, note));
+            text_candidates.push((
+                id.clone(),
+                *bm25,
+                rank + 1,
+                CandRow {
+                    note: row.note.clone(),
+                    body_norm: row.body_norm.clone(),
+                    tags_text: row.tags_text.clone(),
+                },
+            ));
         }
 
         // 3. Normalised seed scores for the graph expansion (§6.3.3: the added
@@ -539,42 +747,48 @@ impl Cell {
         // body_norm already holds the stemmed title+body (computed at write
         // time): reuse it instead of re-stemming per candidate.
         let mut hits: Vec<Hit> = Vec::new();
-        for (id, bm25, rank, note) in text_candidates {
-            let (matched, coverage) = coverage_of(conn, &id, &note, &terms);
+        for (_id, bm25, rank, row) in &text_candidates {
+            let (matched, coverage) = coverage_of(&row.body_norm, &row.tags_text, &terms);
             let raw = (bm25 / max_bm25)
                 * coverage
-                * q.weights.confidence(note.confidence)
-                * recency_of(now, &note, q.weights.recency_half_life_days);
+                * q.weights.confidence(row.note.confidence)
+                * recency_of(now, &row.note, q.weights.recency_half_life_days);
             hits.push(Hit {
                 explain: Explain {
                     matched_terms: matched,
-                    bm25_rank: Some(rank),
+                    bm25_rank: Some(*rank),
                     lists: vec!["text"],
                     fused_score: Some(raw),
                     ..Explain::default()
                 },
-                note,
+                note: row.note.clone(),
                 raw_score: raw,
                 score: raw,
             });
         }
-        // Cap the expansion: the nearest graph notes only.
+        // Cap the expansion: the nearest graph notes only — one batched read.
         let mut extras: Vec<(String, (u8, String, f64))> = extra.into_iter().take(40).collect();
         extras.sort_by_key(|(_, (hops, _, _))| *hops);
+        let extra_rows = read_candidates(
+            conn,
+            &extras.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+            q.filters.include_quarantined,
+            &q.filters.types,
+        )?;
         for (id, (hops, path, seed)) in extras {
-            let Ok(note) = read_note_by_id(conn, &id) else {
+            let Some(row) = extra_rows.get(&id) else {
                 continue;
             };
-            if !passes_filters(&note, &q.filters, now) {
+            if !passes_filters(&row.note, &q.filters, now) {
                 continue;
             }
-            let (matched, coverage) = coverage_of(conn, &id, &note, &terms);
+            let (matched, coverage) = coverage_of(&row.body_norm, &row.tags_text, &terms);
             // one extra decay step: no text match is one hop less evidence
             let w_graph = q.weights.hop_decay.powi(i32::from(hops) + 1);
             let raw = GRAPH_FLOOR.max(seed)
                 * coverage
-                * q.weights.confidence(note.confidence)
-                * recency_of(now, &note, q.weights.recency_half_life_days)
+                * q.weights.confidence(row.note.confidence)
+                * recency_of(now, &row.note, q.weights.recency_half_life_days)
                 * w_graph;
             hits.push(Hit {
                 explain: Explain {
@@ -584,7 +798,7 @@ impl Cell {
                     fused_score: Some(raw),
                     ..Explain::default()
                 },
-                note,
+                note: row.note.clone(),
                 raw_score: raw,
                 score: raw,
             });
@@ -1008,30 +1222,41 @@ fn vector_candidates(
                 }
             }
         }
-        // rank by exact cosine, then filter
+        // rank by exact cosine, then filter — notes read in chunks of 64
+        // (one batched query per chunk instead of two per candidate)
         let mut ranked: Vec<(String, f64, i64)> = best
             .into_iter()
             .map(|(id, (cos, chunk))| (id, cos, chunk))
             .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out.clear();
-        for (rank, (id, cos, chunk)) in ranked.into_iter().enumerate() {
-            if out.len() >= 50 {
-                break;
+        let mut base = 0_usize;
+        'ranked: while base < ranked.len() && out.len() < 50 {
+            let end = (base + 64).min(ranked.len());
+            let ids: Vec<String> = ranked[base..end]
+                .iter()
+                .map(|(id, _, _)| id.clone())
+                .collect();
+            let rows = read_candidates(conn, &ids, filters.include_quarantined, &filters.types)?;
+            for (i, (id, cos, chunk)) in ranked[base..end].iter().enumerate() {
+                if out.len() >= 50 {
+                    break 'ranked;
+                }
+                let Some(row) = rows.get(id) else {
+                    continue;
+                };
+                if !passes_filters(&row.note, filters, now) {
+                    continue;
+                }
+                out.push(VecCand {
+                    id: id.clone(),
+                    cosine: *cos,
+                    rank: base + i + 1,
+                    note: row.note.clone(),
+                    chunk: usize::try_from(*chunk).unwrap_or(0),
+                });
             }
-            let Ok(note) = read_note_by_id(conn, &id) else {
-                continue;
-            };
-            if !passes_filters(&note, filters, now) {
-                continue;
-            }
-            out.push(VecCand {
-                id,
-                cosine: cos,
-                rank: rank + 1,
-                note,
-                chunk: usize::try_from(chunk).unwrap_or(0),
-            });
+            base = end;
         }
         let filtered_short = out.len() < k;
         if !filtered_short || m >= total {
@@ -1201,7 +1426,8 @@ fn semantic_pipeline(
     let dim = ensure_index(inner)?;
     let conn = &inner.conn;
 
-    // --- text list (BM25, as in v0.1; skipped in vector mode)
+    // --- text list (BM25, as in v0.1; skipped in vector mode). Ubiquitous
+    // terms leave the MATCH (P0.3); they still count for coverage.
     let terms = if sem.mode == Mode::Vector {
         Vec::new()
     } else {
@@ -1209,34 +1435,33 @@ fn semantic_pipeline(
     };
     let mut text_hits: Vec<(String, f64)> = Vec::new();
     if !terms.is_empty() {
-        let match_expr = terms
-            .iter()
-            .map(|t| format!("\"{}\"", t.replace('"', "")))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        let mut stmt = conn.prepare(
-            "SELECT n.id, bm25(notes_fts, 10.0, 3.0, 2.0) FROM notes_fts
-             JOIN notes n ON n.rowid = notes_fts.rowid
-             WHERE notes_fts MATCH ?1
-             ORDER BY bm25(notes_fts, 10.0, 3.0, 2.0) LIMIT 50",
-        )?;
-        let rows = stmt.query_map([&match_expr], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-        })?;
-        for row in rows {
-            let (id, bm25) = row?;
-            text_hits.push((id, -bm25));
-        }
+        let match_expr = match_expr_for(conn, &terms)?;
+        text_hits = bm25_candidates(conn, &match_expr, 50)?;
     }
+    // one batched read for the candidates (P0.3): note + coverage columns
+    let cand_rows = read_candidates(
+        conn,
+        &text_hits
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+        q.filters.include_quarantined,
+        &q.filters.types,
+    )?;
     let mut text_list: Vec<(String, f64, usize, Note)> = Vec::new();
+    let mut text_cov: HashMap<String, (Vec<String>, f64)> = HashMap::new();
     for (rank, (id, bm25)) in text_hits.iter().enumerate() {
-        let Ok(note) = read_note_by_id(conn, id) else {
+        let Some(row) = cand_rows.get(id) else {
             continue;
         };
-        if !passes_filters(&note, &q.filters, now) {
+        if !passes_filters(&row.note, &q.filters, now) {
             continue;
         }
-        text_list.push((id.clone(), *bm25, rank + 1, note));
+        text_cov.insert(
+            id.clone(),
+            coverage_of(&row.body_norm, &row.tags_text, &terms),
+        );
+        text_list.push((id.clone(), *bm25, rank + 1, row.note.clone()));
     }
 
     // --- vector list
@@ -1361,7 +1586,10 @@ fn semantic_pipeline(
                 lists,
                 winning_chunk: chunk,
                 matched_terms: if from_text {
-                    coverage_of(conn, id, note, &terms).0
+                    text_cov
+                        .get(id.as_str())
+                        .map(|(m, _)| m.clone())
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 },
@@ -1373,20 +1601,26 @@ fn semantic_pipeline(
             },
         });
     }
-    // graph-discovered notes (never candidates themselves)
+    // graph-discovered notes (never candidates themselves) — one batched read
     let mut extras: Vec<(String, (u8, String, f64))> = extra.into_iter().take(40).collect();
     extras.sort_by_key(|(_, (hops, _, _))| *hops);
+    let extra_rows = read_candidates(
+        conn,
+        &extras.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+        q.filters.include_quarantined,
+        &q.filters.types,
+    )?;
     for (id, (hops, path, seed)) in extras {
-        let Ok(note) = read_note_by_id(conn, &id) else {
+        let Some(row) = extra_rows.get(&id) else {
             continue;
         };
-        if !passes_filters(&note, &q.filters, now) {
+        if !passes_filters(&row.note, &q.filters, now) {
             continue;
         }
         let w_graph = q.weights.hop_decay.powi(i32::from(hops) + 1);
-        let raw = GRAPH_FLOOR.max(seed) * q.weights.confidence(note.confidence) * w_graph;
+        let raw = GRAPH_FLOOR.max(seed) * q.weights.confidence(row.note.confidence) * w_graph;
         hits.push(Hit {
-            note,
+            note: row.note.clone(),
             raw_score: raw,
             score: raw,
             explain: Explain {
@@ -1482,21 +1716,6 @@ fn read_note_by_id(conn: &rusqlite::Connection, id: &str) -> Result<Note, Search
             .map_err(|e| SearchError::Db(e.to_string()))?;
     note.body = body;
     Ok(note)
-}
-
-fn note_tag_string(conn: &rusqlite::Connection, id: &str) -> String {
-    let Ok(mut stmt) = conn.prepare("SELECT tag FROM note_tags WHERE note_id = ?1 ORDER BY tag")
-    else {
-        return String::new();
-    };
-    let Ok(rows) = stmt.query_map([id], |r| r.get::<_, String>(0)) else {
-        return String::new();
-    };
-    let mut tags = Vec::new();
-    for r in rows.flatten() {
-        tags.push(r);
-    }
-    tags.join(" ")
 }
 
 fn passes_filters(note: &Note, f: &Filters, now: OffsetDateTime) -> bool {
@@ -1666,34 +1885,6 @@ fn edges_touching_frontier(
         out.push(row?);
     }
     Ok(out)
-}
-
-/// Query terms found in the note (stems of `body_norm` or tags) and the
-/// coverage factor: 1.0 when every term matches, 0.5 when none does.
-fn coverage_of(
-    conn: &rusqlite::Connection,
-    id: &str,
-    _note: &Note,
-    terms: &[String],
-) -> (Vec<String>, f64) {
-    let norm: String = conn
-        .query_row("SELECT body_norm FROM notes WHERE id = ?1", [id], |r| {
-            r.get(0)
-        })
-        .unwrap_or_default();
-    let words: BTreeSet<&str> = norm.split(' ').filter(|w| !w.is_empty()).collect();
-    let tag_words = note_tag_string(conn, id);
-    let matched: Vec<String> = terms
-        .iter()
-        .filter(|t| words.contains(t.as_str()) || tag_words.split(' ').any(|w| w == t.as_str()))
-        .cloned()
-        .collect();
-    let coverage = if terms.is_empty() {
-        1.0
-    } else {
-        0.5 + 0.5 * (matched.len() as f64 / terms.len() as f64)
-    };
-    (matched, coverage)
 }
 
 /// Recency weight: exponential decay with the configured half-life (days).
@@ -2322,6 +2513,121 @@ mod tests {
         let roma = titles.iter().position(|t| t.contains("Roma"));
         let milano = titles.iter().position(|t| t.contains("Milano"));
         assert!(roma.unwrap(/* test-only */) < milano.unwrap(/* test-only */));
+    }
+
+    #[test]
+    fn ubiquitous_terms_leave_the_match_but_stay_in_coverage() {
+        // v0.2.1 (P0.3), at the scale the rule is about: "lavora" and
+        // "molto" sit in ~every note (FTS5 ranks every matching row before
+        // the LIMIT — the very pass this fix removes), "spesso" in 81% but
+        // under the 1000-document floor, "pinco" in 50. The MATCH keeps the
+        // terms that discriminate; the dropped term still counts as found.
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let cell = Cell::create(&dir.path().join("freq.sqlite"), "t", "tester")
+            .unwrap(/* test-only */);
+        let mut pinco_id = None;
+        for i in 1..=1100_u32 {
+            let body = if i <= 1050 {
+                if i <= 900 {
+                    format!("Nota {i}: la squadra lavora e molto spesso.")
+                } else {
+                    format!("Nota {i}: la squadra lavora e molto.")
+                }
+            } else {
+                format!("Pinco {i} lavora poco.")
+            };
+            let mut n = note(
+                (i % 60_000) as u16,
+                &format!("Nota {i}"),
+                &body,
+                NoteType::Fact,
+            );
+            if i > 1050 {
+                n.title = Some(format!("Pinco {i}"));
+            }
+            n.lang = Some(crate::format::Lang::It);
+            // unique ids beyond the helper's 16-bit counter
+            n.id = ulid::Ulid::from_string(&format!("01{:018}{i:06}", 0))
+                .unwrap(/* test-only */);
+            cell.put_note(&n, "t").unwrap(/* test-only */);
+            if i == 1100 {
+                pinco_id = Some(n.id);
+            }
+        }
+        let stems = text::query_terms("pinco lavora spesso", Some(crate::format::Lang::It));
+        assert_eq!(stems.len(), 3, "{stems:?}");
+        {
+            let inner = cell.inner.lock().unwrap(/* test-only */);
+            let dfs: Vec<String> = inner
+                .conn
+                .prepare("SELECT term || '=' || doc FROM notes_fts_vocab WHERE term IN (?1, ?2, ?3)")
+                .unwrap(/* test-only */)
+                .query_map([&stems[0], &stems[1], &stems[2]], |r| r.get::<_, String>(0))
+                .unwrap(/* test-only */)
+                .flatten()
+                .collect();
+            eprintln!("dfs {stems:?} -> {dfs:?}");
+            // "lavora" (above the fraction AND the 1000-document floor) leaves
+            let expr = match_expr_for(&inner.conn, &stems).unwrap(/* test-only */);
+            assert!(
+                !expr.contains(&format!("\"{}\"", stems[1])),
+                "the ubiquitous term must leave the MATCH: {expr}"
+            );
+            assert!(
+                expr.contains(&stems[0].as_str()) && expr.contains(&stems[2].as_str()),
+                "the discriminating terms stay: {expr}"
+            );
+            // "spesso": 81% of the corpus but only 900 documents — it stays
+            // (below the floor the term is signal, not filler)
+            // every matching term frequent (lavora+squadra, both ≥ 1000
+            // documents): everything stays — an empty MATCH is worse
+            let both = text::query_terms("lavora squadra", Some(crate::format::Lang::It));
+            assert_eq!(both.len(), 2, "{both:?}");
+            let expr2 = match_expr_for(&inner.conn, &both).unwrap(/* test-only */);
+            assert!(
+                expr2.contains(&both[0].as_str()) && expr2.contains(&both[1].as_str()),
+                "no term may be dropped when every matching term is frequent: {expr2}"
+            );
+        }
+        let hits = cell
+            .search_with_now(&Query::text("pinco lavora spesso").k(10), now())
+            .unwrap(/* test-only */);
+        assert!(
+            hits[0]
+                .note
+                .display_title()
+                .to_lowercase()
+                .contains("pinco"),
+            "the rare term decides the ranking: {:?}",
+            hits.iter()
+                .map(|h| h.note.display_title().to_string())
+                .collect::<Vec<_>>()
+        );
+        let _ = pinco_id;
+        assert!(
+            hits[0].explain.matched_terms.contains(&stems[1]),
+            "the dropped term still counts as found: {:?}",
+            hits[0].explain.matched_terms
+        );
+    }
+
+    #[test]
+    fn connection_carries_the_vector_cache_pragmas() {
+        // v0.2.1 (P0.3): 64 MB of page cache and a 256 MB mmap window — the
+        // f32 recomputation reads candidate vectors straight off the pages.
+        let (_d, cell) = setup();
+        let inner = cell.inner.lock().unwrap(/* test-only */);
+        let cache: i64 = inner
+            .conn
+            .query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap(/* test-only */);
+        assert_eq!(cache, -65_536);
+        let mmap: i64 = inner
+            .conn
+            .query_row("PRAGMA mmap_size", [], |r| r.get(0))
+            .unwrap(/* test-only */);
+        // mmap is best-effort: set, or 0 where the VFS refuses
+        assert!(mmap == 268_435_456 || mmap == 0, "mmap_size: {mmap}");
     }
 
     #[test]

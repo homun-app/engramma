@@ -240,6 +240,14 @@ fn configure(conn: &Connection) -> Result<(), CellError> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // v0.2.1 (P0.3): the exact f32 recomputation reads candidate vectors as
+    // BLOBs off the pages — with SQLite's default ~2 MB cache every read
+    // reached unixRead. A 64 MB page cache plus a 256 MB read-only mmap
+    // window keeps the hot pages in memory (the mmap is best-effort: not
+    // every VFS supports it, and the engine stays correct without it). See
+    // docs/architecture.md.
+    conn.pragma_update(None, "cache_size", -65_536_i64)?;
+    let _ = conn.pragma_update(None, "mmap_size", 268_435_456_i64);
     Ok(())
 }
 
