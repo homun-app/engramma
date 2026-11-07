@@ -215,11 +215,16 @@ enum Command {
     },
     /// Verify the log (hash chain + replay)
     Verify,
-    /// Compact the log: snapshot the cell and forget the old payloads
+    /// Compact the log: register a checkpoint (no second copy of the cell)
+    /// and forget the old payloads
     Compact {
         /// Keep the last N operations uncompacted (default 1000)
         #[arg(long, default_value_t = 1_000)]
         keep_last: i64,
+        /// Also keep a snapshot FILE next to the cell (the v0.3.1 behavior:
+        /// the logical state; purge scrubs it with the cell)
+        #[arg(long)]
+        keep_snapshot: bool,
     },
     /// Consolidation candidates: near duplicates and probable
     /// contradictions — the engine proposes, the application decides (v0.3)
@@ -1040,7 +1045,10 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Command::Compact { keep_last } => {
+        Command::Compact {
+            keep_last,
+            keep_snapshot,
+        } => {
             let cell = open_cell(cli)?;
             let head: i64 = cell
                 .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
@@ -1049,29 +1057,41 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 .unwrap_or(0);
             let target = head - keep_last;
             if target >= 1 {
-                // the snapshot is taken at the live head; the payloads up to
-                // `target` are forgotten, the last `keep_last` stay replayable
-                let bytes_before = std::fs::metadata(cell.file_path())
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                let snap = cell.compact(target)?;
-                let bytes_after = std::fs::metadata(cell.file_path())
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                // the payloads up to `target` are forgotten, the last
+                // `keep_last` stay replayable; the restart point is a
+                // checkpoint without a file unless --keep-snapshot
+                let report = cell.compact(
+                    target,
+                    &engramma_core::cell::CompactOptions {
+                        keep_snapshot: *keep_snapshot,
+                    },
+                )?;
                 if cli.json {
                     print_json(&serde_json::json!({
-                        "snapshot": snap.display().to_string(),
-                        "seq": target,
-                        "head": head,
-                        "bytes_before": bytes_before,
-                        "bytes_after": bytes_after,
+                        "cut_seq": report.cut_seq,
+                        "head_seq": report.head_seq,
+                        "head_hash": report.head_hash,
+                        "state_digest": report.state_digest,
+                        "snapshot": report.snapshot.as_ref()
+                            .map(|p| p.display().to_string()),
+                        "bytes_before": report.bytes_before,
+                        "bytes_after": report.bytes_after,
                     }));
+                } else if let Some(snap) = &report.snapshot {
+                    println!(
+                        "compattata fino a seq {} (testa {}): {} \
+                         (cella+WAL+istantanee: {} → {} byte)",
+                        report.cut_seq,
+                        report.head_seq,
+                        snap.display(),
+                        report.bytes_before,
+                        report.bytes_after
+                    );
                 } else {
                     println!(
-                        "compattata fino a seq {target} (testa {head}): {} (file {} → {} byte)",
-                        snap.display(),
-                        bytes_before,
-                        bytes_after
+                        "compattata fino a seq {} (testa {}): punto di controllo \
+                         senza file (cella+WAL+istantanee: {} → {} byte)",
+                        report.cut_seq, report.head_seq, report.bytes_before, report.bytes_after
                     );
                 }
             } else if cli.json {

@@ -219,19 +219,31 @@ happen: the purge says so and exits with code **5** (`scrubbed: false`,
 cell close, and `--json` carries the same fields. A failed `VACUUM` or
 PRAGMA is an error, never a silent success.
 
-### `engramma compact [--keep-last N]`
+### `engramma compact [--keep-last N] [--keep-snapshot]`
 
-Snapshots the cell (`VACUUM INTO <cella>-snap-<seq>.sqlite`) and strips
-the file to its **logical state**: the payloads up to `head − N` (default
-`keep-last` 1000), the vectors, the model registry, the vault bindings
-and the FTS content go (derived or recomputable — and all of them carry
-content). The skeletons and the hash chain stay whole; the row records
-the head hash and the state digest, and only the **last** snapshot stays
-on disk. `verify` restores the snapshot into memory, checks its digest
-and replays only the tail; `changes_since` below the snapshot answers
-`Compacted` (a replica restarts from the snapshot). A later `purge`
-scrubs the snapshot file too, and its row records the redacted digest
-with `redacted_by` naming the purge (spec §6.4).
+Registers a **checkpoint** and forgets the payloads up to `head − N`
+(default `keep-last` 1000): the row records the head hash and the state
+digest of the logical state at the head, **without a file** — the live
+cell already is the durable state, and a second copy of it (the v0.3.1
+snapshot) only served the full audit. The skeletons and the hash chain
+stay whole; the last `keep-last` operations stay replayable;
+`changes_since` below the cut answers `Compacted`. `verify` says what it
+could check (`rigioco: solo catena da seq N (compattata senza
+istantanea)` in `replay`): the whole chain, every surviving payload's
+digest, the derived indexes — but no from-zero replay is possible.
+
+With `--keep-snapshot` the v0.3.1 behavior: `VACUUM INTO
+<cella>-snap-<seq>.sqlite`, stripped to the **logical state** (payloads
+up to the cut, vectors, model registry, vault bindings and FTS content
+go). Only the **last** row stays, with or without a file: the latest
+compaction replaces the previous one, and a compaction without the flag
+deletes the file of the previous one. A later `purge` scrubs a snapshot
+file (its row records the redacted digest with `redacted_by` naming the
+purge, spec §6.4).
+
+`--json` carries `cut_seq`, `head_seq`, `head_hash`, `state_digest`,
+`snapshot` (null for a checkpoint), `bytes_before`/`bytes_after` — the
+latter measured over cell + WAL + snapshot files.
 
 ### `engramma vault init <dir> | sync [dir] [--allow-deletions] | watch [dir]`
 

@@ -214,7 +214,11 @@ proptest! {
             .unwrap(/* test-only */)[0]
             .parse()
             .unwrap(/* test-only */);
-        let snap = cell.compact(head).unwrap(/* test-only */);
+        let snap = cell
+            .compact(head, &engramma_core::cell::CompactOptions { keep_snapshot: true })
+            .unwrap(/* test-only */)
+            .snapshot
+            .unwrap(/* keep_snapshot always writes one */);
         // v0.3.1 (P0.4): the snapshot is the LOGICAL state. Its recorded
         // digest is its own — the payloads up to the cut are stripped from
         // the file — and it must equal the live state's digest at the same
@@ -348,7 +352,8 @@ proptest! {
                     }
                 }
                 _ => {
-                    // a compaction somewhere inside the run
+                    // a compaction somewhere inside the run — v0.3.2 (P0.1):
+                    // with or without the file, at random
                     let head: i64 = cell
                         .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
                         .unwrap_or_default()
@@ -357,7 +362,10 @@ proptest! {
                         .unwrap_or(0);
                     if head >= 1 {
                         let cut = (head - (next() % 3) as i64).max(1);
-                        let _ = cell.compact(cut);
+                        let opts = engramma_core::cell::CompactOptions {
+                            keep_snapshot: next() % 2 == 0,
+                        };
+                        let _ = cell.compact(cut, &opts);
                     }
                 }
             }

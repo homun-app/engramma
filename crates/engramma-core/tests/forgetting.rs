@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use engramma_core::cell::{CompactOptions, Replay};
 use engramma_core::format::{At, Lang, Note, NoteType};
 use engramma_core::{Cell, Confidence, Status};
 use time::OffsetDateTime;
@@ -198,8 +199,8 @@ struct SnapshotRow {
 
 fn snapshots_of(cell: &Cell) -> Vec<SnapshotRow> {
     cell.debug_column(
-        "SELECT seq || '|' || head_hash || '|' || state_digest || '|' || file || '|' \
-          || COALESCE(redacted_by, 'MISSING')
+        "SELECT seq || '|' || head_hash || '|' || COALESCE(state_digest, 'NULL') \
+          || '|' || COALESCE(file, 'NULL') || '|' || COALESCE(redacted_by, 'MISSING')
          FROM snapshots ORDER BY seq",
     )
     .unwrap(/* test-only */)
@@ -239,7 +240,11 @@ fn compact_then_purge_scrubs_the_snapshot() {
         .unwrap(/* test-only */)[0]
         .parse()
         .unwrap(/* test-only */);
-    let snap = cell.compact(head).unwrap(/* test-only */);
+    let snap = cell
+        .compact(head, &CompactOptions { keep_snapshot: true })
+        .unwrap(/* test-only */)
+        .snapshot
+        .expect(/* test-only */ "keep_snapshot writes a file");
     assert!(snap.is_file(), "{}", snap.display());
     let before = snapshots_of(&cell);
     assert_eq!(before.len(), 1, "{before:?}");
@@ -308,7 +313,8 @@ fn snapshot_purge_censors_the_supersede_inside_it() {
         .unwrap(/* test-only */)[0]
         .parse()
         .unwrap(/* test-only */);
-    cell.compact(head).unwrap(/* test-only */);
+    cell.compact(head, &CompactOptions { keep_snapshot: true })
+        .unwrap(/* test-only */);
 
     cell.purge(&secret.id, "oblio", "tester").unwrap(/* t */);
     let report = cell.verify().unwrap(/* test-only */);
@@ -342,7 +348,11 @@ fn compact_makes_a_logical_snapshot_and_keeps_only_the_last() {
         .unwrap(/* test-only */)[0]
         .parse()
         .unwrap(/* test-only */);
-    let snap = cell.compact(head - 1).unwrap(/* test-only */);
+    let snap = cell
+        .compact(head - 1, &CompactOptions { keep_snapshot: true })
+        .unwrap(/* test-only */)
+        .snapshot
+        .expect(/* test-only */ "keep_snapshot writes a file");
     assert!(snap.is_file(), "{}", snap.display());
 
     // the snapshot carries the logical state only
@@ -379,9 +389,12 @@ fn compact_makes_a_logical_snapshot_and_keeps_only_the_last() {
     );
     drop(snap_conn);
     // and the cell still verifies with it
-    assert!(cell.verify().unwrap(/* test-only */).ok());
+    let report = cell.verify().unwrap(/* test-only */);
+    assert!(report.ok(), "{report:?}");
+    assert_eq!(report.replay, Replay::FromSnapshot { seq: head - 1 });
 
-    // a second compact after one more write: ONE row, ONE file
+    // v0.3.2 (P0.1): a compact WITHOUT the flag replaces the file snapshot
+    // with a checkpoint — the file goes, ONE row stays, without a file
     cell.put_note(&note_of(9, "dopo la prima compattazione"), "tester")
         .unwrap(/* test-only */);
     let head2: i64 = cell
@@ -389,11 +402,24 @@ fn compact_makes_a_logical_snapshot_and_keeps_only_the_last() {
         .unwrap(/* test-only */)[0]
         .parse()
         .unwrap(/* test-only */);
-    let snap2 = cell.compact(head2 - 1).unwrap(/* test-only */);
-    assert!(snap2.is_file(), "{}", snap2.display());
-    assert!(cell.verify().unwrap(/* test-only */).ok());
+    let plain = cell.compact(head2 - 1, &CompactOptions::default())
+        .unwrap(/* test-only */);
+    assert!(
+        plain.snapshot.is_none(),
+        "the default compaction keeps no file"
+    );
+    assert!(plain.bytes_after < plain.bytes_before, "disk usage drops");
+    let report = cell.verify().unwrap(/* test-only */);
+    assert!(report.ok(), "{report:?}");
+    assert_eq!(
+        report.replay,
+        Replay::ChainOnly {
+            since_seq: head2 - 1
+        }
+    );
     let rows = snapshots_of(&cell);
-    assert_eq!(rows.len(), 1, "only the last snapshot stays: {rows:?}");
+    assert_eq!(rows.len(), 1, "only the last row stays: {rows:?}");
+    assert_eq!(rows[0].file, "NULL", "the row has no file: {rows:?}");
     let snaps: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap(/* test-only */)
         .flatten()
@@ -404,7 +430,86 @@ fn compact_makes_a_logical_snapshot_and_keeps_only_the_last() {
                 .is_some_and(|n| n.starts_with("logica-snap-"))
         })
         .collect();
-    assert_eq!(snaps.len(), 1, "one snapshot file: {snaps:?}");
+    assert!(snaps.is_empty(), "no snapshot file left: {snaps:?}");
     // the old file is really gone
-    assert!(!snap.exists() || snap == snap2, "the old file went away");
+    assert!(!snap.exists(), "the old file went away");
+}
+
+/// v0.3.2 (P0.1): the DEFAULT compaction is a checkpoint without a file —
+/// no `*-snap-*` next to the cell, the total on disk DROPS, `verify` says
+/// `ChainOnly` and passes, and a hand-tampered surviving payload fails it.
+#[test]
+fn compact_default_is_a_checkpoint_on_disk() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let path = dir.path().join("punto.sqlite");
+    let cell = Cell::create(&path, "punto", "tester").unwrap(/* test-only */);
+    let secret = note_of(1, "zibellinotremante quokkaviolaceo");
+    cell.put_note(&secret, "tester").unwrap(/* test-only */);
+    // enough payload bytes that forgetting them shrinks the file
+    for i in 2..=40_u16 {
+        let body = format!("riempimento {i} {}", "parola lunga ".repeat(40));
+        cell.put_note(&note_of(i, &body), "tester").unwrap(/* t */);
+    }
+    let head: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+
+    let report = cell.compact(head, &CompactOptions::default())
+        .unwrap(/* test-only */);
+    assert_eq!(report.cut_seq, head);
+    assert_eq!(report.head_seq, head);
+    assert_ne!(report.head_hash, "");
+    assert!(report.snapshot.is_none(), "no file by default");
+    // the total on disk (cell + WAL + snapshots) DROPS
+    assert!(
+        report.bytes_after < report.bytes_before,
+        "footprint {} -> {}",
+        report.bytes_before,
+        report.bytes_after
+    );
+    // no *-snap-* file next to the cell
+    let snaps: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap(/* test-only */)
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("-snap-"))
+        })
+        .collect();
+    assert!(snaps.is_empty(), "unexpected snapshot files: {snaps:?}");
+    // one row: the checkpoint, with the digest of the current state
+    let live_digest = cell.state_digest().unwrap(/* test-only */);
+    assert_eq!(report.state_digest, live_digest);
+    let rows = snapshots_of(&cell);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].file, "NULL", "{rows:?}");
+    assert_eq!(rows[0].state_digest, live_digest, "{rows:?}");
+    // verify: chain-only, and it passes
+    let vr = cell.verify().unwrap(/* test-only */);
+    assert!(vr.ok(), "{vr:?}");
+    assert_eq!(vr.replay, Replay::ChainOnly { since_seq: head });
+
+    // a payload that SURVIVES the cut (a write after it), tampered by hand,
+    // fails the verification: the chain check covers every remaining digest
+    cell.put_note(&note_of(90, "dopo il punto di controllo"), "tester")
+        .unwrap(/* test-only */);
+    let vr = cell.verify().unwrap(/* test-only */);
+    assert!(vr.ok() && vr.replay == Replay::ChainOnly { since_seq: head });
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap(/* test-only */);
+        conn.execute(
+            "UPDATE op_payloads SET body = replace(body, 'dopo il punto', 'DOPO IL PUNTO')",
+            [],
+        )
+        .unwrap(/* test-only */);
+    }
+    let vr = cell.verify().unwrap(/* test-only */);
+    assert!(
+        !vr.ok() && !vr.hash_chain_ok,
+        "a tampered surviving payload must fail: {vr:?}"
+    );
 }

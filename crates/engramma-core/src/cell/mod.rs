@@ -178,11 +178,59 @@ pub struct PurgeReport {
     pub pending: Vec<&'static str>,
 }
 
+/// How a compaction keeps its restart point (v0.3.2, P0.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CompactOptions {
+    /// Keep a snapshot FILE next to the cell — the v0.3.1 behavior (the
+    /// logical state, purged together with the cell). Default `false`: the
+    /// compaction registers a **checkpoint** (head hash and state digest, no
+    /// second copy of the cell on disk — the live cell already IS the
+    /// durable state, as in rqlite, which uses the SQLite file itself as
+    /// its snapshot).
+    pub keep_snapshot: bool,
+}
+
+/// What one compaction did (v0.3.2, P0.1).
+#[derive(Debug, Clone)]
+pub struct CompactReport {
+    /// The cut: payloads of ops up to this seq are forgotten.
+    pub cut_seq: i64,
+    /// The head at compaction time.
+    pub head_seq: i64,
+    /// The hash chain's head at `head_seq`.
+    pub head_hash: String,
+    /// Digest of the logical state at the head, after the cut.
+    pub state_digest: String,
+    /// The snapshot file, when `keep_snapshot` was set.
+    pub snapshot: Option<PathBuf>,
+    /// Cell + WAL + snapshot files, bytes on disk, before and after.
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// What `verify` could replay (v0.3.2, P0.2): a compaction without a
+/// snapshot file makes the from-zero replay impossible and the tail cannot
+/// replay without the state at the cut — the report says which of the three
+/// worlds it checked instead of implying the full one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replay {
+    /// No compaction: the whole log replays from zero.
+    Full,
+    /// A snapshot file exists: the tail replays on it (from its cut `seq`).
+    FromSnapshot { seq: i64 },
+    /// A checkpoint without a file: only the hash chain, the surviving
+    /// payloads and the derived indexes could be checked, from the cut
+    /// `since_seq` on. `ok()` can still be true.
+    ChainOnly { since_seq: i64 },
+}
+
 /// Report of [`Cell::verify`].
 #[derive(Debug, Clone)]
 pub struct VerifyReport {
     /// Number of ops checked.
     pub ops: usize,
+    /// What could be replayed (v0.3.2, P0.2).
+    pub replay: Replay,
     /// Hash chain valid.
     pub hash_chain_ok: bool,
     /// Replay produced the same tables.
@@ -200,9 +248,45 @@ pub struct VerifyReport {
 }
 
 impl VerifyReport {
-    /// Everything passed.
+    /// Everything passed. `ChainOnly` can pass: it checked the chain, the
+    /// surviving payloads and the derived indexes.
     pub fn ok(&self) -> bool {
         self.hash_chain_ok && self.replay_ok && self.fts_ok && self.snapshot_ok
+    }
+}
+
+/// One `snapshots` row as verify reads it: (seq, head_hash, state_digest,
+/// file, redacted_by) — the digest and the file are nullable (v0.3.2).
+type SnapshotRecord = (i64, String, Option<String>, Option<String>, String);
+
+/// The `ChainOnly` checks of a checkpoint row (v0.3.2, P0.2): when the head
+/// has not moved past the checkpoint, the digest of the current state must
+/// equal the recorded one. (The hash chain and the surviving payloads were
+/// checked in the chain loop; the FTS coherence runs on the live cell.)
+fn verify_checkpoint_digest(
+    conn: &Connection,
+    snapshot: Option<&SnapshotRecord>,
+) -> Result<(), String> {
+    let Some((cut, head_hash, digest, _file, _redacted)) = snapshot else {
+        return Ok(());
+    };
+    let live_head: Option<String> = conn
+        .query_row("SELECT hash FROM ops ORDER BY seq DESC LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .ok();
+    if live_head.as_deref() != Some(head_hash.as_str()) {
+        return Ok(()); // the head moved: the recorded digest is history
+    }
+    let Some(digest) = digest else {
+        return Ok(()); // redacted by a purge: nothing left to compare
+    };
+    match state_digest(conn) {
+        Ok(live) if live == *digest => Ok(()),
+        Ok(_) => Err(format!(
+            "the state digest moved from the checkpoint at seq {cut}"
+        )),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -705,7 +789,7 @@ impl Cell {
                 .flatten()
                 .collect()
         };
-        let rows: Vec<(i64, String)> = {
+        let rows: Vec<(i64, Option<String>)> = {
             let mut stmt = inner
                 .conn
                 .prepare("SELECT seq, file FROM snapshots ORDER BY seq DESC")?;
@@ -714,6 +798,12 @@ impl Cell {
                 .collect()
         };
         for (i, (seq, file)) in rows.into_iter().enumerate() {
+            // v0.3.2 (P0.1): a checkpoint row has no file to scrub — the
+            // digest it recorded described a state that contained the
+            // purged note; P0.3 redacts it.
+            let Some(file) = file else {
+                continue;
+            };
             let snap_path = self
                 .path
                 .parent()
@@ -1305,34 +1395,70 @@ impl Cell {
         Ok(())
     }
 
-    /// The latest compaction snapshot, when any.
-    fn last_snapshot(&self) -> Result<Option<(i64, String, String, String)>, CellError> {
+    /// The latest compaction row's cut, when any (the row may be a
+    /// checkpoint without a file — the payloads below the cut are gone
+    /// either way).
+    fn last_cut_seq(&self) -> Result<Option<i64>, CellError> {
         let inner = self.lock()?;
         inner
             .conn
             .query_row(
-                "SELECT seq, head_hash, state_digest, file FROM snapshots ORDER BY seq DESC LIMIT 1",
+                "SELECT seq FROM snapshots ORDER BY seq DESC LIMIT 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| r.get(0),
             )
             .optional()
             .map_err(CellError::from)
     }
 
-    /// Compact the log (DESIGN §4.3, v0.3): `VACUUM INTO` a snapshot of the
-    /// cell **exactly as it stands** (`up_to_seq` must be within the live
-    /// log), register it with its head hash and its [`state_digest`], then
-    /// forget the payloads of every op up to `seq`: the skeletons and the
-    /// chain stay whole. v0.3.1 (P0.4): the snapshot file is the **logical
-    /// state** — the payloads up to the cut, the vectors, the model registry,
-    /// the markdown-view bindings and the FTS content are stripped from it
-    /// (derived or recomputable, and all of them carry content) — and only
-    /// the LAST snapshot is kept. Returns the snapshot path.
+    /// Bytes on disk of the cell, its WAL and every snapshot file (v0.3.2:
+    /// the honest bill of a compaction is the whole directory footprint).
+    fn dir_footprint(&self) -> u64 {
+        let mut total = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        let mut wal = self.path.clone().into_os_string();
+        wal.push("-wal");
+        total += std::fs::metadata(Path::new(&wal))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if let Some(dir) = self.path.parent()
+            && let Some(stem) = self
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+            && let Ok(entries) = std::fs::read_dir(dir)
+        {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&format!("{stem}-snap-")) && name.ends_with(".sqlite") {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        total
+    }
+
+    /// Compact the log (DESIGN §4.3, v0.3): forget the payloads of every op
+    /// up to `up_to_seq` (must be within the live log); the skeletons and
+    /// the chain stay whole. v0.3.2 (P0.1): by default the compaction
+    /// registers a **checkpoint** — head hash and [`state_digest`] of the
+    /// logical state at the head, no file (a second copy of the cell served
+    /// only the full audit, and the logical state *is* almost the whole
+    /// cell). With `keep_snapshot` the v0.3.1 behavior: `VACUUM INTO` a
+    /// snapshot of the cell **exactly as it stands**, stripped to its
+    /// logical state (payloads up to the cut, vectors, model registry,
+    /// markdown-view bindings and FTS content go), registered with its head
+    /// hash and digest. Only the LAST row stays, with or without a file:
+    /// the latest compaction replaces the previous one.
     ///
     /// # Errors
     /// [`CellError::Invalid`] when `up_to_seq` is outside the live log;
-    /// [`CellError::Db`] on SQL or I/O failures.
-    pub fn compact(&self, up_to_seq: i64) -> Result<PathBuf, CellError> {
+    /// [`CellError::Db`] on SQL or I/O failures (a failed compaction leaves
+    /// the previous row and its file alone).
+    pub fn compact(
+        &self,
+        up_to_seq: i64,
+        opts: &CompactOptions,
+    ) -> Result<CompactReport, CellError> {
         let _guard = self
             .write_lock
             .lock()
@@ -1353,7 +1479,8 @@ impl Cell {
                 r.get(0)
             })
             .unwrap_or_default();
-        let file = format!(
+        let bytes_before = self.dir_footprint();
+        let file_name = format!(
             "{}-snap-{head_seq}.sqlite",
             self.path
                 .file_name()
@@ -1361,67 +1488,74 @@ impl Cell {
                 .unwrap_or_else(|| "cell".into())
                 .trim_end_matches(".sqlite")
         );
-        let target = self
+        let parent = self
             .path
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(&file);
-        // VACUUM INTO refuses an existing file: a re-compact at the same head
-        // replaces its own snapshot
-        if target.exists() {
-            std::fs::remove_file(&target)?;
-        }
-        inner.conn.execute_batch(&format!(
-            "VACUUM INTO '{}'",
-            target.display().to_string().replace('\'', "''")
-        ))?;
-        // v0.3.1 (P0.4): strip the file to its logical state, then digest
-        // what stays. The payloads up to the cut go first: their content
-        // must not outlive the compaction in the one file that never gets a
-        // purge otherwise.
-        let digest = {
-            let mut snap_conn = Connection::open(&target)?;
-            snap_conn.pragma_update(None, "journal_mode", "DELETE")?;
-            let secure_before: i64 =
-                snap_conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
-            snap_conn.pragma_update(None, "secure_delete", "ON")?;
-            {
-                let tx = snap_conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                tx.execute(
-                    "DELETE FROM op_payloads WHERE op_id IN (
-                         SELECT op_id FROM ops WHERE seq <= ?1)",
-                    [up_to_seq],
-                )?;
-                tx.execute("DELETE FROM note_vectors", [])?;
-                tx.execute("DELETE FROM embedding_models", [])?;
-                tx.execute("DELETE FROM vault_files", [])?;
-                tx.execute("DELETE FROM snapshots", [])?;
-                // external-content FTS5: `delete-all` empties the index (its
-                // segments carry the stems); verify rebuilds it from the
-                // content table before the tail replay
-                tx.execute("INSERT INTO notes_fts(notes_fts) VALUES('delete-all')", [])?;
-                tx.commit()?;
+            .unwrap_or_else(|| PathBuf::from("."));
+        // The file snapshot, when asked for: written and stripped BEFORE the
+        // transaction, so a failure here leaves the cell untouched.
+        let file_snapshot: Option<(PathBuf, String)> = if opts.keep_snapshot {
+            let target = parent.join(&file_name);
+            // VACUUM INTO refuses an existing file: a re-compact at the same
+            // head replaces its own snapshot
+            if target.exists() {
+                std::fs::remove_file(&target)?;
             }
-            snap_conn.pragma_update(None, "secure_delete", secure_before)?;
-            snap_conn.execute_batch("VACUUM;")?;
-            state_digest(&snap_conn)?
+            inner.conn.execute_batch(&format!(
+                "VACUUM INTO '{}'",
+                target.display().to_string().replace('\'', "''")
+            ))?;
+            // v0.3.1 (P0.4): strip the file to its logical state, then
+            // digest what stays. The payloads up to the cut go first: their
+            // content must not outlive the compaction in the one file that
+            // never gets a purge otherwise.
+            let digest = {
+                let mut snap_conn = Connection::open(&target)?;
+                snap_conn.pragma_update(None, "journal_mode", "DELETE")?;
+                let secure_before: i64 =
+                    snap_conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+                snap_conn.pragma_update(None, "secure_delete", "ON")?;
+                {
+                    let tx = snap_conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    tx.execute(
+                        "DELETE FROM op_payloads WHERE op_id IN (
+                             SELECT op_id FROM ops WHERE seq <= ?1)",
+                        [up_to_seq],
+                    )?;
+                    tx.execute("DELETE FROM note_vectors", [])?;
+                    tx.execute("DELETE FROM embedding_models", [])?;
+                    tx.execute("DELETE FROM vault_files", [])?;
+                    tx.execute("DELETE FROM snapshots", [])?;
+                    // external-content FTS5: `delete-all` empties the index
+                    // (its segments carry the stems); verify rebuilds it
+                    // from the content table before the tail replay
+                    tx.execute("INSERT INTO notes_fts(notes_fts) VALUES('delete-all')", [])?;
+                    tx.commit()?;
+                }
+                snap_conn.pragma_update(None, "secure_delete", secure_before)?;
+                snap_conn.execute_batch("VACUUM;")?;
+                state_digest(&snap_conn)?
+            };
+            Some((target, digest))
+        } else {
+            None
         };
         let created = OffsetDateTime::now_utc()
             .replace_millisecond(0)
             .unwrap_or(OffsetDateTime::now_utc())
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
-        // Only the last snapshot stays (P0.4). Order, crash-safe: the new
-        // file exists and its row lands first; the old row and its file go
-        // after (a crash between the two leaves a ghost row without file —
-        // the next purge drops it, it is never the newest).
-        let stale: Vec<(i64, String)> = {
+        // Only the last row stays (P0.4). The rows that exist NOW are read
+        // before the new one lands (the write lock is held): at most one by
+        // invariant, more only after a failed or crashed compaction. Their
+        // files must not outlive them.
+        let previous: Vec<(i64, Option<String>)> = {
             let mut stmt = inner
                 .conn
-                .prepare("SELECT seq, file FROM snapshots WHERE seq != ?1 OR file != ?2")?;
-            stmt.query_map(rusqlite::params![up_to_seq, file], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+                .prepare("SELECT seq, file FROM snapshots ORDER BY seq")?;
+            stmt.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
             })?
             .flatten()
             .collect()
@@ -1430,42 +1564,85 @@ impl Cell {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT INTO snapshots (seq, head_hash, state_digest, file, redacted_by, created_at)
-             VALUES (?1, ?2, ?3, ?4, '[]', ?5)
-             ON CONFLICT(seq) DO UPDATE SET head_hash = ?2, state_digest = ?3,
-                                            file = ?4, redacted_by = '[]', created_at = ?5",
-            rusqlite::params![up_to_seq, head_hash, digest, file, created],
-        )?;
-        tx.execute(
             "DELETE FROM op_payloads WHERE op_id IN (
                  SELECT op_id FROM ops WHERE seq <= ?1)",
             [up_to_seq],
         )?;
-        for (seq, old_file) in &stale {
-            // by (seq, file), not seq alone: a re-compact at the same cut
-            // with a new head reuses the seq, and the fresh row must survive
+        // For a checkpoint the digest is the LIVE state's after the cut (the
+        // same bytes the file snapshot would carry: the live cell minus the
+        // forgotten payloads); for a file snapshot it is the stripped file's
+        // — equal by construction to the live one (property-tested).
+        let digest = match &file_snapshot {
+            Some((_, d)) => d.clone(),
+            None => state_digest(&tx)?,
+        };
+        let new_file: Option<&str> = file_snapshot.as_ref().map(|_| file_name.as_str());
+        tx.execute(
+            "INSERT INTO snapshots (seq, head_hash, state_digest, file, redacted_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, '[]', ?5)
+             ON CONFLICT(seq) DO UPDATE SET head_hash = ?2, state_digest = ?3,
+                                            file = ?4, redacted_by = '[]', created_at = ?5",
+            rusqlite::params![up_to_seq, head_hash, digest, new_file, created],
+        )?;
+        // The old FILE goes before its row (v0.3.2, P0.4): a row deleted
+        // first would orphan the file on a crash or a failed removal, and a
+        // file no row points at escapes every later purge — purge walks the
+        // ROWS. A removal that fails is a compaction error: the transaction
+        // unwinds, the old row stays with its file, and the next purge
+        // scrubs it. A crash inside this window leaves a row WITH its file,
+        // never a row without one.
+        for (seq, old_file) in &previous {
+            let Some(old_file) = old_file else { continue };
+            if Some(old_file.as_str()) == new_file {
+                continue; // the file this very compaction just wrote
+            }
+            let old = parent.join(old_file);
+            match std::fs::remove_file(&old) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(CellError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "cannot remove the old snapshot {} (seq {seq}): {e}",
+                            old.display()
+                        ),
+                    )));
+                }
+            }
+        }
+        let new_file_owned: Option<String> = new_file.map(str::to_string);
+        for (seq, old_file) in &previous {
+            // The previous row survives when it IS the new row — a re-compact
+            // at the same cut with the same file rewrites it in place (found
+            // by the compaction property test: deleting by identity left the
+            // cell with no row at all, and a from-zero replay of a redacted
+            // log diverged). By (seq, file), not seq alone: a re-compact at
+            // the same cut with a new head reuses the seq, and the fresh row
+            // must survive.
+            if *seq == up_to_seq && *old_file == new_file_owned {
+                continue;
+            }
             tx.execute(
-                "DELETE FROM snapshots WHERE seq = ?1 AND file = ?2",
+                "DELETE FROM snapshots WHERE seq = ?1 AND file IS ?2",
                 rusqlite::params![seq, old_file],
             )?;
         }
         tx.commit()?;
-        for (_, old_file) in &stale {
-            if old_file != &file {
-                let old = self
-                    .path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(old_file);
-                let _ = std::fs::remove_file(old);
-            }
-        }
         // the forgotten payloads are the point: give the space back to the OS
         inner
             .conn
             .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
-        Ok(target)
+        let bytes_after = self.dir_footprint();
+        Ok(CompactReport {
+            cut_seq: up_to_seq,
+            head_seq,
+            head_hash,
+            state_digest: digest,
+            snapshot: file_snapshot.map(|(p, _)| p),
+            bytes_before,
+            bytes_after,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -1586,12 +1763,10 @@ impl Cell {
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
     pub fn changes_since(&self, seq: i64) -> Result<Vec<Op>, CellError> {
-        if let Some((snap_seq, _, _, _)) = self.last_snapshot()?
-            && seq < snap_seq
+        if let Some(cut) = self.last_cut_seq()?
+            && seq < cut
         {
-            return Err(CellError::Compacted {
-                snapshot_seq: snap_seq,
-            });
+            return Err(CellError::Compacted { snapshot_seq: cut });
         }
         let inner = self.lock()?;
         let mut stmt = inner.conn.prepare(
@@ -1640,6 +1815,15 @@ impl Cell {
     /// rows, columns disagreeing with the hashed envelope, a broken chain, a
     /// diverging replay) is reported in the report, not as an error.
     ///
+    /// v0.3.2 (P0.2): the report says WHAT could be replayed
+    /// ([`Replay`]). A compaction without a snapshot file (a checkpoint)
+    /// makes the from-zero replay impossible and the tail cannot replay
+    /// without the state at the cut: there `verify` still checks the whole
+    /// hash chain, that every surviving payload matches its digest, the
+    /// coherence of the derived indexes (FTS, vectors, edges) and — when the
+    /// head has not moved past the checkpoint — that the current state's
+    /// digest is the recorded one.
+    ///
     /// # Errors
     /// [`CellError::Db`] only on infrastructure failures.
     pub fn verify(&self) -> Result<VerifyReport, CellError> {
@@ -1649,6 +1833,7 @@ impl Cell {
             Err(e) => {
                 return Ok(VerifyReport {
                     ops: 0,
+                    replay: Replay::Full,
                     hash_chain_ok: false,
                     replay_ok: false,
                     fts_ok: false,
@@ -1687,12 +1872,16 @@ impl Cell {
         // tail), so the snapshot's position is found by its last op_id, and a
         // redacted snapshot is accepted exactly when the tail replay, that
         // purge included, reproduces the live state (the comparison below).
+        // v0.3.2 (P0.1/P0.2): a checkpoint row has no file — nothing to
+        // restore, the tail cannot replay without the state at the cut.
         let mut snapshot_ok = true;
+        let mut replay = Replay::Full;
         let mut rebuild_conn = Connection::open_in_memory()?;
         configure(&rebuild_conn)?;
         let mut tail: &[Op] = &source_ops;
+        let mut chain_only = false;
         // (read inline: the cell lock is already held)
-        let snapshot: Option<(i64, String, String, String, String)> = inner
+        let snapshot: Option<SnapshotRecord> = inner
             .conn
             .query_row(
                 "SELECT seq, head_hash, state_digest, file, redacted_by FROM snapshots
@@ -1701,113 +1890,139 @@ impl Cell {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        if let Some((snap_seq, head_hash, digest, file, redacted_by)) = snapshot.as_ref() {
-            let snap_path = self
-                .path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(file);
-            // what the file says: its logical digest and its own last op
-            let checks = Connection::open(&snap_path).and_then(|snap| {
-                let d = state_digest(&snap)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                let last: Option<(String, String)> = snap
-                    .query_row(
-                        "SELECT op_id, hash FROM ops ORDER BY seq DESC LIMIT 1",
-                        [],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()?;
-                Ok((snap, d, last))
-            });
-            let was_redacted = redacted_by != "[]" && !redacted_by.is_empty();
-            match checks {
-                Ok((snap_conn, d, last)) if &d == digest => {
-                    // Where this snapshot sits in the live log: by its last
-                    // op id. A redaction rehashes the snapshot's log tail, so
-                    // the recorded head hash only has to match when the
-                    // snapshot was never redacted (it stays as history).
-                    let position = last.as_ref().and_then(|(last_op_id, last_hash)| {
-                        let seq = source_ops
-                            .iter()
-                            .find(|o| o.op_id.to_string() == *last_op_id)
-                            .map(|o| o.seq)?;
-                        (was_redacted || last_hash == head_hash).then_some(seq)
-                    });
-                    if let Some(snap_head_seq) = position {
-                        let tx = rebuild_conn.transaction()?;
-                        tx.execute_batch("DROP TABLE IF EXISTS snapshots;")?;
-                        tx.commit()?;
-                        {
-                            let backup =
-                                rusqlite::backup::Backup::new(&snap_conn, &mut rebuild_conn)
+        match snapshot.as_ref() {
+            Some((snap_seq, head_hash, digest, Some(file), redacted_by)) => {
+                replay = Replay::FromSnapshot { seq: *snap_seq };
+                let snap_path = self
+                    .path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(file);
+                // what the file says: its logical digest and its own last op
+                let checks = Connection::open(&snap_path).and_then(|snap| {
+                    let d = state_digest(&snap)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    let last: Option<(String, String)> = snap
+                        .query_row(
+                            "SELECT op_id, hash FROM ops ORDER BY seq DESC LIMIT 1",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?;
+                    Ok((snap, d, last))
+                });
+                let was_redacted = redacted_by != "[]" && !redacted_by.is_empty();
+                match checks {
+                    Ok((snap_conn, d, last)) if Some(d.as_str()) == digest.as_deref() => {
+                        // Where this snapshot sits in the live log: by its
+                        // last op id. A redaction rehashes the snapshot's log
+                        // tail, so the recorded head hash only has to match
+                        // when the snapshot was never redacted (it stays as
+                        // history).
+                        let position = last.as_ref().and_then(|(last_op_id, last_hash)| {
+                            let seq = source_ops
+                                .iter()
+                                .find(|o| o.op_id.to_string() == *last_op_id)
+                                .map(|o| o.seq)?;
+                            (was_redacted || last_hash == head_hash).then_some(seq)
+                        });
+                        if let Some(snap_head_seq) = position {
+                            let tx = rebuild_conn.transaction()?;
+                            tx.execute_batch("DROP TABLE IF EXISTS snapshots;")?;
+                            tx.commit()?;
+                            {
+                                let backup =
+                                    rusqlite::backup::Backup::new(&snap_conn, &mut rebuild_conn)
+                                        .map_err(|e| {
+                                            CellError::Db(format!("snapshot restore: {e}"))
+                                        })?;
+                                backup
+                                    .run_to_completion(
+                                        128,
+                                        std::time::Duration::from_millis(0),
+                                        None,
+                                    )
                                     .map_err(|e| CellError::Db(format!("snapshot restore: {e}")))?;
-                            backup
-                                .run_to_completion(128, std::time::Duration::from_millis(0), None)
-                                .map_err(|e| CellError::Db(format!("snapshot restore: {e}")))?;
+                            }
+                            // the snapshot may come from an older schema (a
+                            // v0.3 cell opened after the upgrade): bring the
+                            // restored copy to the current one — `meta` is
+                            // compared
+                            {
+                                let tx = rebuild_conn.transaction()?;
+                                schema::migrate(&tx)?;
+                                tx.commit()?;
+                            }
+                            // v0.3.1 (P0.4): the snapshot carries no FTS
+                            // content (stripped at compact — it is derived,
+                            // and its segments hold the stems). Rebuild it
+                            // from the content table BEFORE the tail replay:
+                            // the tail's FTS deletes must find their rows.
+                            // Not the `rebuild` command: it indexes every
+                            // content row, tombstones included, while the
+                            // live index holds exactly the non-deleted notes
+                            // — so the same discipline: empty, then insert
+                            // the living rows only.
+                            {
+                                let tx = rebuild_conn.transaction()?;
+                                tx.execute_batch(
+                                    "INSERT INTO notes_fts(notes_fts) VALUES('delete-all');
+                                     INSERT INTO notes_fts(rowid, title, body_norm, tags_text)
+                                     SELECT rowid, COALESCE(title, ''), body_norm, tags_text
+                                     FROM notes WHERE status != 'deleted';",
+                                )?;
+                                tx.commit()?;
+                            }
+                            // v0.3 snapshots are full copies taken BEFORE the
+                            // forgetting: apply the same compaction cut to
+                            // the restored copy (idempotent for the logical
+                            // snapshots of v0.3.1, whose payloads are already
+                            // cut).
+                            {
+                                let tx = rebuild_conn.transaction()?;
+                                tx.execute(
+                                    "DELETE FROM op_payloads WHERE op_id IN (
+                                         SELECT op_id FROM ops WHERE seq <= ?1)",
+                                    [*snap_seq],
+                                )?;
+                                tx.commit()?;
+                            }
+                            let from = source_ops
+                                .iter()
+                                .position(|o| o.seq > snap_head_seq)
+                                .unwrap_or(source_ops.len());
+                            tail = &source_ops[from..];
+                        } else {
+                            snapshot_ok = false;
                         }
-                        // the snapshot may come from an older schema (a v0.3
-                        // cell opened after the upgrade): bring the restored
-                        // copy to the current one — `meta` is compared
-                        {
-                            let tx = rebuild_conn.transaction()?;
-                            schema::migrate(&tx)?;
-                            tx.commit()?;
-                        }
-                        // v0.3.1 (P0.4): the snapshot carries no FTS content
-                        // (stripped at compact — it is derived, and its
-                        // segments hold the stems). Rebuild it from the
-                        // content table BEFORE the tail replay: the tail's
-                        // FTS deletes must find their rows. Not the `rebuild`
-                        // command: it indexes every content row, tombstones
-                        // included, while the live index holds exactly the
-                        // non-deleted notes — so the same discipline: empty,
-                        // then insert the living rows only.
-                        {
-                            let tx = rebuild_conn.transaction()?;
-                            tx.execute_batch(
-                                "INSERT INTO notes_fts(notes_fts) VALUES('delete-all');
-                                 INSERT INTO notes_fts(rowid, title, body_norm, tags_text)
-                                 SELECT rowid, COALESCE(title, ''), body_norm, tags_text
-                                 FROM notes WHERE status != 'deleted';",
-                            )?;
-                            tx.commit()?;
-                        }
-                        // v0.3 snapshots are full copies taken BEFORE the
-                        // forgetting: apply the same compaction cut to the
-                        // restored copy (idempotent for the logical snapshots
-                        // of v0.3.1, whose payloads are already cut).
-                        {
-                            let tx = rebuild_conn.transaction()?;
-                            tx.execute(
-                                "DELETE FROM op_payloads WHERE op_id IN (
-                                     SELECT op_id FROM ops WHERE seq <= ?1)",
-                                [*snap_seq],
-                            )?;
-                            tx.commit()?;
-                        }
-                        let from = source_ops
-                            .iter()
-                            .position(|o| o.seq > snap_head_seq)
-                            .unwrap_or(source_ops.len());
-                        tail = &source_ops[from..];
-                    } else {
-                        snapshot_ok = false;
                     }
+                    _ => snapshot_ok = false,
                 }
-                _ => snapshot_ok = false,
             }
-        } else {
-            let tx = rebuild_conn.transaction()?;
-            schema::migrate(&tx)?;
-            tx.commit()?;
+            // v0.3.2 (P0.1): the checkpoint — a row without a file. The
+            // from-zero replay is impossible and the tail has no state to
+            // replay on: chain-only. The chain loop above already checked
+            // every surviving payload against its digest; below, the FTS
+            // coherence runs on the live cell and `ChainOnly` coherence of
+            // the derived indexes replaces the state comparison.
+            Some((snap_seq, ..)) => {
+                replay = Replay::ChainOnly {
+                    since_seq: *snap_seq,
+                };
+                chain_only = true;
+            }
+            None => {
+                let tx = rebuild_conn.transaction()?;
+                schema::migrate(&tx)?;
+                tx.commit()?;
+            }
         }
         let mut mismatch: Option<String> =
             (!snapshot_ok).then(|| "the compaction snapshot does not match its record".to_string());
         // Replay: the tail on the snapshot, or everything from zero.
         let mut replay_err: Option<String> = None;
-        {
+        if !chain_only {
             let tx = rebuild_conn.transaction()?;
             for op in tail {
                 if let Err(e) = ops::apply(&tx, op) {
@@ -1822,6 +2037,7 @@ impl Cell {
         if let Some(e) = replay_err {
             return Ok(VerifyReport {
                 ops: source_ops.len(),
+                replay,
                 hash_chain_ok: chain_ok,
                 replay_ok: false,
                 fts_ok: false,
@@ -1830,14 +2046,24 @@ impl Cell {
                 coverage: Vec::new(),
             });
         }
-        if mismatch.is_none() {
+        if chain_only {
+            // ChainOnly (P0.2): what can still be checked without a replay.
+            let digest_ok = verify_checkpoint_digest(&inner.conn, snapshot.as_ref());
+            if let Err(e) = digest_ok {
+                mismatch = mismatch.or(Some(e));
+            }
+        } else if mismatch.is_none() {
             mismatch = compare_states(&inner.conn, &rebuild_conn)?;
         }
         // The FTS index is not part of the logical replay: check it against
-        // its content table, on the live cell and on the rebuild alike.
-        let fts_ok = match fts_integrity_check(&inner.conn)
-            .and_then(|()| fts_integrity_check(&rebuild_conn))
-        {
+        // its content table, on the live cell and on the rebuild alike (a
+        // checkpoint has no rebuild: the live check is all there is).
+        let fts_check = if chain_only {
+            fts_integrity_check(&inner.conn)
+        } else {
+            fts_integrity_check(&inner.conn).and_then(|()| fts_integrity_check(&rebuild_conn))
+        };
+        let fts_ok = match fts_check {
             Ok(()) => true,
             Err(e) => {
                 mismatch = Some(mismatch.unwrap_or_else(|| format!("fts index: {e}")));
@@ -1851,6 +2077,7 @@ impl Cell {
             .unwrap_or_default();
         Ok(VerifyReport {
             ops: source_ops.len(),
+            replay,
             hash_chain_ok: chain_ok,
             replay_ok: mismatch.is_none(),
             fts_ok,
@@ -2935,6 +3162,7 @@ mod tests {
 
     /// v0.3 (P3): compact, write more, verify — the chain is whole, the
     /// payloads up to the snapshot are gone, the tail replays on it.
+    /// v0.3.2 (P0.1): the default compaction is a checkpoint without a file.
     #[test]
     fn compact_then_write_then_verify() {
         let dir = tempfile::tempdir().unwrap(/* test-only */);
@@ -2950,7 +3178,12 @@ mod tests {
             .parse()
             .unwrap(/* test-only */);
         // compact up to one before the head: the last op stays replayable
-        let snap = cell.compact(head - 1).unwrap(/* test-only */);
+        let report = cell
+            .compact(head - 1, &CompactOptions { keep_snapshot: true })
+            .unwrap(/* test-only */);
+        let snap = report
+            .snapshot
+            .expect(/* test-only */ "keep_snapshot writes a file");
         assert!(snap.is_file(), "{}", snap.display());
         let ops = cell.ops().unwrap(/* test-only */);
         assert!(ops.iter().all(|o| o.seq > head - 1 || o.body.is_none()));
@@ -2966,15 +3199,45 @@ mod tests {
         // more writes after the compaction
         cell.put_note(&note(9, "dopo la compattazione [[Roma]]"), "t")
             .unwrap(/* test-only */);
-        let report = cell.verify().unwrap(/* test-only */);
-        assert!(
-            report.ok(),
-            "verify after compaction: {:?}",
-            report.mismatch
-        );
+        let vr = cell.verify().unwrap(/* test-only */);
+        assert!(vr.ok(), "verify after compaction: {:?}", vr.mismatch);
+        assert_eq!(vr.replay, Replay::FromSnapshot { seq: head - 1 });
         // compacting outside the live log is refused
-        assert!(cell.compact(head + 5).is_err());
-        assert!(cell.compact(0).is_err());
+        assert!(cell.compact(head + 5, &CompactOptions::default()).is_err());
+        assert!(cell.compact(0, &CompactOptions::default()).is_err());
+    }
+
+    /// v0.3.2 (P0.1): the checkpoint compaction keeps `changes_since`
+    /// compacted below the cut too, and verify says `ChainOnly`.
+    #[test]
+    fn checkpoint_compact_compacts_changes_since() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let path = dir.path().join("k.sqlite");
+        let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
+        for i in 1..=4_u16 {
+            cell.put_note(&note(i, &format!("nota {i} [[Roma]]")), "t")
+                .unwrap(/* test-only */);
+        }
+        let head: i64 = cell
+            .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+            .unwrap(/* test-only */)[0]
+            .parse()
+            .unwrap(/* test-only */);
+        let report = cell
+            .compact(head - 1, &CompactOptions::default())
+            .unwrap(/* test-only */);
+        assert!(report.snapshot.is_none());
+        let err = cell.changes_since(head - 2).unwrap_err(/* t */);
+        assert!(matches!(err, CellError::Compacted { snapshot_seq } if snapshot_seq == head - 1));
+        assert!(cell.changes_since(head - 1).is_ok());
+        let vr = cell.verify().unwrap(/* test-only */);
+        assert!(vr.ok(), "{vr:?}");
+        assert_eq!(
+            vr.replay,
+            Replay::ChainOnly {
+                since_seq: head - 1
+            }
+        );
     }
 
     /// v0.3 (P3): a tampered snapshot fails verification (the recorded
@@ -2991,7 +3254,11 @@ mod tests {
             .unwrap(/* test-only */)[0]
             .parse::<i64>()
             .unwrap(/* test-only */);
-        let snap = cell.compact(head).unwrap(/* test-only */);
+        let snap = cell
+            .compact(head, &CompactOptions { keep_snapshot: true })
+            .unwrap(/* test-only */)
+            .snapshot
+            .expect(/* test-only */ "keep_snapshot writes a file");
         drop(cell);
         {
             let conn = Connection::open(&snap).unwrap(/* test-only */);

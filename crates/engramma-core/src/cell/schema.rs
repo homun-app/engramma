@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 9] = [
+pub const MIGRATIONS: [&str; 10] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -121,6 +121,27 @@ DELETE FROM vault_files WHERE rowid NOT IN (
     SELECT MIN(rowid) FROM vault_files GROUP BY note_id
 );
 CREATE UNIQUE INDEX idx_vault_files_note ON vault_files(note_id);
+"#,
+    r#"
+-- v10 (v0.3.2, P0.1): the compaction checkpoint. By default a compaction no
+-- longer keeps a second copy of the cell: the row records the head, the
+-- digest of the logical state at the head and `redacted_by`, and `file` is
+-- NULL — a checkpoint without a file (the live cell IS the durable state,
+-- as in rqlite, which uses the SQLite file itself as its snapshot). A file
+-- snapshot stays available with `--keep-snapshot`. `state_digest` becomes
+-- nullable too: a purge redacts a checkpoint's digest (it described a state
+-- that contained the purged note). SQLite cannot drop a NOT NULL constraint
+-- in place, hence the table rebuild.
+CREATE TABLE snapshots_v10 (seq INTEGER PRIMARY KEY,
+                             head_hash TEXT NOT NULL,
+                             state_digest TEXT,
+                             file TEXT,
+                             redacted_by TEXT NOT NULL DEFAULT '[]',
+                             created_at TEXT NOT NULL);
+INSERT INTO snapshots_v10 (seq, head_hash, state_digest, file, redacted_by, created_at)
+     SELECT seq, head_hash, state_digest, file, redacted_by, created_at FROM snapshots;
+DROP TABLE snapshots;
+ALTER TABLE snapshots_v10 RENAME TO snapshots;
 "#,
 ];
 

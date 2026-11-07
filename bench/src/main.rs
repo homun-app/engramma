@@ -995,10 +995,16 @@ struct RunReport {
     mrr: f64,
     questions: usize,
     file_bytes: u64,
-    bytes_after_compact: u64,
-    /// The snapshot's size after the compaction (v0.3.1: cell + snapshot is
-    /// the honest space bill).
-    snap_bytes: u64,
+    /// v0.3.2 (P0.1): the compaction bill is the whole footprint (cell +
+    /// WAL + snapshot files), before and after, in BOTH modes.
+    footprint_before: u64,
+    /// After the `--keep-snapshot` compaction (cell + logical snapshot).
+    footprint_after_keep: u64,
+    /// After the default checkpoint compaction (no second copy).
+    footprint_after_plain: u64,
+    /// The two compactions' wall times, in seconds.
+    compact_keep_s: f64,
+    compact_plain_s: f64,
     /// One `purge` at scale, in ms (v0.3.1): the whole forgetting path —
     /// FTS optimize, VACUUM, WAL checkpoint, snapshot scrub.
     purge_ms: f64,
@@ -1374,10 +1380,12 @@ fn run_semantic(
     });
 
     // file size (checkpoint the WAL first, like a rest after a bulk load),
-    // then again after a compaction (v0.3): the payloads up to head-1000 go.
-    // v0.3.1: the snapshot's size is measured too (the honest space bill is
-    // cell + snapshot), and a purge at scale times the whole forgetting path
-    // — FTS optimize, VACUUM, checkpoint, snapshot scrub.
+    // then again after a compaction — v0.3.2 (P0.1): BOTH ways, and the bill
+    // is the whole footprint (cell + WAL + snapshot files), before and
+    // after. First WITH the file snapshot (v0.3.1 behavior), then a purge at
+    // scale with the file present (the whole forgetting path: FTS optimize,
+    // VACUUM, checkpoint, snapshot scrub), then the checkpoint compaction —
+    // which replaces the snapshot row and deletes its file.
     cell.checkpoint()
         .expect(/* single bench writer */ "checkpoint");
     let file_bytes = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
@@ -1386,13 +1394,44 @@ fn run_semantic(
         .ok()
         .and_then(|v| v.first().and_then(|s| s.parse().ok()))
         .unwrap_or(0);
+    let stem = db
+        .file_name()
+        .map(|n| n.to_string_lossy().trim_end_matches(".sqlite").to_string())
+        .unwrap_or_default();
+    let footprint = |dir: &std::path::Path| -> u64 {
+        let mut total = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+        total += std::fs::metadata(dir.join(format!("{stem}.sqlite-wal")))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with(&format!("{stem}-snap-")) {
+                    total += e.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        total
+    };
     let compacted_ops = (head - 1000).max(0);
-    let mut snap_bytes = 0_u64;
+    let mut footprint_before = 0_u64;
+    let mut footprint_after_keep = 0_u64;
+    let mut footprint_after_plain = 0_u64;
+    let mut keep_s = 0.0_f64;
+    let mut plain_s = 0.0_f64;
     let mut purge_ms = 0.0_f64;
     if compacted_ops >= 1 {
-        let snap_path = cell
-            .compact(compacted_ops)
-            .expect(/* head is live */ "compact");
+        footprint_before = footprint(dir);
+        let t = Instant::now();
+        cell.compact(
+            compacted_ops,
+            &engramma_core::cell::CompactOptions {
+                keep_snapshot: true,
+            },
+        )
+        .expect(/* head is live */ "compact with snapshot");
+        keep_s = t.elapsed().as_secs_f64();
+        footprint_after_keep = footprint(dir);
         if let Some(id) = corpus.notes.first().map(|n| n.id) {
             let t = Instant::now();
             let _ = cell.purge(&id, "bench", "bench");
@@ -1400,9 +1439,20 @@ fn run_semantic(
         }
         cell.checkpoint()
             .expect(/* single bench writer */ "checkpoint");
-        snap_bytes = std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
+        let head2: i64 = cell
+            .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
+            .ok()
+            .and_then(|v| v.first().and_then(|s| s.parse().ok()))
+            .unwrap_or(0);
+        let t = Instant::now();
+        cell.compact(
+            (head2 - 1000).max(1),
+            &engramma_core::cell::CompactOptions::default(),
+        )
+        .expect(/* head is live */ "checkpoint compact");
+        plain_s = t.elapsed().as_secs_f64();
+        footprint_after_plain = footprint(dir);
     }
-    let bytes_after_compact = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
     // the bench deletes its own cells: nothing may survive the run (the
     // prompt: the disk is nearly full)
     drop(cell);
@@ -1448,8 +1498,11 @@ fn run_semantic(
         },
         questions: answered,
         file_bytes,
-        bytes_after_compact,
-        snap_bytes,
+        footprint_before,
+        footprint_after_keep,
+        footprint_after_plain,
+        compact_keep_s: keep_s,
+        compact_plain_s: plain_s,
         purge_ms,
         compacted_ops,
         semantic,
@@ -1467,12 +1520,19 @@ fn median_report(variant: &'static str, runs: &[RunReport]) -> RunReport {
     RunReport {
         variant,
         notes: runs[0].notes,
-        bytes_after_compact: runs
+        footprint_before: runs.iter().map(|r| r.footprint_before).max().unwrap_or(0),
+        footprint_after_keep: runs
             .iter()
-            .map(|r| r.bytes_after_compact)
+            .map(|r| r.footprint_after_keep)
             .max()
             .unwrap_or(0),
-        snap_bytes: runs.iter().map(|r| r.snap_bytes).max().unwrap_or(0),
+        footprint_after_plain: runs
+            .iter()
+            .map(|r| r.footprint_after_plain)
+            .max()
+            .unwrap_or(0),
+        compact_keep_s: pick(|r| r.compact_keep_s),
+        compact_plain_s: pick(|r| r.compact_plain_s),
         purge_ms: pick(|r| r.purge_ms),
         compacted_ops: runs[0].compacted_ops,
         insert_notes_per_s: pick(|r| r.insert_notes_per_s),
@@ -1526,15 +1586,15 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
         "# Benchmark Engramma v0.3\n\nGenerato da `engramma-bench` (seme fisso, corpus sintetico italiano; macchina: vedi REPORT.md). \
          Ogni riga è la **mediana di {runs} giri**. Le righe `sem-*` misurano il ramo vettoriale (corpus vivo). \
          Obiettivi del §11 del documento di progetto in fondo.\n\n\
-         | corpus | note | inserimento (note/s) | apertura cella (ms) | ricerca p50 (ms) | ricerca p95 (ms) | solo testo p50 (ms) | testo+grafo p50 (ms) | testo+grafo p95 (ms) | richiamo@5 | MRR | domande | file (MB) | dopo compattazione (MB) | istantanea (MB) | purge (ms) |\n\
-         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+         | corpus | note | inserimento (note/s) | apertura cella (ms) | ricerca p50 (ms) | ricerca p95 (ms) | solo testo p50 (ms) | testo+grafo p50 (ms) | testo+grafo p95 (ms) | richiamo@5 | MRR | domande | file (MB) | impronta prima (MB) | dopo compatt. base (MB) | dopo compatt. +istantanea (MB) | compact base (s) | compact +istantanea (s) | purge (ms) |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
     );
     for r in reports {
         // v0.3.1 (P2.11): measured for every variant — the viva and uniform
         // rows printed 0.0 when these lived only in the semantic report
         let (tp50, tp95) = (r.text_hops_p50_ms, r.text_hops_p95_ms);
         out.push_str(&format!(
-            "| {} | {} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.3} | {:.3} | {} | {:.1} | {:.1} | {:.1} | {:.0} |\n",
+            "| {} | {} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.3} | {:.3} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.0} |\n",
             r.variant,
             r.notes,
             r.insert_notes_per_s,
@@ -1548,8 +1608,11 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
             r.mrr,
             r.questions,
             r.file_bytes as f64 / 1e6,
-            r.bytes_after_compact as f64 / 1e6,
-            r.snap_bytes as f64 / 1e6,
+            r.footprint_before as f64 / 1e6,
+            r.footprint_after_plain as f64 / 1e6,
+            r.footprint_after_keep as f64 / 1e6,
+            r.compact_plain_s,
+            r.compact_keep_s,
             r.purge_ms,
         ));
     }
@@ -1628,7 +1691,7 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
     out.push_str(
         "\nDue varianti per dimensione: **viva** — i fatti correnti hanno `updated_at` recente (ottobre 2026, come una memoria viva) e i riempitivi datano 2025, quindi il peso di recenza lavora; **uniform** — lo stesso `updated_at` per ogni nota, così il ranking è solo testo+grafo (quanto del richiamo dipendeva dalla recenza si vede dal confronto). \
          Nota: l'inserimento è una `put_note` per nota (una transazione ciascuna, fsync in WAL/NORMAL). La ricerca è testo+grafo (2 passi, come le domande multi-salto) con 5 risultati; «testo+grafo» è la stessa modalità testo con i salti accesi (il PPR ha sostituito la camminata SQL). Richiamo@5 e MRR sulle domande generatrici. \
-         «Ibrido caldo»: la LRU delle domande tiene tutto il corpus (capacità = numero di domande), niente re-incorporazioni. «Dopo compattazione»: payload dimenticati fino a 1000 operazioni dalla fine (v0.3); «istantanea» è il file della compattazione (v0.3.1: stato logico, una sola vive) e «purge» è una purga a corpus pieno, FTS optimize e VACUUM compresi (v0.3.1). \
+         «Ibrido caldo»: la LRU delle domande tiene tutto il corpus (capacità = numero di domande), niente re-incorporazioni. «Impronta» è cella + WAL + file d'istantanea (v0.3.2: il conto onesto): «prima» è l'impronta subito prima della compattazione, «dopo compatt. base» segue la compattazione senza istantanea (punto di controllo, nessuna seconda copia), «dopo compatt. +istantanea» segue quella con --keep-snapshot (v0.3.1: stato logico, una sola vive); i payload sono dimenticati fino a 1000 operazioni dalla fine in entrambi i casi, e «purge» è una purga a corpus pieno con l'istantanea presente, FTS optimize e VACUUM compresi. \
          La varianza tra giri è riportata in REPORT.md (il primo giro a freddo è sempre il più lento: il file nasce e cresce).\n",
     );
     out
@@ -1749,11 +1812,17 @@ fn graph_probe(target: usize, dir: &std::path::Path) {
         .and_then(|v| v.first().and_then(|s| s.parse().ok()))
         .unwrap_or(0);
     let t1 = Instant::now();
-    cell.compact(head - 1000).expect(/* head */ "compact");
+    cell.compact(
+        head - 1000,
+        &engramma_core::cell::CompactOptions {
+            keep_snapshot: true,
+        },
+    )
+    .expect(/* head */ "compact");
     cell.checkpoint().expect(/* writer */ "ckpt");
     let after = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
     eprintln!(
-        "compact: {:.1}s, file {} → {} MB (testa {head})",
+        "compact (con istantanea): {:.1}s, file {} → {} MB (testa {head})",
         t1.elapsed().as_secs_f64(),
         before as f64 / 1e6,
         after as f64 / 1e6
