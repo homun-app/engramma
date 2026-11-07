@@ -752,3 +752,95 @@ fn compact_fails_cleanly_when_the_old_file_cannot_go() {
     drop(cell);
     assert_forgotten(dir.path(), "ordine", &needles);
 }
+
+/// v0.3.2 (P0.5): a v0.3.1 cell (schema 9, `snapshots` with NOT NULL file
+/// and digest, a logical snapshot on disk) opens through the migration,
+/// `verify` passes as before (`FromSnapshot`), and the FIRST compaction
+/// without the flag turns it into a checkpoint and takes the file away.
+#[test]
+fn a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let path = dir.path().join("vecchia.sqlite");
+    let cell = Cell::create(&path, "vecchia", "tester").unwrap(/* test-only */);
+    for i in 1..=3_u16 {
+        cell.put_note(&note_of(i, &format!("nota {i} che resta [[Roma]]")), "tester")
+            .unwrap(/* test-only */);
+    }
+    let head: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    let snap = cell
+        .compact(head, &CompactOptions { keep_snapshot: true })
+        .unwrap(/* test-only */)
+        .snapshot
+        .expect(/* test-only */ "keep_snapshot writes a file");
+    assert!(snap.is_file());
+    drop(cell);
+
+    // the v0.3.1 shape: snapshots with NOT NULL file and digest, schema 9
+    // (in both files — the snapshot's own table was emptied by the strip,
+    // its `meta` still says the version the copy was taken at). The row's
+    // digest is recomputed over the DOWNGRADED snapshot, as a real v0.3.1
+    // compaction would have recorded it (the digest covers meta, schema
+    // version included).
+    let downgrade = |p: &std::path::Path| {
+        let conn = rusqlite::Connection::open(p).unwrap(/* test-only */);
+        conn.execute_batch(
+            "CREATE TABLE snapshots_v9 (seq INTEGER PRIMARY KEY,
+                                         head_hash TEXT NOT NULL,
+                                         state_digest TEXT NOT NULL,
+                                         file TEXT NOT NULL,
+                                         redacted_by TEXT NOT NULL DEFAULT '[]',
+                                         created_at TEXT NOT NULL);
+             INSERT INTO snapshots_v9 SELECT * FROM snapshots;
+             DROP TABLE snapshots;
+             ALTER TABLE snapshots_v9 RENAME TO snapshots;
+             UPDATE meta SET value = '9' WHERE key = 'schema_version';",
+        )
+        .unwrap(/* test-only */);
+    };
+    downgrade(&snap);
+    let v9_digest = {
+        let conn = rusqlite::Connection::open(&snap).unwrap(/* test-only */);
+        engramma_core::cell::state_digest(&conn).unwrap(/* test-only */)
+    };
+    downgrade(&path);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap(/* test-only */);
+        conn.execute(
+            "UPDATE snapshots SET state_digest = ?1",
+            [&v9_digest],
+        )
+        .unwrap(/* test-only */);
+    }
+
+    // it opens (the v10 migration runs), and verify is as before
+    let cell = Cell::open(&path).unwrap(/* test-only */);
+    let vr = cell.verify().unwrap(/* test-only */);
+    assert!(vr.ok(), "{vr:?}");
+    assert_eq!(vr.replay, Replay::FromSnapshot { seq: head });
+    assert_eq!(
+        cell.debug_column("SELECT value FROM meta WHERE key = 'schema_version'")
+            .unwrap(/* test-only */),
+        vec!["10".to_string()]
+    );
+
+    // the first default compaction: checkpoint, the old file goes
+    let head2: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    let report = cell
+        .compact(head2, &CompactOptions::default())
+        .unwrap(/* test-only */);
+    assert!(report.snapshot.is_none());
+    assert!(!snap.exists(), "the v0.3.1 snapshot file is gone");
+    let rows = snapshots_of(&cell);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].file, "NULL", "{rows:?}");
+    let vr = cell.verify().unwrap(/* test-only */);
+    assert!(vr.ok() && vr.replay == Replay::ChainOnly { since_seq: head2 });
+}
