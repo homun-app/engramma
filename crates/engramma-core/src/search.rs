@@ -334,10 +334,14 @@ impl Default for Fusion {
     fn default() -> Self {
         // Measured on the golden vault and the 10k/100k benchmark (REPORT
         // §v0.2.1): the convex combination with the cosine min-max'd over the
-        // candidates and α = 0.7 — the cosine rides on BM25's [0, 1] scale,
-        // so α means what it says.
+        // candidates — the cosine rides on BM25's [0, 1] scale, so α means
+        // what it says. α = 0.7 there; retuned JOINTLY with the graph weight
+        // in v0.3.1 (REPORT §v0.3.1): the full α × weight grid at 100k has
+        // 0.6/0.40 ahead on the weighted MRR (0.8656 vs 0.8552, beyond the
+        // 0.002 tie bar), keeping more paraphrases than 0.5 at the same
+        // weight.
         Fusion::Convex {
-            alpha: 0.7,
+            alpha: 0.6,
             cos_norm: CosNorm::Candidates,
         }
     }
