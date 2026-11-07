@@ -139,11 +139,14 @@ Indici: `edges(src)`, `edges(dst)`, `edges(rel)`, `notes(status, valid_to)`, `no
   - sul corpo, una **copia di conflitto** visibile all'utente, come fanno i sistemi di sincronizzazione maturi.
 
   Una fusione automatica del testo (CRDT) è rimandata e va misurata prima di adottarla.
-- **Compattazione** (v0.3):
-  - un'istantanea della cella a un `seq` si fa con `VACUUM INTO` ed è registrata con l'hash di testa e un **digest dello stato** (`state_digest`, il dump canonico delle tabelle logiche);
-  - i payload delle operazioni fino a quel `seq` si dimenticano, mentre gli scheletri con gli hash restano: la catena è intera;
-  - `verify` controlla l'istantanea e rigioca solo le operazioni successive;
-  - `changes_since` sotto l'istantanea risponde `Compacted`: la replica parte dall'istantanea (§ 9).
+- **Compattazione** (v0.3; **rivista il 2026-11-07, v0.3.2**):
+  - i payload delle operazioni fino a un `seq` si dimenticano, mentre gli scheletri con gli hash restano: la catena è intera;
+  - **di base la compattazione registra un punto di controllo senza file**: testa, digest dello stato logico alla testa e `redacted_by`. La cella SQLite è già lo stato durevole; una seconda copia (l'istantanea di v0.3/v0.3.1) serviva solo all'audit completo e valeva quasi tutta la cella (a 100k: 190 MB di cella + 179 di istantanea = +50%). Come rqlite, che usa il file SQLite stesso come istantanea;
+  - l'istantanea resta **facoltativa** (`--keep-snapshot`): il comportamento v0.3.1, cioè il file dello stato logico (payload fino al taglio, vettori, registro modelli, legami della vista e contenuto FTS tolti), una sola per cella, purgata insieme alla cella;
+  - resta sempre **una sola riga**: l'ultima compattazione sostituisce la precedente, con o senza file; il file vecchio si cancella **prima** della sua riga (una riga senza file sfuggirebbe a ogni purge successiva), e un fallimento della cancellazione è un errore della compattazione;
+  - `verify` dice cosa ha potuto controllare (`replay`): `Full` (nessuna compattazione), `FromSnapshot` (istantanea: rigioca la coda) o `ChainOnly` (punto di controllo senza file: catena intera degli hash, ogni payload superstite col suo digest, coerenza degli indici derivati — archi riderivati dalle note, nessun vettore oltre la propria nota — e digest dello stato finché la testa non avanza dal punto di controllo);
+  - `purge` su un punto di controllo ne azzera il digest (descriveva uno stato che conteneva la nota purgata) e aggiunge il proprio `op_id` a `redacted_by`; sull'istantanea con file vale il v0.3.1 (scrub del file, digest aggiornato);
+  - `changes_since` sotto il taglio risponde `Compacted`: la replica parte dall'istantanea, o non può partire senza (§ 9).
 
 ### 4.4 Versioni e cancellazione
 - Ogni modifica crea una riga in `note_versions`: lo storico è consultabile e ripristinabile.

@@ -33,23 +33,29 @@ engramma-core
 │   └── schema.rs  v5: op_payloads + the v1→v2 migration (v1 chain verified
 │                first, bookmarked in meta); v6: snapshots; v7: vault_files;
 │                v8: snapshots.redacted_by; v9: one file per note
-│                (UNIQUE(note_id) on vault_files).
-├── cell/       compact(seq): VACUUM INTO a snapshot of the cell, then strip
-│               it to the LOGICAL state (v0.3.1): payloads ≤ seq, vectors,
-│               model registry, vault bindings and the FTS content go —
-│               derived or recomputable, and all of them carry content.
-│               Registered with its head hash and state_digest (blake3 of
-│               the canonical dump of the logical tables — the same
-│               rendering verify compares); only the LAST snapshot stays.
-│               verify restores the snapshot (backup API), brings it to the
-│               current schema, rebuilds its FTS from the living notes,
-│               re-applies the cut (idempotent) and replays the tail;
-│               changes_since below the cut is CellError::Compacted.
-│               purge reaches the snapshot files too: same state purge and
-│               log scrub, new digest recorded under the same head hash
-│               with redacted_by naming the purge ops — verify accepts a
-│               redacted digest exactly when the tail replay, purges
-│               included, reproduces the live state (spec §6.4).
+│                (UNIQUE(note_id) on vault_files); v10: snapshots.file and
+│                state_digest nullable (the checkpoint); v11: vault_roots +
+│                vault_conflicts (the cell remembers its views).
+├── cell/       compact(seq, opts) (v0.3.2): by default a CHECKPOINT —
+│               head hash and state_digest of the logical state at the
+│               head, no file (the live cell already is the durable state;
+│               a second copy served only the full audit and was worth
+│               almost the whole cell). keep_snapshot keeps the v0.3.1
+│               file: VACUUM INTO, stripped to the LOGICAL state (payloads
+│               ≤ seq, vectors, model registry, vault bindings, vault
+│               roots/conflicts and the FTS content go), one row only; the
+│               OLD file is removed BEFORE its row, and a failed removal
+│               fails the compaction (a row-less file escapes every purge).
+│               verify says what it could check (VerifyReport.replay):
+│               Full | FromSnapshot { seq } | ChainOnly { since_seq } —
+│               chain-only still checks the whole chain, every surviving
+│               payload's digest, the derived edges re-derived from the
+│               notes, that no vector outlives its note, and the state
+│               digest while the head has not moved. changes_since below
+│               the cut is CellError::Compacted. purge reaches the snapshot
+│               files (scrub, new digest, redacted_by naming the purge ops,
+│               spec §6.4) and REDACTS a checkpoint (digest → NULL: it
+│               described a state that contained the purged note).
 └── search/     the graph list as a THIRD list of the fusion: PPR scores of
                 the notes (seeds out), scaled by the list maximum; convex
                 (1−w)·fused + w·g (RRF: weighted rank reciprocal), w = 0.40
