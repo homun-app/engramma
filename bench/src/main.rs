@@ -1638,6 +1638,12 @@ struct Args {
     /// Diagnose the multi-hop questions (v0.2.1 P1.7): where the expected
     /// note ends up, its score and its graph path.
     multihop_debug: bool,
+    /// Build a cell at the given size, then sustain `put_note` on it for a
+    /// few seconds (v0.3.1, P2.9): run it under `sample` to see where a
+    /// write's time goes at 100k.
+    profile_insert: bool,
+    /// How long the sustained write phase lasts (seconds).
+    seconds: u64,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Args {
@@ -1647,6 +1653,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Args {
         runs: 3,
         fake_embedder: false,
         multihop_debug: false,
+        profile_insert: false,
+        seconds: 15,
     };
     let mut it = args.peekable();
     while let Some(arg) = it.next() {
@@ -1664,6 +1672,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Args {
             }
             "--fake-embedder" => a.fake_embedder = true,
             "--multihop-debug" => a.multihop_debug = true,
+            "--profile-insert" => a.profile_insert = true,
+            "--seconds" => {
+                if let Some(v) = it.next().and_then(|v| v.parse::<u64>().ok()) {
+                    a.seconds = v.clamp(1, 600);
+                }
+            }
             other => {
                 if let Ok(n) = other.parse::<usize>() {
                     a.targets.push(n);
@@ -1744,6 +1758,47 @@ fn graph_probe(target: usize, dir: &std::path::Path) {
     }
 }
 
+/// v0.3.1 (P2.9): where does a `put_note`'s time go at 100k? Build the
+/// corpus cell (that phase IS the insert rate the report measures), then
+/// sustain full replaces on the full cell for `seconds` while the operator
+/// runs `sample` on the process. The cell is deleted at the end.
+fn profile_insert(target: usize, seconds: u64, dir: &std::path::Path) {
+    let corpus = build_corpus(target, false);
+    let db = dir.join(format!("prof-{target}.sqlite"));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(dir.join(format!("prof-{target}.sqlite{suffix}")));
+    }
+    let cell = Cell::create(&db, "prof", "bench").expect(/* fresh */ "create");
+    let t0 = Instant::now();
+    for note in &corpus.notes {
+        cell.put_note(note, "bench").expect(/* valid */ "put");
+    }
+    eprintln!(
+        "insert: {} note in {:.1}s ({:.0} note/s)",
+        corpus.notes.len(),
+        t0.elapsed().as_secs_f64(),
+        corpus.notes.len() as f64 / t0.elapsed().as_secs_f64()
+    );
+    // sustained full replaces, round-robin over the corpus
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut done: usize = 0;
+    let mut i: usize = 0;
+    while std::time::Instant::now() < deadline {
+        let note = &corpus.notes[i % corpus.notes.len()];
+        cell.put_note(note, "bench").expect(/* valid */ "put");
+        done += 1;
+        i += 1;
+    }
+    eprintln!(
+        "sustain: {done} put_note in {seconds}s ({:.0}/s)",
+        done as f64 / seconds as f64
+    );
+    drop(cell);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(dir.join(format!("prof-{target}.sqlite{suffix}")));
+    }
+}
+
 fn main() {
     if std::env::var("ENGRAMMA_GRAPH_PROBE").is_ok() {
         let dir = std::env::temp_dir().join("engramma-bench");
@@ -1768,6 +1823,11 @@ fn main() {
             eprintln!("diagnosi multi-salto su {t} note…");
             multihop_debug(*t, 5, &dir);
         }
+        return;
+    }
+    if args.profile_insert {
+        let t = targets.first().copied().unwrap_or(100_000);
+        profile_insert(t, args.seconds, &dir);
         return;
     }
     if args.fake_embedder {
