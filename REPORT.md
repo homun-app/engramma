@@ -2091,3 +2091,228 @@ nulla da fare
 4. **Le due multi-salto ibride fuori dai primi 5** sul vault dorato: la
    catena c'è (il testo+grafo le risolve), è il rango che manca — il
    punto 1 le copre in parte.
+
+---
+
+# REPORT — Engramma v0.3.2 (compattazione senza seconda copia, e i residui della v0.3.1)
+
+Data: 2026-11-07. Base: `main` @ `8ec3a4b` (tag `fase-v0.3.1`). Un commit
+per punto, test rosso prima della correzione (per due punti la
+dimostrazione del rosso è nel testo sotto). Tutto offline, Rust 1.95,
+macOS arm64, nessuna crate nuova, nessun `unsafe`, nessun `unwrap`/`expect`
+fuori dai test, `Cargo.lock` invariato.
+
+## Punto 1 — la compattazione di base è un punto di controllo senza file
+
+- `compact(up_to_seq, &CompactOptions { keep_snapshot })` → `CompactReport`
+  (`cut_seq`, `head_seq`, `head_hash`, `state_digest`, `snapshot:
+  Option<PathBuf>`, `bytes_before`/`bytes_after` su **cella + WAL +
+  istantanee**). Di base **nessun `VACUUM INTO`**: la riga in `snapshots`
+  registra testa, digest dello stato logico alla testa (calcolato **dopo**
+  il taglio, nella stessa transazione: è il digest dello stato che resta) e
+  `redacted_by`; il file di un'istantanea precedente si cancella.
+  `--keep-snapshot` tiene il comportamento v0.3.1 (stato logico, una sola,
+  purgata con la cella). Resta sempre **una sola riga**: l'ultima
+  compattazione sostituisce la precedente, con o senza file.
+- Migrazione v10: `snapshots.file` e `state_digest` annullabili (SQLite
+  non rimuove un NOT NULL sul posto: la tabella si ricostruisce).
+- **Bug trovato dal proptest**: alla ricompattazione con lo stesso taglio e
+  lo stesso nome file, la riga precedente cancellata «per identità» era la
+  riga appena registrata — la cella restava senza righe e `verify`
+  rigiocava da zero un registro redatto, divergendo. La riga precedente
+  sopravvive solo quando NON è la riga nuova.
+- Bug evitato per costruzione: la lista delle righe precedenti si legge
+  PRIMA dell'upsert (alla stessa testa l'upsert riscrive la riga in posto e
+  il suo file vecchio sparirebbe dalla lista).
+
+## Punto 2 — `verify` dice cosa ha potuto controllare
+
+`VerifyReport.replay: Replay` con `Full`, `FromSnapshot { seq }`,
+`ChainOnly { since_seq }`. Con `ChainOnly` (punto di controllo senza file)
+`verify` controlla comunque: la catena intera degli hash (ogni payload
+superstite contro il proprio `payload_digest` — la catena v2 copre il
+digest salato), la coerenza degli **archi derivati** (riderivati da ogni
+nota con la stessa analisi deterministica di `reindex_note`, ora
+factorizzata in `derived_edges_of`: la tabella deve contenere esattamente
+quelli; gli archi manuali non sono riderivabili e restano fuori),
+**nessun vettore oltre la propria nota** (purge e lapidi li cancellano),
+l'FTS (come sempre), e — finché la testa non avanza dal punto di controllo
+— che il digest dello stato attuale sia quello registrato. `ok()` resta
+vero con `ChainOnly`; la CLI stampa «rigioco: solo catena da seq N
+(compattata senza istantanea)» e `--json` porta `replay.kind/since_seq`.
+
+Dichiarazione: con la testa avanzata oltre il punto di controllo, una
+manomissione dello *stato* (non del registro) non è più opponibile senza
+istantanea: è il prezzo del punto di controllo, detto dall'uscita stessa
+del comando. Il costo di `verify` in `ChainOnly` cresce con le note (la
+riderivazione degli archi tocca tutte le note vive; è lo stesso ordine del
+digest dello stato, che `FromSnapshot` paga comunque).
+
+## Punto 3 — `purge` e il punto di controllo
+
+Il digest di un punto di controllo descrive uno stato che conteneva la
+nota purgata: non è un dato leggibile (è l'hash dell'intero stato logico),
+ma da lì in poi non è più verificabile e non serve tenerlo. `purge` lo
+mette a `NULL` e aggiunge il proprio `op_id` a `redacted_by`. Con il file
+d'istantanea il comportamento v0.3.1 resta (scrub del file, digest
+aggiornato, `redacted_by` che nomina la purge).
+
+## Punto 4 — la vecchia istantanea non sfugge più
+
+Ordine nuovo (già col commit del punto 1): registra la riga nuova, poi
+cancella il **file** vecchio (`NotFound` conta come fatto), solo dopo la
+sua riga; un errore al passo file è un errore di `compact` (transazione
+annullata: le righe vecchie restano coi loro file) e la `purge` successiva
+ripulisce quel file. Il commento sul crash dice ora la verità: la finestra
+lascia una riga CON il suo file, non una riga fantasma. Dimostrazione del
+rosso: con l'ordine v0.3.1 simulato (riga prima, `let _ =` sul remove), il
+test della cartella in sola lettura fallisce — la compact «riusciva» e il
+file restava orfano, invisibile a ogni purge.
+
+## Punto 5 — le celle v0.3.1 con istantanea
+
+La migrazione v10 gira all'apertura; il test costruisce la cella col
+motore, la riporta alla forma v9 (`snapshots` con file e digest NOT NULL,
+`schema_version` 9, digest ricalcolato sulla copia downgrade come
+l'avrebbe registrato un binario v0.3.1): si apre, `verify` passa
+`FromSnapshot`, e il primo `compact` senza flag registra il punto di
+controllo e toglie il file. (Il file d'istantanea attraversa il ripristino
+di `verify` anche quando la sua copia interna è a schema vecchio: la copia
+ripristinata migra prima del rigioco della coda, come già da v0.3.1.)
+
+## Punto 6 — l'oblio raggiunge la vista
+
+- Migrazione v11: `vault_roots(root, bound_at)` — il percorso assoluto
+  canonico, scritto a ogni `vault init`/`sync` — e `vault_conflicts(path,
+  note_id, created_at)` — ogni copia `.conflitto` che il motore crea (lo
+  scanner la ignora: nessuno l'avrebbe mai pulita). Dati derivati, fuori
+  dal registro e dall'istantanea di compattazione.
+- `Vault::forget_note(id)`: cancella il file legato alla nota e ogni sua
+  copia di conflitto, poi le righe. Il nucleo non scrive nella vista; la
+  CLI `purge` chiama `forget_note` per ogni vista registrata. L'MCP è di
+  sola lettura e non espone purge: la chiamata è pronta per quando
+  servirà (dichiarato).
+- Una vista irraggiungibile (smontata, permessi) → `PurgeReport.pending`
+  contiene `"vault"`, la CLI esce con **5** (stesso codice del WAL); la
+  `vault sync` successiva finisce il lavoro, copie di conflitto comprese
+  (lo spazzino di sync cancella le copie delle note che non esistono più).
+- `delete_note` (lapide, reversibile) NON tocca le copie di conflitto.
+
+## Punto 7 — il titolo dei file senza intestazione
+
+`parse_obsidian` applicava il nome-file-senza-estensione solo con
+l'intestazione presente (`&& has_header`): il file senza intestazione — il
+caso più comune — restava senza titolo. Ora il fallback scatta sempre e la
+riscrittura con l'id porta `title:` nel blocco nuovo. Prova a mano sotto
+(«Mele rosse»). **I numeri dorati non si muovono**: tutti i 66 file del
+vault dorato hanno intestazione Engramma completa con `title:` (verificato
+a mano con grep: 66/66), quindi nessun titolo nuovo entra nell'indice FTS
+— i test dorati passano con le attese di v0.3.1, non ritoccate.
+
+## Punto 8 — gli avvisi della vista non si ripetono
+
+Gli avvisi di un file (chiavi sconosciute, valori inutilizzabili) viaggano
+solo con la lettura che li ha causati: file nuovo o cambiato. La seconda
+`sync` di una vista ferma è un `SyncReport` vuoto, avvisi compresi.
+
+## Punto 9 — i due test HTTP che fallivano a caso
+
+Causa confermata nel codice: il listener della `FakeServer` è non
+bloccante e su macOS/BSD il socket restituito da `accept` **eredita
+`O_NONBLOCK`** (su Linux no); la prima `read` di `handle` rispondeva
+`WouldBlock` con la richiesta ancora in viaggio, e `Err(_) => return`
+chiudeva la connessione senza risposta. Correzione:
+`stream.set_nonblocking(false)` subito dopo `accept` (il timeout di
+lettura di 5 s resta).
+
+Numeri della prova: il ciclo pre-correzione NON ha riportato il fallimento
+a macchina ferma — 30 giri verdi di `cargo test -p engramma-embed --lib`,
+e altri 30 verdi sotto carico parallelo di tre processi (il difetto è
+caricato dal sistema e ~1/10 era la misura della verifica, non una
+garanzia). Il test nuovo `a_slow_client_still_gets_its_response` rende la
+finestra deterministica: un client che esita 150 ms tra connect e invio,
+senza la correzione riceve la chiusura senza risposta (rosso), con la
+correzione la risposta arriva (verde). Dopo la correzione: **100 giri
+verdi di fila (100/100)**.
+
+## Punto 10 — il banco e la scelta robusta
+
+- La tabella per modalità guadagna la riga della **fusione predefinita**
+  (`mm-0.6-g0.40`): mancava da sempre, ed è quella che conta.
+- La griglia misura anche **0,45** (il peso 0,40 sta subito prima di un
+  crollo: a 0,50 l'MRR pesato perde ~0,15, e il bordo del dirupo non era
+  mai stato misurato).
+- **Regola di scelta robusta**: vince la configurazione con il miglior MRR
+  pesato **nel caso peggiore dei vicini** (il minimo su ±1 passo di α e
+  del peso del grafo, i punti della griglia che esistono); a parità entro
+  0,002 vince chi tiene le parafrasi. Griglia e minimo dei vicini sotto.
+
+<!-- NUMERI-TARATURA -->
+
+## Prove a mano (uscite trascritte)
+
+**Compact di base a 100k** (cella costruita dal generatore del banco,
+100 000 note + 3 768 put di sostenimento, poi la CLI — binario release):
+
+```console
+$ engramma --root $R compact --keep-last 1000          # nessun flag
+compattata fino a seq 102768 (testa 103768): punto di controllo senza file
+  (cella+WAL+istantanee: 251985920 → 193753088 byte)        # 240,3 → 184,7 MB
+$ engramma --root $R verify
+registro verificato: 103768 operazioni, catena hash e indici derivati a posto
+rigioco: solo catena da seq 102768 (compattata senza istantanea)
+$ engramma --root $R verify --json
+{"ops":103768,"replay":{"kind":"chain_only","since_seq":102768},…,"ok":true}
+$ ls cells/
+default.sqlite                       # nessun *-snap-* accanto alla cella
+```
+
+Con `--keep-snapshot` sulla stessa cella (copia pulita): 240,3 MB →
+**358,7 MB** (cella 184,7 + istantanea 174,0) e `verify` risponde
+«ricostruzione (coda da istantanea di seq 102768)». Una `purge` a corpus
+pieno sulla cella col punto di controllo: **2,2 s** (v0.3.1: 3,4–4,1 s con
+lo scrub dell'istantanea; qui niente file da lavare — il banco misura
+sotto anche il caso con il file).
+
+**Conflitto, poi purge** (punto 6) — la ricerca delle radici in TUTTA la
+cartella della vista:
+
+```console
+$ engramma --root $T add - --source user --confidence stated \
+    --title "Nota segreta"      # corpo: Il pin del lucchetto e quokkaviolaceo42
+$ engramma --root $T vault init $V
+$ sed 's/quokkaviolaceo42/quokkaviolaceo99 dal file/' …md   # il file si muove
+$ EDITOR=script-che-modifica engramma --root $T edit <id>   # e anche la cella
+$ engramma --root $T vault sync $V
+conflitti (vince la cella, copia .conflitto): 1
+  - fact/nota-segreta-AKVF7D2M.md                            # copia registrata
+$ engramma --root $T purge <id> --reason "prova oblio v0.3.2" --yes
+purgata: 01M6VKF4R9QR7VT1A9AKVF7D2M (2 payload dimenticati)  # exit 0
+$ find $V -type f
+…/vault/engramma.json                          # file della nota E copia .conflitto: andati subito
+$ grep -r -e quokkaviolace -e lucchetto $V
+nessuna radice in nessun file della vista
+```
+
+**Mele rosse** (punto 7):
+
+```console
+$ printf 'Mi piacciono.\n' > obs/"Mele rosse.md"
+$ engramma --root $T import obs --obsidian
+importate: 1 / saltate: 0 / errori: 0
+$ engramma --root $T search "mele" --mode text
+1. [active] Mele rosse (SCTHY76Y)   liste: text   termini: mel   supporto: strong
+$ engramma --root $T3 vault sync $V3            # stessa cosa nella vista
+nuove note da file: 1
+  - Mele rosse.md
+$ cat $V3/"Mele rosse.md" | grep title
+title: Mele rosse                                 # il blocco nuovo porta il titolo
+$ engramma --root $T3 vault sync $V3
+nulla da fare                                     # punto fisso
+```
+
+## Chiusura
+
+(fmt, clippy, test, deny, benchmark: sezione che segue.)
+
+<!-- CHIUSURA-NUMERI -->

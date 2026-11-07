@@ -1886,8 +1886,13 @@ fn profile_insert(target: usize, seconds: u64, dir: &std::path::Path) {
         done as f64 / seconds as f64
     );
     drop(cell);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(dir.join(format!("prof-{target}.sqlite{suffix}")));
+    // `ENGRAMMA_KEEP_CELL=1` leaves the built cell on disk: the REPORT's
+    // manual proofs need a real 100k cell to run the CLI against (the
+    // caller deletes it — the disk is nearly full).
+    if std::env::var("ENGRAMMA_KEEP_CELL").is_err() {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.join(format!("prof-{target}.sqlite{suffix}")));
+        }
     }
 }
 
