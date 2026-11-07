@@ -951,8 +951,8 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
 ///   [`Note::serialize`] (one merged `---` block); standard-field keys with
 ///   unusable values are dropped with a warning — they would collide with
 ///   the line the serialiser owns;
-/// - a file without any frontmatter keeps the v0.3 behavior: the whole text
-///   is the body, the caller supplies the title convention.
+/// - a file without any frontmatter keeps the v0.3 behavior (the whole
+///   text is the body) and gains the same title rule: the file name.
 ///
 /// The warnings stay (unknown keys, unusable values): the importer and the
 /// markdown view surface them.
@@ -1084,7 +1084,11 @@ pub fn parse_obsidian(
             }
         }
     }
-    if note.title.is_none() && has_header {
+    // v0.3.2 (P1.7): without a `title`, the file name without extension is
+    // the title — with OR without a header, as Obsidian displays it (the
+    // v0.3.1 code only fell back when a header existed, and the plain file
+    // is the common case).
+    if note.title.is_none() {
         note.title = Some(fallback_title.to_string());
     }
     let analysis = body::analyze(&note.body)?;
@@ -1406,11 +1410,16 @@ mod obsidian_tests {
         assert_eq!(again.note.extensions, n.extensions);
         assert_eq!(again.note.tags, n.tags);
 
-        // no header at all: the whole text is the body, like v0.3
+        // no header at all: the whole text is the body, like v0.3 — and
+        // v0.3.2 (P1.7): the file name is the title here too, as Obsidian
+        // displays it (the v0.3.1 code only fell back WITH a header)
         let parsed = parse_obsidian("# Idea\n\nUna nota.\n", "idea", at(), Ulid::nil())
             .unwrap(/* test-only */);
         assert_eq!(parsed.note.body, "# Idea\n\nUna nota.\n");
-        assert_eq!(parsed.note.title, None);
+        assert_eq!(parsed.note.title.as_deref(), Some("idea"));
+        // the rewrite carries the title into the new header block
+        let rewritten = parsed.note.serialize().unwrap(/* test-only */);
+        assert!(rewritten.contains("title: idea"), "{rewritten}");
     }
 
     /// a broken YAML header is still an error (the vault reports it and

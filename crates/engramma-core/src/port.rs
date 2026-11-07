@@ -563,4 +563,24 @@ mod tests {
         assert!(n.source.starts_with("import:obsidian/appunti.md"));
         assert_eq!(n.note_type, NoteType::Note);
     }
+    /// v0.3.2 (P1.7): a plain file without a header takes the FILE NAME as
+    /// its title (as Obsidian displays it) — the v0.3.1 fallback only fired
+    /// when a header existed.
+    #[test]
+    fn obsidian_import_titles_plain_files_by_name() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let vault = dir.path().join("v");
+        std::fs::create_dir_all(&vault).unwrap(/* test-only */);
+        std::fs::write(vault.join("Mele rosse.md"), "Mi piacciono.\n")
+            .unwrap(/* test-only */);
+        let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t")
+            .unwrap(/* test-only */);
+        let s = import_obsidian(&cell, &vault, "t").unwrap(/* test-only */);
+        assert_eq!(s.imported, 1, "{s:?}");
+        let ids = cell.note_ids().unwrap(/* test-only */);
+        assert_eq!(ids.len(), 1);
+        let note = cell.get(&ids[0]).unwrap(/* test-only */);
+        assert_eq!(note.title.as_deref(), Some("Mele rosse"), "{note:?}");
+        assert_eq!(note.body, "Mi piacciono.\n");
+    }
 }

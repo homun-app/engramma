@@ -893,3 +893,28 @@ fn unreachable_view_is_pending_and_the_next_sync_finishes() {
         }
     }
 }
+
+/// v0.3.2 (P1.7): a plain file WITHOUT a header takes the file name as its
+/// title (as Obsidian displays it) — the v0.3.1 code only fell back when a
+/// header existed. The rewrite adds `title:` to the new block.
+#[test]
+fn plain_file_title_is_the_file_name() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    write(&vault, "Mele rosse.md", "Mi piacciono.\n");
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r.created, vec!["Mele rosse.md".to_string()], "{r:?}");
+    let ids = vault.cell().note_ids().unwrap(/* t */);
+    assert_eq!(ids.len(), 1);
+    let note = vault.cell().get(&ids[0]).unwrap(/* t */);
+    assert_eq!(note.title.as_deref(), Some("Mele rosse"));
+    assert_eq!(note.body, "Mi piacciono.\n");
+    let on_disk = read(&vault, "Mele rosse.md");
+    assert!(
+        on_disk.contains("title: Mele rosse"),
+        "the rewrite carries the title: {on_disk}"
+    );
+    // and the fixed point holds
+    let r2 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r2.is_noop(), "{r2:?}");
+}
