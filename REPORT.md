@@ -2349,6 +2349,85 @@ nulla da fare                                     # punto fisso
 
 ## Chiusura
 
-(fmt, clippy, test, deny, benchmark: sezione che segue.)
+`cargo fmt --check`, `cargo clippy --all-targets --offline -- -D warnings`,
+`cargo test --offline --workspace` (**208 test** in debug, **208** in
+`--release`, zero falliti), `cargo deny check licenses bans` (offline: le
+advisory richiedono rete, come sempre dichiarato): verdi.
 
-<!-- CHIUSURA-NUMERI -->
+### La compattazione senza seconda copia (il punto della fase)
+
+L'impronta è **cella + WAL + file d'istantanea** (il conto onesto), prima e
+poi, nei due modi — banco, mediana di 3, taglio a testa−1000:
+
+| corpus | prima | dopo: base | dopo: +istantanea | compact base | compact +istant. | purge (ms) |
+|---|---|---|---|---|---|---|
+| 10k (testo) | 24,4 MB | **19,2 MB** | 37,4 MB | 0,1 s | 0,4 s | 418–544 |
+| 100k (testo) | 246,2 MB | **189,9 MB** | 369,0 MB | 1,1–1,7 s | 3,0–4,3 s | 4 963–7 955 |
+| 100k (+97M) | 465,0 MB | **407,1 MB** | 586,1 MB | 2,0 s | 5,1 s | 4 407 |
+
+Attesso dalla spec: «circa 246 → 190 MB di base, circa 246 → 369 MB con
+--keep-snapshot» — misurato 246,2 → 189,9 e → 369,0. La purge del banco
+corre con l'istantanea presente (il percorso v0.3.1, scrub compreso); sulla
+cella col solo punto di controllo, a mano: **2,2 s**. I tempi di compact
+della riga «viva» registrata (3,0/7,6 s) attraversano lo stesso picco di
+carico delle righe plain sotto; il giro di controllo dà 1,1/3,5 s.
+
+### Le latenze: il confronto like-for-like con v0.3.1
+
+(100k, 97M, mediana di 3, cache calda vera; v0.3.1 = `bench/RESULTS.md` del
+tag `fase-v0.3.1`.)
+
+| misura | v0.3.1 | v0.3.2 | Δ |
+|---|---|---|---|
+| ibrido caldo p50 / p95 (ms) | 11,6 / 14,8 | 11,7 / 14,9 | +0,9% / +0,7% |
+| ibrido + embedding p50 / p95 (ms) | 20,3 / 23,5 | 20,6 / 23,7 | +1,5% / +0,9% |
+| testo+grafo p50 / p95 (ms, riga sem) | 9,1 / 12,4 | 9,3 / 12,6 | +2,2% / +1,6% |
+| solo vettori p50 / p95 (ms) | 4,4 / 5,1 | 4,5 / 5,1 | +2,3% / 0 |
+| inserimento (note/s) | 2 191 | 2 144 | −2,1% |
+| embedding (note/s) | 193 | 188 | −2,6% |
+
+**Soglia del ≤10%: rispettata ovunque** (niente nel percorso di ricerca è
+cambiato: solo le costanti α e peso grafo).
+
+Dichiarazione onesta: questa è la macchina di sviluppo dell'utente, non una
+macchina di banco. Le righe **plain** a 100k della tornata registrata
+(`viva` p50 22,8, `uniform` 13,4) hanno attraversato un picco di carico
+della sessione utente (load ~8: WindowServer 40%, ZCode 28%, Chrome) — le
+righe sem della stessa tornata, misurate nella finestra tranquilla,
+combaciano con v0.3.1 al millisecondo. Giro di controllo dopo il picco
+(una sola tornata, stessa cella, stesso seme): `viva` p50/p95 **9,4/12,7**,
+`uniform` 9,4/12,8, inserimento 1 906–2 171 note/s — invariati rispetto a
+v0.3.1 (9,2/12,5). `bench/RESULTS.md` conserva la tornata registrata
+com'è; le tabelle di questa sezione portano il like-for-like.
+
+Tabella completa e per-modalità in `bench/RESULTS.md` (la riga della
+fusione predefinita c'è finalmente: `mm-0.7-g0.35`, accanto alla
+`mm-0.6-g0.40` che era il default v0.3.1).
+
+## Cosa non ho potuto provare
+
+- **Windows e Linux**: solo macOS arm64, come nelle fasi precedenti.
+- **cargo deny advisories**: richiedono rete; eseguito `licenses bans`.
+- **Il 311M a 100k**: dichiarato (come v0.2.1/v0.3; il 97M resta il
+  predefinito); le sue misure a 10k sono nel banco.
+- **La taratura robusta su un secondo corpus**: la regola dei vicini nasce
+  da UNA griglia (questa); la sua ragione è proprio non fidarsi del
+  massimo puntuale, ma un corpus diverso resta la prova definitiva.
+
+## Domande aperte per la v0.4
+
+1. **Il costo di `verify` in ChainOnly cresce con le note** (la
+   riderivazione degli archi tocca tutte le note vive): campionare o
+   indicizzare se diventa un comando quotidiano.
+2. **Il prezzo multi-salto del peso 0,35** (0,356 di MRR contro 0,795 a
+   0,40 a 100k): un peso che dipenda dalla densità del grafo resta il
+   candidato dichiarato da v0.3 — la regola robusta sceglie la sicurezza,
+   non il picco.
+3. **Il punto di controllo ammette solo il rigioco della coda con
+   istantanea**: una replica che parte da una cella compattata senza file
+   deve chiedere l'istantanea (o rigiocare da zero è impossibile) — da
+   formalizzare nel §9 quando la replica arriva.
+4. **`purge` dall'MCP**: il server è di sola lettura; `Vault::forget_note`
+   è pronta per quando servirà.
+
+Tag: `fase-v0.3.2`. Nessun push (repo locale).
