@@ -461,7 +461,14 @@ impl Vault {
                 return Ok(());
             }
         };
-        report.warnings.extend(parsed.warnings);
+        // v0.3.2 (P1.8): a file's warnings ride only with the read that
+        // earned them — a quiet view must report nothing, or the fixed
+        // point would never be silent (unknown keys warned at EVERY sync).
+        let row_early = known.get(&file.path);
+        let file_changed_early = row_early.is_none_or(|r| r.file_hash != file.hash);
+        if file_changed_early {
+            report.warnings.extend(parsed.warnings);
+        }
         let mut file_note = parsed.note;
         if file_note.id != note_id {
             report.errors.push(format!(

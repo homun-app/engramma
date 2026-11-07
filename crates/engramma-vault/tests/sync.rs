@@ -918,3 +918,30 @@ fn plain_file_title_is_the_file_name() {
     let r2 = vault.sync_once(false).unwrap(/* test-only */);
     assert!(r2.is_noop(), "{r2:?}");
 }
+
+/// v0.3.2 (P1.8): a file's warnings (unknown keys, unusable values) are
+/// emitted only when the file is (re)read because it is new or changed —
+/// the second sync of a quiet view is an EMPTY report, warnings included.
+#[test]
+fn second_sync_of_a_quiet_view_is_empty_warnings_included() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    write(
+        &vault,
+        "con-campi.md",
+        "---\ntitle: Con campi\nrating: 5\ncssclass: wide\n---\nCorpo con [[Roma]].\n",
+    );
+    let r1 = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r1.created, vec!["con-campi.md".to_string()], "{r1:?}");
+    assert!(
+        r1.warnings.iter().any(|w| w.contains("rating")),
+        "the first read warns about the unknown keys: {:?}",
+        r1.warnings
+    );
+    // the view is quiet now: the second reconciliation says NOTHING
+    let r2 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(
+        r2.is_noop(),
+        "the second sync must be empty, warnings included: {r2:?}"
+    );
+}
