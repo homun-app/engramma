@@ -569,6 +569,50 @@ impl Cell {
         Ok(())
     }
 
+    /// Scrub one compaction snapshot file in place (v0.3.1, P0.3): the same
+    /// state purge and log scrub the live cell went through, an FTS
+    /// `optimize`, a `VACUUM` — and back comes the snapshot's new logical
+    /// digest. The snapshot's log must stay identical to the live log's
+    /// prefix, so the censor mirrors what the live scrub did (`censorable`).
+    fn scrub_snapshot(
+        path: &Path,
+        id: &Ulid,
+        censorable: &std::collections::HashSet<String>,
+    ) -> Result<String, CellError> {
+        let mut conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        // a stray -wal next to a snapshot would survive the file's VACUUM:
+        // fold it in and stay in rollback-journal mode
+        conn.pragma_update(None, "journal_mode", "DELETE")?;
+        let secure_before: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+        conn.pragma_update(None, "secure_delete", "ON")?;
+        {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            ops::purge_state(&tx, id)?;
+            ops::scrub_log_snapshot(&tx, id, censorable)?;
+            tx.commit()?;
+        }
+        conn.execute("INSERT INTO notes_fts(notes_fts) VALUES('optimize')", [])?;
+        conn.pragma_update(None, "secure_delete", secure_before)?;
+        conn.execute_batch("VACUUM;")?;
+        state_digest(&conn)
+    }
+
+    /// The `redacted_by` JSON of a snapshot row after one more purge op.
+    fn redacted_by(conn: &Connection, seq: i64, purge_op_id: &Ulid) -> Result<String, CellError> {
+        let current: String = conn.query_row(
+            "SELECT redacted_by FROM snapshots WHERE seq = ?1",
+            [seq],
+            |r| r.get(0),
+        )?;
+        let mut ops: Vec<String> = serde_json::from_str(&current)
+            .map_err(|e| CellError::Db(format!("bad redacted_by: {e}")))?;
+        if !ops.contains(&purge_op_id.to_string()) {
+            ops.push(purge_op_id.to_string());
+        }
+        serde_json::to_string(&ops).map_err(|e| CellError::Db(format!("redacted_by: {e}")))
+    }
+
     /// Right to be forgotten (DESIGN §4.4, v0.3): the note, its versions,
     /// its edges, vectors, FTS row and orphaned entities go, and the
     /// payloads of its operations are forgotten — the chain stays whole
@@ -604,7 +648,7 @@ impl Cell {
             .conn
             .query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
         inner.conn.pragma_update(None, "secure_delete", "ON")?;
-        execute_op(
+        let purge_op_id = execute_op(
             &mut inner,
             OpKind::Purge,
             Some(*id),
@@ -643,6 +687,46 @@ impl Cell {
             inner.pending_scrub = vec!["wal"];
             vec!["wal"]
         };
+        // v0.3.1 (P0.3): every registered snapshot is a full copy made before
+        // the purge — it holds the note, its payloads and its FTS entries.
+        // The same purge (state + log scrub + optimize + VACUUM) runs on the
+        // file; the row keeps its head hash and records the new digest with
+        // `redacted_by` naming this purge op. `censorable`: the supersede
+        // payloads the LIVE log still carries after its own scrub — only
+        // those are censored inside the snapshot; the ones the compaction
+        // cut already forgot are merely deleted there, or the snapshot's ops
+        // rows would fork from the live prefix.
+        let censorable: std::collections::HashSet<String> = {
+            let mut stmt = inner.conn.prepare(
+                "SELECT o.op_id FROM ops o JOIN op_payloads p ON p.op_id = o.op_id
+                 WHERE o.kind = 'supersede'",
+            )?;
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .flatten()
+                .collect()
+        };
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = inner
+                .conn
+                .prepare("SELECT seq, file FROM snapshots ORDER BY seq")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .flatten()
+                .collect()
+        };
+        for (seq, file) in rows {
+            let snap_path = self
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(&file);
+            let digest = Self::scrub_snapshot(&snap_path, id, &censorable)?;
+            let redacted = Self::redacted_by(&inner.conn, seq, &purge_op_id)?;
+            inner.conn.execute(
+                "UPDATE snapshots SET state_digest = ?2, redacted_by = ?3 WHERE seq = ?1",
+                rusqlite::params![seq, digest, redacted],
+            )?;
+        }
         // the purge itself wrote one payload: the forgotten rows are the drop
         // net of it
         let forgotten = usize::try_from((payloads_before + 1 - payloads_after).max(0)).unwrap_or(0);
@@ -1513,69 +1597,101 @@ impl Cell {
         // Compaction (v0.3): the payloads up to the snapshot are forgotten,
         // so a from-zero replay is impossible — restore the snapshot into
         // memory (checking its recorded head hash and state digest) and
-        // replay only the tail.
+        // replay only the tail. v0.3.1 (P0.3): a purge may have REDACTED the
+        // snapshot after the fact — its recorded digest is the redacted one
+        // and its head hash stays as history (the in-file censor rehashes the
+        // tail), so the snapshot's position is found by its last op_id, and a
+        // redacted snapshot is accepted exactly when the tail replay, that
+        // purge included, reproduces the live state (the comparison below).
         let mut snapshot_ok = true;
         let mut rebuild_conn = Connection::open_in_memory()?;
         configure(&rebuild_conn)?;
         let mut tail: &[Op] = &source_ops;
         // (read inline: the cell lock is already held)
-        let snapshot: Option<(i64, String, String, String)> = inner
+        let snapshot: Option<(i64, String, String, String, String)> = inner
             .conn
             .query_row(
-                "SELECT seq, head_hash, state_digest, file FROM snapshots
+                "SELECT seq, head_hash, state_digest, file, redacted_by FROM snapshots
                  ORDER BY seq DESC LIMIT 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        if let Some((snap_seq, head_hash, digest, file)) = snapshot.as_ref() {
+        if let Some((snap_seq, head_hash, digest, file, redacted_by)) = snapshot.as_ref() {
             let snap_path = self
                 .path
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(file);
+            // what the file says: its logical digest and its own last op
             let checks = Connection::open(&snap_path).and_then(|snap| {
                 let d = state_digest(&snap)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                Ok((snap, d))
+                let last: Option<(String, String)> = snap
+                    .query_row(
+                        "SELECT op_id, hash FROM ops ORDER BY seq DESC LIMIT 1",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                Ok((snap, d, last))
             });
-            // the snapshot was taken at the op whose hash it records; the
-            // payloads up to `snap_seq` (≤ that head) were forgotten after it
-            let snap_head = source_ops
-                .iter()
-                .find(|o| &o.hash == head_hash)
-                .map(|o| o.seq);
-            match (snap_head, checks) {
-                (Some(snap_head_seq), Ok((snap_conn, d))) if &d == digest => {
-                    let tx = rebuild_conn.transaction()?;
-                    tx.execute_batch("DROP TABLE IF EXISTS snapshots;")?;
-                    tx.commit()?;
-                    {
-                        let backup =
-                            rusqlite::backup::Backup::new(&snap_conn, &mut rebuild_conn)
-                                .map_err(|e| CellError::Db(format!("snapshot restore: {e}")))?;
-                        backup
-                            .run_to_completion(128, std::time::Duration::from_millis(0), None)
-                            .map_err(|e| CellError::Db(format!("snapshot restore: {e}")))?;
-                    }
-                    // the snapshot was taken BEFORE the forgetting: apply the
-                    // same compaction cut to the restored copy, or the
-                    // comparison sees payload rows the live cell dropped
-                    {
+            let was_redacted = redacted_by != "[]" && !redacted_by.is_empty();
+            match checks {
+                Ok((snap_conn, d, last)) if &d == digest => {
+                    // Where this snapshot sits in the live log: by its last
+                    // op id. A redaction rehashes the snapshot's log tail, so
+                    // the recorded head hash only has to match when the
+                    // snapshot was never redacted (it stays as history).
+                    let position = last.as_ref().and_then(|(last_op_id, last_hash)| {
+                        let seq = source_ops
+                            .iter()
+                            .find(|o| o.op_id.to_string() == *last_op_id)
+                            .map(|o| o.seq)?;
+                        (was_redacted || last_hash == head_hash).then_some(seq)
+                    });
+                    if let Some(snap_head_seq) = position {
                         let tx = rebuild_conn.transaction()?;
-                        tx.execute(
-                            "DELETE FROM op_payloads WHERE op_id IN (
-                                 SELECT op_id FROM ops WHERE seq <= ?1)",
-                            [*snap_seq],
-                        )?;
+                        tx.execute_batch("DROP TABLE IF EXISTS snapshots;")?;
                         tx.commit()?;
+                        {
+                            let backup =
+                                rusqlite::backup::Backup::new(&snap_conn, &mut rebuild_conn)
+                                    .map_err(|e| CellError::Db(format!("snapshot restore: {e}")))?;
+                            backup
+                                .run_to_completion(128, std::time::Duration::from_millis(0), None)
+                                .map_err(|e| CellError::Db(format!("snapshot restore: {e}")))?;
+                        }
+                        // the snapshot may come from an older schema (a v0.3
+                        // cell opened after the upgrade): bring the restored
+                        // copy to the current one — `meta` is compared
+                        {
+                            let tx = rebuild_conn.transaction()?;
+                            schema::migrate(&tx)?;
+                            tx.commit()?;
+                        }
+                        // v0.3 snapshots are full copies taken BEFORE the
+                        // forgetting: apply the same compaction cut to the
+                        // restored copy (idempotent for the logical snapshots
+                        // of v0.3.1, whose payloads are already cut).
+                        {
+                            let tx = rebuild_conn.transaction()?;
+                            tx.execute(
+                                "DELETE FROM op_payloads WHERE op_id IN (
+                                     SELECT op_id FROM ops WHERE seq <= ?1)",
+                                [*snap_seq],
+                            )?;
+                            tx.commit()?;
+                        }
+                        let from = source_ops
+                            .iter()
+                            .position(|o| o.seq > snap_head_seq)
+                            .unwrap_or(source_ops.len());
+                        tail = &source_ops[from..];
+                    } else {
+                        snapshot_ok = false;
                     }
-                    let from = source_ops
-                        .iter()
-                        .position(|o| o.seq > snap_head_seq)
-                        .unwrap_or(source_ops.len());
-                    tail = &source_ops[from..];
                 }
                 _ => snapshot_ok = false,
             }
@@ -1661,7 +1777,7 @@ fn execute_op(
     note_id: Option<Ulid>,
     actor: &str,
     payload: Value,
-) -> Result<(), CellError> {
+) -> Result<Ulid, CellError> {
     let op_id = crate::id::new_ulid()?;
     let tx = inner
         .conn
@@ -1730,7 +1846,7 @@ fn execute_op(
     if !inner.pending_scrub.is_empty() && wal_checkpoint(&inner.conn).unwrap_or(false) {
         inner.pending_scrub.clear();
     }
-    Ok(())
+    Ok(op_id)
 }
 
 /// Read a note through any transaction-ish handle.

@@ -1179,9 +1179,19 @@ fn apply_purge(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
             op.op_id
         )));
     };
+    purge_state(tx, &id)?;
+    scrub_log(tx, &id)?;
+    Ok(())
+}
+
+/// The state side of the right to be forgotten: everything the note touched —
+/// rows, FTS entry, vectors, orphaned entities and tags. Also the purge step
+/// for a **compaction snapshot** (v0.3.1, P0.3): there no op row is appended,
+/// the frozen log keeps its shape and only the state changes.
+pub(crate) fn purge_state(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
     let id_str = id.to_string();
-    // 1. everything the note touched, when it is still there
-    if let Some(row) = read_note(tx, &id)?
+    // everything the note touched, when it is still there
+    if let Some(row) = read_note(tx, id)?
         && row.note.status != Status::Deleted
     {
         fts_delete(
@@ -1252,83 +1262,151 @@ fn apply_purge(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
          )",
         [],
     )?;
-    super::vectors::delete_note_vectors(tx, &id)?;
-    // 2. forget the payloads: every op about the note, and the supersede ops
-    //    where it appeared as the NEW note (their note_id column is the old
-    //    one, the new id only ever lived in the payload)
-    let mut victims: Vec<String> = Vec::new();
-    {
-        // supersede ops (note_id = the old note) carry the OTHER note's
-        // content: they are censored below when this note was the new one,
-        // and left whole when it was the old one — forgetting them would
-        // erase the surviving note from every replay
-        let mut stmt = tx.prepare(
-            "SELECT op_id FROM ops
-             WHERE note_id = ?1 AND kind NOT IN ('purge', 'supersede')",
-        )?;
-        for row in stmt.query_map([&id_str], |r| r.get::<_, String>(0))? {
-            victims.push(row?);
+    super::vectors::delete_note_vectors(tx, id)?;
+    Ok(())
+}
+
+/// The log side of the purge on the LIVE cell: forget the payloads of the
+/// note's operations and **censor** the `supersede` ops where it was the NEW
+/// note (deterministic salt, recomputed chain tail).
+pub(crate) fn scrub_log(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
+    forget_note_payloads(tx, id)?;
+    censor_supersedes(tx, id, &CensorFilter::Live)
+}
+
+/// The log side of the purge on a **compaction snapshot** (v0.3.1, P0.3):
+/// the snapshot's log must end up identical to the live log's prefix. A
+/// snapshot is a copy taken at compaction time: it may still carry payloads
+/// the live log forgot with the compaction cut — for those the live `ops`
+/// row kept the ORIGINAL digest, so the snapshot only deletes the body. The
+/// payloads the live log still carries (`censorable`, their op ids) are
+/// censored exactly like the live purge did: deterministic salt, same
+/// digest, same rehash — the tail replay stays equal.
+pub(crate) fn scrub_log_snapshot(
+    tx: &Transaction<'_>,
+    id: &Ulid,
+    censorable: &std::collections::HashSet<String>,
+) -> Result<(), CellError> {
+    forget_note_payloads(tx, id)?;
+    censor_supersedes(tx, id, &CensorFilter::Snapshot(censorable))
+}
+
+/// Which supersede payloads a censor may rewrite (see [`scrub_log_snapshot`]).
+enum CensorFilter<'a> {
+    /// The live log: every match is censored.
+    Live,
+    /// A snapshot: only op ids the live log still carries a payload for.
+    Snapshot(&'a std::collections::HashSet<String>),
+}
+
+impl CensorFilter<'_> {
+    fn may_censor(&self, op_id: &str) -> bool {
+        match self {
+            CensorFilter::Live => true,
+            CensorFilter::Snapshot(set) => set.contains(op_id),
         }
     }
-    {
-        let mut stmt = tx.prepare(
-            "SELECT o.op_id, p.body FROM ops o JOIN op_payloads p ON p.op_id = o.op_id
-             WHERE o.kind = 'supersede'",
-        )?;
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .flatten()
-            .collect();
-        let mut censored: Vec<(i64, String, String, String)> = Vec::new(); // (seq, op_id, body, new note)
-        for (op_id, body) in rows {
-            let parsed = serde_json::from_str::<Value>(&body).ok();
-            let new_id = parsed
-                .as_ref()
-                .and_then(|b| b.get("note"))
-                .and_then(|n| n.get("id"))
-                .and_then(Value::as_str)
-                .map(String::from);
-            if new_id.as_deref() != Some(id_str.as_str()) {
-                continue;
-            }
-            // Censor, do not forget: the new note's content goes, the closing
-            // of the OLD note's validity must stay replayable — forgetting
-            // the whole body would leave the old note un-superseded in a
-            // replay of the redacted log.
-            let mut kept = serde_json::Map::new();
-            for k in ["old_id", "valid_to", "old_updated_at"] {
-                if let Some(v) = parsed.as_ref().and_then(|b| b.get(k)) {
-                    kept.insert(k.into(), v.clone());
-                }
-            }
-            kept.insert("note".into(), Value::Null);
-            let seq: i64 = tx
-                .query_row("SELECT seq FROM ops WHERE op_id = ?1", [&op_id], |r| {
-                    r.get(0)
-                })
-                .unwrap_or(0);
-            censored.push((seq, op_id, Value::Object(kept).to_string(), body));
+}
+
+/// Forget the payloads of every op about the note (but never the `supersede`
+/// ops: they carry the OTHER note's content — forgetting them would erase
+/// the surviving note from every replay; they are censored instead).
+fn forget_note_payloads(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
+    let mut stmt = tx.prepare(
+        "DELETE FROM op_payloads WHERE op_id IN (
+             SELECT op_id FROM ops
+             WHERE note_id = ?1 AND kind NOT IN ('purge', 'supersede'))",
+    )?;
+    stmt.execute([id.to_string()])?;
+    Ok(())
+}
+
+/// Censor the `supersede` payloads where the note was the NEW note: the
+/// content goes, the closing of the OLD note's validity stays replayable —
+/// forgetting the whole body would leave the old note un-superseded in a
+/// replay of the redacted log.
+fn censor_supersedes(
+    tx: &Transaction<'_>,
+    id: &Ulid,
+    filter: &CensorFilter<'_>,
+) -> Result<(), CellError> {
+    let id_str = id.to_string();
+    let mut stmt = tx.prepare(
+        "SELECT o.op_id, p.body FROM ops o JOIN op_payloads p ON p.op_id = o.op_id
+         WHERE o.kind = 'supersede'",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .flatten()
+        .collect();
+    drop(stmt);
+    let mut censored: Vec<(i64, String, String)> = Vec::new(); // (seq, op_id, body)
+    let mut plain_deleted: Vec<String> = Vec::new();
+    for (op_id, body) in rows {
+        let parsed = serde_json::from_str::<Value>(&body).ok();
+        let new_id = parsed
+            .as_ref()
+            .and_then(|b| b.get("note"))
+            .and_then(|n| n.get("id"))
+            .and_then(Value::as_str)
+            .map(String::from);
+        if new_id.as_deref() != Some(id_str.as_str()) {
+            continue;
         }
-        drop(stmt);
-        for (seq, op_id, censored_body, _) in &censored {
-            let salt = crate::id::random_salt()?;
-            let digest = payload_digest(
-                &salt,
-                &serde_json::from_str::<Value>(censored_body)
-                    .map_err(|e| CellError::Db(format!("censored body: {e}")))?,
-            );
-            tx.execute(
-                "UPDATE op_payloads SET salt = ?2, body = ?3 WHERE op_id = ?1",
-                rusqlite::params![op_id, salt, censored_body],
-            )?;
-            tx.execute(
-                "UPDATE ops SET payload_digest = ?2 WHERE op_id = ?1",
-                rusqlite::params![op_id, digest],
-            )?;
-            rehash_tail(tx, *seq)?;
+        if !filter.may_censor(&op_id) {
+            // the live log already forgot this payload (compaction cut): its
+            // ops row keeps the original digest, so here the body only goes
+            plain_deleted.push(op_id);
+            continue;
         }
+        let mut kept = serde_json::Map::new();
+        for k in ["old_id", "valid_to", "old_updated_at"] {
+            if let Some(v) = parsed.as_ref().and_then(|b| b.get(k)) {
+                kept.insert(k.into(), v.clone());
+            }
+        }
+        kept.insert("note".into(), Value::Null);
+        let seq: i64 = tx
+            .query_row("SELECT seq FROM ops WHERE op_id = ?1", [&op_id], |r| {
+                r.get(0)
+            })
+            .unwrap_or(0);
+        censored.push((seq, op_id, Value::Object(kept).to_string()));
     }
-    for op_id in &victims {
+    // the rehash of the tail depends on the order the censored ops are
+    // applied in: seq order, deterministically, on the live log and on the
+    // snapshot alike
+    censored.sort_by_key(|(seq, _, _)| *seq);
+    for (seq, op_id, censored_body) in &censored {
+        // The censor's salt is DETERMINISTIC (blake3 over the op id): the
+        // live purge and the in-snapshot purge censor the same original body
+        // and must land on the same digest, hence on the same chain — a
+        // fresh random salt would fork the two logs (found by the
+        // in-snapshot censor test). The censored body carries none of the
+        // purged note's content, so the salt has nothing personal left to
+        // decouple.
+        let salt: [u8; 16] = {
+            let h = blake3::hash(format!("censor:{op_id}").as_bytes());
+            let mut s = [0_u8; 16];
+            s.copy_from_slice(&h.as_bytes()[..16]);
+            s
+        };
+        let digest = payload_digest(
+            &salt,
+            &serde_json::from_str::<Value>(censored_body)
+                .map_err(|e| CellError::Db(format!("censored body: {e}")))?,
+        );
+        tx.execute(
+            "UPDATE op_payloads SET salt = ?2, body = ?3 WHERE op_id = ?1",
+            rusqlite::params![op_id, salt, censored_body],
+        )?;
+        tx.execute(
+            "UPDATE ops SET payload_digest = ?2 WHERE op_id = ?1",
+            rusqlite::params![op_id, digest],
+        )?;
+        rehash_tail(tx, *seq)?;
+    }
+    for op_id in &plain_deleted {
         tx.execute("DELETE FROM op_payloads WHERE op_id = ?1", [op_id])?;
     }
     Ok(())

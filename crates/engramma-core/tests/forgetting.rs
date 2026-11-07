@@ -182,3 +182,144 @@ fn purge_with_an_open_reader_completes_the_scrub_on_the_next_write() {
     drop(cell);
     assert_forgotten(dir.path(), "lettore", &needles);
 }
+
+/// The snapshots of a cell, as registered at purge time (seq, head hash,
+/// digest, file name, why it was redacted).
+#[derive(Debug)]
+struct SnapshotRow {
+    #[allow(dead_code, reason = "read for completeness of the row's picture")]
+    seq: i64,
+    head_hash: String,
+    state_digest: String,
+    #[allow(dead_code, reason = "read for completeness of the row's picture")]
+    file: String,
+    redacted_by: String,
+}
+
+fn snapshots_of(cell: &Cell) -> Vec<SnapshotRow> {
+    cell.debug_column(
+        "SELECT seq || '|' || head_hash || '|' || state_digest || '|' || file || '|' \
+          || COALESCE(redacted_by, 'MISSING')
+         FROM snapshots ORDER BY seq",
+    )
+    .unwrap(/* test-only */)
+    .into_iter()
+    .map(|row| {
+        let mut parts = row.splitn(5, '|');
+        let mut next = move || parts.next().unwrap_or_default().to_string();
+        SnapshotRow {
+            seq: next().parse().unwrap_or(0),
+            head_hash: next(),
+            state_digest: next(),
+            file: next(),
+            redacted_by: next(),
+        }
+    })
+    .collect()
+}
+
+/// P0.3: a purge must reach every registered snapshot — the snapshot is a
+/// full copy made before the purge, roots and all. After the purge the file
+/// is scrubbed, its row records a new digest under the same head hash with
+/// `redacted_by` naming the purge op, and `verify` accepts it (the tail
+/// replay, purge included, reproduces the live state).
+#[test]
+fn compact_then_purge_scrubs_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let path = dir.path().join("istantanea.sqlite");
+    let cell = Cell::create(&path, "istantanea", "tester").unwrap(/* test-only */);
+    let secret = note_of(1, "zibellinotremante quokkaviolaceo");
+    cell.put_note(&secret, "tester").unwrap(/* test-only */);
+    let innocent = note_of(2, "una nota che resta");
+    cell.put_note(&innocent, "tester").unwrap(/* test-only */);
+    let needles = roots_of(&secret.body, Some(Lang::It));
+
+    let head: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    let snap = cell.compact(head).unwrap(/* test-only */);
+    assert!(snap.is_file(), "{}", snap.display());
+    let before = snapshots_of(&cell);
+    assert_eq!(before.len(), 1, "{before:?}");
+
+    let report = cell
+        .purge(&secret.id, "oblio anche dall'istantanea", "tester")
+        .unwrap(/* test-only */);
+    assert!(report.scrubbed, "{report:?}");
+    // the snapshot row: same head hash, new digest, redacted_by names the purge
+    let after = snapshots_of(&cell);
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_eq!(after[0].head_hash, before[0].head_hash, "head stays");
+    assert_ne!(after[0].state_digest, before[0].state_digest);
+    let purge_op = cell
+        .ops()
+        .unwrap(/* test-only */)
+        .into_iter()
+        .rev()
+        .find(|o| o.kind == engramma_core::cell::ops::OpKind::Purge)
+        .unwrap(/* test-only */);
+    assert!(
+        after[0].redacted_by.contains(&purge_op.op_id.to_string()),
+        "redacted_by must name the purge op: {}",
+        after[0].redacted_by
+    );
+    // verify accepts the redacted snapshot: the tail replay (purge included)
+    // reproduces the live state
+    let report = cell.verify().unwrap(/* test-only */);
+    assert!(
+        report.ok(),
+        "verify after snapshot purge: {:?}",
+        report.mismatch
+    );
+    assert!(report.snapshot_ok, "{report:?}");
+    drop(cell);
+    assert_forgotten(dir.path(), "istantanea", &needles);
+}
+
+/// P0.3, the hard case: the purged note was the NEW note of a supersede that
+/// sits INSIDE the snapshot. The in-snapshot purge must censor that supersede
+/// payload and rehash the snapshot's log tail exactly like the live purge
+/// did — only then does the tail replay reproduce the live state.
+#[test]
+fn snapshot_purge_censors_the_supersede_inside_it() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let path = dir.path().join("sopr.sqlite");
+    let cell = Cell::create(&path, "t", "tester").unwrap(/* test-only */);
+    let mut old = note_of(1, "la vecchia versione resta");
+    old.valid_from = Some(engramma_core::Validity::parse("2024-01-01").unwrap(/* t */));
+    cell.put_note(&old, "tester").unwrap(/* test-only */);
+    let mut secret = note_of(2, "zibellinotremante quokkaviolaceo");
+    secret.supersedes = vec![old.id];
+    secret.valid_from = Some(engramma_core::Validity::parse("2026-09-01").unwrap(/* t */));
+    cell.put_note(&secret, "tester").unwrap(/* test-only */);
+    // close the old note through the real supersede op (payload carries the
+    // secret note's content: the censor case)
+    let mut replacement = note_of(3, "il fatto nuovo dopo la chiusura");
+    replacement.supersedes = vec![old.id];
+    replacement.valid_from = Some(engramma_core::Validity::parse("2026-09-01").unwrap(/* t */));
+    cell.supersede(&old.id, &secret, None, "tester")
+        .unwrap(/* test-only */);
+    let needles = roots_of(&secret.body, Some(Lang::It));
+
+    let head: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    cell.compact(head).unwrap(/* test-only */);
+
+    cell.purge(&secret.id, "oblio", "tester").unwrap(/* t */);
+    let report = cell.verify().unwrap(/* test-only */);
+    assert!(
+        report.ok() && report.snapshot_ok,
+        "verify after the in-snapshot censor: {:?}",
+        report.mismatch
+    );
+    // the old note is still closed, the censored supersede still replays it
+    let back = cell.get(&old.id).unwrap(/* test-only */);
+    assert_eq!(back.status, Status::Superseded);
+    drop(cell);
+    assert_forgotten(dir.path(), "sopr", &needles);
+}

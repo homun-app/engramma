@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 7] = [
+pub const MIGRATIONS: [&str; 8] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -100,6 +100,16 @@ CREATE TABLE vault_files (path TEXT PRIMARY KEY,       -- relative to the vault 
                           note_version INTEGER NOT NULL,
                           mtime INTEGER NOT NULL,
                           size INTEGER NOT NULL);
+"#,
+    r#"
+-- v8 (v0.3.1, P0.3): a purge reaches the compaction snapshots too — they are
+-- copies made before it. The row records WHY its state digest changed (the
+-- op_ids of the purges applied to the file): `verify` accepts a redacted
+-- digest when the tail replay, those purges included, reproduces the live
+-- state (spec §6.4). The head hash stays as the historical record of where
+-- the snapshot was taken; after a redaction it no longer matches the file's
+-- internal head (the censored supersedes rehash it).
+ALTER TABLE snapshots ADD COLUMN redacted_by TEXT NOT NULL DEFAULT '[]';
 "#,
 ];
 

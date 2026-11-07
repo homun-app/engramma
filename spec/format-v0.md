@@ -220,17 +220,38 @@ never rewritten), every op is rewritten in the v2 form with fresh salts, and
 `meta` gains `log_v1_head` (the last v1 hash) and `log_v2_from_seq` (= 1).
 The format of the log is declared unstable in 0.x.
 
-### 6.4 Compaction snapshots (schema v6)
+### 6.4 Compaction snapshots (schema v6, redactions in v0.3.1)
 
 `compact(up_to_seq)` takes a `VACUUM INTO` snapshot of the cell **exactly as
 it stands**, registers it in `snapshots(seq, head_hash, state_digest, file,
-created_at)` — `state_digest` is blake3 of the canonical dump of the logical
-tables, the same rendering `verify` compares — and forgets the payloads of
-the ops up to `up_to_seq` (≤ the head: the last ops stay replayable).
-`verify` restores the snapshot into memory, checks its recorded head hash and
-state digest, re-applies the same cut to the restored copy and replays only
-the tail. `changes_since` below the snapshot answers `Compacted
-{ snapshot_seq }`: a replica restarts from the snapshot.
+created_at, redacted_by)` — `state_digest` is blake3 of the canonical dump of
+the logical tables, the same rendering `verify` compares — and forgets the
+payloads of the ops up to `up_to_seq` (≤ the head: the last ops stay
+replayable). `verify` restores the snapshot into memory, checks its recorded
+digest, re-applies the same cut to the restored copy (idempotent for logical
+snapshots, still needed for v0.3 full copies) and replays only the tail.
+`changes_since` below the snapshot answers `Compacted { snapshot_seq }`: a
+replica restarts from the snapshot.
+
+**Redacted snapshots (v0.3.1).** A snapshot is a copy made before any later
+`purge`, so a purge applies to every registered snapshot too: the same state
+purge, the same log scrub (payloads forgotten, supersedes censored), an FTS
+`optimize` and a `VACUUM`, then a new `state_digest`. The snapshot's row
+keeps its `head_hash` — the historical record of where it was taken — while
+`redacted_by` records the op ids of the purges applied to the file, as a JSON
+array (`[]` when none was). The censor inside a snapshot uses the same
+**deterministic** salt as the live censor (blake3 over the op id), so both
+scrubs land on the same payload digests and the same chain; a supersede
+whose payload the live log already forgot with the compaction cut keeps its
+original digest there, so inside the snapshot its body is only deleted.
+`verify` accepts a redacted snapshot exactly when the tail replay — the
+redacting purges included, they are ordinary ops of the tail — reproduces
+the live state: the digest binds the file, the replay binds the state, and
+a redaction that diverged from the live log fails the comparison. A
+never-redacted snapshot must additionally match its recorded `head_hash`
+byte for byte; after a redaction the in-file head hash may differ (the
+censor rehashes the tail), which is why the position is found by the
+snapshot's last op id, which no rehash ever touches.
 
 ## 7. Folders
 
