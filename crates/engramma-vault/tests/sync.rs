@@ -365,7 +365,11 @@ fn random_edits_converge_to_a_fixed_point() {
         vault.sync_once(false).unwrap(/* t */); // files exist
         for round in 0..12 {
             let pick = ids[(next() % ids.len() as u64) as usize];
-            match next() % 3 {
+            // v0.3.2 (P1.6): the mix now makes CONFLICTS (file and cell both
+            // move) and PURGES too — the fixed point must survive them, and
+            // the conflict copies of purged notes must not survive them
+            let mut conflict_edit = false;
+            match next() % 5 {
                 0 => {
                     // edit the file behind the engine's back
                     let rows = vault.cell().vault_files().unwrap(/* t */);
@@ -385,7 +389,8 @@ fn random_edits_converge_to_a_fixed_point() {
                         }
                     }
                 }
-                1 => {
+                1 | 2 => {
+                    conflict_edit = next() % 2 == 0;
                     vault
                         .cell()
                         .patch_note(
@@ -398,7 +403,39 @@ fn random_edits_converge_to_a_fixed_point() {
                         )
                         .unwrap_or(()); // tombstoned notes reject patches
                 }
+                // a purge: the note goes, its file and conflict copies
+                // must follow (at the next sync, when the view is here)
+                3 if vault.cell().purge(&pick, "prop", "tester").is_ok() => {
+                    ids.retain(|i| *i != pick);
+                }
                 _ => {}
+            }
+            if conflict_edit
+                && let Some(row) = vault
+                    .cell()
+                    .vault_files()
+                    .unwrap(/* t */)
+                    .iter()
+                    .find(|r| r.note_id == pick.to_string())
+                    .cloned()
+            {
+                // the OTHER side of a conflict: the file moves too, and the
+                // next sync saves its version as a `.conflitto` copy
+                let path = vault.root().join(&row.path);
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let edited = text.replace(
+                    &format!(
+                        "corpo {}",
+                        ids.iter()
+                            .position(|i| *i == pick)
+                            .map(|p| p + 1)
+                            .unwrap_or(0)
+                    ),
+                    &format!("corpo {round} dal file"),
+                );
+                if edited != text {
+                    std::fs::write(&path, edited).unwrap(/* t */);
+                }
             }
             // v0.3.1 (P1.5/P1.6): new files with an OBSIDIAN header land in
             // the vault during the run — their header must be read (not
@@ -468,6 +505,15 @@ fn random_edits_converge_to_a_fixed_point() {
             rows.len(),
             "seed {seed}: every living note has its file"
         );
+        // the conflict registry holds only notes that still exist: the
+        // copies of the purged ones went with them (seed {seed})
+        for (path, note_id) in vault.cell().vault_conflicts().unwrap(/* t */) {
+            let id = Ulid::from_string(&note_id).unwrap(/* t */);
+            assert!(
+                vault.cell().get(&id).is_ok(),
+                "seed {seed}: the conflict copy {path} outlives its note"
+            );
+        }
     }
 }
 
@@ -662,4 +708,188 @@ fn one_file_per_note_no_second_export_no_ping_pong() {
     write(&vault, "nuova.md", &edited);
     let r4 = vault.sync_once(false).unwrap(/* test-only */);
     assert_eq!(r4.updated_from_file, vec!["nuova.md".to_string()], "{r4:?}");
+}
+
+/// v0.3.2 (P1.6): a conflict copy holds the file's version of a note; when
+/// that note is purged, the copy and the bound file go IMMEDIATELY (the
+/// purge reaches every registered view through `forget_note`) — no root of
+/// the body anywhere in the view folder, without any sync.
+#[test]
+fn purge_takes_the_conflict_copy_and_the_file_now() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    let secret_body = "il quokkaviolaceo zibellinotremante segreto";
+    let n = note(11, "segreta", secret_body);
+    vault.cell().put_note(&n, "t").unwrap(/* test-only */);
+    vault.sync_once(false).unwrap(/* test-only */);
+    // a conflict: the file's version (with the secret words) is saved as a
+    // `.conflitto` copy
+    let path = list_md(&vault)[0].clone();
+    let text = std::fs::read_to_string(&path).unwrap(/* test-only */);
+    std::fs::write(path, text.replace("segreta", "versione dal file segreta"))
+        .unwrap(/* test-only */);
+    vault
+        .cell()
+        .patch_note(
+            &n.id,
+            &NotePatch {
+                body: Some("versione dalla cella [[Roma]]".into()),
+                ..Default::default()
+            },
+            "cli",
+        )
+        .unwrap(/* test-only */);
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r.conflicts.len(), 1, "{r:?}");
+    // the conflict copy is registered
+    assert_eq!(
+        vault.cell().vault_conflicts_of(&n.id).unwrap(/* t */).len(),
+        1
+    );
+    assert_eq!(
+        vault.cell().vault_roots().unwrap(/* t */).len(),
+        1,
+        "the view is bound in the cell"
+    );
+
+    // the purge: cell first, then every registered view
+    vault.cell().purge(&n.id, "oblio", "tester").unwrap(/* t */);
+    for root in vault.cell().vault_roots().unwrap(/* t */) {
+        let v = Vault::open(
+            vault.cell().clone(),
+            std::path::PathBuf::from(&root).as_path(),
+        )
+        .unwrap(/* test-only */);
+        v.forget_note(&n.id).unwrap(/* test-only */);
+    }
+    // no file in the WHOLE view folder holds a root of the body — now,
+    // without any sync
+    let needles: Vec<String> = ["quokkaviolaceo", "zibellinotremante", "segret"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    fn walk_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap(/* t */).flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk_files(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk_files(vault.root(), &mut files);
+    assert!(!files.is_empty());
+    for f in files {
+        let raw = std::fs::read_to_string(&f).unwrap_or_default();
+        for n in &needles {
+            assert!(
+                !raw.contains(n.as_str()),
+                "«{n}» sopravvive in {}",
+                f.display()
+            );
+        }
+    }
+    // and the rows are gone too
+    assert!(
+        vault
+            .cell()
+            .vault_files()
+            .unwrap(/* t */)
+            .iter()
+            .all(|r| r.note_id != n.id.to_string())
+    );
+    assert!(vault.cell().vault_conflicts().unwrap(/* t */).is_empty());
+}
+
+/// v0.3.2 (P1.6): an unreachable view (unmounted, renamed away) makes
+/// `forget_note` fail — the caller marks `pending: ["vault"]` — and once
+/// the view is back, the NEXT sync finishes the work: the bound file, the
+/// conflict copies and their rows all go.
+#[test]
+fn unreachable_view_is_pending_and_the_next_sync_finishes() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    let secret_body = "il quokkaviolaceo segreto della vista";
+    let n = note(12, "nascosta", secret_body);
+    vault.cell().put_note(&n, "t").unwrap(/* test-only */);
+    vault.sync_once(false).unwrap(/* test-only */);
+    let path = list_md(&vault)[0].clone();
+    let text = std::fs::read_to_string(&path).unwrap(/* test-only */);
+    std::fs::write(&path, text.replace("nascosta", "dal file quokkaviolaceo"))
+        .unwrap(/* test-only */);
+    vault
+        .cell()
+        .patch_note(
+            &n.id,
+            &NotePatch {
+                body: Some("dalla cella [[Roma]]".into()),
+                ..Default::default()
+            },
+            "cli",
+        )
+        .unwrap(/* test-only */);
+    vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(
+        vault.cell().vault_conflicts_of(&n.id).unwrap(/* t */).len(),
+        1
+    );
+
+    // the purge happens while the view is AWAY (renamed, like an unmounted
+    // volume): forget_note cannot reach it
+    let rel = path
+        .strip_prefix(vault.root())
+        .unwrap(/* test-only */)
+        .to_path_buf();
+    vault.cell().purge(&n.id, "oblio", "tester").unwrap(/* t */);
+    let away = dir.path().join("via");
+    std::fs::rename(vault.root(), &away).unwrap(/* test-only */);
+    let root = vault.cell().vault_roots().unwrap(/* t */)[0].clone();
+    let v = Vault::open(
+        vault.cell().clone(),
+        std::path::PathBuf::from(&root).as_path(),
+    )
+    .unwrap(/* test-only */);
+    assert!(
+        v.forget_note(&n.id).is_err(),
+        "the unreachable view must be an error, not a silent ok"
+    );
+    assert!(
+        away.join(&rel).exists(),
+        "the file is still there, with the secret"
+    );
+
+    // back in place: the sync finishes the purge's work
+    std::fs::rename(&away, vault.root()).unwrap(/* test-only */);
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(!path.exists(), "the bound file went with the note");
+    assert!(
+        vault.cell().vault_conflicts().unwrap(/* t */).is_empty(),
+        "the conflict copies went too: {:?}",
+        vault.cell().vault_conflicts().unwrap(/* t */)
+    );
+    let _ = r;
+    fn walk_files2(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap(/* t */).flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk_files2(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk_files2(vault.root(), &mut files);
+    for f in files {
+        let raw = std::fs::read_to_string(&f).unwrap_or_default();
+        for needle in ["quokkaviolaceo", "segret"] {
+            assert!(
+                !raw.contains(needle),
+                "«{needle}» sopravvive in {}",
+                f.display()
+            );
+        }
+    }
 }

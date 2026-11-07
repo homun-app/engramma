@@ -1496,6 +1496,125 @@ impl Cell {
         Ok(())
     }
 
+    /// The views this cell is bound to: the canonical absolute roots
+    /// (v0.3.2, P1.6), oldest binding first.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_roots(&self) -> Result<Vec<String>, CellError> {
+        let inner = self.lock()?;
+        let mut stmt = inner
+            .conn
+            .prepare("SELECT root FROM vault_roots ORDER BY bound_at, root")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Register (or refresh) a view binding: the canonical absolute root,
+    /// written by every `vault init`/`sync` (v0.3.2, P1.6) so that a purge
+    /// can reach the view without being told again.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_root_put(&self, root: &str) -> Result<(), CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let inner = self.lock()?;
+        let now = OffsetDateTime::now_utc()
+            .replace_millisecond(0)
+            .unwrap_or(OffsetDateTime::now_utc())
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        inner.conn.execute(
+            "INSERT INTO vault_roots (root, bound_at) VALUES (?1, ?2)
+             ON CONFLICT(root) DO UPDATE SET bound_at = ?2",
+            rusqlite::params![root, now],
+        )?;
+        Ok(())
+    }
+
+    /// The path (relative to the view root) of every `.conflitto` copy of a
+    /// note (v0.3.2, P1.6).
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_conflicts_of(&self, id: &Ulid) -> Result<Vec<String>, CellError> {
+        let inner = self.lock()?;
+        let mut stmt = inner
+            .conn
+            .prepare("SELECT path FROM vault_conflicts WHERE note_id = ?1 ORDER BY path")?;
+        let rows = stmt.query_map([id.to_string()], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every conflict copy the cell knows about: `(path, note_id)` pairs.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_conflicts(&self) -> Result<Vec<(String, String)>, CellError> {
+        let inner = self.lock()?;
+        let mut stmt = inner
+            .conn
+            .prepare("SELECT path, note_id FROM vault_conflicts ORDER BY path")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Register a `.conflitto` copy the engine just created (v0.3.2, P1.6):
+    /// the scanner ignores it, so this registry is the only thing that lets
+    /// a purge take it away.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_conflict_put(&self, path: &str, note_id: &Ulid) -> Result<(), CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let inner = self.lock()?;
+        let now = OffsetDateTime::now_utc()
+            .replace_millisecond(0)
+            .unwrap_or(OffsetDateTime::now_utc())
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        inner.conn.execute(
+            "INSERT INTO vault_conflicts (path, note_id, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(path) DO UPDATE SET note_id = ?2, created_at = ?3",
+            rusqlite::params![path, note_id.to_string(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Forget one conflict copy's row.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_conflict_delete(&self, path: &str) -> Result<(), CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let inner = self.lock()?;
+        inner
+            .conn
+            .execute("DELETE FROM vault_conflicts WHERE path = ?1", [path])?;
+        Ok(())
+    }
+
     /// Forget one path of the markdown view's state (the file is gone).
     ///
     /// # Errors
@@ -1643,6 +1762,8 @@ impl Cell {
                     tx.execute("DELETE FROM note_vectors", [])?;
                     tx.execute("DELETE FROM embedding_models", [])?;
                     tx.execute("DELETE FROM vault_files", [])?;
+                    tx.execute("DELETE FROM vault_roots", [])?;
+                    tx.execute("DELETE FROM vault_conflicts", [])?;
                     tx.execute("DELETE FROM snapshots", [])?;
                     // external-content FTS5: `delete-all` empties the index
                     // (its segments carry the stems); verify rebuilds it

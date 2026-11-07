@@ -215,9 +215,18 @@ operations** (log v2: the chain covers salted digests, not the bodies).
 segments (the **stems** leave the index too) and a `VACUUM` rebuilds the
 file: no byte — and no root — of the body survives in the cell. The
 purge's own payload keeps only the id and the reason, never content.
-`[[Mentions]]` of the note in OTHER notes stay (they are other notes);
-the markdown view deletes the note's file at the next `vault sync`.
+`[[Mentions]]` of the note in OTHER notes stay (they are other notes).
 **Exports made before the purge are outside the engine's control.**
+
+v0.3.2: the cell remembers its views (`vault init`/`sync` register the
+folder's canonical absolute path) and the purge reaches every one of them
+right away — the note's file AND every `.conflitto` copy of it go in the
+same command (`Vault::forget_note`; the MCP server is read-only and does
+not expose purge, but the call is there for when it does). A view that
+cannot be reached (unmounted folder, permissions) makes the purge exit
+with code **5** and `pending: ["vault"]`, like the WAL case; the next
+`vault sync` finishes the work. A `delete_note` (tombstone, reversible)
+does NOT remove conflict copies.
 
 The WAL is truncated after the vacuum (`wal_checkpoint(TRUNCATE)`). When
 another process holds a read transaction open, the truncation cannot

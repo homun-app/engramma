@@ -598,7 +598,23 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     return Ok(());
                 }
             }
-            let report = cell.purge(&note_id, reason, "cli-user")?;
+            let mut report = cell.purge(&note_id, reason, "cli-user")?;
+            // v0.3.2 (P1.6): reach every registered view — the note's file
+            // and every `.conflitto` copy of it go NOW, not at the next
+            // sync. The core never writes into a view; `forget_note` does.
+            for root in cell.vault_roots().unwrap_or_default() {
+                let vault = engramma_vault::Vault::open(cell.clone(), std::path::Path::new(&root));
+                match vault.and_then(|v| v.forget_note(&note_id)) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("engramma: vista {root}: {e}");
+                        if !report.pending.contains(&"vault") {
+                            report.pending.push("vault");
+                        }
+                    }
+                }
+            }
+            report.scrubbed = report.pending.is_empty();
             if cli.json {
                 print_json(&serde_json::json!({
                     "purged": note_id.to_string(),
@@ -614,10 +630,23 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             if !report.pending.is_empty() {
                 // the purge is not done: say so, with its own exit code
+                let why = report
+                    .pending
+                    .iter()
+                    .map(|p| match *p {
+                        "wal" => "il WAL non è stato troncato (un lettore teneva \
+                                  la cella aperta; verrà ritentato alla prossima \
+                                  scrittura)"
+                            .to_string(),
+                        "vault" => "una vista markdown non era raggiungibile (la \
+                                    prossima `vault sync` finisce il lavoro)"
+                            .to_string(),
+                        other => other.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 return Err(CliError::incomplete_forgetting(format!(
-                    "oblio incompleto ({}): il WAL non è stato troncato, \
-                     un lettore teneva la cella aperta; verrà ritentato alla \
-                     prossima scrittura",
+                    "oblio incompleto ({}): {why}",
                     report.pending.join(", ")
                 )));
             }

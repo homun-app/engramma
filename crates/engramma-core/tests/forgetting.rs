@@ -797,6 +797,8 @@ fn a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint() {
              INSERT INTO snapshots_v9 SELECT * FROM snapshots;
              DROP TABLE snapshots;
              ALTER TABLE snapshots_v9 RENAME TO snapshots;
+             DROP TABLE IF EXISTS vault_roots;
+             DROP TABLE IF EXISTS vault_conflicts;
              UPDATE meta SET value = '9' WHERE key = 'schema_version';",
         )
         .unwrap(/* test-only */);
@@ -824,7 +826,7 @@ fn a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint() {
     assert_eq!(
         cell.debug_column("SELECT value FROM meta WHERE key = 'schema_version'")
             .unwrap(/* test-only */),
-        vec!["10".to_string()]
+        vec![engramma_core::cell::schema::SCHEMA_VERSION.to_string()]
     );
 
     // the first default compaction: checkpoint, the old file goes

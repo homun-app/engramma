@@ -153,6 +153,7 @@ impl Vault {
     /// the export reads the cell.
     pub fn init(&self) -> Result<SyncReport, VaultError> {
         std::fs::create_dir_all(&self.root)?;
+        self.bind_root()?;
         let out = engramma_core::port::export(&self.cell, &self.root)?;
         let mut report = SyncReport::default();
         report.warnings.extend(out.errors);
@@ -164,6 +165,59 @@ impl Vault {
             }
         }
         Ok(report)
+    }
+
+    /// The forgetting side of a purge in THIS view (v0.3.2, P1.6): the
+    /// bound file of the note and every `.conflitto` copy of it go, then
+    /// their rows. The core never writes into the view — this is the one
+    /// place that does, called by the CLI's `purge` for every registered
+    /// root. A view that cannot be reached (unmounted folder, permissions)
+    /// is an error: the caller reports `pending: ["vault"]` and the next
+    /// `sync` finishes the work.
+    ///
+    /// # Errors
+    /// [`VaultError::Io`] when the view is unreachable or a removal fails;
+    /// [`VaultError::Cell`] on cell failures.
+    pub fn forget_note(&self, id: &Ulid) -> Result<(), VaultError> {
+        if !self.root.exists() {
+            return Err(VaultError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("la vista {} non è raggiungibile", self.root.display()),
+            )));
+        }
+        let gone = |p: &Path| -> Result<(), VaultError> {
+            match std::fs::remove_file(p) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(VaultError::Io(e)),
+            }
+        };
+        // the bound file, when this note has one
+        if let Some(row) = self
+            .cell
+            .vault_files()?
+            .into_iter()
+            .find(|r| r.note_id == id.to_string())
+        {
+            gone(&self.root.join(&row.path))?;
+            self.cell.vault_file_delete(&row.path)?;
+        }
+        // every conflict copy of the note
+        for rel in self.cell.vault_conflicts_of(id)? {
+            gone(&self.root.join(&rel))?;
+            self.cell.vault_conflict_delete(&rel)?;
+        }
+        Ok(())
+    }
+
+    /// Bind this folder in the cell (`vault_roots`, v0.3.2, P1.6): the
+    /// canonical absolute path, so a purge reaches every view without being
+    /// told again. Called by every `init`/`sync`.
+    fn bind_root(&self) -> Result<(), VaultError> {
+        if let Ok(canon) = std::fs::canonicalize(&self.root) {
+            self.cell.vault_root_put(&canon.to_string_lossy())?;
+        }
+        Ok(())
     }
 
     /// Walk the folder for markdown files: `.obsidian/`, `.trash/` and hidden
@@ -342,6 +396,34 @@ impl Vault {
             }
             self.cell.vault_file_delete(&row.path)?;
         }
+
+        // 5. v0.3.2 (P1.6): finish a purge's work — the `.conflitto` copies
+        //    of notes that no longer exist (a purge that could not reach
+        //    this view left them, with their rows). Copies of LIVING notes
+        //    stay: they are the user's safety copies, and a tombstone is
+        //    not a purge.
+        for (path, note_id) in self.cell.vault_conflicts()? {
+            let Ok(id) = Ulid::from_string(&note_id) else {
+                self.cell.vault_conflict_delete(&path)?;
+                continue;
+            };
+            if self.cell.get(&id).is_ok() {
+                continue; // living (or tombstoned): the copy stays
+            }
+            let abs = self.root.join(&path);
+            match std::fs::remove_file(&abs) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    report.errors.push(format!("{path}: {e}"));
+                    continue;
+                }
+            }
+            self.cell.vault_conflict_delete(&path)?;
+        }
+
+        // and this folder is one of the cell's views now
+        self.bind_root()?;
         Ok(report)
     }
 
@@ -488,6 +570,14 @@ impl Vault {
                         .unwrap_or_default()
                 ));
                 std::fs::rename(&file.abs, &conflict)?;
+                // v0.3.2 (P1.6): the scanner ignores this copy forever —
+                // register it, or no purge would ever take it away
+                let conflict_rel = conflict
+                    .strip_prefix(&self.root)
+                    .unwrap_or(&conflict)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                self.cell.vault_conflict_put(&conflict_rel, &note_id)?;
                 self.write_file(&file.abs, &live_note)?;
                 let fresh = self.snapshot(&file.abs)?;
                 self.record(&fresh, &note_id, live_note.status)?;

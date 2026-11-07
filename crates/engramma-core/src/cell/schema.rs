@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 10] = [
+pub const MIGRATIONS: [&str; 11] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -142,6 +142,21 @@ INSERT INTO snapshots_v10 (seq, head_hash, state_digest, file, redacted_by, crea
      SELECT seq, head_hash, state_digest, file, redacted_by, created_at FROM snapshots;
 DROP TABLE snapshots;
 ALTER TABLE snapshots_v10 RENAME TO snapshots;
+"#,
+    r#"
+-- v11 (v0.3.2, P1.6): the cell remembers its views. `vault_roots`: the
+-- absolute canonical path of every folder bound with `vault init`/`sync` —
+-- a purge must reach them all without being told again. `vault_conflicts`:
+-- every `.conflitto` copy the engine creates — the scanner ignores them, so
+-- nothing else would ever clean them. Derived data, outside the log (they
+-- describe folders the cell does not own), stripped from the compaction
+-- snapshots like `vault_files`.
+CREATE TABLE vault_roots (root TEXT PRIMARY KEY,
+                          bound_at TEXT NOT NULL);
+CREATE TABLE vault_conflicts (path TEXT PRIMARY KEY,  -- relative to the root
+                              note_id TEXT NOT NULL,
+                              created_at TEXT NOT NULL);
+CREATE INDEX idx_vault_conflicts_note ON vault_conflicts(note_id);
 "#,
 ];
 
