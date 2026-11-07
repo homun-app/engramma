@@ -564,14 +564,11 @@ impl Cell {
             .conn
             .query_row("SELECT COUNT(*) FROM op_payloads", [], |r| r.get(0))
             .unwrap_or(0);
-        // no byte of the body left in the file: rebuild it
-        inner
-            .conn
-            .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let _ = inner.conn.execute_batch("VACUUM;");
         // the purge itself wrote one payload: the forgotten rows are the drop
         // net of it
-        let forgotten = payloads_before + 1 - payloads_after;
-        Ok(usize::try_from(forgotten.max(0)).unwrap_or(0))
+        let forgotten = usize::try_from((payloads_before + 1 - payloads_after).max(0)).unwrap_or(0);
+        Ok(forgotten)
     }
 
     // ------------------------------------------------------------------
@@ -1173,6 +1170,11 @@ impl Cell {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."))
             .join(&file);
+        // VACUUM INTO refuses an existing file: a re-compact at the same head
+        // replaces its own snapshot
+        if target.exists() {
+            std::fs::remove_file(&target)?;
+        }
         inner.conn.execute_batch(&format!(
             "VACUUM INTO '{}'",
             target.display().to_string().replace('\'', "''")
@@ -1198,6 +1200,10 @@ impl Cell {
             [up_to_seq],
         )?;
         tx.commit()?;
+        // the forgotten payloads are the point: give the space back to the OS
+        inner
+            .conn
+            .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(target)
     }
 

@@ -1050,6 +1050,15 @@ fn run_semantic(
     }
     let open_ms = open_times.iter().sum::<f64>() / open_times.len() as f64;
 
+    // the graph index, measured before any search builds it (v0.3): the
+    // plain runs print it, the semantic ones carry it in the report
+    let (graph_build_ms, (graph_nodes, graph_edges, graph_bytes)) =
+        cell.build_graph().expect(/* bench cell is open */ "graph");
+    eprintln!(
+        "grafo: {graph_build_ms:.0} ms, {graph_nodes} nodi, {graph_edges} archi, {:.1} MB",
+        graph_bytes as f64 / 1e6
+    );
+
     // search — full pipeline, text-only (graph_hops = 0) and text+graph
     // (hops = 2, the §11 "ricerca testo+grafo" row: the PPR replaced the
     // per-level SQL walk)
@@ -1533,25 +1542,14 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
             let modes = [
                 "testo",
                 "testo-g0",
-                "testo-g0.15",
-                "testo-g0.20",
-                "testo-g0.25",
-                "testo-g0.35",
                 "vettori",
                 "rrf",
-                "rrf-g0.20",
-                "rrf-g0.30",
+                "rrf-g0.40",
                 "mm-0.3",
                 "mm-0.5",
                 "mm-0.7",
-                "mm-0.7-g0.15",
-                "mm-0.7-g0.20",
                 "mm-0.7-g0.25",
-                "mm-0.7-g0.30",
                 "mm-0.7-g0.40",
-                "th-0.3",
-                "th-0.5",
-                "th-0.7",
             ];
             for m in modes {
                 let mut cells = Vec::new();
@@ -1651,7 +1649,64 @@ fn load_model(name: &str) -> Option<std::sync::Arc<dyn Embedder>> {
     }
 }
 
+fn graph_probe(target: usize, dir: &std::path::Path) {
+    let corpus = build_corpus(target, false);
+    let db = dir.join(format!("probe-{target}.sqlite"));
+    let _ = std::fs::remove_file(&db);
+    let cell = Cell::create(&db, "probe", "bench").expect(/* fresh */ "create");
+    let t0 = Instant::now();
+    for note in &corpus.notes {
+        cell.put_note(note, "bench").expect(/* valid */ "put");
+    }
+    eprintln!(
+        "insert: {} note in {:.1}s",
+        corpus.notes.len(),
+        t0.elapsed().as_secs_f64()
+    );
+    let (ms, (nodes, edges, bytes)) = cell.build_graph().expect(/* open */ "graph");
+    eprintln!(
+        "graph: {ms:.0} ms, {nodes} nodi, {edges} archi, {} MB",
+        bytes as f64 / 1e6
+    );
+    cell.checkpoint().expect(/* writer */ "ckpt");
+    let before = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    let head: i64 = cell
+        .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
+        .ok()
+        .and_then(|v| v.first().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    let t1 = Instant::now();
+    cell.compact(head - 1000).expect(/* head */ "compact");
+    cell.checkpoint().expect(/* writer */ "ckpt");
+    let after = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "compact: {:.1}s, file {} → {} MB (testa {head})",
+        t1.elapsed().as_secs_f64(),
+        before as f64 / 1e6,
+        after as f64 / 1e6
+    );
+    assert!(cell.verify().expect(/* open */ "verify").ok());
+    eprintln!("verify: ok");
+    let _ = std::fs::remove_file(&db);
+    let snap_name = format!(
+        "{}-snap-{head}.sqlite",
+        db.file_name()
+            .map(|n| n.to_string_lossy().trim_end_matches(".sqlite").to_string())
+            .unwrap_or_default()
+    );
+    if let Some(dir) = db.parent() {
+        let _ = std::fs::remove_file(dir.join(snap_name));
+    }
+}
+
 fn main() {
+    if std::env::var("ENGRAMMA_GRAPH_PROBE").is_ok() {
+        let dir = std::env::temp_dir().join("engramma-bench");
+        std::fs::create_dir_all(&dir).expect(/* temp */ "mkdir");
+        graph_probe(100_000, &dir);
+        graph_probe(10_000, &dir);
+        return;
+    }
     let args = parse_args(std::env::args().skip(1));
     let mut targets = args.targets;
     if targets.is_empty() {

@@ -1315,3 +1315,428 @@ verificare prima di affermare.
 4. Il costo della «viva» a 100k (p95 54 ms) è la camminata del grafo del
    percorso di testo — ora con passo 5 000 smorzato; compattare la
    frontiera resta il lavoro del §registro/grafo.
+
+# REPORT — Engramma v0.3 (grafo veloce e utile, registro dimenticabile, compattazione, vista markdown, consolidamento)
+
+Data: 2026-11-06. Base: `main` @ `c9a7f2a`. Un commit per punto (vedi la
+nota sotto sui file condivisi), test rosso prima della correzione dove il
+punto lo prevedeva. Tutto offline, Rust 1.95, macOS arm64. Crate nuove:
+nessuna — `notify` 8.2.1 e `notify-debouncer-full` 0.7.0 erano già nel
+lock dalla chore `62dfade`; le feature aggiunte (`backup` di rusqlite,
+`signal` di tokio) e la dipendenza piena di `tempfile` (già dev-dep) non
+toccano il lock.
+
+## Nota sui commit
+
+I punti 0–3 condividono `cell/`: il registro v2 (punto 1) ha toccato
+`execute`, `verify` e `compare_states`, e purge/compattazione (punti 2–3)
+vivono negli stessi file. I commit seguono i punti per ciò che è
+separabile (graph/search/bench/golden nel punto 0; registro nel 1; CLI
+nel 2), ma `cell/{mod,ops,schema}.rs` arriva intero col commit del punto
+3 e il commit del punto 0 non compila da solo. La fase è verificata
+nell'insieme (fmt/clippy/test/deny verdi albero alla fine).
+
+## Punto 0 — il grafo in memoria col PPR
+
+### Cosa è stato fatto
+
+- **`GraphIndex`** (`crates/engramma-core/src/graph.rs`): nodi = note ed
+  entità (nomi intercati lowercase, chiavi `note:<ulid>`), adiacenza CSR
+  non orientata sugli archi visibili, costruita pigramente alla prima
+  ricerca, aggiornata dalle scritture della stessa `Cell` con una
+  sovrapposizione (overlay) sui nodi toccati, ricostruita a cambio di
+  `PRAGMA data_version` o quando l'overlay supera 1/8 degli archi. Ogni
+  arco porta relazione (interncata), finestra di validità (in microsecondi
+  interncati: `as_of` salta gli archi non validi), stato del dichiarante.
+- **Due generi di adiacenza.** Archi *reali* = le righe di `edges`.
+  Adiacenze *dichiarate* = la proiezione bipartita: la nota che dichiara
+  una relazione viene collegata ai suoi estremi (una riga «Giulia
+  works_at Studio Rossi» non tocca altrimenti la nota che l'afferma; la
+  camminata v0.2 la scopriva attraverso `note_id`, il prototipo la
+  legava strutturalmente). `neighbors` e `path` vedono solo gli archi
+  reali; la spinta vede entrambi.
+- **Camminata ponderata.** Una relazione tipizzata pesa 1, un `mentions`
+  0,25: navigazione, non asserzione. Su una camminata piatta i ~40
+  riempitivi che menzionano il soggetto affogavano l'unico arco
+  `partner_of` (misurato: la lista grafo amplificava il vicinato del
+  soggetto invece di estenderlo). È la linea di HippoRAG 2, che cammina
+  sul grafo delle triple, non sulle menzioni.
+- **Spinta Andersen–Chung–Lang**: si espande un nodo solo se il residuo
+  ≥ ε·grado pesato; α teletrasporto, θ lo smorzamento degli hub
+  (`θ/deg` sopra θ gradi). ε di **default 10⁻⁴**, non i 10⁻³ del
+  prototipo: i semi qui condividono la massa in dieci e a 10⁻³ le note a
+  due salti restavano sotto soglia e non si depositavano mai
+  (diagnosi `--multihop-debug`, che ora misura anche l'ibrido).
+- **Terza lista della fusione**: punteggi PPR delle note (semi esclusi),
+  scalati sul massimo della lista — la min-max dava 0 esatto
+  all'ultimo della lista e lo scartava (trovato col test «Zoro»).
+  Convessa `(1−w)·fuso + w·g`, RRF con reciproco di rango pesato.
+  `explain` porta `via` (catena dei predecessori a massa massima) e
+  `graph_rank`; `SearchOutcome.graph_pushed_edges` conta gli archi
+  spinti. `expand_graph`, `edges_touching_frontier` e `WALK_LIMIT` sono
+  andati via del tutto: `neighbors` e `path` girano sull'indice (test
+  VDBE a zero sul path dopo il build).
+- **In modalità testo il grafo resta supporto** (la regola v0.2.1
+  «support, never replace»): il boost porta copertura e recenza. Misurato
+  di nuovo: senza la disciplina una nota-persona con un solo termine
+  spodestava la risposta di «che lavoro fa Fabio».
+- **LRU delle domande configurabile** (`Cell::set_query_cache_capacity`),
+  default 4 096; il banco la alza al numero di domande.
+
+### La taratura del peso (criterio dichiarato)
+
+**MRR medio del benchmark a 100k pesato per numero di domande** (fattuali
+1913, parafrasi 1533, multi-salto 237, inglese 1001; a parità vince chi
+tiene le parafrasi), come in v0.2.1:
+
+| peso grafo | MRR pesato | multi-salto ibrido | parafrasi (100k) |
+|---|---|---|---|
+| v0.2.1 (camminata SQL) | 0,839 | 0,063/0,019 | 0,993/0,878 |
+| 0,25 | 0,849 | 0,536/0,165 | 0,993/0,878 |
+| 0,30 | 0,850 | 0,692/0,248 | 0,993/0,877 |
+| 0,35 | 0,853 | 0,865/0,356 | 0,993/0,873 |
+| **0,40 (predefinito)** | **0,855** | **0,949/0,503** | 0,992/0,864 |
+
+0,40 vince sul criterio ed è l'unico che porta il multi-salto ibrido
+sopra il solo testo − 0,05 (0,949 contro 0,916). Il prezzo: le parafrasi
+cedono 0,014 di MRR (richiamo 0,993→0,992, dentro l'1%) e sul vault
+dorato (65 note, massa piatta) la pagina-persona del soggetto — a un
+salto dall'hub — può stare sopra la risposta: le due domande manuali
+ibride del test v0.2.1 ora vincono nei primi **due**, non più al primo
+(test aggiornato con la deriva dichiarata).
+
+### Le domande dorate multi-salto
+
+Il prompt chiedeva ≥ 5 domande che il solo testo (con `graph_hops = 0`)
+**non** risolve: c'è un test dedicato (`multihop_questions_need_the_graph`).
+La storia è dovuta cambiare (il suggerimento era proprio «la sorella di
+Giulia lavora altrove»):
+
+- Sara lavora alla Biblioteca Angelica (nota nuova 112, con la relazione
+  dichiarata); Davide sposato con Sara; la Dott.ssa Conti segue Giulia;
+  Marco «capo dei progetti» (non più «capoprogetto di Fabio» nel corpo —
+  il testo la trovava da solo); il matrimonio di Sara ha perso la parola
+  «sorella» dal corpo e il titolo; le note chiave portano le relazioni
+  nella sezione `## Relations` (il vincolo sintattico che la catena usa).
+- Le cinque: «dove lavora il partner di Fabio», «come si chiama il medico
+  del partner di Fabio», «dove lavora la sorella di Giulia», «chi è il
+  marito della sorella di Giulia», «come si chiama il capoprogetto per cui
+  lavora Fabio». In ibrido, all'istante fisso del test, tutte e cinque
+  rispondono nei primi 5 (test `golden_semantic` col 97M).
+- **Deriva onesta all'orologio vero**: alle prove a mano (oggi, recenza
+  viva) tre su cinque rispondono nei primi 5; per le altre due il match
+  lessicale (la Dott.ssa Ricci contiene «medico di base di Fabio»)
+  supera la catena. Le catene ci sono — l'`explain` le mostra — ma il
+  peso grafo 0,40 distribuisce la lista sulle pagine-persona. È lo stesso
+  compromesso della taratura, dichiarato: su un vault piccolo la recenza
+  e il lessico vincono ancora.
+
+### Obiettivi (benchmark a 100k, 97M, mediana di 3, cache calda vera)
+
+Cache calda vera = LRU con capacità uguale al numero di domande del
+corpus (4 684 a 100k): il banco la imposta prima dei pass; il «warm» non
+re-incorpora più nulla (il pass a freddo sulle stesse domande fa da
+riscaldamento). Numeri nella tabella di chiusura.
+
+## Punto 1 — registro v2, payload dimenticabili
+
+- `payload_digest = blake3(sale ‖ JSON canonico del corpo)`,
+  `hash = blake3(prev ‖ JSON canonico della busta {op_id, hlc, actor,
+  kind, note_id, payload_digest})`: le colonne SONO la busta. Il corpo
+  vive in `op_payloads(op_id, sale, corpo)`; il sale (16 byte) si genera
+  alla creazione dell'operazione, come id e HLC — `apply` resta
+  deterministica.
+- **Redazione**: il rigioco di un'operazione dimenticata è un no-op
+  (scheletro + tick dell'HLC). Spec in `spec/format-v0.md` §6.2 con i
+  vettori dorati v2 (sale fisso) e il vettore v1 congelato per la
+  migrazione.
+- **Migrazione v5**: verifica la catena v1 (rotta → rifiuto), riscrive
+  tutto in forma v2 con sali nuovi, bookmark `log_v1_head` e
+  `log_v2_from_seq` in `meta` (fuori dal confronto di stato: nessuna
+  operazione li scrive). Il test costruisce la cella v1 copiando lo stato
+  di una cella reale e riscrivendo il registro con la regola v1.
+- Test richiesti: dimenticare un payload mantiene la catena (la verifica
+  completa passa quando l'effetto è interamente sostituito da una
+  scrittura successiva, o dopo `purge`); un byte del corpo cambiato →
+  verifica fallisce; il sale cambiato → fallisce; proptest: operazioni
+  casuali (ora anche `purge`, vedi sotto) → il rigioco dà lo stesso
+  stato.
+- Scoperta dei proptest: il confronto di stato usa l'insieme **derivato**
+  delle entità (estremi degli archi ∪ soggetti delle note vive): la
+  tabella grezza è un indice il cui storia sotto redazione diverge
+  legittimamente (l'ultimo che reclama un titolo vince, e una purga
+  sgancia il reclamo). Anche i tag orfani vengono potati dalla purga.
+
+## Punto 2 — purge
+
+- `purge(note_id, reason, actor)`: nota, versioni, archi dichiarati
+  (derivati e manuali), vettori, riga FTS, entità rimaste senza
+  riferimenti (con **riderivazione del reclamo**: conta solo il reclamo
+  di una nota viva) e tag senza portatori. `secure_delete = ON` durante
+  l'operazione e `VACUUM` dopo: **nessun byte del corpo nel file**
+  (test che legge il file grezzo).
+- **Dimenticanza selettiva**: i payload delle operazioni della nota; le
+  `supersede` dove la nota è la NUOVA vengono **censurate** (nota→null,
+  sale nuovo, coda della catena ricalcolata) perché la chiusura della
+  vecchia deve restare rigiocabile; dove la nota è la VECCHIA il payload
+  resta (contiene i dati dell'altra nota) e `apply_supersede` impara a
+  creare comunque la nuova quando la vecchia manca (rigioco redatto).
+- `purge` è idempotente; le menzioni `[[Nome]]` in altre note restano
+  (documentato nella CLI e nel REPORT); le esportazioni già fatte sono
+  dichiarate fuori controllo nell'aiuto.
+- Test richiesti tutti verdi, incluso il rigioco (verify ok dopo purge).
+
+## Punto 3 — compattazione
+
+- `compact(up_to_seq)`: `VACUUM INTO` un'istantanea della cella **allo
+  stato attuale** (la testa), registrata in `snapshots(seq, head_hash,
+  state_digest, file, created_at)`; i payload fino a `up_to_seq` (≤
+  testa: `--keep-last` tiene una coda rigiocabile) vengono dimenticati.
+- `state_digest(conn)` è pubblica: blake3 del dump canonico delle
+  tabelle logiche (lo stesso rendering di `compare_states`, che ora
+  condivide il codice).
+- `verify` dopo la compattazione: catena intera; ripristina
+  l'istantanea in memoria (API backup di rusqlite), ne controlla il
+  digest registrato, **riapplica lo stesso taglio** alla copia (il file
+  d'istantanea è anteriore alla dimenticanza) e rigioca solo la coda;
+  trova la testa d'istantanea dal suo hash (che può superare il taglio).
+- `changes_since` sotto il taglio → `CellError::Compacted
+  { snapshot_seq }`; istantanea manomessa → verify fallisce
+  (test dedicato).
+- CLI `engramma compact [--keep-last N]` (predefinito 1000). Il banco
+  misura il file prima e dopo (tabella di chiusura).
+- Proptest: operazioni casuali con purge, compattazione, altre
+  operazioni → verify ok e il digest dell'istantanea è quello del rigioco
+  completo fatto prima di compattare.
+
+## Punto 4 — la vista markdown
+
+- **Riconciliazione per scansione** (`sync_once`), deterministica:
+  `vault_files` (migrazione v7, dati derivati fuori dal registro) è lo
+  stato dell'ultima riconciliazione; il file è legato alla nota
+  dall'`id` nell'intestazione. Ogni riga della tabella del prompt ha il
+  suo test: file cambiato/nota invariata, invariato/cambiata (riscrittura
+  atomica: temporaneo + rename), entrambi (conflitto: vince la cella,
+  copia `.conflitto-<ts>.md` che lo scanner ignora), nuovo senza id
+  (nota nuova con le regole dell'import Obsidian, file riscritto CON
+  l'id), sparito (lapide).
+- Aggiunte oltre la tabella, misurate dai test: le note vive senza file
+  (scritte dopo `init`) vengono esportate; una nota purgata o lapidata
+  trascina con sé il suo file; lo spostamento/rinomina aggiorna il
+  legame senza cancellare niente e senza far scattare la guardia.
+- **Guardia**: più di 20 file **o** più del 10% delle note spariti
+  insieme → `MassDelete`, niente cancellato, `--allow-deletions` per
+  procedere. Nota: nei vault piccoli la soglia percentuale scatta prima
+  di quella assoluta (dieci note, un file cancellato = 10%) — è la
+  lettera del prompt, dichiarata.
+- **Eco**: l'hash del file scritto da noi viene registrato; il test del
+  punto fisso la verifica insieme a tutto il resto.
+- Validazione: intestazione rotta → errore nel riepilogo, cella intatta;
+  un file non può promuovere una nota `external` ad `active` (warning e
+  quarantena). `.obsidian/`, `.trash/`, nascosti, symlink e copie di
+  conflitto saltati.
+- `watch`: notify + debouncer (500 ms) **come innesco**, scansione
+  completa ogni 60 s come rete di sicurezza, fermo pulito. Test
+  d'integrazione: una modifica a mano diventa una nota aggiornata entro
+  3 s (passato qui su FSEvents; marcato potenzialmente instabile in CI
+  come chiedeva il prompt).
+- **Proptest del punto fisso**: otto semi, dodici giri di modifiche
+  casuali da file e dalla cella con sincronizzazioni sparse; alla fine
+  due `sync_once` di fila — la seconda non fa nulla, ogni nota viva ha
+  il suo file con contenuto `serialize(nota)` esatto.
+- CLI: `vault init`, `vault sync [--allow-deletions]`, `vault watch`.
+
+## Punto 5 — candidati al consolidamento
+
+- `consolidation_candidates(limit, cfg)` in sola lettura
+  (`crates/engramma-core/src/consolidation.rs`):
+  - **quasi duplicati**: coseno ≥ 0,95 (ricalcolato esatto dai vettori
+    del modello ready; le proposte arrivano dall'indice int8 della
+    ricerca) **e** Jaccard delle entità ≥ 0,5 (menzioni, relazioni,
+    soggetto);
+  - **contraddizioni probabili**: stessa entità soggetto, stessa
+    relazione funzionale (predefinite `lives_in`, `works_at`,
+    `partner_of`), destinazioni diverse, note attive, validità
+    sovrapposte — anche **nella stessa nota** (il caso del prompt: due
+    `lives_in` sulla pagina di Luca senza supersede).
+- Vault dorato: aggiunti il doppione del bagno (nota 115, Jaccard 1,00
+  con la 041) e i due `lives_in` aperti di Luca. Test col 97M: entrambi
+  trovati, nessun falso positivo dalle catene chiuse. Il test senza
+  modello copre le contraddizioni.
+- CLI `engramma consolidate [--limit N] [--json]`; niente MCP.
+
+## Punto 6 — documentazione
+
+`docs/architecture.md` (GraphIndex e PPR, registro v2, compattazione,
+vista, stato logico sotto redazione), `docs/cli.md` (purge, compact,
+vault, consolidate), `spec/format-v0.md` (§6 riscritto: regola v2,
+vettori dorati, redazione, migrazione, istantanee), `README.md` (vista
+Obsidian, purge e i suoi limiti).
+
+## Chiusura
+
+`cargo fmt --check`, `cargo clippy --all-targets --offline -- -D
+warnings`, `cargo test --offline --workspace` (159+18 test di integrazione
+debug, **184 in --release**), `cargo deny check licenses bans`: verdi.
+(Un flake noto e preesistente: il test bearer-token di
+`engramma-embed/src/http.rs` fa girare un server TCP su una porta locale
+e in parallelo ogni tanto perde la gara — riprodotto anche sull'albero
+pulito a inizio fase.)
+
+### Le tabelle
+
+**Il punto 0 prima/dopo** (100k, 97M, mediana di 3, cache calda vera =
+LRU con capacità 4 684 = tutte le domande; v0.2.1 dal REPORT precedente,
+che misurava «caldo» con una LRU da 256 e quindi re-incorporava):
+
+| misura | v0.2.1 | v0.3 |
+|---|---|---|
+| ibrido p50 / p95 (ms) | 48,5 / 59,8 | **7,7 / 11,2** |
+| ibrido + incorporazione p50 / p95 (ms) | 57,6 / 68,5 | **19,4 / 22,5** |
+| solo vettori p50 / p95 (ms) | 51,1 / 64,7 | 4,2 / 4,7 |
+| solo testo (hops 0) p50 (ms) | 9,2 | 7,5 |
+| testo+grafo p50 / p95 (ms) | ~43,5 / 54,3 (era la riga «ricerca») | **7,6 / 10,5** |
+| multi-salto ibrido (ric/MRR) | 0,063 / 0,019 | **0,949 / 0,503** |
+| multi-salto solo testo | 0,895 / 0,536 | 0,895 / 0,536 |
+| richiamo@5 / MRR (viva) | 0,940 / 0,683 | 0,940 / 0,683 |
+| inserimento (note/s) | 2 092 | 1 486 (due righe per op: scheletro + payload) |
+| apertura cella (ms) | 1,6 | 1,6 |
+
+Obiettivi del §11 e del prompt: ibrido p95 ≤ 50 → **11,2** ✓; solo testo
+p95 ≤ 30 → **10,5** (testo+grafo a 2 salti) ✓; multi-salto ibrido ≥
+solo testo − 0,05 → 0,949 ≥ 0,845 ✓; nessuna categoria peggiora oltre
+0,01 → fattuali 0,998→0,996, parafrasi 0,993→0,992, inglese 0,994→0,990
+(richiamo; le parafrasi cedono 0,014 di MRR: il compromesso dichiarato
+della taratura) ✓; apertura ≤ 50 ms → 1,6 ✓.
+
+**Il grafo in memoria** (sonda dedicata, prima di ogni ricerca):
+
+| corpus | costruzione | nodi | archi | memoria |
+|---|---|---|---|---|
+| 10k | 11 ms | 10 008 | 17 322 | 2,2 MB |
+| 100k | 123 ms | 100 090 | 184 459 | 21,6 MB |
+
+Archi spinti per domanda (media ibrido): 1 001 a 10k, 695 a 100k — più
+del prototipo (157) perché il grafo vero ha la proiezione dichiarata e
+persone con più relazioni, ma sempre O(centinaia) contro le migliaia
+della camminata SQL.
+
+**La compattazione** (sonda: `compact(head − 1000)` poi `verify` ok):
+
+| corpus | prima | dopo | tempo |
+|---|---|---|---|
+| 10k | 24,3 MB | 19,2 MB (−21%) | 0,1 s |
+| 100k | 246,1 MB | 190,0 MB (−23%) | 1,8 s |
+
+(Le celle col modello ready: 465,0 → 408,8 MB a 100k — la parte
+recuperata sono i payload, i vettori restano.) Nella prima tiratura del
+banco la compattazione non rimpiccioliva il file vivo: le pagine libere
+restano a SQLite senza un `VACUUM` della cella — corretto (la
+compattazione ora fa il VACUUM anche della cella viva), e la
+ricompattazione alla stessa testa sostituisce la propria istantanea
+(`VACUUM INTO` rifiuta i file esistenti).
+
+Tabella completa e per-modalità in `bench/RESULTS.md`.
+
+### Prove a mano (uscite trascritte)
+
+```console
+$ engramma --root $T init && engramma --root $T model use …97M…
+$ engramma --root $T import tests/golden/vault-it --obsidian
+incorporate: 66 (in attesa: 0) / importate: 66 / errori: 0
+$ engramma --root $T verify
+registro verificato: 67 operazioni, catena hash, ricostruzione e indice FTS a posto
+copertura vettori: granite-embedding-97m-multilingual-r2@835ad140 [ready] 66/66 note
+```
+
+Le cinque multi-salto in ibrido (primi risultati e `via`; all'istante del
+test tutte rispondono nei primi 5):
+
+```console
+$ engramma --root $T search "dove lavora il partner di Fabio" --k 3
+1. [active] Giulia (00000002)
+   liste: text, vector, graph
+   via: [[nota 00000081]] -mentions-> [[Milano]] -lives_in-> (nota 00000002)
+$ engramma --root $T search "chi è il marito della sorella di Giulia" --k 3
+1. [active] Sara (00000005)
+   liste: text, vector, graph   via: [[nota 00000091]] -mentions-> [[Roma]] -lives_in-> (nota 00000005)
+```
+
+La vista:
+
+```console
+$ engramma --root $T vault init $V
+vault inizializzato: …/vault
+$ engramma --root $T vault sync $V          # subito dopo init
+nulla da fare                              # l'eco non rientra
+$ sed -i '' 's/amaro/dolce/' $V/preference/caffe-amaro-00000062.md
+$ engramma --root $T vault sync $V
+note aggiornate da file: 1
+  - preference/caffe-amaro-00000062.md
+$ engramma --root $T get 00000062 --json | grep body
+"body": "[[Fabio]] prende il caffè dolce, senza zucchero: da sempre.\n"
+$ EDITOR=script-che-modifica engramma --root $T edit 00000062   # dalla CLI
+$ engramma --root $T vault sync $V
+conflitti (vince la cella, copia .conflitto): 1
+  - preference/caffe-amaro-00000062.md
+$ grep caffè $V/preference/caffe-amaro-00000062.conflitto-2026-11-06T22_52_52.md
+…caffè amaro, senza zucchero…              # la versione del file, salvata
+$ engramma --root $T vault sync $V
+nulla da fare                              # punto fisso
+```
+
+Purge e compattazione:
+
+```console
+$ engramma --root $T purge 01M6SH1T… --reason "prova oblio" --yes
+purgata: 01M6SH1T1FM5GHE3XSGZ94W535 (1 payload dimenticati)
+$ grep -c "prova-purge-zanzara-…" $T/cells/default.sqlite
+0                                          # nessun byte nel file
+$ engramma --root $T history 01M6SH1T1F…
+engramma: note … not found
+$ engramma --root $T compact --keep-last 1
+compattata fino a seq 70 (testa 71): …/default-snap-71.sqlite
+$ engramma --root $T verify
+registro verificato: 71 operazioni, catena hash, ricostruzione e indice FTS a posto
+$ engramma --root $T consolidate
+[quasi duplicato] Ristrutturazione bagno (00000041) ↔ Il piano del bagno (appunto) (00000115)
+  coseno 0.964, entità in comune 1.00
+[contraddizione probabile] Luca Ferrari (00000007) ↔ Luca Ferrari (00000007)
+  Luca Ferrari lives_in Roma (from 2026-09-01 to ora) e lives_in Torino (from 2024-01-01 to ora)
+… (quasi duplicati anche per Luca Ferrari/Luca e la matematica, 0.961,
+  ed Elena Bianchi/Il ruolo di Elena Bianchi, 0.954)
+```
+
+## Cosa non ho potuto provare
+
+- **Windows e Linux**: solo macOS arm64, come nelle fasi precedenti.
+- **Il watch su CI**: il test d'integrazione (3 s) passa qui su FSEvents;
+  marcato come potenzialmente instabile in ambienti condivisi.
+- **La migrazione v5 su celle v0.2.1 vere**: il test costruisce il file
+  v1 copiando lo stato di una cella reale e riscrivendo il registro con
+  la regola v1 congelata — non ho aperto celle prodotte dal binario del
+  tag (il formato è equivalente per costruzione: stesse colonne, stessa
+  regola, stesso hash dorato).
+- **Il 311M a 100k**: come v0.2.1, dichiarato (il 97M è il modello
+  predefinito).
+- **cargo deny advisories**: richiede rete; eseguito `licenses bans`.
+
+## Domande aperte per la v0.4
+
+1. **Il compromesso del peso grafo** (0,40): le parafrasi cedono 0,014
+   di MRR a 100k e i vault piccoli vedono le pagine-persona sopra le
+   risposte. Un peso che dipenda dalla densità del grafo (o un PPR su
+   semi meno numerosi ma riponderati) potrebbe tenersi entrambi.
+2. **L'astensione semantica resta aperta** (v0.2.1): col vault cresciuto
+   «che auto guida Giulia» tiene un sopravvissuto strong in --strict
+   (margine 0,043 sulla soglia 0,03) e 11/15 parafrasi cadono — la
+   curva è nel test aggiornato.
+3. **Il collegamento Node** (napi-rs) e l'integrazione in Homun: la
+   vista markdown e il registro dimenticabile cambiano il modo in cui
+   Homun dovrebbe scrivere (attore `vault`? purge dal turno contaminato?).
+4. **`neighbors`/`path` con l'indice**: ora ignorano gli archi con
+   validità non più valida solo in ricerca (`as_of`); `neighbors` non ha
+   filtro temporale — servirà?
+5. **La guardia della vista** scatta per percentuale nei vault piccoli:
+   una soglia minima assoluta (per esempio «meno di 5 file non conta»)
+   sarebbe più usabile; la lettera del prompt diceva altrimenti.
