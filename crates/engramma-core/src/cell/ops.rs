@@ -1194,13 +1194,24 @@ pub(crate) fn purge_state(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellErr
     if let Some(row) = read_note(tx, id)?
         && row.note.status != Status::Deleted
     {
-        fts_delete(
-            tx,
-            row.rowid,
-            row.note.title.as_deref().unwrap_or(""),
-            &row.body_norm,
-            &row.tags_text,
+        // The FTS row is removed only when the index really holds it: a
+        // compaction snapshot's index is empty by construction (P0.4:
+        // `delete-all` at compact, rebuilt at verify), and a `delete` for a
+        // rowid that is not there corrupts FTS5's accounting.
+        let in_index: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM notes_fts_docsize WHERE id = ?1",
+            [row.rowid],
+            |r| r.get(0),
         )?;
+        if in_index > 0 {
+            fts_delete(
+                tx,
+                row.rowid,
+                row.note.title.as_deref().unwrap_or(""),
+                &row.body_norm,
+                &row.tags_text,
+            )?;
+        }
     }
     tx.execute("DELETE FROM notes WHERE id = ?1", [&id_str])?;
     tx.execute("DELETE FROM note_versions WHERE note_id = ?1", [&id_str])?;

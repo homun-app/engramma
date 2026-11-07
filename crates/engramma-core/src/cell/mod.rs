@@ -708,18 +708,33 @@ impl Cell {
         let rows: Vec<(i64, String)> = {
             let mut stmt = inner
                 .conn
-                .prepare("SELECT seq, file FROM snapshots ORDER BY seq")?;
+                .prepare("SELECT seq, file FROM snapshots ORDER BY seq DESC")?;
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .flatten()
                 .collect()
         };
-        for (seq, file) in rows {
+        for (i, (seq, file)) in rows.into_iter().enumerate() {
             let snap_path = self
                 .path
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(&file);
+            if !snap_path.exists() {
+                if i > 0 {
+                    // a ghost row (crash between the row's removal and the
+                    // file's in a past compaction — the newest always exists):
+                    // drop it, nothing references it
+                    inner
+                        .conn
+                        .execute("DELETE FROM snapshots WHERE seq = ?1", [seq])?;
+                    continue;
+                }
+                return Err(CellError::Db(format!(
+                    "the newest snapshot {} is missing: the purge refuses to                      forget half of the cell",
+                    snap_path.display()
+                )));
+            }
             let digest = Self::scrub_snapshot(&snap_path, id, &censorable)?;
             let redacted = Self::redacted_by(&inner.conn, seq, &purge_op_id)?;
             inner.conn.execute(
@@ -1302,14 +1317,17 @@ impl Cell {
     }
 
     /// Compact the log (DESIGN §4.3, v0.3): `VACUUM INTO` a snapshot of the
-    /// cell **exactly as it stands** (`up_to_seq` must be the current head —
-    /// the point of compacting is now), register it with its head hash and
-    /// its [`state_digest`], then forget the payloads of every op up to
-    /// `seq`: the skeletons and the chain stay whole. Returns the snapshot
-    /// path.
+    /// cell **exactly as it stands** (`up_to_seq` must be within the live
+    /// log), register it with its head hash and its [`state_digest`], then
+    /// forget the payloads of every op up to `seq`: the skeletons and the
+    /// chain stay whole. v0.3.1 (P0.4): the snapshot file is the **logical
+    /// state** — the payloads up to the cut, the vectors, the model registry,
+    /// the markdown-view bindings and the FTS content are stripped from it
+    /// (derived or recomputable, and all of them carry content) — and only
+    /// the LAST snapshot is kept. Returns the snapshot path.
     ///
     /// # Errors
-    /// [`CellError::Invalid`] when `up_to_seq` is not the live head;
+    /// [`CellError::Invalid`] when `up_to_seq` is outside the live log;
     /// [`CellError::Db`] on SQL or I/O failures.
     pub fn compact(&self, up_to_seq: i64) -> Result<PathBuf, CellError> {
         let _guard = self
@@ -1332,7 +1350,6 @@ impl Cell {
                 r.get(0)
             })
             .unwrap_or_default();
-        let digest = state_digest(&inner.conn)?;
         let file = format!(
             "{}-snap-{head_seq}.sqlite",
             self.path
@@ -1356,19 +1373,64 @@ impl Cell {
             "VACUUM INTO '{}'",
             target.display().to_string().replace('\'', "''")
         ))?;
+        // v0.3.1 (P0.4): strip the file to its logical state, then digest
+        // what stays. The payloads up to the cut go first: their content
+        // must not outlive the compaction in the one file that never gets a
+        // purge otherwise.
+        let digest = {
+            let mut snap_conn = Connection::open(&target)?;
+            snap_conn.pragma_update(None, "journal_mode", "DELETE")?;
+            let secure_before: i64 =
+                snap_conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+            snap_conn.pragma_update(None, "secure_delete", "ON")?;
+            {
+                let tx = snap_conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "DELETE FROM op_payloads WHERE op_id IN (
+                         SELECT op_id FROM ops WHERE seq <= ?1)",
+                    [up_to_seq],
+                )?;
+                tx.execute("DELETE FROM note_vectors", [])?;
+                tx.execute("DELETE FROM embedding_models", [])?;
+                tx.execute("DELETE FROM vault_files", [])?;
+                tx.execute("DELETE FROM snapshots", [])?;
+                // external-content FTS5: `delete-all` empties the index (its
+                // segments carry the stems); verify rebuilds it from the
+                // content table before the tail replay
+                tx.execute("INSERT INTO notes_fts(notes_fts) VALUES('delete-all')", [])?;
+                tx.commit()?;
+            }
+            snap_conn.pragma_update(None, "secure_delete", secure_before)?;
+            snap_conn.execute_batch("VACUUM;")?;
+            state_digest(&snap_conn)?
+        };
         let created = OffsetDateTime::now_utc()
             .replace_millisecond(0)
             .unwrap_or(OffsetDateTime::now_utc())
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
+        // Only the last snapshot stays (P0.4). Order, crash-safe: the new
+        // file exists and its row lands first; the old row and its file go
+        // after (a crash between the two leaves a ghost row without file —
+        // the next purge drops it, it is never the newest).
+        let stale: Vec<(i64, String)> = {
+            let mut stmt = inner
+                .conn
+                .prepare("SELECT seq, file FROM snapshots WHERE seq != ?1 OR file != ?2")?;
+            stmt.query_map(rusqlite::params![up_to_seq, file], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .flatten()
+            .collect()
+        };
         let tx = inner
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
-            "INSERT INTO snapshots (seq, head_hash, state_digest, file, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO snapshots (seq, head_hash, state_digest, file, redacted_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, '[]', ?5)
              ON CONFLICT(seq) DO UPDATE SET head_hash = ?2, state_digest = ?3,
-                                            file = ?4, created_at = ?5",
+                                            file = ?4, redacted_by = '[]', created_at = ?5",
             rusqlite::params![up_to_seq, head_hash, digest, file, created],
         )?;
         tx.execute(
@@ -1376,7 +1438,26 @@ impl Cell {
                  SELECT op_id FROM ops WHERE seq <= ?1)",
             [up_to_seq],
         )?;
+        for (seq, old_file) in &stale {
+            // by (seq, file), not seq alone: a re-compact at the same cut
+            // with a new head reuses the seq, and the fresh row must survive
+            tx.execute(
+                "DELETE FROM snapshots WHERE seq = ?1 AND file = ?2",
+                rusqlite::params![seq, old_file],
+            )?;
+        }
         tx.commit()?;
+        for (_, old_file) in &stale {
+            if old_file != &file {
+                let old = self
+                    .path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(old_file);
+                let _ = std::fs::remove_file(old);
+            }
+        }
         // the forgotten payloads are the point: give the space back to the OS
         inner
             .conn
@@ -1669,6 +1750,25 @@ impl Cell {
                         {
                             let tx = rebuild_conn.transaction()?;
                             schema::migrate(&tx)?;
+                            tx.commit()?;
+                        }
+                        // v0.3.1 (P0.4): the snapshot carries no FTS content
+                        // (stripped at compact — it is derived, and its
+                        // segments hold the stems). Rebuild it from the
+                        // content table BEFORE the tail replay: the tail's
+                        // FTS deletes must find their rows. Not the `rebuild`
+                        // command: it indexes every content row, tombstones
+                        // included, while the live index holds exactly the
+                        // non-deleted notes — so the same discipline: empty,
+                        // then insert the living rows only.
+                        {
+                            let tx = rebuild_conn.transaction()?;
+                            tx.execute_batch(
+                                "INSERT INTO notes_fts(notes_fts) VALUES('delete-all');
+                                 INSERT INTO notes_fts(rowid, title, body_norm, tags_text)
+                                 SELECT rowid, COALESCE(title, ''), body_norm, tags_text
+                                 FROM notes WHERE status != 'deleted';",
+                            )?;
                             tx.commit()?;
                         }
                         // v0.3 snapshots are full copies taken BEFORE the

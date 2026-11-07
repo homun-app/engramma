@@ -215,13 +215,22 @@ proptest! {
             .parse()
             .unwrap(/* test-only */);
         let snap = cell.compact(head).unwrap(/* test-only */);
-        // the snapshot records exactly the pre-compaction state
+        // v0.3.1 (P0.4): the snapshot is the LOGICAL state. Its recorded
+        // digest is its own — the payloads up to the cut are stripped from
+        // the file — and it must equal the live state's digest at the same
+        // head (the live cell forgot the very same payloads).
         let recorded = cell
             .debug_column(&format!(
                 "SELECT state_digest FROM snapshots WHERE seq = {head}"
             ))
             .unwrap(/* test-only */);
-        prop_assert_eq!(recorded.first().map(String::as_str), Some(digest_before.as_str()));
+        let digest_after = cell.state_digest().unwrap(/* test-only */);
+        prop_assert_eq!(
+            recorded.first().map(String::as_str),
+            Some(digest_after.as_str())
+        );
+        let _ = digest_before; // the pre-compaction digest: replaced by the
+                               // logical-state comparison above
         prop_assert!(snap.is_file());
         // more ops, then verify replays the tail on the snapshot
         run_random_ops(&cell, seed.wrapping_mul(3) | 1, 8);
@@ -229,8 +238,177 @@ proptest! {
         prop_assert!(report.ok(), "verify after compaction: {:?}", report.mismatch);
     }
 
-    /// Export then import into a fresh cell gives the same notes and edges.
+    /// v0.3.1 (P0): random ops with `compact` and `purge` interleaved —
+    /// verify holds at the end, and no root of any body a purged note ever
+    /// had survives in the cell file, in the WAL or in any snapshot. Each
+    /// note carries distinctive invented words: a hit is always a leak.
     #[test]
+    fn random_ops_compact_and_purge_leave_no_roots(seed in any::<u64>()) {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let path = dir.path().join("dimenticare.sqlite");
+        let cell = Cell::create(&path, "p", "prop").unwrap(/* test-only */);
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // (id, every word its body ever carried)
+        let mut living: Vec<(ulid::Ulid, Vec<String>)> = Vec::new();
+        let mut purged_words: Vec<String> = Vec::new();
+        // The discriminating letters sit at the FRONT: an Italian stem can
+        // drop the tail of a word (verboae -> verboa), and a purged word's
+        // stem must never be a substring of a living word's text.
+        let word_of = |i: u16| {
+            format!(
+                "{}{}parola",
+                char::from(b'a' + (i / 26) as u8),
+                char::from(b'a' + (i % 26) as u8)
+            )
+        };
+        let note_of = |i: u16, word: &str| Note {
+            id: {
+                let mut id = format!("01P{}{:05}", seed % 100, i);
+                while id.len() < 26 {
+                    id.push('0');
+                }
+                Ulid::from_string(&id).unwrap(/* test-only */)
+            },
+            note_type: NoteType::Fact,
+            title: None,
+            body: format!("{word} [[Roma]]"),
+            tags: vec![],
+            scope: None,
+            lang: Some(Lang::It),
+            source: "prop".into(),
+            confidence: Confidence::Stated,
+            status: Status::Active,
+            valid_from: None,
+            valid_to: None,
+            supersedes: vec![],
+            created_at: ts(1000),
+            updated_at: ts(1000),
+            extensions: vec![],
+        };
+        let draw = |pool: &[(ulid::Ulid, Vec<String>)], rnd: u64| {
+            if pool.is_empty() {
+                None
+            } else {
+                pool.get((rnd % pool.len() as u64) as usize)
+                    .map(|(id, _)| *id)
+            }
+        };
+        for i in 0..40_u16 {
+            match next() % 6 {
+                0 | 1 => {
+                    let w = word_of(i);
+                    let note = note_of(i, &w);
+                    if cell.put_note(&note, "prop").is_ok() {
+                        living.push((note.id, vec![w]));
+                    }
+                }
+                2 => {
+                    // a purge: the note and every body it ever had go
+                    if let Some(id) = draw(&living, next())
+                        && cell.get(&id).is_ok()
+                        && cell.purge(&id, "prop", "prop").is_ok()
+                    {
+                        if let Some((_, words)) = living.iter().find(|(n, _)| n == &id) {
+                            purged_words.extend(words.iter().cloned());
+                        }
+                        living.retain(|(n, _)| n != &id);
+                    }
+                }
+                3 => {
+                    // a patch moves a living note to a fresh word
+                    if let Some(id) = draw(&living, next()) {
+                        let w = word_of(200 + i);
+                        let patch = NotePatch {
+                            body: Some(format!("{w} [[Roma]]")),
+                            ..Default::default()
+                        };
+                        if cell.patch_note(&id, &patch, "prop").is_ok()
+                            && let Some(entry) = living.iter_mut().find(|(n, _)| n == &id)
+                        {
+                            entry.1.push(w);
+                        }
+                    }
+                }
+                4 => {
+                    // a supersede: the new note is the censor case when purged
+                    if let Some(id) = draw(&living, next()) {
+                        let w = word_of(400 + i);
+                        let mut new = note_of(600 + i, &w);
+                        new.supersedes = vec![id];
+                        if cell.supersede(&id, &new, None, "prop").is_ok() {
+                            living.retain(|(n, _)| n != &id);
+                            living.push((new.id, vec![w]));
+                        }
+                    }
+                }
+                _ => {
+                    // a compaction somewhere inside the run
+                    let head: i64 = cell
+                        .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
+                        .unwrap_or_default()
+                        .first()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if head >= 1 {
+                        let cut = (head - (next() % 3) as i64).max(1);
+                        let _ = cell.compact(cut);
+                    }
+                }
+            }
+        }
+        prop_assert!(
+            !purged_words.is_empty(),
+            "the mix must purge something (seed {seed})"
+        );
+        let report = cell.verify().unwrap(/* test-only */);
+        prop_assert!(report.ok(), "verify: {:?}", report.mismatch);
+        drop(cell);
+        // no root of any purged word in the cell file, the WAL or any
+        // snapshot — the same needle rule as tests/forgetting.rs
+        let needles: Vec<String> = purged_words
+            .iter()
+            .flat_map(|w| {
+                let folded = engramma_core::text::strip_diacritics(&w.to_lowercase());
+                let stem = engramma_core::text::normalize(&folded, Some(Lang::It));
+                [folded, stem]
+            })
+            .collect();
+        let mut files: Vec<std::path::PathBuf> = vec![
+            path.clone(),
+            dir.path().join("dimenticare.sqlite-wal"),
+        ];
+        let mut snaps: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("dimenticare-snap-"))
+            })
+            .collect();
+        snaps.sort();
+        files.extend(snaps);
+        for f in files {
+            let raw = std::fs::read(&f).unwrap_or_default();
+            for n in &needles {
+                prop_assert!(
+                    !raw.windows(n.len()).any(|w| w == n.as_bytes()),
+                    "«{n}» sopravvive in {} (seed {seed})",
+                    f.display()
+                );
+            }
+        }
+    }
+
+    /// Export then import into a fresh cell gives the same notes and edges.    #[test]
     fn export_import_equality(seed in any::<u64>()) {
         let dir = tempfile::tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* test-only */);

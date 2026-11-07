@@ -323,3 +323,88 @@ fn snapshot_purge_censors_the_supersede_inside_it() {
     drop(cell);
     assert_forgotten(dir.path(), "sopr", &needles);
 }
+
+/// P0.4: a compaction snapshot is the LOGICAL state — payloads up to the
+/// cut, vectors, vault bindings and the FTS content are derived or
+/// recomputable, and they all carry content. And only the LAST snapshot
+/// stays: two compacts leave one row and one file.
+#[test]
+fn compact_makes_a_logical_snapshot_and_keeps_only_the_last() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let path = dir.path().join("logica.sqlite");
+    let cell = Cell::create(&path, "logica", "tester").unwrap(/* test-only */);
+    for i in 1..=3_u16 {
+        cell.put_note(&note_of(i, &format!("nota {i} che resta")), "tester")
+            .unwrap(/* test-only */);
+    }
+    let head: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    let snap = cell.compact(head - 1).unwrap(/* test-only */);
+    assert!(snap.is_file(), "{}", snap.display());
+
+    // the snapshot carries the logical state only
+    let snap_conn = rusqlite::Connection::open(&snap).unwrap(/* test-only */);
+    let count = |sql: &str| -> i64 {
+        snap_conn
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap_or(/* test-only */ -1)
+    };
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM op_payloads p JOIN ops o ON o.op_id = p.op_id WHERE o.seq <= (SELECT MAX(seq) FROM ops) - 1"
+        ),
+        0,
+        "no payload up to the cut"
+    );
+    // the tail payload (the last op) stays replayable
+    assert_eq!(
+        count("SELECT COUNT(*) FROM op_payloads"),
+        1,
+        "exactly the head payload stays"
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM note_vectors"), 0, "vectors go");
+    assert_eq!(
+        count("SELECT COUNT(*) FROM embedding_models"),
+        0,
+        "the model registry goes"
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM vault_files"), 0, "bindings go");
+    assert_eq!(
+        count("SELECT COUNT(*) FROM notes_fts_docsize"),
+        0,
+        "the FTS content goes (recomputed at verify)"
+    );
+    drop(snap_conn);
+    // and the cell still verifies with it
+    assert!(cell.verify().unwrap(/* test-only */).ok());
+
+    // a second compact after one more write: ONE row, ONE file
+    cell.put_note(&note_of(9, "dopo la prima compattazione"), "tester")
+        .unwrap(/* test-only */);
+    let head2: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    let snap2 = cell.compact(head2 - 1).unwrap(/* test-only */);
+    assert!(snap2.is_file(), "{}", snap2.display());
+    assert!(cell.verify().unwrap(/* test-only */).ok());
+    let rows = snapshots_of(&cell);
+    assert_eq!(rows.len(), 1, "only the last snapshot stays: {rows:?}");
+    let snaps: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap(/* test-only */)
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("logica-snap-"))
+        })
+        .collect();
+    assert_eq!(snaps.len(), 1, "one snapshot file: {snaps:?}");
+    // the old file is really gone
+    assert!(!snap.exists() || snap == snap2, "the old file went away");
+}

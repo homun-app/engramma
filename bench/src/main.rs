@@ -727,7 +727,7 @@ fn run_fake(n: usize, loops: usize, dir: &std::path::Path) -> FakeReport {
     let index_build_ms = build;
     let (hybrid_p50, hybrid_p95) = latencies(Mode::Hybrid, &mut 0.0_f64);
 
-    FakeReport {
+    let report = FakeReport {
         notes: n,
         insert_s,
         embed_s,
@@ -737,7 +737,13 @@ fn run_fake(n: usize, loops: usize, dir: &std::path::Path) -> FakeReport {
         hybrid_p95_ms: hybrid_p95,
         top_int_p50_ms: fake_top_int_ms(n.max(1000), 384, loops),
         index_build_ms,
+    };
+    // the probe deletes its own cell: no 885 MB left in the temp folder
+    drop(cell);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(dir.join(format!("{stem}.sqlite{suffix}")));
     }
+    report
 }
 
 /// The int8 flat scan in isolation: `n` synthetic unit vectors of `dim`
@@ -986,6 +992,12 @@ struct RunReport {
     questions: usize,
     file_bytes: u64,
     bytes_after_compact: u64,
+    /// The snapshot's size after the compaction (v0.3.1: cell + snapshot is
+    /// the honest space bill).
+    snap_bytes: u64,
+    /// One `purge` at scale, in ms (v0.3.1): the whole forgetting path —
+    /// FTS optimize, VACUUM, WAL checkpoint, snapshot scrub.
+    purge_ms: f64,
     compacted_ops: i64,
     // v0.2 semantic metrics (None when no embedder ran)
     semantic: Option<SemanticReport>,
@@ -1356,7 +1368,10 @@ fn run_semantic(
     });
 
     // file size (checkpoint the WAL first, like a rest after a bulk load),
-    // then again after a compaction (v0.3): the payloads up to head-1000 go
+    // then again after a compaction (v0.3): the payloads up to head-1000 go.
+    // v0.3.1: the snapshot's size is measured too (the honest space bill is
+    // cell + snapshot), and a purge at scale times the whole forgetting path
+    // — FTS optimize, VACUUM, checkpoint, snapshot scrub.
     cell.checkpoint()
         .expect(/* single bench writer */ "checkpoint");
     let file_bytes = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
@@ -1366,16 +1381,40 @@ fn run_semantic(
         .and_then(|v| v.first().and_then(|s| s.parse().ok()))
         .unwrap_or(0);
     let compacted_ops = (head - 1000).max(0);
+    let mut snap_bytes = 0_u64;
+    let mut purge_ms = 0.0_f64;
     if compacted_ops >= 1 {
-        let _ = cell.compact(compacted_ops);
+        let snap_path = cell
+            .compact(compacted_ops)
+            .expect(/* head is live */ "compact");
+        if let Some(id) = corpus.notes.first().map(|n| n.id) {
+            let t = Instant::now();
+            let _ = cell.purge(&id, "bench", "bench");
+            purge_ms = t.elapsed().as_secs_f64() * 1000.0;
+        }
         cell.checkpoint()
             .expect(/* single bench writer */ "checkpoint");
+        snap_bytes = std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
     }
     let bytes_after_compact = std::fs::metadata(&db).map(|m| m.len()).unwrap_or(0);
+    // the bench deletes its own cells: nothing may survive the run (the
+    // prompt: the disk is nearly full)
     drop(cell);
-    let _ = std::fs::remove_file(&db);
-    let snap = db.with_extension(format!("snap-{head}.sqlite"));
-    let _ = std::fs::remove_file(snap);
+    let stem = db
+        .file_name()
+        .map(|n| n.to_string_lossy().trim_end_matches(".sqlite").to_string())
+        .unwrap_or_default();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(dir.join(format!("{stem}.sqlite{suffix}")));
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with(&format!("{stem}-snap-")) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 
     RunReport {
         variant: if uniform_updated_at {
@@ -1402,6 +1441,8 @@ fn run_semantic(
         questions: answered,
         file_bytes,
         bytes_after_compact,
+        snap_bytes,
+        purge_ms,
         compacted_ops,
         semantic,
     }
@@ -1423,6 +1464,8 @@ fn median_report(variant: &'static str, runs: &[RunReport]) -> RunReport {
             .map(|r| r.bytes_after_compact)
             .max()
             .unwrap_or(0),
+        snap_bytes: runs.iter().map(|r| r.snap_bytes).max().unwrap_or(0),
+        purge_ms: pick(|r| r.purge_ms),
         compacted_ops: runs[0].compacted_ops,
         insert_notes_per_s: pick(|r| r.insert_notes_per_s),
         open_ms: pick(|r| r.open_ms),
@@ -1473,8 +1516,8 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
         "# Benchmark Engramma v0.2\n\nGenerato da `engramma-bench` (seme fisso, corpus sintetico italiano; macchina: vedi REPORT.md). \
          Ogni riga è la **mediana di {runs} giri**. Le righe `sem-*` misurano il ramo vettoriale (corpus vivo). \
          Obiettivi del §11 del documento di progetto in fondo.\n\n\
-         | corpus | note | inserimento (note/s) | apertura cella (ms) | ricerca p50 (ms) | ricerca p95 (ms) | solo testo p50 (ms) | testo+grafo p50 (ms) | testo+grafo p95 (ms) | richiamo@5 | MRR | domande | file (MB) | dopo compattazione (MB) |\n\
-         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+         | corpus | note | inserimento (note/s) | apertura cella (ms) | ricerca p50 (ms) | ricerca p95 (ms) | solo testo p50 (ms) | testo+grafo p50 (ms) | testo+grafo p95 (ms) | richiamo@5 | MRR | domande | file (MB) | dopo compattazione (MB) | istantanea (MB) | purge (ms) |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
     );
     for r in reports {
         let (tp50, tp95) = r
@@ -1483,7 +1526,7 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
             .map(|s| (s.text_hops_p50_ms, s.text_hops_p95_ms))
             .unwrap_or((0.0, 0.0));
         out.push_str(&format!(
-            "| {} | {} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.3} | {:.3} | {} | {:.1} | {:.1} |\n",
+            "| {} | {} | {:.0} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.3} | {:.3} | {} | {:.1} | {:.1} | {:.1} | {:.0} |\n",
             r.variant,
             r.notes,
             r.insert_notes_per_s,
@@ -1498,6 +1541,8 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
             r.questions,
             r.file_bytes as f64 / 1e6,
             r.bytes_after_compact as f64 / 1e6,
+            r.snap_bytes as f64 / 1e6,
+            r.purge_ms,
         ));
     }
     // semantic table
@@ -1575,7 +1620,7 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
     out.push_str(
         "\nDue varianti per dimensione: **viva** — i fatti correnti hanno `updated_at` recente (ottobre 2026, come una memoria viva) e i riempitivi datano 2025, quindi il peso di recenza lavora; **uniform** — lo stesso `updated_at` per ogni nota, così il ranking è solo testo+grafo (quanto del richiamo dipendeva dalla recenza si vede dal confronto). \
          Nota: l'inserimento è una `put_note` per nota (una transazione ciascuna, fsync in WAL/NORMAL). La ricerca è testo+grafo (2 passi, come le domande multi-salto) con 5 risultati; «testo+grafo» è la stessa modalità testo con i salti accesi (il PPR ha sostituito la camminata SQL). Richiamo@5 e MRR sulle domande generatrici. \
-         «Ibrido caldo»: la LRU delle domande tiene tutto il corpus (capacità = numero di domande), niente re-incorporazioni. «Dopo compattazione»: payload dimenticati fino a 1000 operazioni dalla fine (v0.3). \
+         «Ibrido caldo»: la LRU delle domande tiene tutto il corpus (capacità = numero di domande), niente re-incorporazioni. «Dopo compattazione»: payload dimenticati fino a 1000 operazioni dalla fine (v0.3); «istantanea» è il file della compattazione (v0.3.1: stato logico, una sola vive) e «purge» è una purga a corpus pieno, FTS optimize e VACUUM compresi (v0.3.1). \
          La varianza tra giri è riportata in REPORT.md (il primo giro a freddo è sempre il più lento: il file nasce e cresce).\n",
     );
     out
