@@ -687,3 +687,68 @@ fn compact_default_is_a_checkpoint_on_disk() {
         "a tampered surviving payload must fail: {vr:?}"
     );
 }
+
+/// v0.3.2 (P0.4): the old snapshot FILE goes before its row. When the
+/// removal fails (here: a read-only directory), `compact` is an error, the
+/// row stays WITH its file — no orphaned file that no row points at — and
+/// a later purge scrubs that file all the same.
+#[test]
+#[cfg(unix)]
+fn compact_fails_cleanly_when_the_old_file_cannot_go() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let path = dir.path().join("ordine.sqlite");
+    let cell = Cell::create(&path, "ordine", "tester").unwrap(/* test-only */);
+    let secret = note_of(1, "zibellinotremante quokkaviolaceo");
+    cell.put_note(&secret, "tester").unwrap(/* test-only */);
+    cell.put_note(&note_of(2, "una nota che resta"), "tester")
+        .unwrap(/* test-only */);
+    let head: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    cell.compact(head, &CompactOptions { keep_snapshot: true })
+        .unwrap(/* test-only */);
+    let snap_file = dir.path().join(format!("ordine-snap-{head}.sqlite"));
+    assert!(snap_file.is_file(), "{}", snap_file.display());
+    let needles = roots_of(&secret.body, Some(Lang::It));
+
+    // one more write, then a directory the compaction cannot remove from
+    cell.put_note(&note_of(3, "dopo l'istantanea"), "tester")
+        .unwrap(/* test-only */);
+    let head2: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    let meta = std::fs::metadata(dir.path()).unwrap(/* test-only */);
+    let mode = meta.permissions().mode();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+        .unwrap(/* test-only */);
+    let failed = cell.compact(head2, &CompactOptions::default());
+    // restore before any early return below can skip the cleanup
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode))
+        .unwrap(/* test-only */);
+    let err = failed.expect_err(/* the removal must fail */ "read-only dir");
+    assert!(
+        err.to_string().contains("cannot remove the old snapshot"),
+        "{err}"
+    );
+    // the row and its file both stay — verify still passes on them
+    let rows = snapshots_of(&cell);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].file,
+        format!("ordine-snap-{head}.sqlite"),
+        "the old row keeps its file: {rows:?}"
+    );
+    assert!(snap_file.is_file());
+    assert!(cell.verify().unwrap(/* test-only */).ok());
+
+    // the purge scrubs that file: no root of the purged body anywhere
+    cell.purge(&secret.id, "oblio", "tester").unwrap(/* t */);
+    assert!(cell.verify().unwrap(/* test-only */).ok());
+    drop(cell);
+    assert_forgotten(dir.path(), "ordine", &needles);
+}
