@@ -303,24 +303,23 @@ impl Vault {
 
         // 2. per-file reconciliation
         for file in &scanned {
-            self.reconcile_file(file, &known, &mut report)?;
+            self.reconcile_file(file, &known, &scanned_paths, &mut report)?;
         }
 
-        // 3. living notes no file talks about: the cell moved first —
-        //    write their file (the export naming) and record it
+        // 3. living notes no file is bound to: the cell moved first — write
+        //    their file (the export naming) and record it. The bindings phase
+        //    2 created in THIS sync count (v0.3.1, P1.6): a note imported
+        //    from its own file is already bound, and a second export copy
+        //    would give it two files to bounce between.
+        let bound_now: BTreeMap<String, String> = self
+            .cell
+            .vault_files()?
+            .into_iter()
+            .map(|f| (f.note_id, f.path))
+            .collect();
         for id in self.cell.note_ids()? {
-            let id_str = id.to_string();
-            if scanned_ids.contains(&id_str) {
+            if bound_now.contains_key(&id.to_string()) {
                 continue;
-            }
-            if let Some(row) = known.values().find(|r| r.note_id == id_str)
-                && !scanned_paths.contains(row.path.as_str())
-            {
-                // its file is gone and the guard said no: skip quietly
-                let _ = row;
-                if !allow_deletions && gone.iter().any(|g| g.note_id == id_str) {
-                    continue;
-                }
             }
             let note = match self.cell.get(&id) {
                 Ok(n) => n,
@@ -360,6 +359,7 @@ impl Vault {
         &self,
         file: &Scanned,
         known: &BTreeMap<String, engramma_core::VaultFile>,
+        scanned_paths: &BTreeSet<&str>,
         report: &mut SyncReport,
     ) -> Result<(), VaultError> {
         let Some(header_id) = id_of(&file.text) else {
@@ -412,10 +412,23 @@ impl Vault {
             return Ok(());
         };
 
-        // a moved or renamed file: same id, new path
+        // a moved or renamed file: same id, new path. But when the BOUND
+        // file is still on disk this is a second COPY of the same note, not
+        // a move: the binding wins (one file per note is structural,
+        // v0.3.1), the duplicate is reported and left alone — re-binding it
+        // would bounce every edit between the two copies forever.
         if !known.contains_key(&file.path)
             && let Some(old) = known.values().find(|r| r.note_id == header_id)
         {
+            if scanned_paths.contains(old.path.as_str()) {
+                report.warnings.push(format!(
+                    "{}: seconda copia della nota {} ({} è quella legata), lasciata stare",
+                    file.path,
+                    engramma_core::id::id8(&note_id),
+                    old.path
+                ));
+                return Ok(());
+            }
             self.cell.vault_file_delete(&old.path)?;
             report.moved.push(format!("{} ← {}", file.path, old.path));
         }

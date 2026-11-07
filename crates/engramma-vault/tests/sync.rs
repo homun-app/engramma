@@ -400,6 +400,19 @@ fn random_edits_converge_to_a_fixed_point() {
                 }
                 _ => {}
             }
+            // v0.3.1 (P1.5/P1.6): new files with an OBSIDIAN header land in
+            // the vault during the run — their header must be read (not
+            // swallowed) and they must not grow an export twin
+            if next() % 5 == 0 {
+                let k = 100 + (next() % 5) as u16;
+                write(
+                    &vault,
+                    &format!("nuova-{k}.md"),
+                    &format!(
+                        "---\ntitle: Nuova {k}\ntags: [batch{k}]\n---\nCorpo {k} di [[Roma]].\n"
+                    ),
+                );
+            }
             if next() % 4 == 0 {
                 vault.sync_once(false).unwrap(/* t */);
             }
@@ -412,6 +425,28 @@ fn random_edits_converge_to_a_fixed_point() {
         );
         // every living note has its file, with serialize(note) as content
         let rows = vault.cell().vault_files().unwrap(/* t */);
+        // one row per note, structurally and in the files on disk
+        let mut bound_notes: Vec<&String> = rows.iter().map(|r| &r.note_id).collect();
+        bound_notes.sort();
+        let mut dedup = bound_notes.clone();
+        dedup.dedup();
+        assert_eq!(
+            bound_notes, dedup,
+            "seed {seed}: a note is bound to exactly one file"
+        );
+        let plain_files = list_md(&vault)
+            .into_iter()
+            .filter(|f| {
+                !f.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".conflitto-"))
+            })
+            .count();
+        assert_eq!(
+            plain_files,
+            rows.len(),
+            "seed {seed}: exactly one file per living note on disk"
+        );
         for row in &rows {
             let id = Ulid::from_string(&row.note_id).unwrap(/* t */);
             let note = vault.cell().get(&id).unwrap(/* t */);
@@ -576,4 +611,55 @@ fn obsidian_import_reads_the_header_too() {
         "{:?}",
         note.extensions
     );
+}
+
+/// v0.3.1 (P1.6): one note, one file. The export phase must see the binding
+/// the SAME sync created (before: the user's file became a note AND the
+/// phase-3 export wrote `note/<slug>-<id8>.md`, two files for one note and
+/// edits bouncing between the copies), `vault_files` carries a UNIQUE
+/// constraint on `note_id`, and a duplicate copy of a bound file is reported
+/// and left alone instead of stealing the binding back and forth.
+#[test]
+fn one_file_per_note_no_second_export_no_ping_pong() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    vault.sync_once(false).unwrap(/* test-only */); // settle init
+    write(
+        &vault,
+        "nuova.md",
+        "---\ntitle: Nuova da file\ntags: [frutta]\n---\n[[Fabio]] ama i fichi.\n",
+    );
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r.created, vec!["nuova.md".to_string()], "{r:?}");
+    // exactly ONE file for the note: its own, no export twin
+    let all = list_md(&vault);
+    assert_eq!(all.len(), 1, "one file for one note: {all:?}");
+    assert!(
+        all[0].ends_with("nuova.md"),
+        "the file is the user's own: {all:?}"
+    );
+    // one row per note in the reconciliation state
+    let rows = vault.cell().vault_files().unwrap(/* test-only */);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    // the second sync does nothing at all
+    let r2 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r2.is_noop(), "{r2:?}");
+
+    // a hand-made duplicate with the same id: the binding wins, no bounce
+    let text = read(&vault, "nuova.md");
+    write(&vault, "copia.md", &text);
+    let r3 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(
+        r3.warnings.iter().any(|w| w.contains("copia.md")),
+        "the duplicate is reported: {r3:?}"
+    );
+    assert!(r3.deleted.is_empty() && r3.moved.is_empty(), "{r3:?}");
+    let rows = vault.cell().vault_files().unwrap(/* test-only */);
+    assert_eq!(rows.len(), 1, "still one binding: {rows:?}");
+    assert!(rows[0].path.ends_with("nuova.md"), "{rows:?}");
+    // and editing the bound file still updates the note (no bounce)
+    let edited = text.replace("fichi", "fichi e more");
+    write(&vault, "nuova.md", &edited);
+    let r4 = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r4.updated_from_file, vec!["nuova.md".to_string()], "{r4:?}");
 }

@@ -1259,7 +1259,8 @@ impl Cell {
     }
 
     /// Record (or replace) one row of the markdown view's state — derived
-    /// data, no operation.
+    /// data, no operation. One row per note is structural (v0.3.1, P1.6): a
+    /// write for an already-bound note REBINDS it to the new path.
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
@@ -1273,7 +1274,9 @@ impl Cell {
             "INSERT INTO vault_files (path, note_id, file_hash, note_version, mtime, size)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(path) DO UPDATE SET note_id = ?2, file_hash = ?3,
-                                             note_version = ?4, mtime = ?5, size = ?6",
+                                             note_version = ?4, mtime = ?5, size = ?6
+             ON CONFLICT(note_id) DO UPDATE SET path = ?1, file_hash = ?3,
+                                              note_version = ?4, mtime = ?5, size = ?6",
             rusqlite::params![
                 row.path,
                 row.note_id,

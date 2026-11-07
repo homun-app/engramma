@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 8] = [
+pub const MIGRATIONS: [&str; 9] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -110,6 +110,17 @@ CREATE TABLE vault_files (path TEXT PRIMARY KEY,       -- relative to the vault 
 -- the snapshot was taken; after a redaction it no longer matches the file's
 -- internal head (the censored supersedes rehash it).
 ALTER TABLE snapshots ADD COLUMN redacted_by TEXT NOT NULL DEFAULT '[]';
+"#,
+    r#"
+-- v9 (v0.3.1, P1.6): one file per note. The view's export phase once wrote a
+-- second file for a note imported in the same sync, and edits bounced
+-- between the two copies. The Rust side of this migration drops the older
+-- duplicate rows (first by rowid wins), then the unique index makes the
+-- invariant structural.
+DELETE FROM vault_files WHERE rowid NOT IN (
+    SELECT MIN(rowid) FROM vault_files GROUP BY note_id
+);
+CREATE UNIQUE INDEX idx_vault_files_note ON vault_files(note_id);
 "#,
 ];
 
