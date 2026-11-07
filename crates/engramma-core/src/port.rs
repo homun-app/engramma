@@ -319,35 +319,44 @@ pub fn import_obsidian(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSum
             .map_err(|e| PortError::NotAnExport(format!("bad mtime: {e}")))?
             .unwrap_or_else(OffsetDateTime::now_utc);
         let mtime = mtime.replace_millisecond(0).unwrap_or(mtime);
+        // v0.3.1 (P1.5): a header that is not Engramma's is READ (title,
+        // tags, aliases, type, dates), not swallowed into the body — the
+        // note keeps the user's fields and the body after the header.
         let parsed = format::parse(&text, ParseMode::Import);
-        let note = match parsed {
+        let mut note = match parsed {
             Ok(p) => {
                 summary.warnings.extend(p.warnings);
                 p.note
             }
-            Err(FormatError::NoFrontmatter) | Err(FormatError::MissingField(_)) => Note {
-                id: crate::id::new_ulid().map_err(PortError::Cell)?,
-                note_type: crate::format::NoteType::Note,
-                title: None,
-                body: text,
-                tags: vec![],
-                scope: None,
-                lang: None,
-                source: format!("import:obsidian/{}", f.relative.replace('\\', "/")),
-                confidence: crate::format::Confidence::Stated,
-                status: Status::Active,
-                valid_from: None,
-                valid_to: None,
-                supersedes: vec![],
-                created_at: crate::format::At(mtime),
-                updated_at: crate::format::At(mtime),
-                extensions: vec![],
-            },
+            Err(FormatError::NoFrontmatter) | Err(FormatError::MissingField(_)) => {
+                let stem = f
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let p = format::parse_obsidian(
+                    &text,
+                    &stem,
+                    crate::format::At(mtime),
+                    crate::id::new_ulid().map_err(PortError::Cell)?,
+                )
+                .map_err(|e| PortError::Note {
+                    path: f.path.clone(),
+                    source: e,
+                })?;
+                summary.warnings.extend(p.warnings);
+                let mut note = p.note;
+                note.source = format!("import:obsidian/{}", f.relative.replace('\\', "/"));
+                note.confidence = crate::format::Confidence::Stated;
+                note.status = Status::Active;
+                note
+            }
             Err(e) => {
                 summary.errors.push(format!("{}: {e}", f.relative));
                 continue;
             }
         };
+        let _ = &mut note; // (a full Engramma header keeps its own source)
         notes.push((note, f.relative));
     }
     // Phase 2: close open superseded validities, then write.

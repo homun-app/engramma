@@ -494,3 +494,86 @@ fn list_md(vault: &Vault) -> Vec<std::path::PathBuf> {
 use CellError as _;
 #[allow(unused_imports)]
 use Validity as _;
+
+/// v0.3.1 (P1.5): a file with an Obsidian header (title, tags — no Engramma
+/// fields) is imported as its title, tags and BODY, and the rewrite merges
+/// the header into ONE `---` block with the user's fields kept; the second
+/// sync does nothing.
+#[test]
+fn obsidian_header_file_imports_with_its_own_fields() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    vault.sync_once(false).unwrap(/* test-only */); // settle init
+    write(
+        &vault,
+        "nuova.md",
+        "---\ntitle: Nuova da file\ntags: [frutta]\n---\n[[Fabio]] ama i fichi.\n",
+    );
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r.created, vec!["nuova.md".to_string()], "{r:?}");
+    let text = read(&vault, "nuova.md");
+    // ONE header block, the user's fields kept, the id merged in, the body
+    // without the header
+    assert_eq!(text.matches("---\n").count(), 2, "one header block: {text}");
+    assert!(text.contains("title: Nuova da file"), "{text}");
+    assert!(text.contains("tags: [frutta]"), "{text}");
+    assert!(text.contains("id: 01"), "{text}");
+    assert!(text.contains("[[Fabio]] ama i fichi."), "{text}");
+    let parsed = engramma_core::format::parse(&text, ParseMode::Strict)
+        .unwrap(/* test-only */)
+        .note;
+    assert_eq!(parsed.title.as_deref(), Some("Nuova da file"));
+    assert_eq!(parsed.tags, vec!["frutta".to_string()]);
+    assert_eq!(parsed.body, "[[Fabio]] ama i fichi.\n");
+    assert_eq!(parsed.source, "import:obsidian/nuova.md");
+    // the note is a real note, found by its title
+    let hits = vault
+        .cell()
+        .search_with_now(
+            &engramma_core::search::Query::text("fichi").k(3),
+            time::OffsetDateTime::from_unix_timestamp(1_810_000_000).unwrap(/* t */),
+        )
+        .unwrap(/* test-only */);
+    assert!(
+        hits.iter()
+            .any(|h| h.note.title.as_deref() == Some("Nuova da file")),
+        "{:?}",
+        hits.iter()
+            .map(|h| h.note.display_title())
+            .collect::<Vec<_>>()
+    );
+    // the second reconciliation is a no-op
+    let r2 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r2.is_noop(), "{r2:?}");
+}
+
+/// v0.3.1 (P1.5): `import --obsidian` of the same folder gives the same
+/// note (same title, tags and body), not a `note-02KZ…` with the header in
+/// the body.
+#[test]
+fn obsidian_import_reads_the_header_too() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let src = dir.path().join("vault");
+    std::fs::create_dir_all(&src).unwrap(/* test-only */);
+    std::fs::write(
+        src.join("nuova.md"),
+        "---\ntitle: Nuova da file\ntags: [frutta]\naliases: [Nuova]\n---\n[[Fabio]] ama i fichi.\n",
+    )
+    .unwrap(/* test-only */);
+    let cell = engramma_core::Cell::create(&dir.path().join("c.sqlite"), "t", "t")
+        .unwrap(/* test-only */);
+    let s = engramma_core::port::import_obsidian(&cell, &src, "t")
+        .unwrap(/* test-only */);
+    assert_eq!(s.imported, 1, "{s:?}");
+    let id = cell.note_ids().unwrap(/* test-only */)[0];
+    let note = cell.get(&id).unwrap(/* test-only */);
+    assert_eq!(note.title.as_deref(), Some("Nuova da file"));
+    assert_eq!(note.tags, vec!["frutta".to_string()]);
+    assert_eq!(note.body, "[[Fabio]] ama i fichi.\n");
+    // the alias rides in the extensions and survives a rewrite
+    assert!(
+        note.extensions.iter().any(|(k, _)| k == "aliases"),
+        "{:?}",
+        note.extensions
+    );
+}

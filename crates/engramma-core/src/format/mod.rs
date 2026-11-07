@@ -873,8 +873,14 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
                         ParseMode::Strict => {
                             return Err(FormatError::UnknownKey(other.to_string()));
                         }
+                        // v0.3.1 (P1.5): an import KEEPS unknown keys — they
+                        // ride in the extensions and stay in the file through
+                        // the rewrite (the Obsidian round trip must not eat
+                        // the user's own fields). Dropping them made the
+                        // merge lossy.
                         ParseMode::Import => {
-                            warnings.push(format!("unknown key `{other}` ignored"))
+                            warnings.push(format!("unknown key `{other}` kept as an extension"));
+                            extensions.push((other.to_string(), v));
                         }
                     }
                 }
@@ -924,6 +930,166 @@ pub fn parse(text: &str, mode: ParseMode) -> FormatResult<ParsedNote> {
             ParseMode::Strict => return Err(bad_field("valid_to", msg)),
             ParseMode::Import => warnings.push(msg.to_string()),
         }
+    }
+    Ok(ParsedNote {
+        note,
+        analysis,
+        warnings,
+    })
+}
+
+/// Parse a file with **Obsidian conventions** (v0.3.1, P1.5): a header that
+/// is present but not Engramma's (no `id`, no `confidence`, …) is READ, not
+/// swallowed into the body.
+///
+/// - `title` (when absent: `fallback_title`, the file name without
+///   extension, as Obsidian displays it), `tags` (a list **or** a plain
+///   string), `aliases` (kept verbatim), `type` when it is a valid Engramma
+///   type, `created`/`date` when it parses as a date;
+/// - the body is what comes AFTER the header;
+/// - unknown keys ride in [`Note::extensions`] and stay in the file through
+///   [`Note::serialize`] (one merged `---` block); standard-field keys with
+///   unusable values are dropped with a warning — they would collide with
+///   the line the serialiser owns;
+/// - a file without any frontmatter keeps the v0.3 behavior: the whole text
+///   is the body, the caller supplies the title convention.
+///
+/// The warnings stay (unknown keys, unusable values): the importer and the
+/// markdown view surface them.
+///
+/// # Errors
+/// [`FormatError::Yaml`] when the header is broken (the vault reports it and
+/// leaves the cell alone); see also [`body::analyze`].
+pub fn parse_obsidian(
+    text: &str,
+    fallback_title: &str,
+    now: At,
+    new_id: Ulid,
+) -> FormatResult<ParsedNote> {
+    let (header, body) = match split_frontmatter(text) {
+        Ok(pair) => pair,
+        Err(FormatError::NoFrontmatter) => (String::new(), text.to_string()),
+        Err(e) => return Err(e),
+    };
+    let has_header = !header.is_empty();
+    let entries = if has_header {
+        yaml::parse_mapping(&header)?
+    } else {
+        Vec::new()
+    };
+    let mut warnings = Vec::new();
+    let mut note = Note {
+        id: new_id,
+        note_type: NoteType::Note,
+        title: None,
+        body,
+        tags: Vec::new(),
+        scope: None,
+        lang: None,
+        source: String::new(),
+        confidence: Confidence::Stated,
+        status: Status::Active,
+        valid_from: None,
+        valid_to: None,
+        supersedes: Vec::new(),
+        created_at: now,
+        updated_at: now,
+        extensions: Vec::new(),
+    };
+    for (k, v) in entries {
+        // Standard fields are never extensions: the serialiser owns their
+        // line, and a duplicate key is a YAML error on the way back.
+        match k.as_str() {
+            "id" => {
+                if let Some(s) = v.as_str()
+                    && let Ok(u) = Ulid::from_string(s)
+                    && u.to_string() == s
+                {
+                    note.id = u;
+                } else {
+                    warnings.push("id is not a canonical ULID: a fresh one was minted".into());
+                }
+            }
+            "type" => match v.as_str().and_then(|s| NoteType::parse(s).ok()) {
+                Some(t) => note.note_type = t,
+                None => warnings.push("type is not an Engramma type: `note` is used".into()),
+            },
+            "title" => match v.as_str() {
+                Some(s) if !s.contains(['\n', '\r']) => note.title = Some(s.to_string()),
+                _ => {
+                    warnings.push("title is not a single-line string: the file name is used".into())
+                }
+            },
+            "tags" => {
+                let list = match &v {
+                    YamlValue::Seq(items) => items
+                        .iter()
+                        .filter_map(|i| i.as_str().map(str::to_string))
+                        .collect::<Vec<_>>(),
+                    YamlValue::Str(s) => vec![s.clone()],
+                    _ => Vec::new(),
+                };
+                if list.is_empty() {
+                    warnings.push("tags is not a list of strings: ignored".into());
+                }
+                for tag in list {
+                    if validate_tag_name(&tag).is_ok() && !note.tags.contains(&tag) {
+                        note.tags.push(tag);
+                    } else {
+                        warnings.push(format!("tag `{tag}` is not a valid tag name: ignored"));
+                    }
+                }
+            }
+            "lang" => match v.as_str().and_then(|s| Lang::parse(s).ok()) {
+                Some(l) => note.lang = Some(l),
+                None => warnings.push("lang is not a supported language: ignored".into()),
+            },
+            "created" | "date" | "created_at" => {
+                let parsed = v.as_str().and_then(|s| At::parse(s).ok()).or_else(|| {
+                    v.as_str()
+                        .and_then(|s| Validity::parse(s).ok())
+                        .map(|d| At(d.start()))
+                });
+                match parsed {
+                    Some(t) => {
+                        note.created_at = t;
+                        note.updated_at = t;
+                    }
+                    None => warnings.push(format!("{k} is not a date: the file time is used")),
+                }
+            }
+            "updated" | "updated_at" => {
+                if let Some(t) = v.as_str().and_then(|s| At::parse(s).ok()).or_else(|| {
+                    v.as_str()
+                        .and_then(|s| Validity::parse(s).ok())
+                        .map(|d| At(d.start()))
+                }) {
+                    note.updated_at = t;
+                } else {
+                    warnings.push("updated is not a date: ignored".into());
+                }
+            }
+            // reserved Engramma fields the importer owns (source,
+            // confidence, status, scope, validity, supersedes): read as
+            // nothing, never duplicated
+            "scope" | "source" | "confidence" | "status" | "valid_from" | "valid_to"
+            | "supersedes" => {
+                warnings.push(format!("{k} is set by the importer: ignored"));
+            }
+            // unknown keys — Obsidian's own (`aliases`, `cssclass`, …) or
+            // anyone's plugins — stay in the file
+            other => {
+                warnings.push(format!("unknown key `{other}` kept as an extension"));
+                note.extensions.push((other.to_string(), v));
+            }
+        }
+    }
+    if note.title.is_none() && has_header {
+        note.title = Some(fallback_title.to_string());
+    }
+    let analysis = body::analyze(&note.body)?;
+    for tag in &analysis.tags {
+        validate_tag_name(tag)?;
     }
     Ok(ParsedNote {
         note,
@@ -1010,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_rejects_unknown_key_import_warns() {
+    fn strict_rejects_unknown_key_import_keeps_it() {
         let text = minimal_text().replace("source: user", "source: user\nfavourite: tè");
         assert!(matches!(
             parse(&text, ParseMode::Strict),
@@ -1018,7 +1184,10 @@ mod tests {
         ));
         let p = parse(&text, ParseMode::Import).unwrap(/* test-only */);
         assert_eq!(p.warnings.len(), 1);
-        assert!(!p.note.serialize().unwrap(/* test-only */).contains("favourite:"));
+        // v0.3.1 (P1.5): the import keeps unknown keys — they stay in the
+        // file through the rewrite (the Obsidian round trip must not eat the
+        // user's own fields)
+        assert!(p.note.serialize().unwrap(/* test-only */).contains("favourite: tè"));
     }
 
     #[test]
@@ -1165,5 +1334,114 @@ mod tests {
             "valid_to: 2026-09-30\ncreated_at: 2026-09-03T10:12:00Z",
         );
         assert!(parse(&closed, ParseMode::Strict).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod obsidian_tests {
+    use super::*;
+
+    fn at() -> At {
+        At(OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(/* test-only */))
+    }
+
+    /// v0.3.1 (P1.5): a header that is not Engramma's (no id, no
+    /// confidence…) is an OBSIDIAN header, not a body. Its YAML is read —
+    /// title, tags (list or plain string), aliases, a valid type, a date —
+    /// the unknown keys ride in the extensions and stay in the file, and the
+    /// body is what comes AFTER the header. Without a title, the file name
+    /// without extension is the title, as in Obsidian.
+    #[test]
+    fn obsidian_header_is_read_not_swallowed() {
+        let text = "---\ntitle: Nuova da file\ntags: [frutta]\n---\n[[Fabio]] ama i fichi.\n";
+        let id = Ulid::from_string("01AAAAAAAAAAAAAAAAAAAAAAAA").unwrap(/* t */);
+        let parsed = parse_obsidian(text, "nuova-da-file", at(), id)
+            .unwrap(/* test-only */);
+        let n = parsed.note;
+        assert_eq!(n.id, id);
+        assert_eq!(n.title.as_deref(), Some("Nuova da file"));
+        assert_eq!(n.tags, vec!["frutta".to_string()]);
+        assert_eq!(n.body, "[[Fabio]] ama i fichi.\n");
+        assert_eq!(n.note_type, NoteType::Note);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+
+        // a plain-string tag, an alias, a valid type, a date and unknown
+        // keys that must survive the rewrite
+        let text = "---\ntags: frutta\naliases: [Nuova, La Nuova]\ntype: person\n\
+                    created: 2026-10-31\ncssclass: wide\n---\nBio di [[Fabio]].\n";
+        let parsed = parse_obsidian(text, "senza-titolo", at(), Ulid::nil())
+            .unwrap(/* test-only */);
+        let n = parsed.note;
+        assert_eq!(
+            n.title.as_deref(),
+            Some("senza-titolo"),
+            "the file name is the title"
+        );
+        assert_eq!(n.tags, vec!["frutta".to_string()]);
+        assert_eq!(n.note_type, NoteType::Person);
+        assert_eq!(
+            n.created_at.to_db_string(),
+            "2026-10-31T00:00:00Z",
+            "a date in `created` becomes created_at"
+        );
+        let keys: Vec<&str> = n.extensions.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"aliases"), "{keys:?}");
+        assert!(keys.contains(&"cssclass"), "{keys:?}");
+        assert!(
+            parsed.warnings.iter().any(|w| w.contains("cssclass")),
+            "the unknown key keeps its warning: {:?}",
+            parsed.warnings
+        );
+        // the rewritten file has ONE header block and the user's fields
+        let rewritten = n.serialize().unwrap(/* test-only */);
+        assert_eq!(rewritten.matches("---\n").count(), 2, "{rewritten}");
+        assert!(
+            rewritten.contains("aliases: [Nuova, La Nuova]"),
+            "{rewritten}"
+        );
+        assert!(rewritten.contains("cssclass: wide"), "{rewritten}");
+        assert!(rewritten.contains("title: senza-titolo"), "{rewritten}");
+        // and the re-parse of the rewrite is stable (import mode keeps them)
+        let again = parse(&rewritten, ParseMode::Import).unwrap(/* test-only */);
+        assert_eq!(again.note.extensions, n.extensions);
+        assert_eq!(again.note.tags, n.tags);
+
+        // no header at all: the whole text is the body, like v0.3
+        let parsed = parse_obsidian("# Idea\n\nUna nota.\n", "idea", at(), Ulid::nil())
+            .unwrap(/* test-only */);
+        assert_eq!(parsed.note.body, "# Idea\n\nUna nota.\n");
+        assert_eq!(parsed.note.title, None);
+    }
+
+    /// a broken YAML header is still an error (the vault reports it and
+    /// leaves the cell alone)
+    #[test]
+    fn obsidian_header_broken_yaml_is_an_error() {
+        let err = parse_obsidian(
+            "---\ntitle: x\nqualcosa: {[\n---\ncorpo\n",
+            "x",
+            at(),
+            Ulid::nil(),
+        );
+        assert!(err.is_err());
+    }
+
+    /// import mode keeps unknown keys as extensions (they stay in the file);
+    /// strict still refuses them
+    #[test]
+    fn import_mode_keeps_unknown_keys_strict_refuses() {
+        let text = "---\nid: 01AAAAAAAAAAAAAAAAAAAAAAAA\ntype: note\nsource: user\n\
+                    confidence: stated\ncreated_at: 2026-01-01T00:00:00Z\n\
+                    updated_at: 2026-01-01T00:00:00Z\naliases: [X]\n---\nCorpo.\n";
+        let imported = parse(text, ParseMode::Import).unwrap(/* test-only */);
+        assert!(
+            imported.note.extensions.iter().any(|(k, _)| k == "aliases"),
+            "{:?}",
+            imported.note.extensions
+        );
+        assert!(matches!(
+            parse(text, ParseMode::Strict),
+            Err(FormatError::UnknownKey(_))
+        ));
     }
 }

@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use engramma_core::format::ParseMode;
-use engramma_core::{Cell, CellError, Confidence, Note, NoteType, Status};
+use engramma_core::{Cell, CellError, Confidence, Note, Status};
 use thiserror::Error;
 use time::OffsetDateTime;
 use ulid::Ulid;
@@ -486,18 +486,33 @@ impl Vault {
 
     /// A file without an `id` becomes a note; the file is then rewritten WITH
     /// its id (the Obsidian import rules: `source: import:obsidian/<rel>`).
+    /// v0.3.1 (P1.5): a header that is not Engramma's is READ (title, tags,
+    /// aliases, a valid type, dates) and the rewrite MERGES it — one `---`
+    /// block with the user's fields kept, the body after the header.
     fn import_new(&self, file: &Scanned, report: &mut SyncReport) -> Result<(), VaultError> {
         let parsed = engramma_core::format::parse(&file.text, ParseMode::Import);
         let mut note = match parsed {
             Ok(p) => p.note,
-            Err(
-                e @ (engramma_core::FormatError::NoFrontmatter
-                | engramma_core::FormatError::MissingField(_)),
-            ) => {
-                let _ = e;
-                let mut note = empty_note();
-                note.body = file.text.clone();
-                note
+            Err(engramma_core::FormatError::NoFrontmatter)
+            | Err(engramma_core::FormatError::MissingField(_)) => {
+                let stem = file
+                    .abs
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let mtime = OffsetDateTime::from_unix_timestamp(file.mtime)
+                    .unwrap_or_else(|_| OffsetDateTime::now_utc())
+                    .replace_millisecond(0)
+                    .unwrap_or_else(|_| OffsetDateTime::now_utc());
+                let p = engramma_core::format::parse_obsidian(
+                    &file.text,
+                    &stem,
+                    engramma_core::format::At(mtime),
+                    Ulid::nil(),
+                )
+                .map_err(VaultError::Format)?;
+                report.warnings.extend(p.warnings.clone());
+                p.note
             }
             Err(e) => {
                 report.errors.push(format!("{}: {e}", file.path));
@@ -512,18 +527,9 @@ impl Vault {
         } else {
             note.id = engramma_core::id::new_ulid()?;
         }
-        note.note_type = NoteType::Note;
         note.source = format!("import:obsidian/{}", file.path);
         note.confidence = Confidence::Stated;
         note.status = Status::Active;
-        if note.created_at.0.year() < 2020 {
-            let mtime = OffsetDateTime::from_unix_timestamp(file.mtime)
-                .unwrap_or_else(|_| OffsetDateTime::now_utc())
-                .replace_millisecond(0)
-                .unwrap_or_else(|_| OffsetDateTime::now_utc());
-            note.created_at = engramma_core::format::At(mtime);
-            note.updated_at = engramma_core::format::At(mtime);
-        }
         if let Err(e) = self.cell.put_note(&note, "vault") {
             report.errors.push(format!("{}: {e}", file.path));
             return Ok(());
@@ -642,30 +648,6 @@ fn mtime_of(meta: &std::fs::Metadata) -> i64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-fn empty_note() -> Note {
-    let now = OffsetDateTime::now_utc()
-        .replace_millisecond(0)
-        .unwrap_or(OffsetDateTime::now_utc());
-    Note {
-        id: Ulid::nil(),
-        note_type: NoteType::Note,
-        title: None,
-        body: String::new(),
-        tags: vec![],
-        scope: None,
-        lang: None,
-        source: String::new(),
-        confidence: Confidence::Stated,
-        status: Status::Active,
-        valid_from: None,
-        valid_to: None,
-        supersedes: vec![],
-        created_at: engramma_core::format::At(now),
-        updated_at: engramma_core::format::At(now),
-        extensions: vec![],
-    }
 }
 
 /// The `id:` field of a frontmatter, without a full parse (the real parse

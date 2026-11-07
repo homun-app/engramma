@@ -63,7 +63,11 @@ Validation rules (each violation is a readable error):
 5. Unknown keys:
    - starting with `x-`: preserved, in file order, after the standard keys;
    - not starting with `x-`: **error** in strict mode (the default for Engramma
-     folders); **warning + dropped** in import mode (Obsidian and friends).
+     folders); **warning + kept as an extension** in import mode (Obsidian and
+     friends, v0.3.1): the key rides in `extensions` and stays in the file
+     through the rewrite — the Obsidian round trip must not eat the user's
+     own fields (`aliases`, `cssclass`, …). An Engramma export of such a note
+     carries the key too, and only an import-mode parse reads it back.
 6. Duplicate keys are a YAML error (saphyr rejects them).
 7. `tags` entries must match `tag-name`: one or more segments separated by
    `/`; each segment starts with a letter, digit or `_` (Unicode letters
@@ -268,5 +272,11 @@ skipped, symlinks are never followed and nothing outside the root is read. A
 note without Engramma frontmatter is imported with a fresh `id`, `type: note`,
 `source: import:obsidian/<relative path>`, `confidence: stated`,
 `created_at`/`updated_at` from the file modification time, `status: active`.
+A header that is present but not Engramma's is **read** (v0.3.1): `title`
+(else the file name without extension, as Obsidian displays it), `tags` (a
+list or a plain string), `aliases` kept verbatim, `type` when valid,
+`created`/`date` when it parses as a date; unknown keys ride in the
+extensions; the body is what comes after the header; the warnings stay. A
+file with a full Engramma header is imported as an Engramma note.
 An Engramma folder imported as Engramma reproduces the same state (notes and
 relations) in a fresh cell.
