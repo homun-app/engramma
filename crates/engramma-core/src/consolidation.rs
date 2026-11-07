@@ -9,6 +9,7 @@ use crate::cell::vectors::VectorTx;
 use crate::error::CellError;
 use crate::format::body;
 use crate::vector::VectorIndex as _;
+use rusqlite::OptionalExtension as _;
 use ulid::Ulid;
 
 /// What kind of pair this is.
@@ -150,6 +151,25 @@ impl Cell {
                 };
                 let cos = best_cosine(va, vb);
                 if cos < cfg.near_duplicate_cosine {
+                    continue;
+                }
+                // v0.3.1 (P2.8): a `person`/`place` page is a HUB — it talks
+                // about its subject by design, so it sits close to any note
+                // about the same person (the two golden false positives:
+                // Luca Ferrari ↔ «Luca e la matematica», 0.961; Elena Bianchi
+                // ↔ «Il ruolo di Elena Bianchi», 0.954). A hub page never
+                // duplicates a note of another kind; the other kinds compare
+                // freely among themselves (the golden duplicate is a project
+                // against a fact — the bathroom plan and its twin).
+                let hub_of = |id: &str| -> Result<bool, CellError> {
+                    let t: Option<String> = inner
+                        .conn
+                        .query_row("SELECT type FROM notes WHERE id = ?1", [id], |r| r.get(0))
+                        .optional()
+                        .map_err(CellError::from)?;
+                    Ok(matches!(t.as_deref(), Some("person") | Some("place")))
+                };
+                if hub_of(&pair.0)? != hub_of(&pair.1)? {
                     continue;
                 }
                 let jac = entity_jaccard(&inner.conn, &pair.0, &pair.1)?;

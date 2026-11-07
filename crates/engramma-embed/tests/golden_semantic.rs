@@ -557,6 +557,38 @@ fn consolidation_candidates_on_the_golden_vault() {
         }),
         "the near duplicate pair: {dups:?}"
     );
+    // v0.3.1 (P2.8): a `person`/`place` page is a HUB — it never duplicates
+    // a note of another kind, while the other kinds compare freely (the
+    // bathroom duplicate is a project against a fact). No hub-note pair.
+    for c in &dups {
+        let hub = |id: &_| {
+            cell.get(id)
+                .map(|n| {
+                    matches!(
+                        n.note_type,
+                        engramma_core::format::NoteType::Person
+                            | engramma_core::format::NoteType::Place
+                    )
+                })
+                .unwrap_or(false)
+        };
+        assert_eq!(
+            hub(&c.a),
+            hub(&c.b),
+            "a hub page does not duplicate a note of another kind: {c:?}"
+        );
+    }
+    let hub_pairs = dups.iter().any(|c| {
+        let (a, b) = (c.a.to_string(), c.b.to_string());
+        let pair = |x: &str, y: &str| {
+            (a.ends_with(x) && b.ends_with(y)) || (b.ends_with(x) && a.ends_with(y))
+        };
+        pair("00000007", "00000094") || pair("00000004", "00000084")
+    });
+    assert!(
+        !hub_pairs,
+        "Luca↔«Luca e la matematica» and Elena↔«Il ruolo di Elena Bianchi» are not duplicates: {dups:?}"
+    );
     // Luca's two lives_in
     assert!(
         contra
