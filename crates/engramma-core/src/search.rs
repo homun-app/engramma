@@ -59,10 +59,12 @@ pub struct Weights {
     /// Recency half-life in days.
     pub recency_half_life_days: f64,
     /// Weight of the graph list in the fusion (v0.3): `0` turns it off, and
-    /// `graph_hops = 0` keeps it off regardless. 0.40 by the declared
-    /// criterion (weighted MRR at 100k: 0.8551 vs 0.8529 at 0.35 and 0.8386
-    /// for the v0.2.1 expansion), and it is the only value that clears the
-    /// multi-hop target (hybrid 0.949 vs text 0.916 at 100k).
+    /// `graph_hops = 0` keeps it off regardless. 0.35 (v0.3.2): the robust
+    /// rule — best weighted MRR in the WORST CASE among the ±1-step
+    /// neighbours of the joint α × graph grid at 100k. 0.40 had the best
+    /// absolute weighted MRR (0.8656 vs 0.8529) but sits on the edge of a
+    /// cliff: at graph 0.45 the same α loses ~0.025 and at 0.50 ~0.15, and
+    /// its neighbourhood minimum is 0.8410 against 0.8483 here.
     pub graph_weight: f64,
     /// Teleport share of the personalised-PageRank push (§6.3.3).
     pub ppr_alpha: f64,
@@ -84,7 +86,7 @@ impl Default for Weights {
             inferred: 0.8,
             external: 0.5,
             recency_half_life_days: 180.0,
-            graph_weight: 0.4,
+            graph_weight: 0.35,
             ppr_alpha: 0.25,
             ppr_epsilon: 1e-4,
             hub_theta: 50.0,
@@ -335,13 +337,15 @@ impl Default for Fusion {
         // Measured on the golden vault and the 10k/100k benchmark (REPORT
         // §v0.2.1): the convex combination with the cosine min-max'd over the
         // candidates — the cosine rides on BM25's [0, 1] scale, so α means
-        // what it says. α = 0.7 there; retuned JOINTLY with the graph weight
-        // in v0.3.1 (REPORT §v0.3.1): the full α × weight grid at 100k has
-        // 0.6/0.40 ahead on the weighted MRR (0.8656 vs 0.8552, beyond the
-        // 0.002 tie bar), keeping more paraphrases than 0.5 at the same
-        // weight.
+        // what it says. Retuned JOINTLY with the graph weight in v0.3.1
+        // (0.6/0.40, best absolute weighted MRR 0.8656) and again in v0.3.2
+        // with the ROBUST rule — best weighted MRR in the worst case among
+        // the ±1-step neighbours of the grid: 0.7/0.35 (0.8529, neighbourhood
+        // minimum 0.8483 against 0.8410 for 0.6/0.40, which sits on the edge
+        // of the 0.45 cliff). A corpus that shifts a little must not fall
+        // into the collapse.
         Fusion::Convex {
-            alpha: 0.6,
+            alpha: 0.7,
             cos_norm: CosNorm::Candidates,
         }
     }

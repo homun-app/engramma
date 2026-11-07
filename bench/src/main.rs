@@ -1328,13 +1328,22 @@ fn run_semantic(
             convex(0.7, engramma_core::CosNorm::Candidates),
             None,
         );
-        // v0.3.2 (P2.10): THE DEFAULT — convex 0.6 with graph weight 0.40
-        // (the v0.3.1 winner). The table never carried it.
+        // v0.3.2 (P2.10): the defaults, old and new, made explicit — the
+        // table never carried its own default row. mm-0.6-g0.40 was the
+        // v0.3.1 winner (best absolute weighted MRR); the robust rule of
+        // this phase (worst case among the neighbours) moves the default to
+        // mm-0.7-g0.35.
         score_mode(
             "mm-0.6-g0.40",
             'h',
             convex(0.6, engramma_core::CosNorm::Candidates),
             Some(0.4),
+        );
+        score_mode(
+            "mm-0.7-g0.35",
+            'h',
+            convex(0.7, engramma_core::CosNorm::Candidates),
+            Some(0.35),
         );
         // the tuning references (the full sweep is in REPORT §v0.3)
         for gw in [0.25_f64, 0.40] {
@@ -1673,6 +1682,7 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
                 "mm-0.5",
                 "mm-0.7",
                 "mm-0.6-g0.40",
+                "mm-0.7-g0.35",
                 "mm-0.7-g0.25",
                 "mm-0.7-g0.40",
             ];
@@ -2027,31 +2037,38 @@ fn calibrate(target: usize, runs: usize, dir: &std::path::Path) {
             .sum::<f64>()
             / total_q.max(1) as f64;
         rows_so.push((*alpha, *gw, weighted));
-        // the worst case among the neighbours (±1 step of α and of the
-        // graph weight — the grid points that exist; the edges of the grid
-        // simply have fewer of them)
+        rows.push(Row {
+            alpha: *alpha,
+            weight: *gw,
+            weighted_mrr: weighted,
+            worst_mrr: 0.0, // filled below, when the whole grid is known
+            para_mrr: mrrs[1],
+            multi_mrr: mrrs[2],
+        });
+    }
+    // the worst case among the neighbours (±1 step of α and of the graph
+    // weight — the grid points that exist; the edges of the grid simply
+    // have fewer of them). Computed over the COMPLETE grid: doing it row by
+    // row would let every cell miss the neighbours that come after it.
+    {
         let idx = |hay: &[f64], needle: f64| -> usize {
             hay.iter()
                 .position(|v| (*v - needle).abs() < 1e-9)
                 .unwrap_or(0)
         };
-        let ai = idx(&alphas, *alpha);
-        let gi = idx(&weights, *gw);
-        let worst = rows_so
+        let values: Vec<(usize, usize, f64)> = rows_so
             .iter()
-            .filter(|(a, g, _)| {
-                (idx(&alphas, *a).abs_diff(ai) <= 1) && (idx(&weights, *g).abs_diff(gi) <= 1)
-            })
-            .map(|(_, _, m)| *m)
-            .fold(f64::INFINITY, f64::min);
-        rows.push(Row {
-            alpha: *alpha,
-            weight: *gw,
-            weighted_mrr: weighted,
-            worst_mrr: worst,
-            para_mrr: mrrs[1],
-            multi_mrr: mrrs[2],
-        });
+            .map(|(a, g, m)| (idx(&alphas, *a), idx(&weights, *g), *m))
+            .collect();
+        for row in &mut rows {
+            let ai = idx(&alphas, row.alpha);
+            let gi = idx(&weights, row.weight);
+            row.worst_mrr = values
+                .iter()
+                .filter(|(a, g, _)| a.abs_diff(ai) <= 1 && g.abs_diff(gi) <= 1)
+                .map(|(_, _, m)| *m)
+                .fold(f64::INFINITY, f64::min);
+        }
     }
     println!("# Taratura congiunta α × peso grafo ({target} note, 97M, mediana di {runs} giri)");
     println!(
