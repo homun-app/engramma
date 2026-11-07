@@ -2247,6 +2247,42 @@ verdi di fila (100/100)**.
   del peso del grafo, i punti della griglia che esistono); a parità entro
   0,002 vince chi tiene le parafrasi. Griglia e minimo dei vicini sotto.
 
+### La griglia (100k note, 97M, mediana di 3 giri, MRR pesato per domande)
+
+| α \\ g | 0,25 | 0,30 | 0,35 | 0,40 | 0,45 | 0,50 |
+|---|---|---|---|---|---|---|
+| 0,4 | 0,8215 | 0,8368 | 0,8397 | 0,8390 | 0,8303 | 0,6993 |
+| 0,5 | 0,8379 | 0,8425 | 0,8577 | 0,8577 | 0,8436 | 0,7118 |
+| 0,6 | 0,8440 | 0,8483 | 0,8527 | **0,8656** | 0,8410 | 0,7065 |
+| 0,7 | 0,8460 | 0,8497 | **0,8529** | 0,8552 | 0,8461 | 0,7015 |
+
+Il minimo dei vicini (finestra completa ±1 passo di α e del peso, i punti
+che esistono):
+
+| α \\ g | 0,25 | 0,30 | 0,35 | 0,40 | 0,45 | 0,50 |
+|---|---|---|---|---|---|---|
+| 0,4 | 0,8215 | 0,8215 | 0,8368 | 0,8303 | 0,6993 | 0,6993 |
+| 0,5 | 0,8215 | 0,8215 | 0,8368 | 0,8303 | 0,6993 | 0,6993 |
+| 0,6 | 0,8379 | 0,8379 | 0,8425 | 0,8410 | 0,7015 | 0,7015 |
+| 0,7 | 0,8440 | 0,8440 | **0,8483** | 0,8410 | 0,7015 | 0,7015 |
+
+Lettura: il crollo comincia PRIMA del previsto — a **0,45** il peso del
+grafo costa già ~0,025 di MRR pesato (0,8656 → 0,8410 alla α 0,6), e a 0,50
+ne costa ~0,15. Il miglior MRR assoluto resta 0,6/0,40 (0,8656), ma sta sul
+bordo del dirupo: il suo caso peggiore dei vicini è 0,8410. **Vince la
+regola robusta: α = 0,7, grafo 0,35** (0,8529, caso peggiore 0,8483 — la
+configurazione più lontana dal crollo che resta vicina al massimo).
+Parafrasi 0,8730 (meglio delle 0,862 di 0,6/0,40), multi-salto 0,3556
+(peggio delle 0,795: il prezzo dichiarato). **Il default in `search.rs` è
+cambiato**: fusione convessa α 0,7, peso grafo 0,35. I 208 test restano
+verdi con il nuovo default, test dorati compresi, attese non ritoccate.
+
+Nota onesta sul banco: la prima stampa del minimo dei vicini aveva un baco
+(calcolato riga per riga, ogni cella non vedeva i vicini successive); il
+vincitore non cambia — verificato ricalcolando la finestra completa a mano
+sulla griglia — ma i valori intermedi della prima stampa erano sbagliati.
+Il banco ora calcola il minimo sulla griglia completa.
+
 <!-- NUMERI-TARATURA -->
 
 ## Prove a mano (uscite trascritte)
