@@ -204,12 +204,20 @@ The right to be forgotten: the note, its versions, the edges it declares,
 its vectors, its FTS row, the entities left with no references and the
 tags no note carries anymore — all gone, plus the **payloads of its
 operations** (log v2: the chain covers salted digests, not the bodies).
-`secure_delete` zeroes the freed pages and a `VACUUM` rebuilds the file:
-no byte of the body survives in the cell. The purge's own payload keeps
-only the id and the reason, never content. `[[Mentions]]` of the note in
-OTHER notes stay (they are other notes); the markdown view deletes the
-note's file at the next `vault sync`. **Exports made before the purge are
-outside the engine's control.**
+`secure_delete` zeroes the freed pages, the FTS `optimize` merges the
+segments (the **stems** leave the index too) and a `VACUUM` rebuilds the
+file: no byte — and no root — of the body survives in the cell. The
+purge's own payload keeps only the id and the reason, never content.
+`[[Mentions]]` of the note in OTHER notes stay (they are other notes);
+the markdown view deletes the note's file at the next `vault sync`.
+**Exports made before the purge are outside the engine's control.**
+
+The WAL is truncated after the vacuum (`wal_checkpoint(TRUNCATE)`). When
+another process holds a read transaction open, the truncation cannot
+happen: the purge says so and exits with code **5** (`scrubbed: false`,
+`pending: ["wal"]`); the checkpoint is retried on the next write and at
+cell close, and `--json` carries the same fields. A failed `VACUUM` or
+PRAGMA is an error, never a silent success.
 
 ### `engramma compact [--keep-last N]`
 

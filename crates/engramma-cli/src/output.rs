@@ -10,7 +10,8 @@ use engramma_core::{CellError, PortError, SearchError};
 /// Everything the CLI can fail with, with distinct exit codes.
 #[derive(Debug)]
 pub struct CliError {
-    /// Exit code: 2 usage, 3 note not found, 4 internal.
+    /// Exit code: 2 usage, 3 note not found, 4 internal, 5 incomplete
+    /// forgetting (a purge left bytes in the WAL).
     pub code: i32,
     /// Human-readable message.
     pub message: String,
@@ -45,6 +46,16 @@ impl CliError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             code: 4,
+            message: message.into(),
+        }
+    }
+
+    /// An incomplete forgetting (v0.3.1, P0.2): the purge removed the note
+    /// but could not truncate the WAL — a reader was open. The checkpoint
+    /// is retried on the next write; the exit code says "not done yet".
+    pub fn incomplete_forgetting(message: impl Into<String>) -> Self {
+        Self {
+            code: 5,
             message: message.into(),
         }
     }

@@ -593,14 +593,28 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     return Ok(());
                 }
             }
-            let forgotten = cell.purge(&note_id, reason, "cli-user")?;
+            let report = cell.purge(&note_id, reason, "cli-user")?;
             if cli.json {
                 print_json(&serde_json::json!({
                     "purged": note_id.to_string(),
-                    "forgotten_payloads": forgotten,
+                    "forgotten_payloads": report.forgotten_payloads,
+                    "scrubbed": report.scrubbed,
+                    "pending": report.pending,
                 }));
             } else {
-                println!("purgata: {} ({} payload dimenticati)", note_id, forgotten);
+                println!(
+                    "purgata: {} ({} payload dimenticati)",
+                    note_id, report.forgotten_payloads
+                );
+            }
+            if !report.pending.is_empty() {
+                // the purge is not done: say so, with its own exit code
+                return Err(CliError::incomplete_forgetting(format!(
+                    "oblio incompleto ({}): il WAL non è stato troncato, \
+                     un lettore teneva la cella aperta; verrà ritentato alla \
+                     prossima scrittura",
+                    report.pending.join(", ")
+                )));
             }
             Ok(())
         }

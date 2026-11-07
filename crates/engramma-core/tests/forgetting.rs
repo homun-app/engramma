@@ -132,3 +132,53 @@ fn purge_scrubs_the_stems_from_the_file() {
     drop(cell);
     assert_forgotten(dir.path(), "oblio", &needles);
 }
+
+/// P0.2: with another connection holding an open read transaction (the MCP
+/// server, Homun) the WAL cannot be truncated. Purge must NOT say "done":
+/// `scrubbed = false`, `pending` holds `"wal"`, the roots are still in the
+/// `-wal` — and once the reader leaves, the NEXT WRITE retries the checkpoint
+/// and the scrub completes.
+#[test]
+fn purge_with_an_open_reader_completes_the_scrub_on_the_next_write() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let path = dir.path().join("lettore.sqlite");
+    let cell = Cell::create(&path, "lettore", "tester").unwrap(/* test-only */);
+    let secret = note_of(1, "zibellinotremante quokkaviolaceo");
+    cell.put_note(&secret, "tester").unwrap(/* test-only */);
+    let needles = roots_of(&secret.body, Some(Lang::It));
+
+    // the concurrent reader: its own connection, one open read transaction
+    let mut reader = rusqlite::Connection::open(&path).unwrap(/* test-only */);
+    let read_tx = reader
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .unwrap(/* test-only */);
+    let _n: i64 = read_tx
+        .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+        .unwrap(/* test-only */);
+
+    let report = cell
+        .purge(&secret.id, "diritto all'oblio", "tester")
+        .unwrap(/* test-only */);
+    assert!(report.forgotten_payloads >= 1, "{report:?}");
+    assert!(!report.scrubbed, "purge cannot say done: {report:?}");
+    assert_eq!(report.pending, vec!["wal"], "{report:?}");
+    // and it is true: the roots are still in the WAL frames
+    let wal = dir.path().join("lettore.sqlite-wal");
+    assert!(
+        leaked(&wal, &needles).is_some(),
+        "the WAL must still hold the roots while the reader is open"
+    );
+    let (scrubbed, pending) = cell.scrub_state().unwrap(/* test-only */);
+    assert!(!scrubbed && pending == vec!["wal"], "still pending");
+
+    // the reader goes away; the next write retries and completes the scrub
+    drop(read_tx);
+    drop(reader);
+    let after = note_of(2, "scrittura successiva");
+    cell.put_note(&after, "tester").unwrap(/* test-only */);
+    let (scrubbed, pending) = cell.scrub_state().unwrap(/* test-only */);
+    assert!(scrubbed && pending.is_empty(), "the scrub must complete");
+    assert!(cell.verify().unwrap(/* test-only */).ok());
+    drop(cell);
+    assert_forgotten(dir.path(), "lettore", &needles);
+}

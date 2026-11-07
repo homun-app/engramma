@@ -163,6 +163,21 @@ pub struct VersionEntry {
     pub note: Note,
 }
 
+/// Report of [`Cell::purge`] (v0.3.1, P0.2): what was forgotten, and whether
+/// every byte is already gone from disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgeReport {
+    /// Payload rows forgotten (net of the one the purge op itself writes).
+    pub forgotten_payloads: usize,
+    /// Whether the file, the WAL and the snapshots already carry none of the
+    /// bytes. False means something still holds them — see [`Self::pending`].
+    pub scrubbed: bool,
+    /// What could not be scrubbed yet. `"wal"`: a reader kept the WAL from
+    /// being truncated (`PRAGMA wal_checkpoint(TRUNCATE)` answered busy);
+    /// the next write and the cell close retry the checkpoint.
+    pub pending: Vec<&'static str>,
+}
+
 /// Report of [`Cell::verify`].
 #[derive(Debug, Clone)]
 pub struct VerifyReport {
@@ -265,6 +280,22 @@ pub(crate) struct Inner {
     pub(crate) query_cache: std::collections::HashMap<String, crate::search::LruCache>,
     /// Capacity of each per-model query LRU.
     pub(crate) query_cache_cap: usize,
+    /// What a purge could not scrub yet (v0.3.1, P0.2): the WAL frames a
+    /// reader kept alive. The next write and the cell close retry the
+    /// checkpoint (in-memory only: a crashed process leaves the frames to
+    /// the next purge or explicit `checkpoint`, declared in the REPORT).
+    pub(crate) pending_scrub: Vec<&'static str>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The close-time checkpoint retry (P0.2). Drop cannot report: on
+        // failure the frames stay in the WAL until the next write, purge or
+        // explicit `checkpoint` — never silently marked scrubbed.
+        if !self.pending_scrub.is_empty() {
+            let _ = wal_checkpoint(&self.conn);
+        }
+    }
 }
 
 /// An open cell. Cheap to clone; one process-wide write lock per file.
@@ -304,6 +335,26 @@ fn now_ms() -> u64 {
     // One single read: two `now_utc()` calls can straddle a second boundary
     // and put the combined value almost a second in the past.
     u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or_default()
+}
+
+/// `PRAGMA wal_checkpoint(TRUNCATE)`: copies every WAL frame into the file
+/// and truncates the WAL. Returns false when it answered busy — a reader
+/// holds an older snapshot and the frames (a purge's included) stay. The
+/// busy timeout is shortened around the call: with the cell's 10 s timeout a
+/// lingering reader would stall a purge for ten whole seconds before the
+/// "busy" that makes it `pending`.
+fn wal_checkpoint(conn: &Connection) -> Result<bool, CellError> {
+    conn.pragma_update(None, "busy_timeout", 250_i64)?;
+    let answer = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    });
+    conn.pragma_update(None, "busy_timeout", 10_000_i64)?;
+    let (busy, _log, _checkpointed) = answer?;
+    Ok(busy == 0)
 }
 
 impl Cell {
@@ -386,6 +437,7 @@ impl Cell {
                 graph_dirt: GraphDirt::default(),
                 query_cache: std::collections::HashMap::new(),
                 query_cache_cap: crate::graph::QUERY_CACHE_CAPACITY,
+                pending_scrub: Vec::new(),
             })),
             write_lock: per_cell_lock(path),
         })
@@ -520,9 +572,14 @@ impl Cell {
     /// Right to be forgotten (DESIGN §4.4, v0.3): the note, its versions,
     /// its edges, vectors, FTS row and orphaned entities go, and the
     /// payloads of its operations are forgotten — the chain stays whole
-    /// (log v2). `secure_delete` zeroes the freed pages and the `VACUUM`
-    /// rebuilds the file, so no byte of the body survives in the file.
-    /// Returns how many payload rows were forgotten.
+    /// (log v2). `secure_delete` zeroes the freed pages, the FTS `optimize`
+    /// merges the segments and the `VACUUM` rebuilds the file, so neither
+    /// the words nor their STEMS survive. The WAL is then truncated
+    /// (`wal_checkpoint(TRUNCATE)`): when a reader keeps it open the report
+    /// says so (`scrubbed: false`, `pending: ["wal"]`) and the checkpoint is
+    /// retried on the next write and at close — a purge never lies "done".
+    /// A failed `VACUUM`, PRAGMA or checkpoint statement is an error, not a
+    /// shrug.
     ///
     /// The markdown view (v0.3) deletes the file of a purged note too;
     /// exports made before the purge are outside the engine's control (the
@@ -531,21 +588,22 @@ impl Cell {
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL or I/O failures.
-    pub fn purge(&self, id: &Ulid, reason: &str, actor: &str) -> Result<usize, CellError> {
+    pub fn purge(&self, id: &Ulid, reason: &str, actor: &str) -> Result<PurgeReport, CellError> {
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
         let mut inner = self.lock()?;
-        let payloads_before: i64 = inner
+        let payloads_before: i64 =
+            inner
+                .conn
+                .query_row("SELECT COUNT(*) FROM op_payloads", [], |r| r.get(0))?;
+        // secure_delete answers 0 (off), 1 (on) or 2 (fast): keep the number,
+        // restore the number.
+        let secure_before: i64 = inner
             .conn
-            .query_row("SELECT COUNT(*) FROM op_payloads", [], |r| r.get(0))
-            .unwrap_or(0);
-        let secure_before: String = inner
-            .conn
-            .query_row("PRAGMA secure_delete", [], |r| r.get(0))
-            .unwrap_or_else(|_| "0".into());
-        let _ = inner.conn.pragma_update(None, "secure_delete", "ON");
+            .query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+        inner.conn.pragma_update(None, "secure_delete", "ON")?;
         execute_op(
             &mut inner,
             OpKind::Purge,
@@ -566,18 +624,44 @@ impl Cell {
         if let Some(st) = &mut inner.index {
             st.idx.remove(&id.to_string());
         }
-        let _ = inner
+        inner
             .conn
-            .pragma_update(None, "secure_delete", secure_before);
-        let payloads_after: i64 = inner
-            .conn
-            .query_row("SELECT COUNT(*) FROM op_payloads", [], |r| r.get(0))
-            .unwrap_or(0);
-        let _ = inner.conn.execute_batch("VACUUM;");
+            .pragma_update(None, "secure_delete", secure_before)?;
+        let payloads_after: i64 =
+            inner
+                .conn
+                .query_row("SELECT COUNT(*) FROM op_payloads", [], |r| r.get(0))?;
+        // v0.3.1 (P0.2): a failed VACUUM is an error — without it the freed
+        // pages stay in the file and the purge must not report success.
+        inner.conn.execute_batch("VACUUM;")?;
+        // secure_delete does not cover the WAL: only a checkpoint copies the
+        // frames over and truncates. `TRUNCATE` answers busy when a reader
+        // holds an older snapshot: that is `pending`, not done.
+        let pending = if wal_checkpoint(&inner.conn)? {
+            Vec::new()
+        } else {
+            inner.pending_scrub = vec!["wal"];
+            vec!["wal"]
+        };
         // the purge itself wrote one payload: the forgotten rows are the drop
         // net of it
         let forgotten = usize::try_from((payloads_before + 1 - payloads_after).max(0)).unwrap_or(0);
-        Ok(forgotten)
+        Ok(PurgeReport {
+            forgotten_payloads: forgotten,
+            scrubbed: pending.is_empty(),
+            pending,
+        })
+    }
+
+    /// The forgetting state as it stands: `(scrubbed, pending)`. A purge that
+    /// could not truncate the WAL (a reader was open) stays pending until the
+    /// next write or the cell close completes the checkpoint.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] when the cell lock is poisoned.
+    pub fn scrub_state(&self) -> Result<(bool, Vec<&'static str>), CellError> {
+        let inner = self.lock()?;
+        Ok((inner.pending_scrub.is_empty(), inner.pending_scrub.clone()))
     }
 
     // ------------------------------------------------------------------
@@ -1640,6 +1724,12 @@ fn execute_op(
             }
         }
     }
+    // v0.3.1 (P0.2): a pending purge scrub retries its checkpoint on every
+    // write. Best effort by design: a busy checkpoint must not fail an
+    // unrelated write — it simply stays pending.
+    if !inner.pending_scrub.is_empty() && wal_checkpoint(&inner.conn).unwrap_or(false) {
+        inner.pending_scrub.clear();
+    }
     Ok(())
 }
 
@@ -2536,7 +2626,10 @@ mod tests {
         cell.put_note(&other, "t").unwrap(/* test-only */);
         let forgotten = cell.purge(&n.id, "diritto all'oblio", "cli-user")
             .unwrap(/* test-only */);
-        assert!(forgotten >= 1, "at least the creating put is forgotten");
+        assert!(
+            forgotten.forgotten_payloads >= 1,
+            "at least the creating put is forgotten"
+        );
         // 1. no byte of the body in the raw file (VACUUM ran inside purge)
         cell.checkpoint().unwrap(/* test-only */);
         drop(cell);
