@@ -553,6 +553,15 @@ impl Cell {
             actor,
             serde_json::json!({ "reason": reason }),
         )?;
+        // v0.3.1 (P0.1): the FTS5 `delete` only writes a tombstone into a NEW
+        // segment; the terms stay in the old ones until a merge. `optimize`
+        // fuses the segments and discards the deleted entries, so the STEMS of
+        // the purged body leave the index too (O(index): measured on the 100k
+        // bench, REPORT §v0.3.1). It runs inside the `secure_delete` window:
+        // the pages the merge frees are zeroed.
+        inner
+            .conn
+            .execute("INSERT INTO notes_fts(notes_fts) VALUES('optimize')", [])?;
         // the in-memory vector index drops the note with its vectors
         if let Some(st) = &mut inner.index {
             st.idx.remove(&id.to_string());
