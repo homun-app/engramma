@@ -115,11 +115,18 @@ never exported; superseded notes are.
 ### `verify`
 Recomputes the hash chain, rebuilds the whole state by replaying the log in
 memory, compares every table and runs the FTS integrity-check (the index
-must hold exactly the non-tombstoned notes). JSON: `{ops, hash_chain_ok,
-replay_ok, fts_ok, mismatch, coverage, ok}` — `coverage` lists the vector
-coverage per model (`{model, state, covered, living}`; embeddings are
-derived data, their absence is never a verification failure). The human
-output prints one `copertura vettori` line per model.
+must hold exactly the non-tombstoned notes). After a compaction the `replay`
+field (and a human line) says what was actually checked: `full` (no
+compaction), `from_snapshot` (the tail replays on the snapshot file) or
+`chain_only` — a checkpoint without a file, where verify checks the whole
+chain, every surviving payload's digest, the derived indexes (the `d…`
+edges re-derived from the notes, no vector for a note that no longer lives)
+and the state digest while the head has not moved past the checkpoint.
+JSON: `{ops, replay, hash_chain_ok, replay_ok, fts_ok, mismatch, coverage,
+ok}` — `coverage` lists the vector coverage per model (`{model, state,
+covered, living}`; embeddings are derived data, their absence is never a
+verification failure). The human output prints one `copertura vettori` line
+per model.
 
 ### `search TEXT` (v0.2)
 Options: `--mode text|vector|hybrid` (default: `hybrid` when the cell has a

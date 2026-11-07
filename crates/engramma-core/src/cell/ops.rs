@@ -743,31 +743,77 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
             rusqlite::params![id.to_string(), subject],
         )?;
     }
-    let vf = valid_to_db(&row.note.valid_from);
-    let vt = valid_to_db(&row.note.valid_to);
-    // Mention edges: note -> entity.
-    for name in &analysis.links {
+    // the derived edges, from the one source of truth (v0.3.2, P0.2: the
+    // same function verify re-derives them with, chain-only)
+    for e in derived_edges_of(&row.note)? {
         tx.execute(
             "INSERT INTO edges (id, src, rel, dst, note_id, valid_from, valid_to, confidence, status)
-             VALUES (?1, ?2, 'mentions', ?3, ?4, ?5, ?6, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
-                derived_edge_id(id, &format!("mentions:{name}")),
-                format!("note:{id}"),
-                name,
+                e.id,
+                e.src,
+                e.rel,
+                e.dst,
                 id.to_string(),
-                vf,
-                vt,
-                row.note.confidence.as_str(),
-                row.note.status.as_str(),
+                e.valid_from,
+                e.valid_to,
+                e.confidence,
+                e.status,
             ],
         )?;
     }
+    Ok(())
+}
+
+/// One derived (declared) edge of a note, exactly as `reindex_note` writes
+/// it (v0.3.2, P0.2): the single source of truth for the `edges` rows a
+/// note declares, so that `verify` can re-derive them without a replay.
+pub(crate) struct DerivedEdge {
+    /// Deterministic id (`d…`).
+    pub id: String,
+    /// Source endpoint.
+    pub src: String,
+    /// Relation.
+    pub rel: String,
+    /// Destination endpoint.
+    pub dst: String,
+    /// Validity start as stored.
+    pub valid_from: Option<String>,
+    /// Validity end as stored.
+    pub valid_to: Option<String>,
+    /// The note's confidence.
+    pub confidence: String,
+    /// The note's status.
+    pub status: String,
+}
+
+/// The derived edges of a note: its mentions and its relations, with the
+/// note's validity, confidence and status (the same deterministic analysis
+/// `reindex_note` applies).
+pub(crate) fn derived_edges_of(note: &Note) -> Result<Vec<DerivedEdge>, CellError> {
+    let analysis = body::analyze(&note.body)
+        .map_err(|e| CellError::Invalid(format!("note {} body: {e}", note.id)))?;
+    let vf = valid_to_db(&note.valid_from);
+    let vt = valid_to_db(&note.valid_to);
+    let mut out = Vec::new();
+    // Mention edges: note -> entity.
+    for name in &analysis.links {
+        out.push(DerivedEdge {
+            id: derived_edge_id(&note.id, &format!("mentions:{name}")),
+            src: format!("note:{}", note.id),
+            rel: "mentions".into(),
+            dst: name.clone(),
+            valid_from: vf.clone(),
+            valid_to: vt.clone(),
+            confidence: note.confidence.as_str().into(),
+            status: note.status.as_str().into(),
+        });
+    }
     // Relation edges: subject entity (or the note) -> entity.
     for r in &analysis.relations {
-        let src = row
-            .note
+        let src = note
             .subject_entity()
-            .unwrap_or_else(|| format!("note:{id}"));
+            .unwrap_or_else(|| format!("note:{}", note.id));
         let rvf = r
             .from
             .as_ref()
@@ -777,23 +823,18 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
             r.to.as_ref()
                 .map(|v| v.to_db_string())
                 .or_else(|| vt.clone());
-        tx.execute(
-            "INSERT INTO edges (id, src, rel, dst, note_id, valid_from, valid_to, confidence, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![
-                derived_edge_id(id, &format!("{}:{}", r.rel, r.dst)),
-                src,
-                r.rel,
-                r.dst,
-                id.to_string(),
-                rvf,
-                rvt,
-                row.note.confidence.as_str(),
-                row.note.status.as_str(),
-            ],
-        )?;
+        out.push(DerivedEdge {
+            id: derived_edge_id(&note.id, &format!("{}:{}", r.rel, r.dst)),
+            src,
+            rel: r.rel.clone(),
+            dst: r.dst.clone(),
+            valid_from: rvf,
+            valid_to: rvt,
+            confidence: note.confidence.as_str().into(),
+            status: note.status.as_str().into(),
+        });
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Deterministic id for a derived edge.

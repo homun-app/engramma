@@ -1122,9 +1122,22 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     })
                 })
                 .collect();
+            // v0.3.2 (P0.2): say WHAT was verified — a checkpoint compaction
+            // leaves no snapshot to replay on, and silence would imply the
+            // full reconstruction.
+            let replay_json = match &report.replay {
+                engramma_core::cell::Replay::Full => serde_json::json!({"kind": "full"}),
+                engramma_core::cell::Replay::FromSnapshot { seq } => {
+                    serde_json::json!({"kind": "from_snapshot", "seq": seq})
+                }
+                engramma_core::cell::Replay::ChainOnly { since_seq } => {
+                    serde_json::json!({"kind": "chain_only", "since_seq": since_seq})
+                }
+            };
             if cli.json {
                 print_json(&serde_json::json!({
                     "ops": report.ops,
+                    "replay": replay_json,
                     "hash_chain_ok": report.hash_chain_ok,
                     "replay_ok": report.replay_ok,
                     "fts_ok": report.fts_ok,
@@ -1133,10 +1146,29 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "ok": report.ok(),
                 }));
             } else if report.ok() {
-                println!(
-                    "registro verificato: {} operazioni, catena hash, ricostruzione e indice FTS a posto",
-                    report.ops
-                );
+                match &report.replay {
+                    engramma_core::cell::Replay::Full => println!(
+                        "registro verificato: {} operazioni, catena hash, ricostruzione e indice FTS a posto",
+                        report.ops
+                    ),
+                    engramma_core::cell::Replay::FromSnapshot { seq } => {
+                        println!(
+                            "registro verificato: {} operazioni, catena hash, ricostruzione \
+                             (coda da istantanea di seq {seq}) e indice FTS a posto",
+                            report.ops
+                        );
+                    }
+                    engramma_core::cell::Replay::ChainOnly { since_seq } => {
+                        println!(
+                            "registro verificato: {} operazioni, catena hash e indici \
+                             derivati a posto",
+                            report.ops
+                        );
+                        println!(
+                            "rigioco: solo catena da seq {since_seq} (compattata senza istantanea)"
+                        );
+                    }
+                }
                 for c in &report.coverage {
                     println!(
                         "copertura vettori: {} [{}] {}/{} note",

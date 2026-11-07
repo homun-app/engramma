@@ -259,14 +259,123 @@ impl VerifyReport {
 /// file, redacted_by) — the digest and the file are nullable (v0.3.2).
 type SnapshotRecord = (i64, String, Option<String>, Option<String>, String);
 
-/// The `ChainOnly` checks of a checkpoint row (v0.3.2, P0.2): when the head
-/// has not moved past the checkpoint, the digest of the current state must
-/// equal the recorded one. (The hash chain and the surviving payloads were
-/// checked in the chain loop; the FTS coherence runs on the live cell.)
-fn verify_checkpoint_digest(
+/// The `ChainOnly` coherence checks of a checkpoint row (v0.3.2, P0.2) —
+/// everything that can still be verified without a replay:
+/// - the derived (`d…`) edges of every note, re-derived from its body with
+///   the same deterministic analysis that wrote them, must be exactly the
+///   table's rows (manual edges cannot be re-derived — the ops that made
+///   them are skeletons now — and stay out of the comparison);
+/// - no vector may outlive its note (purges and tombstones delete them);
+/// - when the head has not moved past the checkpoint, the digest of the
+///   current state must equal the recorded one.
+fn verify_checkpoint_coherence(
     conn: &Connection,
     snapshot: Option<&SnapshotRecord>,
 ) -> Result<(), String> {
+    // 1. derived edges: the expected set re-derived from the notes, the
+    //    actual set from the table
+    let render = |v: rusqlite::types::Value| -> String {
+        match v {
+            rusqlite::types::Value::Null => "\u{0}".into(),
+            rusqlite::types::Value::Integer(i) => i.to_string(),
+            rusqlite::types::Value::Real(f) => f.to_string(),
+            rusqlite::types::Value::Text(t) => t,
+            rusqlite::types::Value::Blob(b) => format!("{b:x?}"),
+        }
+    };
+    let mut expected: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, frontmatter_json, body FROM notes ORDER BY id")
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<Result<(String, String, String), _>> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| e.to_string())?
+            .collect();
+        for row in rows {
+            let (id, frontmatter, body) = row.map_err(|e| e.to_string())?;
+            let note = serde_json::from_str::<Value>(&frontmatter)
+                .ok()
+                .and_then(|v| Note::from_json(&v).ok())
+                .map(|mut n| {
+                    n.body = body;
+                    n
+                });
+            let Some(note) = note else {
+                return Err(format!("note {id}: unreadable frontmatter"));
+            };
+            let note_id = note.id.to_string();
+            for e in ops::derived_edges_of(&note).map_err(|e| e.to_string())? {
+                // NULL renders as \0, like `render` below (state_dump's rule)
+                let null = "\u{0}".to_string();
+                expected.push(format!(
+                    "{note_id}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+                    e.id,
+                    e.src,
+                    e.rel,
+                    e.dst,
+                    e.valid_from.unwrap_or_else(|| null.clone()),
+                    e.valid_to.unwrap_or(null),
+                    e.confidence,
+                    e.status,
+                ));
+                // `render` puts the separator after every column, last one
+                // included — expected must end the same way
+                expected.last_mut().expect("just pushed").push('\u{1}');
+            }
+        }
+    }
+    let mut actual: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT note_id, id, src, rel, dst, valid_from, valid_to, confidence, status
+                 FROM edges WHERE id LIKE 'd%' ORDER BY note_id, id",
+            )
+            .map_err(|e| e.to_string())?;
+        let ncols = stmt.column_count();
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let mut line = String::new();
+            for i in 0..ncols {
+                let v: rusqlite::types::Value = row.get(i).map_err(|e| e.to_string())?;
+                line.push_str(&render(v));
+                line.push('\u{1}');
+            }
+            actual.push(line);
+        }
+    }
+    expected.sort_unstable();
+    actual.sort_unstable();
+    if expected != actual {
+        let first = expected
+            .iter()
+            .zip(actual.iter())
+            .find(|(a, b)| a != b)
+            .map(|(a, _)| a.clone())
+            .unwrap_or_default();
+        return Err(format!(
+            "the derived edges diverge from the notes (around {first}; \
+             expected {}, found {})",
+            expected.len(),
+            actual.len()
+        ));
+    }
+    // 2. vectors: derived data, but they may not outlive their note
+    let dead: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM note_vectors
+             WHERE note_id NOT IN (SELECT id FROM notes WHERE status != 'deleted')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if dead > 0 {
+        return Err(format!(
+            "{dead} vector row(s) belong to a note that is no longer living"
+        ));
+    }
+    // 3. the digest at the head, when the head has not moved
     let Some((cut, head_hash, digest, _file, _redacted)) = snapshot else {
         return Ok(());
     };
@@ -2047,9 +2156,10 @@ impl Cell {
             });
         }
         if chain_only {
-            // ChainOnly (P0.2): what can still be checked without a replay.
-            let digest_ok = verify_checkpoint_digest(&inner.conn, snapshot.as_ref());
-            if let Err(e) = digest_ok {
+            // ChainOnly (P0.2): everything that can still be checked without
+            // a replay — the derived edges re-derived from the notes, the
+            // vectors' liveness, the digest at the head.
+            if let Err(e) = verify_checkpoint_coherence(&inner.conn, snapshot.as_ref()) {
                 mismatch = mismatch.or(Some(e));
             }
         } else if mismatch.is_none() {

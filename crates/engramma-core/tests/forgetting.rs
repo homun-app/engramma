@@ -330,6 +330,94 @@ fn snapshot_purge_censors_the_supersede_inside_it() {
     assert_forgotten(dir.path(), "sopr", &needles);
 }
 
+/// v0.3.2 (P0.2): with a checkpoint (no file) `verify` cannot replay — but
+/// it still checks the COHERENCE of what is on disk: a derived edge changed
+/// by hand, a vector for a note that no longer lives, and (digest at the
+/// head) a note row changed by hand.
+#[test]
+fn chain_only_catches_tampering_below_the_replay() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    // 1. a tampered DERIVED EDGE fails the coherence check
+    let path = dir.path().join("archi.sqlite");
+    let cell = Cell::create(&path, "archi", "tester").unwrap(/* test-only */);
+    cell.put_note(&note_of(1, "una nota che cita [[Roma]]"), "tester")
+        .unwrap(/* test-only */);
+    let head: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    cell.compact(head, &CompactOptions::default())
+        .unwrap(/* test-only */);
+    // the head moves past the checkpoint: the recorded digest is history
+    // now, only the per-note re-derivation of the derived edges can catch
+    // a hand-changed `edges` row
+    cell.put_note(&note_of(2, "una seconda nota [[Roma]]"), "tester")
+        .unwrap(/* test-only */);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap(/* test-only */);
+        conn.execute(
+            "UPDATE edges SET dst = 'Milano' WHERE rel = 'mentions' AND id LIKE 'd%'",
+            [],
+        )
+        .unwrap(/* test-only */);
+    }
+    let vr = cell.verify().unwrap(/* test-only */);
+    assert!(
+        !vr.ok() && vr.replay == Replay::ChainOnly { since_seq: head },
+        "a tampered derived edge must fail: {vr:?}"
+    );
+
+    // 2. a VECTOR for a note that is not living fails too
+    let path2 = dir.path().join("vettori.sqlite");
+    let cell = Cell::create(&path2, "vettori", "tester").unwrap(/* test-only */);
+    cell.put_note(&note_of(1, "un'altra nota [[Roma]]"), "tester")
+        .unwrap(/* test-only */);
+    let head2: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    cell.compact(head2, &CompactOptions::default())
+        .unwrap(/* test-only */);
+    {
+        let conn = rusqlite::Connection::open(&path2).unwrap(/* test-only */);
+        conn.execute(
+            "INSERT INTO note_vectors (note_id, chunk, model, content_hash, note_hash, vec)
+             VALUES ('01ZZZZZZZZZZZZZZZZZZZZZZZZ', 0, 'x', 'h', 'h', x'00000000')",
+            [],
+        )
+        .unwrap(/* test-only */);
+    }
+    let vr = cell.verify().unwrap(/* test-only */);
+    assert!(!vr.ok(), "a vector for a non-living note must fail: {vr:?}");
+
+    // 3. the digest at the head: a note row changed by hand moves the state
+    //    digest away from the checkpoint's record
+    let path3 = dir.path().join("digest.sqlite");
+    let cell = Cell::create(&path3, "digest", "tester").unwrap(/* test-only */);
+    cell.put_note(&note_of(1, "la nota del digest [[Roma]]"), "tester")
+        .unwrap(/* test-only */);
+    let head3: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    cell.compact(head3, &CompactOptions::default())
+        .unwrap(/* test-only */);
+    assert!(cell.verify().unwrap(/* test-only */).ok());
+    {
+        let conn = rusqlite::Connection::open(&path3).unwrap(/* test-only */);
+        conn.execute("UPDATE notes SET title = 'manomesso' WHERE id LIKE '%'", [])
+            .unwrap(/* test-only */);
+    }
+    let vr = cell.verify().unwrap(/* test-only */);
+    assert!(
+        !vr.ok(),
+        "a hand-changed note row must move the digest: {vr:?}"
+    );
+}
+
 /// P0.4: a compaction snapshot is the LOGICAL state — payloads up to the
 /// cut, vectors, vault bindings and the FTS content are derived or
 /// recomputable, and they all carry content. And only the LAST snapshot
