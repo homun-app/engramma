@@ -1416,13 +1416,17 @@ Giulia lavora altrove»):
   dichiarata); Davide sposato con Sara; la Dott.ssa Conti segue Giulia;
   Marco «capo dei progetti» (non più «capoprogetto di Fabio» nel corpo —
   il testo la trovava da solo); il matrimonio di Sara ha perso la parola
-  «sorella» dal corpo e il titolo; le note chiave portano le relazioni
+  «sorella» dal corpo e dal titolo; le note chiave portano le relazioni
   nella sezione `## Relations` (il vincolo sintattico che la catena usa).
-- Le cinque: «dove lavora il partner di Fabio», «come si chiama il medico
-  del partner di Fabio», «dove lavora la sorella di Giulia», «chi è il
-  marito della sorella di Giulia», «come si chiama il capoprogetto per cui
-  lavora Fabio». In ibrido, all'istante fisso del test, tutte e cinque
-  rispondono nei primi 5 (test `golden_semantic` col 97M).
+- Le cinque di `tests/golden/queries.json` (v0.3.1, P2.7 — la lista qui
+  sopra citava due domande che nel file non sono): «dove lavora il
+  partner di Fabio», «chi è la sorella della partner di Fabio», «chi è il
+  marito della sorella di Giulia», «dove lavora la sorella di Giulia»,
+  «dove vive la sorella di Giulia». In testo+grafo, all'istante fisso del
+  test, tutte e cinque rispondono nei primi 5 (test `golden`); in ibrido
+  le attese accettano solo la nota che afferma il fatto e le due
+  domande sulla sorella restano fuori dai primi 5 — numeri nella
+  sezione v0.3.1.
 - **Deriva onesta all'orologio vero**: alle prove a mano (oggi, recenza
   viva) tre su cinque rispondono nei primi 5; per le altre due il match
   lessicale (la Dott.ssa Ricci contiene «medico di base di Fabio»)
@@ -1649,8 +1653,10 @@ registro verificato: 67 operazioni, catena hash, ricostruzione e indice FTS a po
 copertura vettori: granite-embedding-97m-multilingual-r2@835ad140 [ready] 66/66 note
 ```
 
-Le cinque multi-salto in ibrido (primi risultati e `via`; all'istante del
-test tutte rispondono nei primi 5):
+Le cinque multi-salto in ibrido (primi risultati e `via`; all'epoca le
+attese accettavano anche il passo intermedio — v0.3.1, P2.7, ha ristretto
+le attese alla sola nota che afferma il fatto, e due di queste cinque
+possono cadere dai primi 5: numeri nella sezione v0.3.1):
 
 ```console
 $ engramma --root $T search "dove lavora il partner di Fabio" --k 3

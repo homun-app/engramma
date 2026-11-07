@@ -163,7 +163,7 @@
     "category": "multi-salto",
     "q": "chi è il marito della sorella di Giulia",
     "expect": [
-      "Sara",
+      "Davide",
       "Matrimonio a Villa Doria"
     ],
     "mode": "hybrid"
@@ -473,8 +473,7 @@
     "category": "multi-salto",
     "q": "dove lavora la sorella di Giulia",
     "expect": [
-      "Biblioteca Angelica",
-      "Sara"
+      "Sara e la Biblioteca Angelica"
     ],
     "mode": "hybrid"
   },
