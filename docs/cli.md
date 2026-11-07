@@ -246,7 +246,8 @@ go). Only the **last** row stays, with or without a file: the latest
 compaction replaces the previous one, and a compaction without the flag
 deletes the file of the previous one. A later `purge` scrubs a snapshot
 file (its row records the redacted digest with `redacted_by` naming the
-purge, spec §6.4).
+purge, spec §6.4) and **nulls a checkpoint's digest** (it described a
+state that contained the purged note).
 
 `--json` carries `cut_seq`, `head_seq`, `head_hash`, `state_digest`,
 `snapshot` (null for a checkpoint), `bytes_before`/`bytes_after` — the

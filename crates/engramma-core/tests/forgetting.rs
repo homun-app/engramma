@@ -330,6 +330,92 @@ fn snapshot_purge_censors_the_supersede_inside_it() {
     assert_forgotten(dir.path(), "sopr", &needles);
 }
 
+/// v0.3.2 (P0.3): the digest of a checkpoint describes a state that
+/// contained the purged note. It is an hash of the whole state — not
+/// readable data — but from the purge on it is unverifiable, and purge
+/// nulls it and appends its op to `redacted_by`. With the FILE the
+/// v0.3.1 behavior stands (the snapshot is scrubbed, digest updated).
+#[test]
+fn purge_redacts_the_checkpoint_and_scrubs_the_file() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let path = dir.path().join("redazione.sqlite");
+    let cell = Cell::create(&path, "redazione", "tester").unwrap(/* test-only */);
+    let secret = note_of(1, "zibellinotremante quokkaviolaceo");
+    cell.put_note(&secret, "tester").unwrap(/* test-only */);
+    cell.put_note(&note_of(2, "una nota che resta"), "tester")
+        .unwrap(/* test-only */);
+    let head: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+
+    // checkpoint: no file
+    cell.compact(head, &CompactOptions::default())
+        .unwrap(/* test-only */);
+    let before = snapshots_of(&cell);
+    assert_eq!(before.len(), 1);
+    assert_ne!(before[0].state_digest, "NULL", "{before:?}");
+    assert_eq!(before[0].redacted_by, "[]", "{before:?}");
+
+    cell.purge(&secret.id, "oblio", "tester").unwrap(/* t */);
+    let after = snapshots_of(&cell);
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_eq!(
+        after[0].state_digest, "NULL",
+        "the checkpoint digest is redacted: {after:?}"
+    );
+    let purge_op = cell
+        .ops()
+        .unwrap(/* test-only */)
+        .into_iter()
+        .rev()
+        .find(|o| o.kind == engramma_core::cell::ops::OpKind::Purge)
+        .unwrap(/* test-only */);
+    assert!(
+        after[0].redacted_by.contains(&purge_op.op_id.to_string()),
+        "{}",
+        after[0].redacted_by
+    );
+    // and verify still passes (chain + derived indexes)
+    let vr = cell.verify().unwrap(/* test-only */);
+    assert!(vr.ok(), "{vr:?}");
+
+    // with the FILE, the v0.3.1 behavior: scrubbed, digest updated, named
+    let path2 = dir.path().join("file.sqlite");
+    let cell = Cell::create(&path2, "file", "tester").unwrap(/* test-only */);
+    cell.put_note(&secret, "tester").unwrap(/* test-only */);
+    let head2: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    cell.compact(head2, &CompactOptions { keep_snapshot: true })
+        .unwrap(/* test-only */);
+    let before2 = snapshots_of(&cell);
+    cell.purge(&secret.id, "oblio", "tester").unwrap(/* t */);
+    let after2 = snapshots_of(&cell);
+    assert_eq!(after2.len(), 1, "{after2:?}");
+    assert_ne!(after2[0].state_digest, before2[0].state_digest);
+    assert!(
+        after2[0].redacted_by.contains(&purge_of(&cell).to_string()),
+        "{}",
+        after2[0].redacted_by
+    );
+    assert!(cell.verify().unwrap(/* test-only */).ok());
+}
+
+/// The op id of the newest purge in the log.
+fn purge_of(cell: &Cell) -> ulid::Ulid {
+    cell.ops()
+        .unwrap(/* test-only */)
+        .into_iter()
+        .rev()
+        .find(|o| o.kind == engramma_core::cell::ops::OpKind::Purge)
+        .unwrap(/* test-only */)
+        .op_id
+}
+
 /// v0.3.2 (P0.2): with a checkpoint (no file) `verify` cannot replay — but
 /// it still checks the COHERENCE of what is on disk: a derived edge changed
 /// by hand, a vector for a note that no longer lives, and (digest at the

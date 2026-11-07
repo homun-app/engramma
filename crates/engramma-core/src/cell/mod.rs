@@ -907,10 +907,18 @@ impl Cell {
                 .collect()
         };
         for (i, (seq, file)) in rows.into_iter().enumerate() {
-            // v0.3.2 (P0.1): a checkpoint row has no file to scrub — the
-            // digest it recorded described a state that contained the
-            // purged note; P0.3 redacts it.
+            // v0.3.2 (P0.3): a checkpoint row has no file to scrub, but its
+            // digest described a state that contained the purged note. It is
+            // an hash of the whole state — not readable data — yet from here
+            // on it is unverifiable and there is no reason to keep it: NULL,
+            // with this purge's op_id in `redacted_by`.
             let Some(file) = file else {
+                let redacted = Self::redacted_by(&inner.conn, seq, &purge_op_id)?;
+                inner.conn.execute(
+                    "UPDATE snapshots SET state_digest = NULL, redacted_by = ?2
+                     WHERE seq = ?1",
+                    rusqlite::params![seq, redacted],
+                )?;
                 continue;
             };
             let snap_path = self
