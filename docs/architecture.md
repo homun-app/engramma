@@ -31,14 +31,25 @@ engramma-core
 │   │            rehash) so the old note's closure stays replayable;
 │   │            secure_delete + VACUUM leave no body byte in the file.
 │   └── schema.rs  v5: op_payloads + the v1→v2 migration (v1 chain verified
-│                first, bookmarked in meta); v6: snapshots; v7: vault_files.
-├── cell/       compact(seq): VACUUM INTO a snapshot of the cell as it
-│               stands, registered with its head hash and state_digest
-│               (blake3 of the canonical dump of the logical tables — the
-│               same rendering verify compares); the payloads ≤ seq are
-│               forgotten. verify restores the snapshot (backup API),
-│               checks its digest, re-applies the cut and replays the tail;
+│                first, bookmarked in meta); v6: snapshots; v7: vault_files;
+│                v8: snapshots.redacted_by; v9: one file per note
+│                (UNIQUE(note_id) on vault_files).
+├── cell/       compact(seq): VACUUM INTO a snapshot of the cell, then strip
+│               it to the LOGICAL state (v0.3.1): payloads ≤ seq, vectors,
+│               model registry, vault bindings and the FTS content go —
+│               derived or recomputable, and all of them carry content.
+│               Registered with its head hash and state_digest (blake3 of
+│               the canonical dump of the logical tables — the same
+│               rendering verify compares); only the LAST snapshot stays.
+│               verify restores the snapshot (backup API), brings it to the
+│               current schema, rebuilds its FTS from the living notes,
+│               re-applies the cut (idempotent) and replays the tail;
 │               changes_since below the cut is CellError::Compacted.
+│               purge reaches the snapshot files too: same state purge and
+│               log scrub, new digest recorded under the same head hash
+│               with redacted_by naming the purge ops — verify accepts a
+│               redacted digest exactly when the tail replay, purges
+│               included, reproduces the live state (spec §6.4).
 └── search/     the graph list as a THIRD list of the fusion: PPR scores of
                 the notes (seeds out), scaled by the list maximum; convex
                 (1−w)·fused + w·g (RRF: weighted rank reciprocal), w = 0.40

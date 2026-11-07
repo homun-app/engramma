@@ -221,13 +221,17 @@ PRAGMA is an error, never a silent success.
 
 ### `engramma compact [--keep-last N]`
 
-Snapshots the cell exactly as it stands (`VACUUM INTO
-<cella>-snap-<seq>.sqlite`, registered with its head hash and its state
-digest), then forgets the payloads of every operation up to
-`head − N` (default `keep-last` 1000): the skeletons and the hash chain
-stay whole. `verify` restores the snapshot into memory, checks its
-digest and replays only the tail; `changes_since` below the snapshot
-answers `Compacted` (a replica restarts from the snapshot).
+Snapshots the cell (`VACUUM INTO <cella>-snap-<seq>.sqlite`) and strips
+the file to its **logical state**: the payloads up to `head − N` (default
+`keep-last` 1000), the vectors, the model registry, the vault bindings
+and the FTS content go (derived or recomputable — and all of them carry
+content). The skeletons and the hash chain stay whole; the row records
+the head hash and the state digest, and only the **last** snapshot stays
+on disk. `verify` restores the snapshot into memory, checks its digest
+and replays only the tail; `changes_since` below the snapshot answers
+`Compacted` (a replica restarts from the snapshot). A later `purge`
+scrubs the snapshot file too, and its row records the redacted digest
+with `redacted_by` naming the purge (spec §6.4).
 
 ### `engramma vault init <dir> | sync [dir] [--allow-deletions] | watch [dir]`
 
