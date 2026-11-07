@@ -1746,3 +1746,348 @@ $ engramma --root $T consolidate
 5. **La guardia della vista** scatta per percentuale nei vault piccoli:
    una soglia minima assoluta (per esempio «meno di 5 file non conta»)
    sarebbe più usabile; la lettera del prompt diceva altrimenti.
+
+# REPORT — Engramma v0.3.1 (correzioni della verifica v0.3)
+
+Data: 2026-11-07. Base: `main` @ `755b304` (tag `fase-v0.3`). Dodici
+commit, uno per punto più le pulizie; il test rosso prima della correzione
+per ogni punto; ogni commit compila e passa i test da solo (l'obbligo che la
+v0.3 aveva violato). Tutto offline, Rust 1.95, macOS arm64, nessuna crate
+nuova, nessun `unsafe`, nessun `unwrap`/`expect` fuori dai test.
+
+## Punto 1 — l'FTS tiene le radici, l'optimize le scaccia
+
+Il test della v0.3 cercava la parola intera; l'indice conserva le radici
+dopo lo stemmer, e i segmenti vecchi le tengono anche dopo il `'delete'`
+(che scrive una lapide in un segmento NUOVO). `purge` esegue ora
+`INSERT INTO notes_fts(notes_fts) VALUES('optimize')` dentro la finestra di
+`secure_delete`: i segmenti si fondono, le voci cancellate se ne vanno, le
+pagine liberate si azzerano. Costo a 100k: dentro la purge completa
+(3,4–4,1 s, tabella sotto); il `sample` della purge non lo isola ma
+l'optimize è O(indice) una tantum.
+
+Il test dell'oblio (`tests/forgetting.rs`) cerca **ogni radice** dei
+termini del corpo — passate dallo stemmer del motore, non la sola parola
+intera — nel file grezzo: rosso prima della correzione («quokkaviolace»
+sopravviveva), verde dopo.
+
+## Punto 2 — il WAL si tronca, e la purge non mente
+
+Dopo il `VACUUM`, `PRAGMA wal_checkpoint(TRUNCATE)`; se un lettore tiene
+una transazione aperta il checkpoint risponde busy e la purge risponde
+`PurgeReport { forgotten_payloads, scrubbed: false, pending: ["wal"] }`:
+il retry scatta alla scrittura successiva e alla chiusura della cella
+(`Cell::scrub_state()` interroga lo stato), la CLI esce con **codice 5**.
+Nel percorso di purge non c'è più alcun `let _ =`: un `VACUUM` o PRAGMA
+fallito è un errore (e `PRAGMA secure_delete` si legge come l'intero che
+è: prima il fallback silenzioso lo scriveva sempre come stringa). Il busy
+timeout si accorza a 250 ms intorno al checkpoint: con i 10 s della cella
+un lettore lento avrebbe stallato la purge dieci secondi per dire «busy».
+
+Dichiarazione: il pending vive in memoria; un processo che muore con il
+WAL non troncato lascia i frame al prossimo checkpoint esplicito o alla
+prossima purge — la riga non dice mai «fatto» ma nemmeno sopravvive al
+riavvio.
+
+## Punto 3 — la purge raggiunge le istantanee
+
+Ogni istantanea registrata riceve la stessa transizione di stato e lo
+stesso lavaggio del registro (payload dimenticati, supersede censurate),
+poi optimize di FTS e VACUUM; la riga aggiorna il digest tenendo
+`head_hash` come documento storico e la colonna nuova `redacted_by`
+(migrazione v8) registra gli op_id delle purge applicate al file.
+
+La parte delicata era la CENSURA dentro l'istantanea: il vivo e la copia
+devono produrre lo stesso registro. Il sale della censura diventa
+deterministico (blake3 dell'op_id: il corpo censurato non contiene più
+nulla della nota purgata, non c'è nulla da scoppiare), e le supersede il
+cui payload il vivo ha GIÀ dimenticato col taglio di compattazione
+nell'istantanea si cancellano e basta — il digest originale deve restare
+quello del vivo. `verify` accetta un digest redatto solo se il rigioco
+della coda — purge comprese, sono operazioni in coda — dà lo stato vivo;
+la posizione dell'istantanea si trova per l'ultimo op_id del file (la
+censura rehash la coda), e il vincolo sull'head_hash resta per le
+istantanee mai redatte. Regola scritta in `spec/format-v0.md` §6.4.
+
+## Punto 4 — l'istantanea è lo stato logico, e resta sola
+
+Dopo `VACUUM INTO` il file viene spogliato: payload fino al taglio,
+vettori, registro dei modelli, legami della vista, contenuto FTS
+(`delete-all`: si ricostruisce — e `verify` lo ricostruisce dalle sole
+note vive prima di rigiocare la coda, perché il comando `rebuild`
+indicerebbe anche le lapidi). Poi `VACUUM` e digest di ciò che resta. Si
+tiene solo l'ultima: nuova scritta, riga registrata, poi vecchia riga (per
+`(seq, file)`: alla stessa testa il seq si riusa e la riga nuova deve
+sopravvivere — trovato dal proptest) e vecchio file. Una riga fantasma
+senza file (crash tra riga e file) la droppa la prossima purge; la più
+recente che manca è un errore, non un silenzio.
+
+**Spazio, cella + istantanea** (banco, mediana di 3; «totale dopo» è ciò
+che occupa davvero la directory):
+
+| corpus | prima (cella) | dopo: cella | istantanea | totale dopo | copia piena sarebbe |
+|---|---|---|---|---|---|
+| 10k | 24,3 MB | 19,2 MB | 18,1 MB | 37,3 MB | ≈ 24,3 MB |
+| 100k | 246,1 MB | 189,9 MB | 179,0 MB | 368,9 MB | ≈ 246,1 MB |
+
+Con le copie piene della v0.3 il totale dopo era cella + una copia
+integra per OGNI compattazione mai fatta (a mano: due compact → due
+istantanee, la più grande della cella di partenza). Ora: una sola
+istantanea, logicamente più piccola della cella viva (−27% a 100k), e il
+taglio resta riapplicato in `verify` come passo idempotente — alle copie
+piene delle celle v0.3 serve ancora, alle nuove non costa nulla.
+
+Proptest esteso: operazioni, `compact` e `purge` in ordine casuale →
+verify ok e nessuna radice delle note purgate in nessun file (parole
+inventate a prefisso distinto: lo stem di una parola purgata non può
+essere sottostringa di una viva — il primo generatore, col suffisso
+discriminante, produceva falsi positivi).
+
+## Punto 5 — l'intestazione Obsidian si legge
+
+`format::parse_obsidian` (nuova): con `MissingField` l'intestazione
+dell'utente si LEGGE — `title` (senza: il nome del file senza estensione,
+come in Obsidian), `tags` (lista o stringa), `aliases` conservati, `type`
+se valido, `created`/`date` se data — le chiavi sconosciute vanno in
+`extensions` e restano nel file, il corpo è quello dopo l'intestazione, i
+warning restano. La modalità import di `parse` ora CONSERVA le chiavi
+sconosciute nelle estensioni (prima: warning e butto — il giro
+dell'informazione mangiava i campi dell'utente); la strict rifiuta ancora,
+e le chiavi dei campi standard con valori inutilizzabili si scartano col
+warning per non duplicare la riga che il serializzatore possiede. La
+riscrittura con l'id fonde: un solo blocco `---`. Vale per
+`import --obsidian` e per la vista.
+
+Dichiarazione: l'export di una nota con chiavi dell'utente le porta di
+ferro nel file, e solo un'importazione in modalità import le rilegge (le
+cartelle Engramma restano strict); la proprietà export→import senza
+perdite vale per le estensioni `x-*`, che è ogni nota nata in Engramma.
+
+## Punto 6 — una nota, un file
+
+La fase «note vive senza file → esporta» vede i legami creati nello
+stesso giro (prima: il file nuovo diventava nota E la fase esportava la
+copia `note/<slug>-<id8>.md`, due righe in `vault_files` e le modifiche
+che rimbalzavano). `vault_files` guadagna `UNIQUE(note_id)` (migrazione
+v9, con dedup delle righe doppie), `vault_file_put` al conflitto sul nota
+rilega al percorso nuovo. Una seconda copia con lo stesso id di un file
+ancora presente non è uno spostamento: il legame vince, la copia viene
+denunciata e lasciata stare — prima si rubavano il legame a vicenda a
+ogni sync. Il proptest del punto fisso genera anche file nuovi con
+intestazione Obsidian e verifica una riga e un file per nota.
+
+## Punto 7 — le multi-salto accettano solo la risposta
+
+`queries.json`: «chi è il marito della sorella di Giulia» attende ora
+Davide e la nota del matrimonio (non Sara, che è il passo intermedio);
+«dove lavora la sorella di Giulia» attende «Sara e la Biblioteca
+Angelica» (non la pagina di Sara, non il nome del luogo). In testo+grafo
+le cinque del file passano tutte nei primi 5. In ibrido le due domande
+sulla sorella restano fuori dai primi 5 — dichiarato nel test con i
+numeri, attesa non allargata:
+
+- «chi è il marito della sorella di Giulia» → [Giulia, Sara, Il
+  compleanno di Giulia, Fabio, Dott.ssa Conti]
+- «dove lavora la sorella di Giulia» → [Giulia lavora allo Studio Rossi,
+  Fabio, Giulia architetta, Sara, Studio Rossi]
+
+Il REPORT v0.3 citava due domande («il medico del partner di Fabio», «il
+capoprogetto per cui lavora Fabio») che in `queries.json` non sono mai
+state: la sezione è stata allineata alle cinque reali del file.
+
+## Punto 8 — l'hub non duplica
+
+Scelto «escludi le coppie hub-nota» (l'alternativa «stesso type» uccideva
+anche il doppione vero: il bagno dorato è un progetto contro un fatto).
+Una pagina `person`/`place` parla del proprio soggetto per costruzione:
+non duplica una nota di altro tipo. Test dorato: Luca ↔ «Luca e la
+matematica» (0,961) ed Elena ↔ «Il ruolo di Elena Bianchi» (0,954) fuori,
+il doppione del bagno dentro, nessuna coppia hub-nota.
+
+## Punto 9 — dove va il tempo di una put_note a 100k
+
+`engramma-bench --profile-insert --notes 100000 --seconds 25`, campionato
+con `sample` (12 s sulla costruzione, 8 s sulla fase sostenuta).
+Costruzione: 100 000 note in 75,5 s (1 324 note/s); sostenuta a cella
+piena: 871 put_note/s. Il profilo (inclusive, thread principale):
+
+- **≈ 69% nel commit** della transazione, di cui la gran parte nella
+  scrittura dei frame WAL (`pwrite` sotto `walWriteOneFrame` ≈ 32%
+  dell'intero thread) — è il prezzo di una transazione per nota;
+- ≈ 5% nel checkpoint automatico del WAL (scatta ogni 1000 pagine, sul
+  thread che scrive);
+- ≈ 24% in `ops::apply`, di cui `reindex_note` + `write_note` ≈ 4%
+  (rigenerazione FTS/entità della nota riscritta);
+- ≈ 1–4% nella preparazione delle istruzioni (una `prepare` per chiamata:
+  rusqlite non le mette in cache).
+
+Verdetto: nessuno spreco evidente oltre la soglia dichiarata — il tempo è
+nel commit WAL (le «due righe per operazione» ci stanno dentro: scheletro
+e payload sono due INSERT nella stessa transazione, due frame in più su
+cento pagine). Non si corregge; la preparazione memorizzabile delle
+istruzioni è la prima candidata se la v0.4 vorrà riprendersi il passo.
+
+## Punto 10 — la taratura congiunta α × peso del grafo
+
+`engramma-bench --calibrate --notes 100000 --runs 3`: griglia completa,
+97M, cache calda vera, MRR medio pesato per numero di domande (fattuali
+1913, parafrasi 1533, multi-salto 237, inglese 1001); a parità entro
+0,002 vince chi tiene le parafrasi.
+
+| α \ g | 0,25 | 0,30 | 0,35 | 0,40 | 0,50 |
+|---|---|---|---|---|---|
+| 0,4 | 0,8215 | 0,8368 | 0,8397 | 0,8390 | 0,6993 |
+| 0,5 | 0,8379 | 0,8425 | 0,8577 | 0,8577 | 0,7118 |
+| 0,6 | 0,8440 | 0,8483 | 0,8527 | **0,8656** | 0,7065 |
+| 0,7 | 0,8460 | 0,8497 | 0,8529 | 0,8552 | 0,7015 |
+
+**Vince α = 0,6 con grafo 0,40**: 0,8656 contro 0,8552 del predefinito
+v0.3 (oltre la barra di pareggio), multi-salto 0,795 contro 0,503,
+parafrasi 0,862. Nuovo predefinito della fusione convessa.
+
+Deriva dorata dichiarata (vault di 65 note: meno peso al testo, le
+pagine-persona salgono): «cosa mangia Fabio adesso» ha la risposta terza
+(era seconda; l'atteso entro i primi 5), «in che città si è trasferita la
+coppia?» risponde prima «Milano»/«Roma» (il fatto è sesto). Dichiarate
+nei test col numero, attese non allargate — stesso compromesso già
+dichiarato in v0.3 per il peso del grafo, ora leggermente più marcato.
+
+## Punto 11 — le colonne del banco dicono la verità
+
+La colonna «GraphIndex (ms)» stampava 0: la seconda `build_graph` del
+giro semantico misurava un no-op a caldo; ora la prima costruzione È la
+misura e il giro semantico la riusa. Le colonne «testo+grafo» di viva e
+uniform stampavano 0,0 perché i numeri vivevano solo nel rapporto
+semantico: diventano campi di ogni giro. L'intestazione dice v0.3. Il
+banco ora misura anche l'istantanea e il tempo di una purge a corpus
+pieno, e cancella DAVVERO le proprie celle (il nome dell'istantanea era
+costruito con `with_extension` e non corrispondeva: i file snap restavano
+in `T/engramma-bench`; la sonda fake non si ripuliva affatto — gli 885 MB
+della verifica).
+
+## Chiusura
+
+`cargo fmt --check`, `cargo clippy --all-targets --offline -- -D
+warnings`, `cargo test --offline --workspace` (**195 test** in debug,
+altrettanti in `--release`), `cargo deny check licenses bans`: verdi. (Flake
+noto preesistente: il test bearer-token di `engramma-embed/src/http.rs`
+in `--release` ogni tanto perde la gara sulla porta locale.)
+
+### Le latenze: ieri, oggi e il confronto A/B
+
+| misura (100k, 97M, mediana di 3) | v0.3 (ieri, REPORT) | v0.3 (ieri, RESULTS) | v0.3 (oggi, binario del tag) | v0.3.1 (oggi) |
+|---|---|---|---|---|
+| ibrido caldo p50 / p95 (ms) | 7,7 / 11,2 | 10,1 / 13,3 | **11,7 / 14,9** | 11,6–11,7 / 14,8 |
+| testo+grafo p50 / p95 (ms) | 7,6 / 10,5 | — (colonna rotta) | 9,1 / 12,3 | 9,1–9,2 / 12,4 |
+| solo vettori p50 / p95 (ms) | 4,2 / 4,7 | 4,2 / 4,7 | 4,5 / 5,1 | 4,4–4,5 / 5,1 |
+| inserimento (note/s) | 2 092 | 1 486–2 514 | 2 368–2 695 | 2 191–2 688 |
+
+I numeri assoluti di IERI e di OGGI non si confrontano: la macchina non
+era nello stesso stato (il testo p50 è identico, il grafo uguale al
+millisecondo, ma tutto ciò che tocca i vettori sale del 5–15%). Il
+confronto onesto è il binario del tag `fase-v0.3` contro questo albero,
+stesso giorno, stessa macchina: **11,7/14,9 contro 11,6–11,7/14,8** —
+nessuna regressione del codice (il +10% della soglia è rispettato
+alla lettera nel confronto like-for-like; contro i numeri di ieri del
+REPORT la differenza è della macchina, non delle modifiche — nessuna di
+esse tocca il percorso di ricerca, se non la costante α).
+
+**Il costo dell'oblio a corpus pieno**: una purge a 100k (taglio FTS
+`optimize`, `VACUUM`, checkpoint, lavaggio dell'istantanea) prende
+3,4–3,6 s sulla cella di solo testo (190 MB) e 4,1 s su quella col modello
+ready (407 MB). È un'operazione rara che deve durare quanto dura: la
+diritto all'oblio non si misura in millisecondi.
+
+Tabella completa e per-modalità in `bench/RESULTS.md`.
+
+### Prove a mano (uscite trascritte)
+
+Vault dorato importato, modello 97M pronto. La tabella P0 della verifica,
+ripetuta con le **radici**:
+
+```console
+$ engramma --root $T purge 01M6TKBRSY… --reason "prova oblio" --yes
+purgata: 01M6TKBRSY3YXAQZDXDY82Y29F (1 payload dimenticati)   # exit 0
+$ for n in quokkaviolace zibellinotrem segret parol ordin; do …
+quokkaviolace: sqlite=0 wal=0
+zibellinotrem: sqlite=0 wal=0
+segret: sqlite=0 wal=0
+parol: sqlite=0 wal=0
+ordin: sqlite=0 wal=0
+
+$ engramma --root $T compact --keep-last 1
+compattata fino a seq 69 (testa 70): …/default-snap-70.sqlite
+$ engramma --root $T purge 6XD3NDAC --reason "oblio dopo compattazione" --yes
+purgata: 01M6TKDBMXHN… (1 payload dimenticati)                # exit 0
+default.sqlite / ovovivipar: 0    default-snap-70.sqlite / ovovivipar: 0
+default.sqlite-wal / fluorescent: 0   default-snap-70.sqlite / fluorescent: 0
+$ engramma --root $T verify
+registro verificato: 71 operazioni, catena hash, ricostruzione e indice FTS a posto
+
+# con un lettore (transazione di lettura aperta in un altro processo):
+$ engramma --root $T purge … --reason "oblio col lettore" --yes
+purgata: … (1 payload dimenticati)
+engramma: oblio incompleto (wal): il WAL non è stato troncato, un lettore
+teneva la cella aperta; verrà ritentato alla prossima scrittura   # exit 5
+$ engramma --root $T add - …            # chiuso il lettore
+aggiunta: 01M6TKG0YPRZ…                 # la scrittura ritenta e completa
+rinocerontism: sqlite=0 wal=0           # nessuna radice
+```
+
+Il file Obsidian di P1 in un vault legato:
+
+```console
+$ cat $V/nuova-da-file.md
+---
+title: Nuova da file
+tags: [frutta]
+---
+[[Fabio]] ama i fichi.
+$ engramma --root $T vault sync $V
+nuove note da file: 1
+  - nuova-da-file.md
+$ cat $V/nuova-da-file.md            # UN blocco ---, i campi dell'utente
+---
+id: 01M6TKHWF6KR8RD0NA8XM28GKH       # (dell'utente), l'id fuso dentro
+type: note
+title: Nuova da file
+tags: [frutta]
+source: import:obsidian/nuova-da-file.md
+…
+---
+[[Fabio]] ama i fichi.
+$ find $V -name "nuova*"              # UN solo file: nessuna copia note/
+…/vault/nuova-da-file.md
+$ engramma --root $T vault sync $V
+nulla da fare
+```
+
+## Cosa non ho potuto provare
+
+- **Windows e Linux**: solo macOS arm64, come nelle fasi precedenti.
+- **cargo deny advisories**: richiede rete; eseguito `licenses bans`.
+- **Il 311M a 100k**: come v0.2.1/v0.3, dichiarato (il 97M resta il
+  predefinito); il 311M a 10k è nel banco.
+- **La migrazione di celle v0.3 vere con istantanee**: le celle di test
+  sono costruite dal motore stesso; una copia piena v0.3 attraversa la
+  verify grazie al taglio riapplicato e alla migrazione di schema sulla
+  copia ripristinata (test `compact_makes_a_logical_snapshot…`), ma non
+  ho aperto una cella prodotta dal binario del tag CON istantanee già
+  registrate — la migrazione v8/v9 non tocca i dati, solo la riga e
+  l'indice.
+
+## Domande aperte per la v0.4
+
+1. **Il compromesso α=0,6**: il multi-salto a 100k guadagna molto (0,503 →
+   0,795) e le parafrasi a 100k tengono, ma il vault piccolo vede le
+   pagine-persona sopra le risposte più spesso di v0.3. Un peso che
+   dipenda dalla densità del grafo resta il candidato.
+2. **Il pending del WAL è in memoria**: un flag in `meta` sopravvivrebbe
+   al crash (a costo di un'operazione fuori registro — da decidere se la
+   cosa importa davvero).
+3. **Le istruzioni preparate per ogni scrittura** (~1–4% della put_note):
+   una cache di statement in `Inner` è il primo passo se l'inserimento
+   dovesse tornare al passo della v0.2.1.
+4. **Le due multi-salto ibride fuori dai primi 5** sul vault dorato: la
+   catena c'è (il testo+grafo le risolve), è il rango che manca — il
+   punto 1 le copre in parte.
