@@ -1328,6 +1328,14 @@ fn run_semantic(
             convex(0.7, engramma_core::CosNorm::Candidates),
             None,
         );
+        // v0.3.2 (P2.10): THE DEFAULT — convex 0.6 with graph weight 0.40
+        // (the v0.3.1 winner). The table never carried it.
+        score_mode(
+            "mm-0.6-g0.40",
+            'h',
+            convex(0.6, engramma_core::CosNorm::Candidates),
+            Some(0.4),
+        );
         // the tuning references (the full sweep is in REPORT §v0.3)
         for gw in [0.25_f64, 0.40] {
             let tag = format!("mm-0.7-g{gw:.2}");
@@ -1664,6 +1672,7 @@ fn markdown(reports: &[RunReport], runs: usize) -> String {
                 "mm-0.3",
                 "mm-0.5",
                 "mm-0.7",
+                "mm-0.6-g0.40",
                 "mm-0.7-g0.25",
                 "mm-0.7-g0.40",
             ];
@@ -1919,8 +1928,11 @@ fn calibrate(target: usize, runs: usize, dir: &std::path::Path) {
     let now = OffsetDateTime::from_unix_timestamp(1_810_000_000).expect(/* fixed */ "ts");
     let sem = Semantic::new(Arc::clone(&embedder));
     let categories = ["fattuali", "parafrasi", "multi-salto", "inglese"];
+    // v0.3.2 (P2.10): 0.45 joins the grid — the 0.40 graph weight sits just
+    // before a collapse (0.50 loses ~0.15 of weighted MRR), and the edge of
+    // the cliff had never been measured.
     let alphas = [0.4_f64, 0.5, 0.6, 0.7];
-    let weights = [0.25_f64, 0.30, 0.35, 0.40, 0.50];
+    let weights = [0.25_f64, 0.30, 0.35, 0.40, 0.45, 0.50];
     // one grid round: per configuration, per category (recall, mrr, n)
     type Grid = Vec<((f64, f64), Vec<(f64, f64, usize)>)>;
     let mut rounds: Vec<Grid> = Vec::new();
@@ -1983,10 +1995,18 @@ fn calibrate(target: usize, runs: usize, dir: &std::path::Path) {
         alpha: f64,
         weight: f64,
         weighted_mrr: f64,
+        /// The WORST weighted MRR among this configuration and its grid
+        /// neighbours (±1 step of α and of the graph weight, the points
+        /// that exist): v0.3.2's robust choice rule — a corpus that shifts
+        /// a little must not fall into the collapse.
+        worst_mrr: f64,
         para_mrr: f64,
         multi_mrr: f64,
     }
+    // (alpha, graph weight, weighted MRR) first, then the neighbourhood
+    // minimum needs them all
     let mut rows: Vec<Row> = Vec::new();
+    let mut rows_so: Vec<(f64, f64, f64)> = Vec::new();
     for (i, ((alpha, gw), _)) in rounds[0].iter().enumerate() {
         let cat_mrr = |ci: usize| -> f64 {
             let mut v: Vec<f64> = rounds.iter().map(|g| g[i].1[ci].1).collect();
@@ -2001,20 +2021,46 @@ fn calibrate(target: usize, runs: usize, dir: &std::path::Path) {
             .map(|(m, n)| m * *n as f64)
             .sum::<f64>()
             / total_q.max(1) as f64;
+        rows_so.push((*alpha, *gw, weighted));
+        // the worst case among the neighbours (±1 step of α and of the
+        // graph weight — the grid points that exist; the edges of the grid
+        // simply have fewer of them)
+        let idx = |hay: &[f64], needle: f64| -> usize {
+            hay.iter()
+                .position(|v| (*v - needle).abs() < 1e-9)
+                .unwrap_or(0)
+        };
+        let ai = idx(&alphas, *alpha);
+        let gi = idx(&weights, *gw);
+        let worst = rows_so
+            .iter()
+            .filter(|(a, g, _)| {
+                (idx(&alphas, *a).abs_diff(ai) <= 1) && (idx(&weights, *g).abs_diff(gi) <= 1)
+            })
+            .map(|(_, _, m)| *m)
+            .fold(f64::INFINITY, f64::min);
         rows.push(Row {
             alpha: *alpha,
             weight: *gw,
             weighted_mrr: weighted,
+            worst_mrr: worst,
             para_mrr: mrrs[1],
             multi_mrr: mrrs[2],
         });
     }
     println!("# Taratura congiunta α × peso grafo ({target} note, 97M, mediana di {runs} giri)");
     println!(
-        "criterio: MRR medio pesato per numero di domande; a parità entro 0,002 vince chi tiene le parafrasi"
+        "criterio robusto (v0.3.2): MRR medio pesato per numero di domande,          NEL CASO PEGGIORE DEI VICINI (minimo su ±1 passo di α e del peso);          a parità entro 0,002 vince chi tiene le parafrasi"
     );
-    println!("| α \\ g | 0.25 | 0.30 | 0.35 | 0.40 | 0.50 |");
-    println!("|---|---|---|---|---|---|");
+    println!(
+        "| α \\ g | {} |",
+        weights
+            .iter()
+            .map(|g| format!(" {g:.2} "))
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+    println!("|---{}|", "|---".repeat(weights.len()));
     for &alpha in &alphas {
         let cells: Vec<String> = weights
             .iter()
@@ -2027,13 +2073,35 @@ fn calibrate(target: usize, runs: usize, dir: &std::path::Path) {
             .collect();
         println!("| {alpha:.1} | {} |", cells.join(" | "));
     }
-    // the declared criterion: best weighted MRR; within 0.002 the one that
-    // keeps the paraphrases wins
+    println!("\nIl minimo dei vicini (la robustezza):\n");
+    println!(
+        "| α \\ g | {} |",
+        weights
+            .iter()
+            .map(|g| format!(" {g:.2} "))
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+    println!("|---{}|", "|---".repeat(weights.len()));
+    for &alpha in &alphas {
+        let cells: Vec<String> = weights
+            .iter()
+            .map(|gw| {
+                rows.iter()
+                    .find(|r| r.alpha == alpha && (r.weight - gw).abs() < 1e-9)
+                    .map(|r| format!("{:.4}", r.worst_mrr))
+                    .unwrap_or_else(|| "—".into())
+            })
+            .collect();
+        println!("| {alpha:.1} | {} |", cells.join(" | "));
+    }
+    // the declared criterion: best WORST-of-neighbours weighted MRR; within
+    // 0.002 the one that keeps the paraphrases wins
     let wins = |a: &Row, b: &Row| -> bool {
-        if a.weighted_mrr > b.weighted_mrr + 0.002 {
+        if a.worst_mrr > b.worst_mrr + 0.002 {
             return true;
         }
-        (a.weighted_mrr - b.weighted_mrr).abs() <= 0.002 && a.para_mrr > b.para_mrr
+        (a.worst_mrr - b.worst_mrr).abs() <= 0.002 && a.para_mrr > b.para_mrr
     };
     let mut best: &Row = &rows[0];
     for r in &rows[1..] {
@@ -2043,8 +2111,8 @@ fn calibrate(target: usize, runs: usize, dir: &std::path::Path) {
     }
     let b = best;
     println!(
-        "vincitore: α = {}, peso grafo = {} (MRR pesato {:.4}, parafrasi {:.4}, multi-salto {:.4})",
-        b.alpha, b.weight, b.weighted_mrr, b.para_mrr, b.multi_mrr
+        "vincitore (robusto): α = {}, peso grafo = {} (MRR pesato {:.4}, caso peggiore dei vicini {:.4}, parafrasi {:.4}, multi-salto {:.4})",
+        b.alpha, b.weight, b.weighted_mrr, b.worst_mrr, b.para_mrr, b.multi_mrr
     );
     drop(cell);
     for suffix in ["", "-wal", "-shm"] {

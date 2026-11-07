@@ -56,6 +56,15 @@ impl FakeServer {
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // macOS/BSD: the socket returned by `accept`
+                        // INHERITS O_NONBLOCK from the listener (Linux does
+                        // not). Without the reset, a request still in flight
+                        // makes `handle`'s first read answer WouldBlock,
+                        // which was treated as an error: the connection
+                        // closed with no response (the ~1-in-10 flake of
+                        // the bearer-token and download tests; the slow
+                        // client test makes the window deterministic).
+                        let _ = stream.set_nonblocking(false);
                         let respond = &respond;
                         handle(stream, respond, &recorded2);
                     }
@@ -183,4 +192,31 @@ where
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// macOS/BSD: the socket returned by `accept` inherits O_NONBLOCK from the
+/// listener. A client that hesitates between connect and send makes the
+/// window deterministic: without the reset, `handle`'s first read answers
+/// WouldBlock, the connection dies with no response — the ~1-in-10 flake
+/// of the bearer-token and download tests, made reproducible.
+#[test]
+fn a_slow_client_still_gets_its_response() {
+    let server = FakeServer::start(|_| (200, "{\"data\":[]}".into()));
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", server.port))
+        .expect(/* test-only */ "connect");
+    // the request is LATE: 150 ms after the connection, the server has
+    // already accepted and is reading
+    std::thread::sleep(Duration::from_millis(150));
+    let req = b"GET /v1/embeddings HTTP/1.1\r\nHost: x\r\n\r\n";
+    s.write_all(req).expect(/* test-only */ "send");
+    s.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect(/* test-only */ "timeout");
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    let answer = String::from_utf8_lossy(&buf);
+    assert!(
+        answer.starts_with("HTTP/1.1 200"),
+        "the slow client must still get its answer: {answer}"
+    );
+    assert_eq!(server.requests().len(), 1);
 }
