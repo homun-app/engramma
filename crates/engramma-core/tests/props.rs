@@ -362,6 +362,14 @@ proptest! {
                 }
             }
         }
+        // a seed can draw the purge arm zero times: force one so every
+        // case really exercises the forgetting path
+        if purged_words.is_empty()
+            && let Some((id, words)) = living.first().cloned()
+            && cell.purge(&id, "prop", "prop").is_ok()
+        {
+            purged_words.extend(words);
+        }
         prop_assert!(
             !purged_words.is_empty(),
             "the mix must purge something (seed {seed})"
