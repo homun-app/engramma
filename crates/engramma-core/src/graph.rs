@@ -49,6 +49,46 @@ const MENTION_WEIGHT: f64 = 0.25;
 /// 4 096 default — the v0.2.1 256 made "warm" benchmarks re-embed).
 pub const QUERY_CACHE_CAPACITY: usize = 4_096;
 
+/// The name key of [`GraphIndex::names`] (v0.4, P1.4): the §6.1
+/// normalization without stemming — lowercase, Latin diacritics folded,
+/// tokens (non-alphanumeric splits) joined by one space. Entity names are
+/// proper nouns: their stem would lose the very thing being matched.
+fn normalize_name(name: &str) -> String {
+    let folded = crate::text::strip_diacritics(&name.to_lowercase());
+    let tokens: Vec<&str> = folded
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    tokens.join(" ")
+}
+
+/// The `aliases` of a note's canonical frontmatter JSON, verbatim.
+fn aliases_of(frontmatter_json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(frontmatter_json) else {
+        return Vec::new();
+    };
+    v.get("x")
+        .and_then(|x| x.as_array())
+        .map(|exts| {
+            exts.iter()
+                .filter_map(|ext| {
+                    let mut it = ext.as_array()?.iter();
+                    let key = it.next()?.as_str()?;
+                    if key != "aliases" {
+                        return None;
+                    }
+                    it.next()?.as_array().map(|vals| {
+                        vals.iter()
+                            .filter_map(|a| a.as_str().map(str::to_string))
+                            .collect::<Vec<String>>()
+                    })
+                })
+                .flatten()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// u32 node/relation ids to vector indexes (u32 always fits usize here).
 fn ix(n: u32) -> usize {
     n as usize
@@ -214,6 +254,11 @@ pub(crate) struct GraphIndex {
     real_edges: usize,
     /// Live adjacencies of both kinds.
     live_edges: usize,
+    /// v0.4 (P1.4): normalized name → node, for the question's entities.
+    /// Entity names (any case) plus the `aliases` of entity-notes.
+    names: HashMap<String, u32>,
+    /// The aliases each entity-note gave, to drop them when it rewrites.
+    aliases_of_note: HashMap<u32, Vec<String>>,
 }
 
 impl GraphIndex {
@@ -241,6 +286,8 @@ impl GraphIndex {
             window_strings: Vec::new(),
             real_edges: 0,
             live_edges: 0,
+            names: HashMap::new(),
+            aliases_of_note: HashMap::new(),
         };
         let mut raw: Vec<RawEdge> = Vec::new();
         {
@@ -311,7 +358,108 @@ impl GraphIndex {
         }
         gi.real_edges = raw.len();
         gi.place(all);
+        gi.index_names(conn)?;
         Ok(gi)
+    }
+
+    /// Fill [`GraphIndex::names`] (v0.4, P1.4): every entity name, plus the
+    /// `aliases` of the notes that ARE entities. The key is the index-side
+    /// normalization of §6.1 — lowercase, Latin diacritics folded, tokens
+    /// joined by one space — so «Anna Ròssi» and «anna rossi» are one.
+    ///
+    /// # Errors
+    /// [`SearchError::Db`] on SQL failure.
+    fn index_names(&mut self, conn: &Connection) -> Result<(), SearchError> {
+        let mut entity_of_note: HashMap<String, String> = HashMap::new();
+        {
+            let mut stmt = conn.prepare("SELECT name, note_id FROM entities")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))?;
+            for row in rows {
+                let (name, note_id) = row?;
+                let node = self.intern_entity(&name, &name);
+                self.names.insert(normalize_name(&name), node);
+                if let Some(nid) = note_id {
+                    entity_of_note.insert(nid, name);
+                }
+            }
+        }
+        // the aliases of the entity-notes: `x: [["aliases", [...]]]` in the
+        // note's canonical JSON
+        let mut stmt = conn.prepare("SELECT id, frontmatter_json FROM notes")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (id, fm) = row?;
+            if !entity_of_note.contains_key(&id) {
+                continue;
+            }
+            let Some(node) = entity_of_note
+                .get(&id)
+                .and_then(|name| self.node_of_entity(name))
+            else {
+                continue;
+            };
+            let aliases = aliases_of(&fm);
+            if aliases.is_empty() {
+                continue;
+            }
+            for a in &aliases {
+                self.names.insert(normalize_name(a), node);
+            }
+            self.aliases_of_note.insert(node, aliases);
+        }
+        Ok(())
+    }
+
+    /// Drop and re-read one note's names (v0.4, P1.4): its entity note's
+    /// aliases may have changed with the write.
+    ///
+    /// # Errors
+    /// [`SearchError::Db`] on SQL failure.
+    fn patch_names(&mut self, conn: &Connection, id: &Ulid) -> Result<(), SearchError> {
+        let key = format!("note:{id}");
+        let Some(node) = self.node_map.get(&key).copied() else {
+            return Ok(());
+        };
+        if let Some(old) = self.aliases_of_note.remove(&node) {
+            for a in old {
+                self.names.remove(&normalize_name(&a));
+            }
+        }
+        let name: Option<String> = conn
+            .query_row(
+                "SELECT name FROM entities WHERE note_id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .ok();
+        let Some(name) = name else {
+            return Ok(());
+        };
+        // the fresh name joins the index (a renamed entity leaves the old
+        // key pointing at the same node until the next full rebuild — a
+        // harmless stale alias, declared)
+        let named = self.intern_entity(&name, &name);
+        self.names.insert(normalize_name(&name), named);
+        let fm: Option<String> = conn
+            .query_row(
+                "SELECT frontmatter_json FROM notes WHERE id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .ok();
+        let aliases = fm.as_deref().map(aliases_of).unwrap_or_default();
+        if !aliases.is_empty() {
+            for a in &aliases {
+                self.names.insert(normalize_name(a), node);
+            }
+            self.aliases_of_note.insert(node, aliases);
+        }
+        Ok(())
+    }
+
+    /// The node an entity name (or alias) points to, by its normalized key.
+    pub(crate) fn node_of_name(&self, normalized: &str) -> Option<u32> {
+        self.names.get(normalized).copied()
     }
 
     /// Counting-sort `edges` into the CSR arrays and fill the side indexes.
@@ -619,6 +767,8 @@ impl GraphIndex {
         if let Some(n) = self.node_map.get(&key).copied() {
             self.drop_note_edges(n);
         }
+        // v0.4 (P1.4): the note's aliases follow its rewrite
+        self.patch_names(conn, id)?;
         // Re-read what the table says now.
         let mut stmt = conn.prepare(
             "SELECT src, rel, dst, note_id, valid_from, valid_to, status FROM edges WHERE note_id = ?1",

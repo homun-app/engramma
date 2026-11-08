@@ -77,6 +77,27 @@ pub struct Weights {
     pub ppr_epsilon: f64,
     /// Degree above which a node's outflow is damped (`θ/deg`), GAAMA-style.
     pub hub_theta: f64,
+    /// v0.4 (P1.4): how the graph walk starts. The default until this phase
+    /// is retuned is [`GraphSeeding::Fused`] — exactly the v0.3.2 behavior.
+    pub graph_seeding: GraphSeeding,
+}
+
+/// How the personalised-PageRank walk is seeded (v0.4, P1.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GraphSeeding {
+    /// v0.3.2: the strongest fused candidates only, mass ∝ their score.
+    Fused,
+    /// HippoRAG 2-style: the entities the QUESTION names (exact match on
+    /// 1–3 consecutive words against entity names and the aliases of
+    /// entity-notes, normalized like the index) carry the mass, plus the
+    /// fused candidates with `seed_passage_weight ×` their normalized
+    /// score (HippoRAG 2's flat 0.05). **Gate:** a question that names no
+    /// graph entity does not wake the graph at all — the fused list
+    /// stands, and `explain` says so.
+    Question {
+        /// The fused candidates' share (start at 0.05, as HippoRAG 2).
+        seed_passage_weight: f64,
+    },
 }
 
 impl Default for Weights {
@@ -90,6 +111,7 @@ impl Default for Weights {
             ppr_alpha: 0.25,
             ppr_epsilon: 1e-4,
             hub_theta: 50.0,
+            graph_seeding: GraphSeeding::Fused,
         }
     }
 }
@@ -180,6 +202,11 @@ pub struct Explain {
     pub winning_chunk: Option<usize>,
     /// Graph path that led here, e.g. `[[Giulia]] -lives_in-> [[Milano]]`.
     pub via: Option<String>,
+    /// The graph's say for this QUERY (v0.4, P1.4/P1.5) — the same for
+    /// every hit of one search: the weight the graph list ended up with
+    /// and, when it stayed off, why. `None` when the graph never ran
+    /// (`graph_hops = 0` or weight 0).
+    pub graph: Option<GraphExplain>,
     /// Confidence weight applied.
     pub confidence: Confidence,
     /// Validity start.
@@ -203,12 +230,25 @@ impl Default for Explain {
             support: None,
             winning_chunk: None,
             via: None,
+            graph: None,
             confidence: Confidence::Stated,
             valid_from: None,
             valid_to: None,
             source: String::new(),
         }
     }
+}
+
+/// What the graph did for one query (v0.4): per-query, carried by every
+/// hit's explain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphExplain {
+    /// The weight the graph list ended up with in the fusion (`0.0` when
+    /// the gate closed).
+    pub weight: f64,
+    /// Why the graph stayed off, when it did («grafo spento: nessuna
+    /// entità nominata», P1.4).
+    pub off: Option<&'static str>,
 }
 
 /// One search result.
@@ -788,7 +828,8 @@ impl Cell {
         }
 
         // 3. Seeds for the graph push: the strongest filtered candidates,
-        // normalised (mass ∝ bm25_norm).
+        // normalised (mass ∝ bm25_norm) — the passage half of the starting
+        // vector, whichever [`GraphSeeding`] is at work.
         let max_bm25 = text_candidates
             .iter()
             .map(|(_, b, _, _)| *b)
@@ -800,14 +841,34 @@ impl Cell {
             .map(|(id, b, _, _)| (id.clone(), *b / max_bm25))
             .collect();
 
-        // 4. The graph list: a personalised-PageRank push from the seeds over
-        // the in-memory CSR (§6.3.3). Edges declared by quarantined or
-        // deleted notes never carry mass unless asked for; `as_of` skips
-        // edges that were not valid then.
-        let (glist, _pushed) = if q.graph_hops > 0 && !seeds.is_empty() {
-            graph_list(&inner, q, &seeds)?
+        // 4. The graph list: a personalised-PageRank push over the in-memory
+        // CSR (§6.3.3). Edges declared by quarantined or deleted notes never
+        // carry mass unless asked for; `as_of` skips edges that were not
+        // valid then. v0.4 (P1.4): with question-entity seeding a query
+        // that names no entity gates the graph off.
+        let graph_ran = q.graph_hops > 0 && q.weights.graph_weight > 0.0;
+        let (glist, _pushed, graph_say) = if graph_ran {
+            match q.weights.graph_seeding {
+                GraphSeeding::Question { .. } => graph_list(&inner, q, &seeds)?,
+                GraphSeeding::Fused if !seeds.is_empty() => graph_list(&inner, q, &seeds)?,
+                GraphSeeding::Fused => (
+                    Vec::new(),
+                    0,
+                    GraphExplain {
+                        weight: 0.0,
+                        off: None,
+                    },
+                ),
+            }
         } else {
-            (Vec::new(), 0)
+            (
+                Vec::new(),
+                0,
+                GraphExplain {
+                    weight: 0.0,
+                    off: None,
+                },
+            )
         };
         let g_of: HashMap<&str, &GraphEntry> = glist.iter().map(|e| (e.id.as_str(), e)).collect();
         let w_g = q.weights.graph_weight.clamp(0.0, 1.0);
@@ -919,6 +980,12 @@ impl Cell {
                 .then_with(|| a.note.id.to_string().cmp(&b.note.id.to_string()))
         });
         hits.truncate(q.k);
+        // v0.4 (P1.4): every hit carries the graph's say for this query
+        if graph_ran {
+            for h in &mut hits {
+                h.explain.graph = Some(graph_say.clone());
+            }
+        }
         Ok(hits)
     }
 
@@ -1359,35 +1426,137 @@ const GRAPH_LIST_LEN: usize = 50;
 /// used ten, but ten hybrid seeds are mostly same-neighbourhood noise, and
 /// every extra seed spends its mass on its own neighbourhood — the wrong
 /// partners of same-surname people surfaced above the right one (measured on
-/// the 10k multi-hop diagnostics).
+/// the 10k multi-hop diagnostics). With question-entity seeding (v0.4,
+/// P1.4) they ride WITH the entities, at `seed_passage_weight` — the
+/// HippoRAG 2 passage share.
 const GRAPH_SEEDS: usize = 3;
 
-/// Run the personalised-PageRank push from the fused seeds and build the
-/// third list. Seeds are `(note id, fused score)` with scores normalised to
-/// sum ~1 — the mass a seed carries into the walk.
+/// What the gate says when it closes (P1.4): the question named no entity
+/// of the graph, so the walk never starts.
+const GRAPH_OFF_NO_ENTITY: &str = "grafo spento: nessuna entità nominata";
+
+/// The graph entities a question names (v0.4, P1.4): its 1–3-word groups,
+/// normalized like the index (lowercase, diacritics folded, no stemming —
+/// entity names are proper nouns), matched EXACTLY against entity names
+/// and the aliases of entity-notes. The longest match wins its span: a
+/// question naming «Anna Rossi 2» does not also seed an entity «Anna».
+/// Returns `(node, mass share)` — the shares sum to 1.
+pub(crate) fn question_entities(gi: &GraphIndex, text: &str) -> Vec<(u32, f64)> {
+    let folded = text::strip_diacritics(&text.to_lowercase());
+    let tokens: Vec<&str> = folded
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut taken: Vec<(usize, usize)> = Vec::new(); // claimed [start, end)
+    let mut nodes: Vec<u32> = Vec::new();
+    for n in (1..=3_usize).rev() {
+        if tokens.len() < n {
+            continue;
+        }
+        for start in 0..=(tokens.len() - n) {
+            let end = start + n;
+            if taken.iter().any(|(a, b)| start < *b && end > *a) {
+                continue;
+            }
+            let key = tokens[start..end].join(" ");
+            if let Some(node) = gi.node_of_name(&key)
+                && !nodes.contains(&node)
+            {
+                taken.push((start, end));
+                nodes.push(node);
+            }
+        }
+    }
+    let share = 1.0 / nodes.len() as f64;
+    nodes.into_iter().map(|n| (n, share)).collect()
+}
+
+/// Run the personalised-PageRank push and build the third list.
+/// `fused_seeds` are `(note id, score normalised to [0, 1])` — the top
+/// [`GRAPH_SEEDS`] fused candidates. What they mean depends on
+/// [`GraphSeeding`]: the v0.3.2 walk starts from them alone (mass ∝ score);
+/// the question-entity seeding (v0.4, P1.4) starts from the entities the
+/// QUESTION names — they carry the mass, the candidates ride at
+/// `seed_passage_weight` — and a question that names no entity never wakes
+/// the graph (the gate; HippoRAG 2 runs no PageRank without a recognized
+/// query entity either).
 fn graph_list(
     inner: &Inner,
     q: &Query,
-    seeds: &[(String, f64)],
-) -> Result<(Vec<GraphEntry>, usize), SearchError> {
+    fused_seeds: &[(String, f64)],
+) -> Result<(Vec<GraphEntry>, usize, GraphExplain), SearchError> {
     let w = &q.weights;
+    let w_g = w.graph_weight.clamp(0.0, 1.0);
     if w.graph_weight <= 0.0 {
-        return Ok((Vec::new(), 0));
+        return Ok((
+            Vec::new(),
+            0,
+            GraphExplain {
+                weight: 0.0,
+                off: None,
+            },
+        ));
     }
     let Some(g) = inner.graph.as_ref() else {
-        return Ok((Vec::new(), 0));
+        return Ok((
+            Vec::new(),
+            0,
+            GraphExplain {
+                weight: w_g,
+                off: None,
+            },
+        ));
     };
     let gi = &g.index;
-    let mass_sum: f64 = seeds.iter().map(|(_, s)| *s).sum::<f64>().max(f64::EPSILON);
-    let seed_nodes: Vec<(u32, f64)> = seeds
-        .iter()
-        .filter_map(|(id, s)| {
-            gi.node_of_note(&Ulid::from_string(id).ok()?)
-                .map(|n| (n, s / mass_sum))
-        })
-        .collect();
+    let seed_nodes: Vec<(u32, f64)> = match w.graph_seeding {
+        GraphSeeding::Fused => {
+            let mass_sum: f64 = fused_seeds
+                .iter()
+                .map(|(_, s)| *s)
+                .sum::<f64>()
+                .max(f64::EPSILON);
+            fused_seeds
+                .iter()
+                .filter_map(|(id, s)| {
+                    gi.node_of_note(&Ulid::from_string(id).ok()?)
+                        .map(|n| (n, s / mass_sum))
+                })
+                .collect()
+        }
+        GraphSeeding::Question {
+            seed_passage_weight,
+        } => {
+            let entities = question_entities(gi, &q.text);
+            if entities.is_empty() {
+                // the gate (P1.4): no entity named, no walk — the fused
+                // list stands on its own
+                return Ok((
+                    Vec::new(),
+                    0,
+                    GraphExplain {
+                        weight: 0.0,
+                        off: Some(GRAPH_OFF_NO_ENTITY),
+                    },
+                ));
+            }
+            let mut seeds = entities; // shares sum to 1
+            for (id, s) in fused_seeds {
+                if let Some(n) = gi.node_of_note(&Ulid::from_string(id).unwrap_or_default()) {
+                    seeds.push((n, s * seed_passage_weight));
+                }
+            }
+            seeds
+        }
+    };
     if seed_nodes.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok((
+            Vec::new(),
+            0,
+            GraphExplain {
+                weight: w_g,
+                off: None,
+            },
+        ));
     }
     let push = gi.ppr(
         &seed_nodes,
@@ -1400,7 +1569,14 @@ fn graph_list(
     let pushed_edges = push.pushed_edges;
     let top = push.notes.iter().take(GRAPH_LIST_LEN).collect::<Vec<_>>();
     if top.is_empty() {
-        return Ok((Vec::new(), pushed_edges));
+        return Ok((
+            Vec::new(),
+            pushed_edges,
+            GraphExplain {
+                weight: w_g,
+                off: None,
+            },
+        ));
     }
     // Scaled to [0, 1] by the list maximum — the convex fusion normalises
     // every list the same way. The minimum is NOT subtracted: min-max would
@@ -1460,7 +1636,14 @@ fn graph_list(
             })
         })
         .collect();
-    Ok((entries, pushed_edges))
+    Ok((
+        entries,
+        pushed_edges,
+        GraphExplain {
+            weight: w_g,
+            off: None,
+        },
+    ))
 }
 
 /// Reconstruct the walk that carried mass to `node`: follow the predecessor
@@ -1893,16 +2076,38 @@ fn semantic_pipeline(
         })
         .collect();
 
-    // --- graph list: the third list, a PPR push from the fused seeds over
-    // the in-memory CSR (§6.3.3, v0.3). The push replaces the per-question
-    // SQL expansion: ~157 pushed edges per question at 100k notes.
+    // --- graph list: the third list, a PPR push over the in-memory CSR
+    // (§6.3.3, v0.3). The push replaces the per-question SQL expansion:
+    // ~157 pushed edges per question at 100k notes. v0.4 (P1.4): with
+    // question-entity seeding the entities the question names carry the
+    // mass (these candidates ride at `seed_passage_weight`), and a question
+    // that names no entity gates the graph off.
     let mut seeds: Vec<(String, f64)> = fused.iter().map(|(id, s)| (id.clone(), *s)).collect();
     seeds.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let seeds: Vec<(String, f64)> = seeds.into_iter().take(GRAPH_SEEDS).collect();
-    let (glist, pushed_edges): (Vec<GraphEntry>, usize) = if q.graph_hops > 0 && !seeds.is_empty() {
-        graph_list(inner, q, &seeds)?
+    let graph_ran = q.graph_hops > 0 && q.weights.graph_weight > 0.0;
+    let (glist, pushed_edges, graph_say): (Vec<GraphEntry>, usize, GraphExplain) = if graph_ran {
+        match q.weights.graph_seeding {
+            GraphSeeding::Question { .. } => graph_list(inner, q, &seeds)?,
+            GraphSeeding::Fused if !seeds.is_empty() => graph_list(inner, q, &seeds)?,
+            GraphSeeding::Fused => (
+                Vec::new(),
+                0,
+                GraphExplain {
+                    weight: 0.0,
+                    off: None,
+                },
+            ),
+        }
     } else {
-        (Vec::new(), 0)
+        (
+            Vec::new(),
+            0,
+            GraphExplain {
+                weight: 0.0,
+                off: None,
+            },
+        )
     };
     let g_of: HashMap<&str, &GraphEntry> = glist.iter().map(|e| (e.id.as_str(), e)).collect();
     let w_g = q.weights.graph_weight.clamp(0.0, 1.0);
@@ -1991,6 +2196,7 @@ fn semantic_pipeline(
             raw_score: raw,
             score: raw,
             explain: Explain {
+                graph: None, // set for every hit after the rerank (P1.4)
                 bm25_rank: from_text
                     .then(|| bm25_rank_of.get(id.as_str()).copied())
                     .flatten(),
@@ -2067,6 +2273,12 @@ fn semantic_pipeline(
             .then_with(|| a.note.id.to_string().cmp(&b.note.id.to_string()))
     });
     hits.truncate(q.k);
+    // v0.4 (P1.4): every hit carries the graph's say for this query
+    if graph_ran {
+        for h in &mut hits {
+            h.explain.graph = Some(graph_say.clone());
+        }
+    }
     let max_raw = hits.iter().map(|h| h.raw_score).fold(0.0_f64, f64::max);
     if max_raw > 0.0 {
         for h in &mut hits {
@@ -2899,6 +3111,125 @@ mod tests {
     fn empty_query_is_rejected() {
         let (_d, cell) = setup();
         assert!(cell.search_with_now(&Query::text("  "), now()).is_err());
+    }
+    // --- v0.4 (P1.4): the question's entities seed the walk, and a
+    // question that names none never wakes the graph ---------------------
+
+    #[test]
+    fn question_entities_match_names_aliases_and_longest_spans() {
+        let (_d, cell) = setup();
+        // a person entity with an alias, and a namesake shorter entity
+        let mut anna = note(30, "Anna Rossi", "Anna Rossi.", NoteType::Person);
+        anna.extensions = vec![(
+            "aliases".into(),
+            crate::format::yaml::YamlValue::Seq(vec![
+                crate::format::yaml::YamlValue::Str("Nina".into()),
+                crate::format::yaml::YamlValue::Str("Annuccia Ròssi".into()),
+            ]),
+        )];
+        cell.put_note(&anna, "t").unwrap(/* test-only */);
+        let mut anna_solo = note(31, "Anna", "Anna Bianchi.", NoteType::Person);
+        anna_solo.title = Some("Anna Bianchi".into());
+        cell.put_note(&anna_solo, "t").unwrap(/* test-only */);
+        cell.build_graph().unwrap(/* test-only */);
+        let gi = {
+            let inner = cell.inner.lock().unwrap(/* test-only */);
+            crate::graph::GraphIndex::build(&inner.conn).unwrap(/* test-only */)
+        };
+        // an alias leads to the same node as the name
+        let via_alias = question_entities(&gi, "che auto guida nina");
+        assert_eq!(via_alias.len(), 1, "{via_alias:?}");
+        // diacritics fold: «annuccia ròssi» = «annuccia rossi»
+        let via_folded = question_entities(&gi, "dov'è annuccia ròssi adesso");
+        assert_eq!(via_folded, via_alias, "aliases fold like the index");
+        // the longest match owns its span: «anna rossi» is NOT also «anna»
+        let both = question_entities(&gi, "dove abita anna rossi");
+        assert_eq!(both, via_alias, "the 2-word match owns the span: {both:?}");
+        // and a bare «anna bianchi» still finds the OTHER entity
+        let solo = question_entities(&gi, "chi è anna bianchi");
+        assert_eq!(solo.len(), 1);
+        assert_ne!(
+            solo[0].0, via_alias[0].0,
+            "the OTHER Anna, not the Rossi one"
+        );
+        // nothing named: no seeds (the gate's input)
+        assert!(question_entities(&gi, "come si cucina la pasta").is_empty());
+        // the mass is shared equally
+        let two = question_entities(&gi, "anna rossi e milano");
+        assert_eq!(two.len(), 2);
+        assert!((two.iter().map(|(_, m)| m).sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gate_the_graph_off_when_no_entity_is_named() {
+        let (_d, cell) = setup();
+        // the v0.3.2 walk runs from the top text candidates; a question
+        // about the move names no entity (settembre and trasloco are not
+        // graph entities) — with question seeding the graph stays off
+        let mut q = Query::text("traslocato a settembre").k(10).graph_hops(2);
+        q.weights.graph_seeding = crate::search::GraphSeeding::Question {
+            seed_passage_weight: 0.05,
+        };
+        let gated = cell.search_with_now(&q, now()).unwrap(/* test-only */);
+        assert!(!gated.is_empty());
+        for h in &gated {
+            assert!(
+                !h.explain.lists.contains(&"graph"),
+                "the gate keeps graph-discovered notes out: {:?}",
+                h.explain.lists
+            );
+            let say = h
+                .explain
+                .graph
+                .as_ref()
+                .expect(/* test-only */ "the graph ran");
+            assert_eq!(say.weight, 0.0);
+            assert_eq!(
+                say.off,
+                Some("grafo spento: nessuna entità nominata"),
+                "{:?}",
+                say.off
+            );
+        }
+        // …while the v0.3.2 seeding (Fused) still walks from the candidates
+        let mut legacy = Query::text("traslocato a settembre").k(10).graph_hops(2);
+        legacy.weights.graph_seeding = crate::search::GraphSeeding::Fused;
+        let walked = cell.search_with_now(&legacy, now()).unwrap(/* test-only */);
+        assert!(
+            walked.iter().any(|h| h.explain.lists.contains(&"graph")),
+            "the Fused seeding still reaches graph-discovered notes"
+        );
+    }
+
+    #[test]
+    fn question_named_entities_seed_the_walk() {
+        let (_d, cell) = setup();
+        cell.build_graph().unwrap(/* test-only */);
+        // the multi-hop question names Fabio: the walk starts at the Fabio
+        // ENTITY (not at the text candidates), and Giulia's note arrives
+        // through partner_of even though her note shares no query term
+        let mut q = Query::text("il partner di Fabio").k(10).graph_hops(2);
+        q.weights.graph_seeding = crate::search::GraphSeeding::Question {
+            seed_passage_weight: 0.05,
+        };
+        let hits = cell.search_with_now(&q, now()).unwrap(/* test-only */);
+        let giulia = format!("01{:024}", 2);
+        assert!(
+            hits.iter()
+                .any(|h| h.note.id.to_string() == giulia && h.explain.lists.contains(&"graph")),
+            "Giulia via the Fabio entity: {:?}",
+            hits.iter()
+                .map(|h| (h.note.display_title().to_string(), h.explain.lists.to_vec()))
+                .collect::<Vec<_>>()
+        );
+        // and the explain says the graph was on
+        assert!(
+            hits[0]
+                .explain
+                .graph
+                .as_ref()
+                .is_some_and(|g| g.off.is_none())
+        );
     }
 }
 

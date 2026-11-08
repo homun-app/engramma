@@ -104,8 +104,8 @@ pub fn note_json(n: &Note) -> serde_json::Value {
 }
 
 /// Hit JSON: `{score, raw_score, explain{matched_terms, bm25_rank,
-/// semantic_rank, cosine, fused_score, lists, winning_chunk, via, confidence,
-/// valid_from, valid_to, source}, note}`.
+/// semantic_rank, graph, cosine, fused_score, lists, winning_chunk, via,
+/// confidence, valid_from, valid_to, source}, note}`.
 pub fn hit_json(h: &Hit) -> serde_json::Value {
     serde_json::json!({
         "score": h.score,
@@ -121,6 +121,10 @@ pub fn hit_json(h: &Hit) -> serde_json::Value {
             "support": h.explain.support,
             "winning_chunk": h.explain.winning_chunk,
             "via": h.explain.via,
+            "graph": h.explain.graph.as_ref().map(|g| serde_json::json!({
+                "weight": g.weight,
+                "off": g.off,
+            })),
             "confidence": h.explain.confidence.as_str(),
             "valid_from": h.explain.valid_from,
             "valid_to": h.explain.valid_to,
@@ -172,6 +176,12 @@ pub fn hit_human(h: &Hit, index: usize) -> String {
     }
     if let Some(via) = &h.explain.via {
         out.push_str(&format!("\n   via: {via}"));
+    }
+    if let Some(g) = &h.explain.graph {
+        match g.off {
+            Some(why) => out.push_str(&format!("\n   grafo: {why}")),
+            None => out.push_str(&format!("\n   peso grafo: {:.2}", g.weight)),
+        }
     }
     out.push_str(&format!(
         "\n   validità: {} → {}",
