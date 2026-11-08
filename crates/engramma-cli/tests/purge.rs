@@ -154,13 +154,15 @@ fn purge_after_the_view_moved_exits_zero() {
 
 /// Test 2: the folder is gone for good, `vault unbind` detaches the view —
 /// the purge that follows is COMPLETE (exit 0): nothing of the note is
-/// bound to a view the engine cannot reach.
+/// bound to a view the engine cannot reach. v0.4.1 (P2.9): the short id of
+/// a view is its LAST 8 characters (the random part — the first 8 are the
+/// timestamp, and two views minted minutes apart share them).
 #[test]
 fn purge_after_unbind_exits_zero() {
     let fx = Fixture::new(1);
     let view = fx.bind_view("vista");
     let vid = {
-        let cell = Cell::open(&fx.cell_path).unwrap(/* test-only */);
+        let cell = Cell::open(&fx.cell_path).unwrap(/* t */);
         cell.vault_views().unwrap(/* t */)[0].view_id.clone()
     };
     std::fs::remove_dir_all(&view).unwrap(/* test-only */);
@@ -168,12 +170,12 @@ fn purge_after_unbind_exits_zero() {
         .cmd()
         .arg("vault")
         .arg("unbind")
-        .arg(&vid[..8])
+        .arg(&vid[vid.len() - 8..])
         .output()
         .unwrap(/* test-only */);
     assert!(
         out.status.success(),
-        "unbind by id8: {}",
+        "unbind by the last 8: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(

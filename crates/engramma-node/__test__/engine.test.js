@@ -276,6 +276,38 @@ test('modelStatus reports the builtin model (when present)', async () => {
   await e.close();
 });
 
+// v0.4.1 (P2.9): the short id of a view is its LAST 8 characters
+// everywhere — messages, unbind, vaultUnbind — like the notes' (the first 8
+// of a ULID are the timestamp: two views minted minutes apart share them).
+test('vaultUnbind takes the last 8 of the view id (P2.9)', async () => {
+  const cli =
+    process.env.ENGRAMMA_BIN ||
+    ['../../../target/release/engramma', '../../../target/debug/engramma']
+      .map((p) => path.resolve(__dirname, p))
+      .find((p) => fs.existsSync(p));
+  assert.ok(cli, 'engramma binary not found: build it or set ENGRAMMA_BIN');
+  const run = (args) => {
+    const r = require('node:child_process').spawnSync(cli, args, { encoding: 'utf8' });
+    assert.equal(r.status, 0, `${args.join(' ')}\n${r.stdout}${r.stderr}`);
+    return r;
+  };
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  const cell = await e.cell('sgancio');
+  await cell.put({ body: 'una nota qualsiasi', source: 's', confidence: 'stated' });
+  const viewDir = path.join(path.dirname(rootDir), 'vista-sgancio');
+  run(['--root', rootDir, '--cell', 'sgancio', 'vault', 'init', viewDir]);
+  const [view] = await cell.vaultViews();
+  assert.ok(view, 'the view is bound');
+  const last8 = view.viewId.slice(-8);
+  const first8 = view.viewId.slice(0, 8);
+  // the first 8 are the timestamp: NOT a short id anymore
+  await assert.rejects(cell.vaultUnbind(first8), (err) => err.code === 'NOT_FOUND');
+  await cell.vaultUnbind(last8);
+  assert.equal((await cell.vaultViews()).length, 0);
+  await e.close();
+});
+
 // v0.4.1 (P1.8): the REPORT v0.4 already said it — "CONFLICT: una nota
 // external non può nascere attiva" — but the binding silently quarantined
 // an explicit `status: 'active'`. Now it is the caller's conflict; without

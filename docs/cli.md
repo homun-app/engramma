@@ -285,7 +285,7 @@ an unmounted folder — unless `--allow-deletions`.
 
 `unbind` (v0.4) detaches a view: the cell forgets it and ITS bindings
 (files and conflict copies); the files stay on disk, they were never the
-engine's. Accepts the folder or the view id — even just its first 8
+engine's. Accepts the folder or the view id — full, or its last 8
 characters.
 
 ### `engramma consolidate [--limit N] [--json]`

@@ -1365,26 +1365,36 @@ fn run_vault(cli: &Cli, action: &VaultAction) -> Result<(), CliError> {
             let cell = open_cell(cli)?;
             let arg = dir_or_view_id.trim();
             // a folder (canonicalized when it exists) first, then the view
-            // id — full or its first 8 characters
+            // id — full, or its LAST 8 characters (v0.4.1, P2.9: the short
+            // id is the random part, like the notes'; two views minted
+            // minutes apart share the first 8)
             let by_path = std::fs::canonicalize(arg)
                 .ok()
                 .and_then(|c| cell.vault_view_by_root(&c.to_string_lossy()).ok().flatten());
-            let matches_prefix =
-                |vid: &str| arg.len() >= 8 && vid.starts_with(arg) && arg.len() <= vid.len();
+            let short_of = |vid: &str| -> String {
+                ulid::Ulid::from_string(vid)
+                    .map(|u| engramma_core::id::id8(&u))
+                    .unwrap_or_else(|_| vid.split_at(vid.len().saturating_sub(8)).1.to_string())
+            };
             let view = match by_path {
                 Some(v) => Some(v),
                 None => {
                     let hits: Vec<_> = cell
                         .vault_views()?
                         .into_iter()
-                        .filter(|v| v.view_id == arg || matches_prefix(&v.view_id))
+                        .filter(|v| v.view_id == arg || (arg.len() == 8 && v.view_id.ends_with(arg)))
                         .collect();
                     match hits.len() {
                         1 => Some(hits[0].clone()),
                         0 => None,
                         _ => {
+                            let list = hits
+                                .iter()
+                                .map(|v| format!("{} ({})", v.root, short_of(&v.view_id)))
+                                .collect::<Vec<_>>()
+                                .join(", ");
                             return Err(CliError::usage(format!(
-                                "«{arg}» indica {} viste: serve l'id completo",
+                                "«{arg}» indica {} viste: {list}",
                                 hits.len()
                             )));
                         }
@@ -1409,7 +1419,7 @@ fn run_vault(cli: &Cli, action: &VaultAction) -> Result<(), CliError> {
                     "sganciata: {} ({}) — {} file e {} copie di conflitto \
                      dimenticati dalla cella; i file restano dove sono",
                     view.root,
-                    &view.view_id[..8],
+                    short_of(&view.view_id),
                     files,
                     conflicts
                 );

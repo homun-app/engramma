@@ -2300,20 +2300,26 @@ impl Task for VaultUnbindTask {
         let view = match by_path {
             Some(v) => Some(v),
             None => {
+                // v0.4.1 (P2.9): the short id is the LAST 8 characters (the
+                // random part, like the notes'); the full id always works,
+                // an ambiguous short id lists its candidates
                 let hits: Vec<_> = self
                     .cell
                     .vault_views()
                     .map_err(cell_error)?
                     .into_iter()
-                    .filter(|v| v.view_id == arg || (arg.len() >= 8 && v.view_id.starts_with(arg)))
+                    .filter(|v| v.view_id == arg || (arg.len() == 8 && v.view_id.ends_with(arg)))
                     .collect();
                 match hits.len() {
                     1 => Some(hits[0].clone()),
                     0 => None,
                     n => {
-                        return Err(invalid(format!(
-                            "«{arg}» indica {n} viste: serve l'id completo"
-                        )));
+                        let list = hits
+                            .iter()
+                            .map(|v| format!("{} ({})", v.root, &v.view_id[v.view_id.len() - 8..]))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(invalid(format!("«{arg}» indica {n} viste: {list}")));
                     }
                 }
             }
