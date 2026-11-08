@@ -2015,8 +2015,13 @@ fn calibrate(target: usize, runs: usize, dir: &std::path::Path) {
         /// that exist): v0.3.2's robust choice rule — a corpus that shifts
         /// a little must not fall into the collapse.
         worst_mrr: f64,
-        para_mrr: f64,
-        multi_mrr: f64,
+        /// Per-category MRR (v0.4, P0.3): the grid reports it for EVERY
+        /// configuration — the P1.6 criterion decides on it, and the
+        /// question-weighted mean hid multi-salto (a twentieth of the
+        /// questions).
+        cat_mrrs: [f64; 4],
+        /// The plain mean of the categories.
+        cat_mean: f64,
     }
     // (alpha, graph weight, weighted MRR) first, then the neighbourhood
     // minimum needs them all
@@ -2042,8 +2047,8 @@ fn calibrate(target: usize, runs: usize, dir: &std::path::Path) {
             weight: *gw,
             weighted_mrr: weighted,
             worst_mrr: 0.0, // filled below, when the whole grid is known
-            para_mrr: mrrs[1],
-            multi_mrr: mrrs[2],
+            cat_mrrs: [mrrs[0], mrrs[1], mrrs[2], mrrs[3]],
+            cat_mean: category_mean(&mrrs),
         });
     }
     // the worst case among the neighbours (±1 step of α and of the graph
@@ -2117,13 +2122,38 @@ fn calibrate(target: usize, runs: usize, dir: &std::path::Path) {
             .collect();
         println!("| {alpha:.1} | {} |", cells.join(" | "));
     }
+    // v0.4 (P0.3): per-category MRR of EVERY configuration, with the
+    // category mean the next phase's criterion reads
+    println!(
+        "\nMRR per categoria di ogni configurazione (fat = fattuali, par = parafrasi, \
+         mul = multi-salto, ing = inglese; media = media semplice delle categorie):\n"
+    );
+    println!(
+        "| α | g | fattuali | parafrasi | multi-salto | inglese | media | MRR pesato | caso peggiore |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|");
+    for r in &rows {
+        println!(
+            "| {:.1} | {:.2} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} |",
+            r.alpha,
+            r.weight,
+            r.cat_mrrs[0],
+            r.cat_mrrs[1],
+            r.cat_mrrs[2],
+            r.cat_mrrs[3],
+            r.cat_mean,
+            r.weighted_mrr,
+            r.worst_mrr
+        );
+    }
+
     // the declared criterion: best WORST-of-neighbours weighted MRR; within
     // 0.002 the one that keeps the paraphrases wins
     let wins = |a: &Row, b: &Row| -> bool {
         if a.worst_mrr > b.worst_mrr + 0.002 {
             return true;
         }
-        (a.worst_mrr - b.worst_mrr).abs() <= 0.002 && a.para_mrr > b.para_mrr
+        (a.worst_mrr - b.worst_mrr).abs() <= 0.002 && a.cat_mrrs[1] > b.cat_mrrs[1]
     };
     let mut best: &Row = &rows[0];
     for r in &rows[1..] {
@@ -2133,8 +2163,16 @@ fn calibrate(target: usize, runs: usize, dir: &std::path::Path) {
     }
     let b = best;
     println!(
-        "vincitore (robusto): α = {}, peso grafo = {} (MRR pesato {:.4}, caso peggiore dei vicini {:.4}, parafrasi {:.4}, multi-salto {:.4})",
-        b.alpha, b.weight, b.weighted_mrr, b.worst_mrr, b.para_mrr, b.multi_mrr
+        "vincitore (robusto): α = {}, peso grafo = {} (MRR pesato {:.4}, caso peggiore dei vicini {:.4}; per categoria: {:.4}/{:.4}/{:.4}/{:.4}, media {:.4})",
+        b.alpha,
+        b.weight,
+        b.weighted_mrr,
+        b.worst_mrr,
+        b.cat_mrrs[0],
+        b.cat_mrrs[1],
+        b.cat_mrrs[2],
+        b.cat_mrrs[3],
+        b.cat_mean
     );
     drop(cell);
     for suffix in ["", "-wal", "-shm"] {
@@ -2263,6 +2301,16 @@ fn main() {
     eprintln!("scritto {}", out.display());
 }
 
+/// The mean of the per-category MRRs (v0.4, P0.3/P1.6): every category
+/// counts the same — the question-weighted MRR hid multi-salto, which is a
+/// twentieth of the questions.
+fn category_mean(mrrs: &[f64]) -> f64 {
+    if mrrs.is_empty() {
+        return 0.0;
+    }
+    mrrs.iter().sum::<f64>() / mrrs.len() as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2316,5 +2364,14 @@ mod tests {
         assert!(f.calibrate);
         assert_eq!(f.targets, vec![100_000]);
         assert_eq!(f.runs, 3);
+    }
+
+    #[test]
+    fn category_mean_counts_every_category_the_same() {
+        // multi-salto is 5% of the questions: weighted it disappears,
+        // the mean does not
+        let mrrs = [0.9, 0.9, 0.1, 0.9];
+        assert!((category_mean(&mrrs) - 0.7).abs() < 1e-12);
+        assert_eq!(category_mean(&[]), 0.0);
     }
 }
