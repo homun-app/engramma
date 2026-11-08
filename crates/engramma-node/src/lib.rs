@@ -58,6 +58,7 @@ fn split_transport(err: &Error) -> (&'static str, String) {
                 "IO",
                 "MODEL_MISSING",
                 "COMPACTED",
+                "CLOSED",
             ];
             let c: &str = code;
             match known.iter().find(|k| **k == c) {
@@ -767,6 +768,80 @@ fn search_cell(
 }
 
 // ---------------------------------------------------------------------------
+// the closed gate (v0.4.1, P1.7)
+// ---------------------------------------------------------------------------
+
+/// v0.4.1 (P1.7): after `close`, no silent reopening. Every task ENTERS the
+/// gate before touching the engine (a closed gate answers `CLOSED`), holds
+/// it for the whole compute, and `close` seals the gate and WAITS until the
+/// last in-flight compute is done — a late promise in the daemon can never
+/// write to a closed engine.
+#[derive(Clone, Default)]
+pub struct Gate {
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    in_flight: Arc<(Mutex<usize>, std::sync::Condvar)>,
+}
+
+impl Gate {
+    fn closed_err() -> Error {
+        transport_err(
+            "CLOSED",
+            "motore chiuso: `Engine.close` è già stato chiamato",
+        )
+    }
+
+    /// Enter at CALL time, on the JS thread: the count rises before `close`
+    /// can seal, so every promise that already exists when close is called
+    /// finishes its work, and close waits for it. The `closed` check runs
+    /// INSIDE the mutex `seal_and_wait` waits on — a gate sealed first is
+    /// seen first, with no window in between.
+    fn enter_now(&self) -> Result<GateGuard> {
+        let mut n = self
+            .in_flight
+            .0
+            .lock()
+            .map_err(|_| transport_err("IO", "lock del gate avvelenato"))?;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Self::closed_err());
+        }
+        *n += 1;
+        Ok(GateGuard {
+            inner: Arc::clone(&self.in_flight),
+        })
+    }
+
+    /// Seal the gate and wait for the in-flight computes to finish.
+    fn seal_and_wait(&self) -> Result<()> {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        let (lock, cvar) = &*self.in_flight;
+        let mut n = lock
+            .lock()
+            .map_err(|_| transport_err("IO", "lock del gate avvelenato"))?;
+        while *n > 0 {
+            n = cvar
+                .wait(n)
+                .map_err(|_| transport_err("IO", "lock del gate avvelenato"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Drops the in-flight count and wakes `seal_and_wait`.
+struct GateGuard {
+    inner: Arc<(Mutex<usize>, std::sync::Condvar)>,
+}
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        if let Ok(mut n) = self.inner.0.lock() {
+            *n = n.saturating_sub(1);
+        }
+        self.inner.1.notify_all();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
 
@@ -792,6 +867,7 @@ pub struct EngineHandle {
     actor: Arc<String>,
     embedder: Option<Arc<dyn Embedder>>,
     cells: Arc<Mutex<HashMap<String, CoreCell>>>,
+    gate: Gate,
 }
 
 impl EngineHandle {
@@ -907,6 +983,7 @@ impl Task for OpenTask {
             actor: Arc::new(self.opts.actor.clone()),
             embedder,
             cells: Arc::new(Mutex::new(HashMap::new())),
+            gate: Gate::default(),
         })
     }
 
@@ -922,10 +999,11 @@ pub struct CellOpenTask {
     name: String,
     create: bool,
     actor: Option<String>,
+    _open: GateGuard,
 }
 
 impl Task for CellOpenTask {
-    type Output = (CoreCell, String, Option<Arc<dyn Embedder>>, String);
+    type Output = (CoreCell, String, Option<Arc<dyn Embedder>>, String, Gate);
     type JsValue = Cell;
 
     fn compute(&mut self) -> Result<Self::Output> {
@@ -936,11 +1014,17 @@ impl Task for CellOpenTask {
             Some(a) if !a.trim().is_empty() => a.trim().to_string(),
             _ => (*self.handle.actor).clone(),
         };
-        Ok((cell, self.name.clone(), self.handle.embedder.clone(), actor))
+        Ok((
+            cell,
+            self.name.clone(),
+            self.handle.embedder.clone(),
+            actor,
+            self.handle.gate.clone(),
+        ))
     }
 
     fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
-        Ok(Cell::from_parts(out.0, out.1, out.2, out.3))
+        Ok(Cell::from_parts(out.0, out.1, out.2, out.3, out.4))
     }
 
     reject_recode!();
@@ -948,6 +1032,7 @@ impl Task for CellOpenTask {
 
 pub struct CellsTask {
     root: PathBuf,
+    _open: GateGuard,
 }
 
 impl Task for CellsTask {
@@ -979,6 +1064,7 @@ impl Task for CellsTask {
 
 pub struct ModelStatusTask {
     model_dir: Option<PathBuf>,
+    _open: GateGuard,
 }
 
 impl Task for ModelStatusTask {
@@ -998,6 +1084,7 @@ impl Task for ModelStatusTask {
 
 pub struct PullModelTask {
     model_dir: Option<PathBuf>,
+    _open: GateGuard,
     #[allow(clippy::type_complexity)]
     progress: Option<Box<dyn FnMut(u64, u64) + Send>>,
 }
@@ -1039,6 +1126,7 @@ pub struct EngineSearchTask {
     handle: EngineHandle,
     cells: Vec<String>,
     q: SearchInput,
+    _open: GateGuard,
 }
 
 impl Task for EngineSearchTask {
@@ -1087,6 +1175,7 @@ impl Task for EngineSearchTask {
 
 pub struct CloseTask {
     cells: Arc<Mutex<HashMap<String, CoreCell>>>,
+    gate: Gate,
 }
 
 impl Task for CloseTask {
@@ -1094,6 +1183,10 @@ impl Task for CloseTask {
     type JsValue = ();
 
     fn compute(&mut self) -> Result<Self::Output> {
+        // v0.4.1 (P1.7): seal first, then WAIT — the computes already in
+        // flight finish before this close resolves, and no later task can
+        // enter. Closing twice is fine: the gate is already sealed.
+        self.gate.seal_and_wait()?;
         self.cells
             .lock()
             .map_err(|_| transport_err("IO", "lock delle celle avvelenato"))?
@@ -1119,29 +1212,37 @@ impl Engine {
 
     /// A cell by name (`create` defaults to true).
     #[napi(ts_return_type = "Promise<Cell>")]
-    pub fn cell(&self, name: String, opts: Option<CellOpts>) -> AsyncTask<CellOpenTask> {
-        AsyncTask::new(CellOpenTask {
+    pub fn cell(
+        &self,
+        env: Env,
+        name: String,
+        opts: Option<CellOpts>,
+    ) -> Result<AsyncTask<CellOpenTask>> {
+        Ok(AsyncTask::new(CellOpenTask {
             handle: self.handle.clone(),
             name,
             create: opts.as_ref().and_then(|o| o.create).unwrap_or(true),
             actor: opts.and_then(|o| o.actor),
-        })
+            _open: self.handle.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// The names of the cells that exist under root/cells.
     #[napi(ts_return_type = "Promise<string[]>")]
-    pub fn cells(&self) -> AsyncTask<CellsTask> {
-        AsyncTask::new(CellsTask {
+    pub fn cells(&self, env: Env) -> Result<AsyncTask<CellsTask>> {
+        Ok(AsyncTask::new(CellsTask {
             root: self.handle.root.clone(),
-        })
+            _open: self.handle.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Is the builtin model there? (id and bytes when it is)
     #[napi(ts_return_type = "Promise<ModelStatus>")]
-    pub fn model_status(&self) -> AsyncTask<ModelStatusTask> {
-        AsyncTask::new(ModelStatusTask {
+    pub fn model_status(&self, env: Env) -> Result<AsyncTask<ModelStatusTask>> {
+        Ok(AsyncTask::new(ModelStatusTask {
             model_dir: self.handle.model_dir.clone(),
-        })
+            _open: self.handle.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Download the builtin model (pinned revision, sha256 verified per
@@ -1149,6 +1250,7 @@ impl Engine {
     #[napi(ts_return_type = "Promise<void>")]
     pub fn pull_model(
         &self,
+        env: Env,
         #[napi(ts_arg_type = "(done: number, total: number) => void")] on_progress: Option<
             Function<'static, (f64, f64)>,
         >,
@@ -1171,6 +1273,7 @@ impl Engine {
         };
         Ok(AsyncTask::new(PullModelTask {
             model_dir: self.handle.model_dir.clone(),
+            _open: self.handle.gate.enter_now().map_err(|e| recode(env, e))?,
             progress,
         }))
     }
@@ -1179,12 +1282,18 @@ impl Engine {
     /// Approximate by declaration — the scores of different cells do not
     /// compare.
     #[napi(ts_return_type = "Promise<SearchHit[]>")]
-    pub fn search(&self, cells: Vec<String>, q: SearchInput) -> AsyncTask<EngineSearchTask> {
-        AsyncTask::new(EngineSearchTask {
+    pub fn search(
+        &self,
+        env: Env,
+        cells: Vec<String>,
+        q: SearchInput,
+    ) -> Result<AsyncTask<EngineSearchTask>> {
+        Ok(AsyncTask::new(EngineSearchTask {
             handle: self.handle.clone(),
             cells,
             q,
-        })
+            _open: self.handle.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Release the engine's cell handles. Outstanding Cell objects keep
@@ -1193,6 +1302,7 @@ impl Engine {
     pub fn close(&self) -> AsyncTask<CloseTask> {
         AsyncTask::new(CloseTask {
             cells: self.handle.cells.clone(),
+            gate: self.handle.gate.clone(),
         })
     }
 }
@@ -1209,6 +1319,7 @@ pub struct Cell {
     name: String,
     embedder: Option<Arc<dyn Embedder>>,
     actor: String,
+    gate: Gate,
 }
 
 impl Cell {
@@ -1217,12 +1328,14 @@ impl Cell {
         name: String,
         embedder: Option<Arc<dyn Embedder>>,
         actor: String,
+        gate: Gate,
     ) -> Self {
         Cell {
             cell,
             name,
             embedder,
             actor,
+            gate,
         }
     }
 }
@@ -1231,6 +1344,7 @@ pub struct PutTask {
     cell: CoreCell,
     actor: String,
     input: NoteInput,
+    _open: GateGuard,
 }
 
 impl Task for PutTask {
@@ -1289,6 +1403,7 @@ pub struct PatchTask {
     actor: String,
     id: String,
     patch: NotePatchInput,
+    _open: GateGuard,
 }
 
 impl Task for PatchTask {
@@ -1366,6 +1481,7 @@ impl Task for PatchTask {
 pub struct GetTask {
     cell: CoreCell,
     id: String,
+    _open: GateGuard,
 }
 
 impl Task for GetTask {
@@ -1407,6 +1523,7 @@ pub struct ListTask {
     statuses: Option<Vec<String>>,
     limit: Option<u32>,
     offset: Option<u32>,
+    _open: GateGuard,
 }
 
 impl Task for ListTask {
@@ -1472,6 +1589,7 @@ pub struct SearchTask {
     name: String,
     embedder: Option<Arc<dyn Embedder>>,
     q: SearchInput,
+    _open: GateGuard,
 }
 
 impl Task for SearchTask {
@@ -1492,6 +1610,7 @@ impl Task for SearchTask {
 pub struct HistoryTask {
     cell: CoreCell,
     id: String,
+    _open: GateGuard,
 }
 
 impl Task for HistoryTask {
@@ -1524,6 +1643,7 @@ pub struct NeighborsTask {
     cell: CoreCell,
     id: String,
     depth: u8,
+    _open: GateGuard,
 }
 
 impl Task for NeighborsTask {
@@ -1562,6 +1682,7 @@ pub struct SetStatusTask {
     actor: String,
     id: String,
     status: String,
+    _open: GateGuard,
 }
 
 impl Task for SetStatusTask {
@@ -1596,6 +1717,7 @@ pub struct ConfirmTask {
     cell: CoreCell,
     actor: String,
     id: String,
+    _open: GateGuard,
 }
 
 impl Task for ConfirmTask {
@@ -1618,6 +1740,7 @@ pub struct DeleteTask {
     cell: CoreCell,
     actor: String,
     id: String,
+    _open: GateGuard,
 }
 
 impl Task for DeleteTask {
@@ -1641,6 +1764,7 @@ pub struct PurgeTask {
     actor: String,
     id: String,
     reason: String,
+    _open: GateGuard,
 }
 
 impl Task for PurgeTask {
@@ -1688,6 +1812,7 @@ pub struct EmbedPendingTask {
     cell: CoreCell,
     embedder: Option<Arc<dyn Embedder>>,
     limit: Option<u32>,
+    _open: GateGuard,
 }
 
 impl Task for EmbedPendingTask {
@@ -1731,6 +1856,7 @@ impl Task for EmbedPendingTask {
 pub struct ChangesSinceTask {
     cell: CoreCell,
     seq: i64,
+    _open: GateGuard,
 }
 
 impl Task for ChangesSinceTask {
@@ -1785,6 +1911,7 @@ impl Task for ChangesSinceTask {
 
 pub struct VerifyTask {
     cell: CoreCell,
+    _open: GateGuard,
 }
 
 impl Task for VerifyTask {
@@ -1834,6 +1961,7 @@ pub struct CompactTask {
     cell: CoreCell,
     keep_last: i64,
     keep_snapshot: bool,
+    _open: GateGuard,
 }
 
 impl Task for CompactTask {
@@ -1882,109 +2010,134 @@ impl Cell {
     /// `source` and `confidence` are required; an `external` note is born
     /// quarantined.
     #[napi(ts_return_type = "Promise<NoteView>")]
-    pub fn put(&self, note: NoteInput) -> AsyncTask<PutTask> {
-        AsyncTask::new(PutTask {
+    pub fn put(&self, env: Env, note: NoteInput) -> Result<AsyncTask<PutTask>> {
+        Ok(AsyncTask::new(PutTask {
             cell: self.cell.clone(),
             actor: self.actor.clone(),
             input: note,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Change some fields of a note.
     #[napi(ts_return_type = "Promise<NoteView>")]
-    pub fn patch(&self, id: String, patch: NotePatchInput) -> AsyncTask<PatchTask> {
-        AsyncTask::new(PatchTask {
+    pub fn patch(
+        &self,
+        env: Env,
+        id: String,
+        patch: NotePatchInput,
+    ) -> Result<AsyncTask<PatchTask>> {
+        Ok(AsyncTask::new(PatchTask {
             cell: self.cell.clone(),
             actor: self.actor.clone(),
             id,
             patch,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Read a note by id (the short 8-char form works, like the CLI).
     /// Quarantined and deleted notes answer `null` — the same oracle as
     /// search.
     #[napi(ts_return_type = "Promise<NoteView | null>")]
-    pub fn get(&self, id: String) -> AsyncTask<GetTask> {
-        AsyncTask::new(GetTask {
+    pub fn get(&self, env: Env, id: String) -> Result<AsyncTask<GetTask>> {
+        Ok(AsyncTask::new(GetTask {
             cell: self.cell.clone(),
             id,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// The notes of this cell, filtered. Default limit 100.
     #[napi(ts_return_type = "Promise<NoteView[]>")]
-    pub fn list(&self, f: Option<ListFilter>) -> AsyncTask<ListTask> {
-        AsyncTask::new(ListTask {
+    pub fn list(&self, env: Env, f: Option<ListFilter>) -> Result<AsyncTask<ListTask>> {
+        Ok(AsyncTask::new(ListTask {
             cell: self.cell.clone(),
             tags: f.as_ref().and_then(|f| f.tags.clone()),
             note_type: f.as_ref().and_then(|f| f.note_type.clone()),
             statuses: f.as_ref().and_then(|f| f.status.clone()),
             limit: f.as_ref().and_then(|f| f.limit),
             offset: f.as_ref().and_then(|f| f.offset),
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Search this cell.
     #[napi(ts_return_type = "Promise<SearchHit[]>")]
-    pub fn search(&self, q: SearchInput) -> AsyncTask<SearchTask> {
-        AsyncTask::new(SearchTask {
+    pub fn search(&self, env: Env, q: SearchInput) -> Result<AsyncTask<SearchTask>> {
+        Ok(AsyncTask::new(SearchTask {
             cell: self.cell.clone(),
             name: self.name.clone(),
             embedder: self.embedder.clone(),
             q,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// The note's versions, oldest first (each is the state BEFORE the
     /// operation that version records).
     #[napi(ts_return_type = "Promise<VersionView[]>")]
-    pub fn history(&self, id: String) -> AsyncTask<HistoryTask> {
-        AsyncTask::new(HistoryTask {
+    pub fn history(&self, env: Env, id: String) -> Result<AsyncTask<HistoryTask>> {
+        Ok(AsyncTask::new(HistoryTask {
             cell: self.cell.clone(),
             id,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// The note's graph neighborhood (BFS, default depth 1, max 4).
     #[napi(ts_return_type = "Promise<NeighborView[]>")]
-    pub fn neighbors(&self, id: String, depth: Option<u8>) -> AsyncTask<NeighborsTask> {
-        AsyncTask::new(NeighborsTask {
+    pub fn neighbors(
+        &self,
+        env: Env,
+        id: String,
+        depth: Option<u8>,
+    ) -> Result<AsyncTask<NeighborsTask>> {
+        Ok(AsyncTask::new(NeighborsTask {
             cell: self.cell.clone(),
             id,
             depth: depth.unwrap_or(1),
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Change a note's status (`active` | `quarantined` | `superseded`).
     #[napi(ts_return_type = "Promise<void>")]
-    pub fn set_status(&self, id: String, status: String) -> AsyncTask<SetStatusTask> {
-        AsyncTask::new(SetStatusTask {
+    pub fn set_status(
+        &self,
+        env: Env,
+        id: String,
+        status: String,
+    ) -> Result<AsyncTask<SetStatusTask>> {
+        Ok(AsyncTask::new(SetStatusTask {
             cell: self.cell.clone(),
             actor: self.actor.clone(),
             id,
             status,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Promote a quarantined note to active.
     #[napi(ts_return_type = "Promise<void>")]
-    pub fn confirm(&self, id: String) -> AsyncTask<ConfirmTask> {
-        AsyncTask::new(ConfirmTask {
+    pub fn confirm(&self, env: Env, id: String) -> Result<AsyncTask<ConfirmTask>> {
+        Ok(AsyncTask::new(ConfirmTask {
             cell: self.cell.clone(),
             actor: self.actor.clone(),
             id,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// A reversible tombstone.
     #[napi(ts_return_type = "Promise<void>")]
-    pub fn delete(&self, id: String) -> AsyncTask<DeleteTask> {
-        AsyncTask::new(DeleteTask {
+    pub fn delete(&self, env: Env, id: String) -> Result<AsyncTask<DeleteTask>> {
+        Ok(AsyncTask::new(DeleteTask {
             cell: self.cell.clone(),
             actor: self.actor.clone(),
             id,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// The right to be forgotten — irreversible. The view says whether
@@ -1992,23 +2145,29 @@ impl Cell {
     /// `pending` (the WAL, a view): an incomplete forgetting the caller
     /// must finish.
     #[napi(ts_return_type = "Promise<PurgeView>")]
-    pub fn purge(&self, id: String, reason: String) -> AsyncTask<PurgeTask> {
-        AsyncTask::new(PurgeTask {
+    pub fn purge(&self, env: Env, id: String, reason: String) -> Result<AsyncTask<PurgeTask>> {
+        Ok(AsyncTask::new(PurgeTask {
             cell: self.cell.clone(),
             actor: self.actor.clone(),
             id,
             reason,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Embed the notes that are still pending; returns how many it did.
     #[napi(ts_return_type = "Promise<number>")]
-    pub fn embed_pending(&self, limit: Option<u32>) -> AsyncTask<EmbedPendingTask> {
-        AsyncTask::new(EmbedPendingTask {
+    pub fn embed_pending(
+        &self,
+        env: Env,
+        limit: Option<u32>,
+    ) -> Result<AsyncTask<EmbedPendingTask>> {
+        Ok(AsyncTask::new(EmbedPendingTask {
             cell: self.cell.clone(),
             embedder: self.embedder.clone(),
             limit,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// The ops after `seq`, or `{compacted: true, head}` when they sit
@@ -2016,49 +2175,63 @@ impl Cell {
     #[napi(
         ts_return_type = "Promise<{ head: number; ops: OpView[] } | { compacted: true; head: number }>"
     )]
-    pub fn changes_since(&self, seq: i64) -> AsyncTask<ChangesSinceTask> {
-        AsyncTask::new(ChangesSinceTask {
+    pub fn changes_since(&self, env: Env, seq: i64) -> Result<AsyncTask<ChangesSinceTask>> {
+        Ok(AsyncTask::new(ChangesSinceTask {
             cell: self.cell.clone(),
             seq,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Verify the hash chain, the replay and the derived indexes.
     #[napi(ts_return_type = "Promise<VerifyView>")]
-    pub fn verify(&self) -> AsyncTask<VerifyTask> {
-        AsyncTask::new(VerifyTask {
+    pub fn verify(&self, env: Env) -> Result<AsyncTask<VerifyTask>> {
+        Ok(AsyncTask::new(VerifyTask {
             cell: self.cell.clone(),
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Forget the payloads of the oldest operations, keeping the last
     /// `keepLast` replayable.
     #[napi(ts_return_type = "Promise<CompactView>")]
-    pub fn compact(&self, keep_last: i64, opts: Option<CompactOpts>) -> AsyncTask<CompactTask> {
-        AsyncTask::new(CompactTask {
+    pub fn compact(
+        &self,
+        env: Env,
+        keep_last: i64,
+        opts: Option<CompactOpts>,
+    ) -> Result<AsyncTask<CompactTask>> {
+        Ok(AsyncTask::new(CompactTask {
             cell: self.cell.clone(),
             keep_last: keep_last.max(0),
             keep_snapshot: opts.and_then(|o| o.keep_snapshot).unwrap_or(false),
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// The views bound to this cell (diagnostics: names and roots).
     #[napi(ts_return_type = "Promise<VaultView[]>")]
-    pub fn vault_views(&self) -> AsyncTask<VaultViewsTask> {
-        AsyncTask::new(VaultViewsTask {
+    pub fn vault_views(&self, env: Env) -> Result<AsyncTask<VaultViewsTask>> {
+        Ok(AsyncTask::new(VaultViewsTask {
             cell: self.cell.clone(),
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 
     /// Detach a markdown view from this cell (v0.4, P0.1): the cell forgets
     /// it and its bindings — the files stay on disk. Accepts the view id
     /// (even its first 8 characters) or the folder.
     #[napi(ts_return_type = "Promise<void>")]
-    pub fn vault_unbind(&self, dir_or_view_id: String) -> AsyncTask<VaultUnbindTask> {
-        AsyncTask::new(VaultUnbindTask {
+    pub fn vault_unbind(
+        &self,
+        env: Env,
+        dir_or_view_id: String,
+    ) -> Result<AsyncTask<VaultUnbindTask>> {
+        Ok(AsyncTask::new(VaultUnbindTask {
             cell: self.cell.clone(),
             arg: dir_or_view_id,
-        })
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
     }
 }
 
@@ -2072,6 +2245,7 @@ pub struct VaultView {
 
 pub struct VaultViewsTask {
     cell: CoreCell,
+    _open: GateGuard,
 }
 
 impl Task for VaultViewsTask {
@@ -2103,6 +2277,7 @@ impl Task for VaultViewsTask {
 pub struct VaultUnbindTask {
     cell: CoreCell,
     arg: String,
+    _open: GateGuard,
 }
 
 impl Task for VaultUnbindTask {

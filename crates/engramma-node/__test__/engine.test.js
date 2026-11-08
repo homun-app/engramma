@@ -276,6 +276,47 @@ test('modelStatus reports the builtin model (when present)', async () => {
   await e.close();
 });
 
+// v0.4.1 (P1.7): after close, nothing reopens silently. Every method of the
+// engine and of every one of its cells answers CLOSED; closing twice is not
+// an error; operations already in flight finish before close resolves.
+test('after close, everything answers CLOSED (P1.7)', async () => {
+  const e = await engine();
+  const cell = await e.cell('chiusa');
+  const n = await cell.put({ body: 'x', source: 's', confidence: 'stated' });
+  // an operation in flight while close arrives: it finishes
+  const inFlight = cell.put({ body: 'in volo', source: 's', confidence: 'stated' });
+  await e.close();
+  await inFlight; // no error: it was called before the close
+  await e.close(); // closing twice is not an error
+  const closed = async (call) => {
+    try {
+      await call();
+      assert.fail('expected CLOSED');
+    } catch (err) {
+      assert.equal(err.code, 'CLOSED', `message: ${err.message}`);
+    }
+  };
+  await closed(() => cell.put({ body: 'y', source: 's', confidence: 'stated' }));
+  await closed(() => cell.get(n.id));
+  await closed(() => cell.search({ text: 'x' }));
+  await closed(() => cell.list({}));
+  await closed(() => cell.history(n.id));
+  await closed(() => cell.neighbors(n.id));
+  await closed(() => cell.confirm(n.id));
+  await closed(() => cell.delete(n.id));
+  await closed(() => cell.purge(n.id, 'dopo la chiusura'));
+  await closed(() => cell.embedPending());
+  await closed(() => cell.changesSince(0));
+  await closed(() => cell.verify());
+  await closed(() => cell.compact(1));
+  await closed(() => cell.vaultViews());
+  await closed(() => cell.vaultUnbind('01AAAAAAAA'));
+  await closed(() => e.search(['chiusa'], { text: 'x' }));
+  await closed(() => e.cells());
+  await closed(() => e.cell('altra'));
+  await closed(() => e.modelStatus());
+});
+
 // v0.4.1 (P1.6): one engine, one actor per cell — the log says which bot
 // wrote (`homun:bot-<id>`), and two Cell objects over the same cell with
 // different actors are the same cell underneath.
