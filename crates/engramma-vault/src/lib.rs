@@ -311,13 +311,15 @@ impl Vault {
         Ok(view_id)
     }
 
-    /// Walk the folder for markdown files: `.obsidian/`, `.trash/` and hidden
-    /// entries are skipped, symlinks are never followed, `.conflitto-*.md`
-    /// copies are ignored (the import rules).
-    fn scan(&self) -> Result<Vec<Scanned>, VaultError> {
-        let mut out = Vec::new();
+    /// Walk the folder: markdown files for [`Vault::sync_once`] and the
+    /// `.conflitto-*.md` copies it does not read (they are registered, not
+    /// reconciled — v0.4, P0.2). `.obsidian/`, `.trash/` and hidden entries
+    /// are skipped, symlinks are never followed.
+    fn scan_split(&self) -> Result<(Vec<Scanned>, Vec<String>), VaultError> {
+        let mut files = Vec::new();
+        let mut copies = Vec::new();
         if !self.root.exists() {
-            return Ok(out);
+            return Ok((files, copies));
         }
         let mut stack = vec![self.root.clone()];
         while let Some(dir) = stack.pop() {
@@ -338,13 +340,27 @@ impl Vault {
                     stack.push(path);
                     continue;
                 }
-                if path.extension().is_none_or(|e| e != "md") || name.contains(".conflitto-") {
+                if path.extension().is_none_or(|e| e != "md") {
                     continue;
                 }
-                out.push(self.snapshot(&path)?);
+                if name.contains(".conflitto-") {
+                    copies.push(
+                        path.strip_prefix(&self.root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                    continue;
+                }
+                files.push(self.snapshot(&path)?);
             }
         }
-        Ok(out)
+        Ok((files, copies))
+    }
+
+    /// Markdown files only (the reconciliation's input).
+    fn scan(&self) -> Result<Vec<Scanned>, VaultError> {
+        Ok(self.scan_split()?.0)
     }
 
     /// The export-style path for a note: `<type>/<slug>-<id8>.md` (with the
@@ -425,7 +441,7 @@ impl Vault {
     pub fn sync_once(&self, allow_deletions: bool) -> Result<SyncReport, VaultError> {
         let mut report = SyncReport::default();
         let view_id = self.bind_view(None)?;
-        let scanned = self.scan()?;
+        let (scanned, conflict_copies) = self.scan_split()?;
         let known: BTreeMap<String, engramma_core::VaultFile> = self
             .cell
             .vault_files_of_view(&view_id)?
@@ -499,6 +515,13 @@ impl Vault {
             self.cell.vault_file_delete(&view_id, &row.path)?;
         }
 
+        // 4.5 v0.4 (P0.2): copies made by a pre-v0.3.2 binary are in no
+        //     registry — no purge would ever find them. A copy whose base
+        //     file is bound to a note joins that note's registry; an orphan
+        //     (no bound base file) stays the user's and is warned about
+        //     ONCE — its marker row keeps the warning from repeating.
+        self.register_conflict_copies(&view_id, &conflict_copies, &mut report)?;
+
         // 5. v0.3.2 (P1.6): finish a purge's work — the `.conflitto` copies
         //    of notes that no longer exist (a purge that could not reach
         //    this view left them, with their rows). Copies of LIVING notes
@@ -529,6 +552,58 @@ impl Vault {
         }
 
         Ok(report)
+    }
+
+    /// v0.4 (P0.2): adopt the `.conflitto` copies older binaries left out
+    /// of the registry. `<base>.conflitto-<ts>.md` next to a BOUND
+    /// `<base>.md` is registered for that base's note (the engine's own
+    /// copies already are); anything else is an ORPHAN — the user's to
+    /// keep, listed in a warning once (a marker row without a note mutes
+    /// the next syncs and follows the file away).
+    fn register_conflict_copies(
+        &self,
+        view_id: &str,
+        copies: &[String],
+        report: &mut SyncReport,
+    ) -> Result<(), VaultError> {
+        let bound: BTreeMap<String, String> = self
+            .cell
+            .vault_files_of_view(view_id)?
+            .into_iter()
+            .map(|f| (f.path, f.note_id))
+            .collect();
+        let registered: BTreeMap<String, String> = self
+            .cell
+            .vault_conflicts_of_view(view_id)?
+            .into_iter()
+            .collect();
+        for rel in copies {
+            let base = match rel.rfind(".conflitto-") {
+                Some(at) => format!("{}.md", &rel[..at]),
+                None => continue,
+            };
+            match bound.get(&base) {
+                Some(note_id) => {
+                    let Ok(id) = Ulid::from_string(note_id) else {
+                        continue;
+                    };
+                    // register only what changed: a quiet view stays quiet
+                    if registered.get(rel).map(String::as_str) != Some(note_id.as_str()) {
+                        self.cell.vault_conflict_put(view_id, rel, Some(&id))?;
+                    }
+                }
+                None => {
+                    if !registered.contains_key(rel) {
+                        self.cell.vault_conflict_put(view_id, rel, None)?;
+                        report.warnings.push(format!(
+                            "{rel}: copia .conflitto orfana (il suo file base non è \
+                             legato a nessuna nota), lasciata stare"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn living_notes(&self) -> Result<usize, VaultError> {

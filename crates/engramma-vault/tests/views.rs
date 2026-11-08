@@ -282,3 +282,97 @@ fn v032_cell_migrates_roots_to_views_and_the_first_sync_adopts() {
             .unwrap(/* test-only */);
     assert_eq!(after["view_id"].as_str(), Some(minted.as_str()));
 }
+
+/// v0.4 (P0.2): a `.conflitto` copy made by a v0.3.1 binary is not in
+/// `vault_conflicts` — a purge would never find it. The scanner registers
+/// it for the note its base file is bound to; an orphan copy (no bound
+/// base file) stays the user's and is warned about ONCE, not at every sync.
+#[test]
+fn pre_v032_conflict_copy_is_registered_and_purged() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let (vault, n) = setup(dir.path());
+    // the bound file, as the last sync saw it
+    let bound: Vec<String> = {
+        let views = vault.cell().vault_views().unwrap(/* t */);
+        vault
+            .cell()
+            .vault_files_of_view(&views[0].view_id)
+            .unwrap(/* t */)
+            .into_iter()
+            .map(|f| f.path)
+            .collect()
+    };
+    assert_eq!(bound.len(), 1, "{bound:?}");
+    // a v0.3.1-style copy, hand-made next to it: `<base>.conflitto-<ts>.md`
+    let base = bound[0].clone();
+    let copy = format!(
+        "{}.conflitto-2026-01-01T00_00_00.md",
+        base.trim_end_matches(".md")
+    );
+    std::fs::write(
+        vault.root().join(&copy),
+        "versione persa col vecchio binario, corpo quokkaviolaceo",
+    )
+    .unwrap(/* test-only */);
+
+    let report = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(
+        report.warnings.iter().all(|w| !w.contains(&copy)),
+        "a copy with a BOUND base file is not an orphan: {report:?}"
+    );
+    let views = vault.cell().vault_views().unwrap(/* t */);
+    assert_eq!(
+        vault
+            .cell()
+            .vault_conflicts_of(&views[0].view_id, &n.id)
+            .unwrap(/* t */),
+        vec![copy.clone()],
+        "the legacy copy is registered for its note"
+    );
+
+    // and the purge of the note takes it away
+    vault.cell().purge(&n.id, "oblio", "t").unwrap(/* t */);
+    vault.forget_note(&n.id).unwrap(/* test-only */);
+    assert!(
+        !vault.root().join(&copy).exists(),
+        "the legacy conflict copy must not survive the purge"
+    );
+}
+
+/// The orphan half of P0.2: a copy whose base file is NOT bound stays the
+/// user's, warned about once — the second quiet sync says nothing.
+#[test]
+fn orphan_conflict_copy_is_warned_once_and_stays() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let (vault, _) = setup(dir.path());
+    let orphan = "fact/sconosciuta.conflitto-2025-06-01T12_00_00.md";
+    std::fs::create_dir_all(vault.root().join("fact")).unwrap(/* t */);
+    std::fs::write(
+        vault.root().join(orphan),
+        "una copia orfana, il suo file base non è legato a nessuna nota",
+    )
+    .unwrap(/* test-only */);
+
+    let first = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(
+        first
+            .warnings
+            .iter()
+            .any(|w| w.contains(orphan) && w.contains("orfana")),
+        "the orphan is listed, once: {first:?}"
+    );
+    assert!(
+        vault.root().join(orphan).exists(),
+        "an orphan stays the user's"
+    );
+    // the copy becomes a known orphan: no warning at the next quiet sync
+    let second = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(
+        second.warnings.iter().all(|w| !w.contains(orphan)),
+        "warned once, not at every sync: {second:?}"
+    );
+    // …and when the user deletes it by hand, the marker row goes too
+    std::fs::remove_file(vault.root().join(orphan)).unwrap(/* t */);
+    let third = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(third.is_noop(), "{third:?}");
+}

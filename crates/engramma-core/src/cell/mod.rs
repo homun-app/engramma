@@ -1781,29 +1781,6 @@ impl Cell {
         Ok(())
     }
 
-    /// The note a conflict copy is registered to (None: not registered, or
-    /// the orphan marker of P0.2).
-    ///
-    /// # Errors
-    /// [`CellError::Db`] on SQL failure.
-    pub fn vault_conflict_note(
-        &self,
-        view_id: &str,
-        path: &str,
-    ) -> Result<Option<Ulid>, CellError> {
-        let inner = self.lock()?;
-        let note: Option<String> = inner
-            .conn
-            .query_row(
-                "SELECT note_id FROM vault_conflicts WHERE view_id = ?1 AND path = ?2",
-                rusqlite::params![view_id, path],
-                |r| r.get(0),
-            )
-            .optional()?;
-        // an unparseable id is the P0.2 orphan marker (''): no note
-        Ok(note.and_then(|s| Ulid::from_string(&s).ok()))
-    }
-
     /// Forget one conflict copy's row.
     ///
     /// # Errors
