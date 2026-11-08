@@ -276,6 +276,28 @@ test('modelStatus reports the builtin model (when present)', async () => {
   await e.close();
 });
 
+// v0.4.1 (P1.6): one engine, one actor per cell — the log says which bot
+// wrote (`homun:bot-<id>`), and two Cell objects over the same cell with
+// different actors are the same cell underneath.
+test('an actor per cell, one engine (P1.6)', async () => {
+  const e = await engine();
+  const bot7 = await e.cell('condivisa', { actor: 'homun:bot-7' });
+  const daemon = await e.cell('condivisa', { actor: 'homun' });
+  await bot7.put({ body: 'scritta dal bot 7', source: 'homun:chat/7/e1', confidence: 'stated' });
+  await daemon.put({ body: 'scritta dal demone', source: 'homun', confidence: 'stated' });
+  const ops = await daemon.changesSince(0);
+  const actors = ops.ops.map((o) => o.actor).sort();
+  assert.ok(actors.includes('homun:bot-7'), `${actors}`);
+  assert.ok(actors.includes('homun'), `${actors}`);
+  // without the option, the engine's actor (backwards compatible)
+  const plain = await e.cell('altra');
+  const n = await plain.put({ body: 'x', source: 's', confidence: 'stated' });
+  assert.equal(n.id.length, 26);
+  const opsPlain = await plain.changesSince(0);
+  assert.ok(opsPlain.ops.every((o) => o.actor === 'homun'));
+  await e.close();
+});
+
 // v0.4.1 (P1.5): a search hit carries what a result row needs — the id
 // short form, the cell, the date, the tags, the type, the state — without a
 // get per result.

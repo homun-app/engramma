@@ -380,6 +380,10 @@ pub struct ModelStatus {
 #[napi(object)]
 pub struct CellOpts {
     pub create: Option<bool>,
+    /// v0.4.1 (P1.6): the actor this cell's writes are stamped with, instead
+    /// of the engine's (`homun:bot-<id>`). The cell underneath is the same:
+    /// two Cell objects with different actors write the same memory.
+    pub actor: Option<String>,
 }
 
 #[napi(object)]
@@ -917,6 +921,7 @@ pub struct CellOpenTask {
     handle: EngineHandle,
     name: String,
     create: bool,
+    actor: Option<String>,
 }
 
 impl Task for CellOpenTask {
@@ -925,12 +930,13 @@ impl Task for CellOpenTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         let cell = self.handle.open_cell(&self.name, self.create)?;
-        Ok((
-            cell,
-            self.name.clone(),
-            self.handle.embedder.clone(),
-            (*self.handle.actor).clone(),
-        ))
+        let actor = match &self.actor {
+            // v0.4.1 (P1.6): an empty actor is the same as none — the
+            // engine's own stamps the writes
+            Some(a) if !a.trim().is_empty() => a.trim().to_string(),
+            _ => (*self.handle.actor).clone(),
+        };
+        Ok((cell, self.name.clone(), self.handle.embedder.clone(), actor))
     }
 
     fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
@@ -1117,7 +1123,8 @@ impl Engine {
         AsyncTask::new(CellOpenTask {
             handle: self.handle.clone(),
             name,
-            create: opts.and_then(|o| o.create).unwrap_or(true),
+            create: opts.as_ref().and_then(|o| o.create).unwrap_or(true),
+            actor: opts.and_then(|o| o.actor),
         })
     }
 
