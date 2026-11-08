@@ -8,11 +8,14 @@
   "types": "index.d.ts",
   "napi": {
     "binaryName": "engramma",
-    "targets": ["aarch64-apple-darwin"]
+    "targets": [
+      "aarch64-apple-darwin"
+    ]
   },
   "scripts": {
     "build": "napi build --platform --release",
-    "test": "node --test __test__/"
+    "test": "node --test __test__/engine.test.js",
+    "test:electron": "env ELECTRON_RUN_AS_NODE=1 \"${HOMUN_ELECTRON:-node_modules/electron/dist/Electron.app/Contents/MacOS/Electron}\" --test __test__/engine.test.js"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.10.12"
