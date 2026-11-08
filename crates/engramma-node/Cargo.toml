@@ -1,0 +1,23 @@
+[package]
+name = "engramma-node"
+description = "Node.js (N-API) binding of the Engramma memory engine, for Homun"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+engramma-core.workspace = true
+engramma-embed.workspace = true
+engramma-vault.workspace = true
+napi.workspace = true
+napi-derive.workspace = true
+
+[build-dependencies]
+napi-build.workspace = true
+

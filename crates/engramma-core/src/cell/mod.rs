@@ -308,8 +308,11 @@ fn verify_checkpoint_coherence(
             for e in ops::derived_edges_of(&note).map_err(|e| e.to_string())? {
                 // NULL renders as \0, like `render` below (state_dump's rule)
                 let null = "\u{0}".to_string();
+                // `render` puts the separator after every column, last one
+                // included — expected must end the same way (the trailing
+                // \u{1} in the format, not an `expect` on the pushed line)
                 expected.push(format!(
-                    "{note_id}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+                    "{note_id}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}",
                     e.id,
                     e.src,
                     e.rel,
@@ -319,9 +322,6 @@ fn verify_checkpoint_coherence(
                     e.confidence,
                     e.status,
                 ));
-                // `render` puts the separator after every column, last one
-                // included — expected must end the same way
-                expected.last_mut().expect("just pushed").push('\u{1}');
             }
         }
     }

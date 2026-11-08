@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/engramma-core", "crates/engramma-embed", "crates/engramma-vault", "crates/engramma-cli", "crates/engramma-mcp", "bench"]
+members = ["crates/engramma-core", "crates/engramma-embed", "crates/engramma-vault", "crates/engramma-cli", "crates/engramma-mcp", "crates/engramma-node", "bench"]
 
 [workspace.package]
 version = "0.1.0-dev"
@@ -38,6 +38,11 @@ tempfile = "3"
 # v0.2 embedding (verified 2026-11-05: tract gives the same vectors as ONNX
 # Runtime on Granite R2, cos 1.000000; pure Rust, no native runtime to ship).
 tract-onnx = "0.23.10"
+# v0.4 Node binding for Homun (verified 2026-11-08: a napi-rs 3 addon with a
+# class and an AsyncTask loads in Node 24 and in Homun's Electron 45, N-API 10).
+napi = { version = "3.16.1", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+napi-build = "2"
 # `fancy-regex` instead of the default `onig`: no C code, same token ids.
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 # Ollama and external OpenAI-compatible embedding endpoints.

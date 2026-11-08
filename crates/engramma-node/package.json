@@ -1,0 +1,20 @@
+{
+  "name": "engramma-node",
+  "version": "0.1.0-dev",
+  "private": true,
+  "description": "Node.js (N-API) binding of the Engramma memory engine",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "engramma",
+    "targets": ["aarch64-apple-darwin"]
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "test": "node --test __test__/"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.10.12"
+  }
+}
