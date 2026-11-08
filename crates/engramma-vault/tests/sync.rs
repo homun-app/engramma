@@ -59,6 +59,14 @@ fn read(vault: &Vault, rel: &str) -> String {
     std::fs::read_to_string(vault.root().join(rel)).unwrap(/* test-only */)
 }
 
+/// The (single) view's id bound in the cell — v0.4 (P0.1): files and
+/// conflict copies belong to a view now.
+fn vid(vault: &Vault) -> String {
+    vault.cell().vault_views().unwrap(/* test-only */)[0]
+        .view_id
+        .clone()
+}
+
 /// init exports one file per note; sync is a no-op right after (echo).
 #[test]
 fn init_then_sync_is_a_noop() {
@@ -213,7 +221,7 @@ fn moved_file_keeps_its_note() {
     let r = vault.sync_once(false).unwrap(/* test-only */);
     assert_eq!(r.moved.len(), 1, "{r:?}");
     assert!(r.deleted.is_empty(), "{r:?}");
-    let rows = vault.cell().vault_files().unwrap(/* t */);
+    let rows = vault.cell().vault_files_of_view(&vid(&vault)).unwrap(/* t */);
     assert!(
         rows.iter().any(|f| f.path.ends_with("spostata.md")),
         "{rows:?}"
@@ -249,7 +257,10 @@ fn vanished_file_deletes_the_note_and_the_guard_stops_mass_deletions() {
         vault.cell().get(&n.id).unwrap(/* t */).status,
         Status::Deleted
     );
-    assert_eq!(vault.cell().vault_files().unwrap(/* t */).len(), 25);
+    assert_eq!(
+        vault.cell().vault_files_of_view(&vid(&vault)).unwrap(/* t */).len(),
+        25
+    );
 
     // the guard: 25 files vanish together (an unmounted folder)
     for f in list_md(&vault) {
@@ -338,7 +349,7 @@ fn purged_note_loses_its_file() {
             .contains(&f.strip_prefix(vault.root()).unwrap(/* t */).to_string_lossy().to_string()),
         "{r:?}"
     );
-    assert!(vault.cell().vault_files().unwrap(/* t */).is_empty());
+    assert!(vault.cell().vault_files_of_view(&vid(&vault)).unwrap(/* t */).is_empty());
 }
 
 /// the property: random edits from the file side and from the cell, two
@@ -372,7 +383,7 @@ fn random_edits_converge_to_a_fixed_point() {
             match next() % 5 {
                 0 => {
                     // edit the file behind the engine's back
-                    let rows = vault.cell().vault_files().unwrap(/* t */);
+                    let rows = vault.cell().vault_files_of_view(&vid(&vault)).unwrap(/* t */);
                     let row = rows.iter().find(|r| r.note_id == pick.to_string());
                     if let Some(row) = row {
                         let path = vault.root().join(&row.path);
@@ -413,7 +424,7 @@ fn random_edits_converge_to_a_fixed_point() {
             if conflict_edit
                 && let Some(row) = vault
                     .cell()
-                    .vault_files()
+                    .vault_files_of_view(&vid(&vault))
                     .unwrap(/* t */)
                     .iter()
                     .find(|r| r.note_id == pick.to_string())
@@ -461,7 +472,7 @@ fn random_edits_converge_to_a_fixed_point() {
             "seed {seed}: the second reconciliation must do nothing: {r2:?}"
         );
         // every living note has its file, with serialize(note) as content
-        let rows = vault.cell().vault_files().unwrap(/* t */);
+        let rows = vault.cell().vault_files_of_view(&vid(&vault)).unwrap(/* t */);
         // one row per note, structurally and in the files on disk
         let mut bound_notes: Vec<&String> = rows.iter().map(|r| &r.note_id).collect();
         bound_notes.sort();
@@ -507,7 +518,7 @@ fn random_edits_converge_to_a_fixed_point() {
         );
         // the conflict registry holds only notes that still exist: the
         // copies of the purged ones went with them (seed {seed})
-        for (path, note_id) in vault.cell().vault_conflicts().unwrap(/* t */) {
+        for (path, note_id) in vault.cell().vault_conflicts_of_view(&vid(&vault)).unwrap(/* t */) {
             let id = Ulid::from_string(&note_id).unwrap(/* t */);
             assert!(
                 vault.cell().get(&id).is_ok(),
@@ -685,7 +696,7 @@ fn one_file_per_note_no_second_export_no_ping_pong() {
         "the file is the user's own: {all:?}"
     );
     // one row per note in the reconciliation state
-    let rows = vault.cell().vault_files().unwrap(/* test-only */);
+    let rows = vault.cell().vault_files_of_view(&vid(&vault)).unwrap(/* test-only */);
     assert_eq!(rows.len(), 1, "{rows:?}");
     // the second sync does nothing at all
     let r2 = vault.sync_once(false).unwrap(/* test-only */);
@@ -700,7 +711,7 @@ fn one_file_per_note_no_second_export_no_ping_pong() {
         "the duplicate is reported: {r3:?}"
     );
     assert!(r3.deleted.is_empty() && r3.moved.is_empty(), "{r3:?}");
-    let rows = vault.cell().vault_files().unwrap(/* test-only */);
+    let rows = vault.cell().vault_files_of_view(&vid(&vault)).unwrap(/* test-only */);
     assert_eq!(rows.len(), 1, "still one binding: {rows:?}");
     assert!(rows[0].path.ends_with("nuova.md"), "{rows:?}");
     // and editing the bound file still updates the note (no bounce)
@@ -743,21 +754,21 @@ fn purge_takes_the_conflict_copy_and_the_file_now() {
     assert_eq!(r.conflicts.len(), 1, "{r:?}");
     // the conflict copy is registered
     assert_eq!(
-        vault.cell().vault_conflicts_of(&n.id).unwrap(/* t */).len(),
+        vault.cell().vault_conflicts_of(&vid(&vault), &n.id).unwrap(/* t */).len(),
         1
     );
     assert_eq!(
-        vault.cell().vault_roots().unwrap(/* t */).len(),
+        vault.cell().vault_views().unwrap(/* t */).len(),
         1,
         "the view is bound in the cell"
     );
 
     // the purge: cell first, then every registered view
     vault.cell().purge(&n.id, "oblio", "tester").unwrap(/* t */);
-    for root in vault.cell().vault_roots().unwrap(/* t */) {
+    for view in vault.cell().vault_views().unwrap(/* t */) {
         let v = Vault::open(
             vault.cell().clone(),
-            std::path::PathBuf::from(&root).as_path(),
+            std::path::PathBuf::from(&view.root).as_path(),
         )
         .unwrap(/* test-only */);
         v.forget_note(&n.id).unwrap(/* test-only */);
@@ -795,12 +806,12 @@ fn purge_takes_the_conflict_copy_and_the_file_now() {
     assert!(
         vault
             .cell()
-            .vault_files()
+            .vault_files_of_view(&vid(&vault))
             .unwrap(/* t */)
             .iter()
             .all(|r| r.note_id != n.id.to_string())
     );
-    assert!(vault.cell().vault_conflicts().unwrap(/* t */).is_empty());
+    assert!(vault.cell().vault_conflicts_of_view(&vid(&vault)).unwrap(/* t */).is_empty());
 }
 
 /// v0.3.2 (P1.6): an unreachable view (unmounted, renamed away) makes
@@ -832,7 +843,7 @@ fn unreachable_view_is_pending_and_the_next_sync_finishes() {
         .unwrap(/* test-only */);
     vault.sync_once(false).unwrap(/* test-only */);
     assert_eq!(
-        vault.cell().vault_conflicts_of(&n.id).unwrap(/* t */).len(),
+        vault.cell().vault_conflicts_of(&vid(&vault), &n.id).unwrap(/* t */).len(),
         1
     );
 
@@ -845,7 +856,7 @@ fn unreachable_view_is_pending_and_the_next_sync_finishes() {
     vault.cell().purge(&n.id, "oblio", "tester").unwrap(/* t */);
     let away = dir.path().join("via");
     std::fs::rename(vault.root(), &away).unwrap(/* test-only */);
-    let root = vault.cell().vault_roots().unwrap(/* t */)[0].clone();
+    let root = vault.cell().vault_views().unwrap(/* t */)[0].root.clone();
     let v = Vault::open(
         vault.cell().clone(),
         std::path::PathBuf::from(&root).as_path(),
@@ -865,9 +876,9 @@ fn unreachable_view_is_pending_and_the_next_sync_finishes() {
     let r = vault.sync_once(false).unwrap(/* test-only */);
     assert!(!path.exists(), "the bound file went with the note");
     assert!(
-        vault.cell().vault_conflicts().unwrap(/* t */).is_empty(),
+        vault.cell().vault_conflicts_of_view(&vid(&vault)).unwrap(/* t */).is_empty(),
         "the conflict copies went too: {:?}",
-        vault.cell().vault_conflicts().unwrap(/* t */)
+        vault.cell().vault_conflicts_of_view(&vid(&vault)).unwrap(/* t */)
     );
     let _ = r;
     fn walk_files2(dir: &Path, out: &mut Vec<std::path::PathBuf>) {

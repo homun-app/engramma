@@ -797,8 +797,20 @@ fn a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint() {
              INSERT INTO snapshots_v9 SELECT * FROM snapshots;
              DROP TABLE snapshots;
              ALTER TABLE snapshots_v9 RENAME TO snapshots;
+             DROP TABLE IF EXISTS vault_views;
              DROP TABLE IF EXISTS vault_roots;
              DROP TABLE IF EXISTS vault_conflicts;
+             CREATE TABLE vault_files_v9 (path TEXT PRIMARY KEY,
+                                          note_id TEXT NOT NULL,
+                                          file_hash TEXT NOT NULL,
+                                          note_version INTEGER NOT NULL,
+                                          mtime INTEGER NOT NULL,
+                                          size INTEGER NOT NULL);
+             INSERT INTO vault_files_v9 SELECT path, note_id, file_hash, note_version,
+                                            mtime, size FROM vault_files;
+             DROP TABLE vault_files;
+             ALTER TABLE vault_files_v9 RENAME TO vault_files;
+             CREATE UNIQUE INDEX idx_vault_files_note_v9 ON vault_files(note_id);
              UPDATE meta SET value = '9' WHERE key = 'schema_version';",
         )
         .unwrap(/* test-only */);

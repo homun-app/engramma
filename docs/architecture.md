@@ -35,7 +35,9 @@ engramma-core
 │                v8: snapshots.redacted_by; v9: one file per note
 │                (UNIQUE(note_id) on vault_files); v10: snapshots.file and
 │                state_digest nullable (the checkpoint); v11: vault_roots +
-│                vault_conflicts (the cell remembers its views).
+│                vault_conflicts (the cell remembers its views); v12:
+│                vault_views — a view's identity is the view_id ULID in its
+│                engramma.json, not the path (v0.4).
 ├── cell/       compact(seq, opts) (v0.3.2): by default a CHECKPOINT —
 │               head hash and state_digest of the logical state at the
 │               head, no file (the live cell already is the durable state;

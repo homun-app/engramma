@@ -260,6 +260,10 @@ enum VaultAction {
     /// Reconcile on filesystem events (500 ms debounce) and every 60 s;
     /// Ctrl-C exits
     Watch { dir: PathBuf },
+    /// Detach a view (v0.4): the cell forgets it and ITS bindings — the
+    /// files stay on disk, they were never the engine's. Accepts the
+    /// folder or the view id (even just its first 8 characters).
+    Unbind { dir_or_view_id: String },
 }
 
 #[derive(Subcommand)]
@@ -602,16 +606,61 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             // v0.3.2 (P1.6): reach every registered view — the note's file
             // and every `.conflitto` copy of it go NOW, not at the next
             // sync. The core never writes into a view; `forget_note` does.
-            for root in cell.vault_roots().unwrap_or_default() {
-                let vault = engramma_vault::Vault::open(cell.clone(), std::path::Path::new(&root));
-                match vault.and_then(|v| v.forget_note(&note_id)) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        eprintln!("engramma: vista {root}: {e}");
-                        if !report.pending.contains(&"vault") {
-                            report.pending.push("vault");
+            // v0.4 (P0.1): the views are IDENTITIES; an unreachable view
+            // keeps the purge pending only while it still holds something
+            // of THIS note (a bound file or a conflict copy), and the
+            // message names it and offers both ways out — `sync` to reach
+            // it again, `unbind` to let it go. A cell whose views cannot
+            // even be read is NOT a completed forgetting either.
+            let mut view_errors: Vec<String> = Vec::new();
+            match cell.vault_views() {
+                Ok(views) => {
+                    for view in &views {
+                        let vault = engramma_vault::Vault::open(
+                            cell.clone(),
+                            std::path::Path::new(&view.root),
+                        );
+                        match vault.and_then(|v| v.forget_note(&note_id)) {
+                            Ok(()) => {}
+                            Err(engramma_vault::VaultError::Unreachable { .. }) => {
+                                let holds = cell
+                                    .vault_views_of_note(&note_id)
+                                    .map_or(true, |v| v.iter().any(|x| x.view_id == view.view_id));
+                                if !holds {
+                                    // nothing of this note lives there:
+                                    // the forgetting is complete
+                                    continue;
+                                }
+                                view_errors.push(format!(
+                                    "la vista {} ({}) non è raggiungibile e la cella vi lega \
+                                     ancora file o copie della nota: `engramma vault sync {}` \
+                                     per finire, o `engramma vault unbind {}` per sganciarla \
+                                     (i file restano)",
+                                    view.root,
+                                    engramma_core::id::id8(
+                                        &ulid::Ulid::from_string(&view.view_id).unwrap_or_default()
+                                    ),
+                                    view.root,
+                                    view.root,
+                                ));
+                            }
+                            Err(e) => {
+                                view_errors.push(format!("vista {}: {e}", view.root));
+                            }
                         }
                     }
+                }
+                Err(e) => {
+                    // the swallowed `unwrap_or_default` of v0.3.2 (P0.1): a
+                    // purge that cannot know what the views hold is not
+                    // complete — pending says so
+                    view_errors.push(format!("viste non leggibili: {e}"));
+                }
+            }
+            for why in &view_errors {
+                eprintln!("engramma: {why}");
+                if !report.pending.contains(&"vault") {
+                    report.pending.push("vault");
                 }
             }
             report.scrubbed = report.pending.is_empty();
@@ -638,8 +687,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                                   la cella aperta; verrà ritentato alla prossima \
                                   scrittura)"
                             .to_string(),
-                        "vault" => "una vista markdown non era raggiungibile (la \
-                                    prossima `vault sync` finisce il lavoro)"
+                        "vault" => "una vista markdown non era raggiungibile \
+                                    (la `vault sync` finisce il lavoro, o \
+                                    `vault unbind` la sgancia)"
                             .to_string(),
                         other => other.to_string(),
                     })
@@ -1349,6 +1399,61 @@ fn run_vault(cli: &Cli, action: &VaultAction) -> Result<(), CliError> {
             handle
                 .stop()
                 .map_err(|e| CliError::internal(format!("watch stop: {e}")))?;
+            Ok(())
+        }
+        VaultAction::Unbind { dir_or_view_id } => {
+            let cell = open_cell(cli)?;
+            let arg = dir_or_view_id.trim();
+            // a folder (canonicalized when it exists) first, then the view
+            // id — full or its first 8 characters
+            let by_path = std::fs::canonicalize(arg)
+                .ok()
+                .and_then(|c| cell.vault_view_by_root(&c.to_string_lossy()).ok().flatten());
+            let matches_prefix =
+                |vid: &str| arg.len() >= 8 && vid.starts_with(arg) && arg.len() <= vid.len();
+            let view = match by_path {
+                Some(v) => Some(v),
+                None => {
+                    let hits: Vec<_> = cell
+                        .vault_views()?
+                        .into_iter()
+                        .filter(|v| v.view_id == arg || matches_prefix(&v.view_id))
+                        .collect();
+                    match hits.len() {
+                        1 => Some(hits[0].clone()),
+                        0 => None,
+                        _ => {
+                            return Err(CliError::usage(format!(
+                                "«{arg}» indica {} viste: serve l'id completo",
+                                hits.len()
+                            )));
+                        }
+                    }
+                }
+            };
+            let Some(view) = view else {
+                return Err(CliError::not_found(format!(
+                    "nessuna vista legata a «{arg}»"
+                )));
+            };
+            let (files, conflicts) = cell.vault_unbind(&view.view_id)?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "unbound": view.view_id,
+                    "root": view.root,
+                    "files": files,
+                    "conflicts": conflicts,
+                }));
+            } else {
+                println!(
+                    "sganciata: {} ({}) — {} file e {} copie di conflitto \
+                     dimenticati dalla cella; i file restano dove sono",
+                    view.root,
+                    &view.view_id[..8],
+                    files,
+                    conflicts
+                );
+            }
             Ok(())
         }
     }

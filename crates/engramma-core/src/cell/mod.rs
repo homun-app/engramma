@@ -152,6 +152,21 @@ pub struct VaultFile {
     pub size: i64,
 }
 
+/// A registered markdown view (v0.4, P0.1): the folder's IDENTITY is the
+/// `view_id` ULID carried in its `engramma.json`, not the path — a moved
+/// folder is the same view at a new `root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultView {
+    /// The ULID from the view's `engramma.json`.
+    pub view_id: String,
+    /// The canonical absolute path, as last seen.
+    pub root: String,
+    /// When the view was first bound.
+    pub bound_at: String,
+    /// When the view was last seen (every `init`/`sync`).
+    pub last_seen_at: String,
+}
+
 /// A version entry of a note's history.
 #[derive(Debug, Clone)]
 pub struct VersionEntry {
@@ -1405,17 +1420,18 @@ impl Cell {
         state_digest(&inner.conn)
     }
 
-    /// The markdown view's reconciliation state (last scan).
+    /// The markdown view's reconciliation state: one view's rows (last
+    /// scan), path order. v0.4 (P0.1): files belong to a view.
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
-    pub fn vault_files(&self) -> Result<Vec<VaultFile>, CellError> {
+    pub fn vault_files_of_view(&self, view_id: &str) -> Result<Vec<VaultFile>, CellError> {
         let inner = self.lock()?;
         let mut stmt = inner.conn.prepare(
             "SELECT path, note_id, file_hash, note_version, mtime, size
-             FROM vault_files ORDER BY path",
+             FROM vault_files WHERE view_id = ?1 ORDER BY path",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map([view_id], |r| {
             Ok(VaultFile {
                 path: r.get(0)?,
                 note_id: r.get(1)?,
@@ -1430,6 +1446,38 @@ impl Cell {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// The file bound to a note, whichever view holds it — `(view_id, row)`
+    /// (one file per note is structural, v0.3.1): the cross-view lookups of
+    /// the reconciliation.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_file_of_note(&self, id: &Ulid) -> Result<Option<(String, VaultFile)>, CellError> {
+        let inner = self.lock()?;
+        inner
+            .conn
+            .query_row(
+                "SELECT view_id, path, note_id, file_hash, note_version, mtime, size
+                 FROM vault_files WHERE note_id = ?1",
+                [id.to_string()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        VaultFile {
+                            path: r.get(1)?,
+                            note_id: r.get(2)?,
+                            file_hash: r.get(3)?,
+                            note_version: r.get(4)?,
+                            mtime: r.get(5)?,
+                            size: r.get(6)?,
+                        },
+                    ))
+                },
+            )
+            .optional()
+            .map_err(CellError::from)
     }
 
     /// The ids of the living notes (no tombstones), in id order.
@@ -1466,25 +1514,27 @@ impl Cell {
     }
 
     /// Record (or replace) one row of the markdown view's state — derived
-    /// data, no operation. One row per note is structural (v0.3.1, P1.6): a
-    /// write for an already-bound note REBINDS it to the new path.
+    /// data, no operation. One row per note is structural (v0.3.1, P0.6): a
+    /// write for an already-bound note REBINDS it to the new path (and, v0.4,
+    /// to THIS view — that is how a legacy row with no view adopts one).
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
-    pub fn vault_file_put(&self, row: &VaultFile) -> Result<(), CellError> {
+    pub fn vault_file_put(&self, view_id: &str, row: &VaultFile) -> Result<(), CellError> {
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
         let inner = self.lock()?;
         inner.conn.execute(
-            "INSERT INTO vault_files (path, note_id, file_hash, note_version, mtime, size)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(path) DO UPDATE SET note_id = ?2, file_hash = ?3,
-                                             note_version = ?4, mtime = ?5, size = ?6
-             ON CONFLICT(note_id) DO UPDATE SET path = ?1, file_hash = ?3,
-                                              note_version = ?4, mtime = ?5, size = ?6",
+            "INSERT INTO vault_files (view_id, path, note_id, file_hash, note_version, mtime, size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(view_id, path) DO UPDATE SET note_id = ?3, file_hash = ?4,
+                                                     note_version = ?5, mtime = ?6, size = ?7
+             ON CONFLICT(note_id) DO UPDATE SET view_id = ?1, path = ?2, file_hash = ?4,
+                                               note_version = ?5, mtime = ?6, size = ?7",
             rusqlite::params![
+                view_id,
                 row.path,
                 row.note_id,
                 row.file_hash,
@@ -1496,17 +1546,25 @@ impl Cell {
         Ok(())
     }
 
-    /// The views this cell is bound to: the canonical absolute roots
-    /// (v0.3.2, P1.6), oldest binding first.
+    /// The views this cell is bound to (v0.4, P0.1): identities, with the
+    /// root each one was last seen at, oldest binding first.
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
-    pub fn vault_roots(&self) -> Result<Vec<String>, CellError> {
+    pub fn vault_views(&self) -> Result<Vec<VaultView>, CellError> {
         let inner = self.lock()?;
-        let mut stmt = inner
-            .conn
-            .prepare("SELECT root FROM vault_roots ORDER BY bound_at, root")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut stmt = inner.conn.prepare(
+            "SELECT view_id, root, bound_at, last_seen_at
+             FROM vault_views ORDER BY bound_at, view_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(VaultView {
+                view_id: r.get(0)?,
+                root: r.get(1)?,
+                bound_at: r.get(2)?,
+                last_seen_at: r.get(3)?,
+            })
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1514,13 +1572,63 @@ impl Cell {
         Ok(out)
     }
 
-    /// Register (or refresh) a view binding: the canonical absolute root,
-    /// written by every `vault init`/`sync` (v0.3.2, P1.6) so that a purge
-    /// can reach the view without being told again.
+    /// A view by its canonical absolute root, when one is bound there.
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
-    pub fn vault_root_put(&self, root: &str) -> Result<(), CellError> {
+    pub fn vault_view_by_root(&self, root: &str) -> Result<Option<VaultView>, CellError> {
+        let inner = self.lock()?;
+        inner
+            .conn
+            .query_row(
+                "SELECT view_id, root, bound_at, last_seen_at
+                 FROM vault_views WHERE root = ?1",
+                [root],
+                |r| {
+                    Ok(VaultView {
+                        view_id: r.get(0)?,
+                        root: r.get(1)?,
+                        bound_at: r.get(2)?,
+                        last_seen_at: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(CellError::from)
+    }
+
+    /// A view by its id.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_view_by_id(&self, view_id: &str) -> Result<Option<VaultView>, CellError> {
+        let inner = self.lock()?;
+        inner
+            .conn
+            .query_row(
+                "SELECT view_id, root, bound_at, last_seen_at
+                 FROM vault_views WHERE view_id = ?1",
+                [view_id],
+                |r| {
+                    Ok(VaultView {
+                        view_id: r.get(0)?,
+                        root: r.get(1)?,
+                        bound_at: r.get(2)?,
+                        last_seen_at: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(CellError::from)
+    }
+
+    /// Register (or refresh) a view binding (v0.4, P0.1): the id is the
+    /// identity — a known id at a NEW path updates the root, it never adds
+    /// a second view. Written by every `vault init`/`sync`.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_view_put(&self, view_id: &str, root: &str) -> Result<(), CellError> {
         let _guard = self
             .write_lock
             .lock()
@@ -1532,24 +1640,62 @@ impl Cell {
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
         inner.conn.execute(
-            "INSERT INTO vault_roots (root, bound_at) VALUES (?1, ?2)
-             ON CONFLICT(root) DO UPDATE SET bound_at = ?2",
-            rusqlite::params![root, now],
+            "INSERT INTO vault_views (view_id, root, bound_at, last_seen_at) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(view_id) DO UPDATE SET root = ?2, last_seen_at = ?3",
+            rusqlite::params![view_id, root, now],
         )?;
         Ok(())
     }
 
-    /// The path (relative to the view root) of every `.conflitto` copy of a
-    /// note (v0.3.2, P1.6).
+    /// Detach a view (v0.4, P0.1): its row, its files and its conflict
+    /// copies leave the cell — the FILES stay on disk, they were never the
+    /// engine's. Returns `(files, conflicts)` rows removed.
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
-    pub fn vault_conflicts_of(&self, id: &Ulid) -> Result<Vec<String>, CellError> {
+    pub fn vault_unbind(&self, view_id: &str) -> Result<(usize, usize), CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
         let inner = self.lock()?;
-        let mut stmt = inner
+        let files = inner
             .conn
-            .prepare("SELECT path FROM vault_conflicts WHERE note_id = ?1 ORDER BY path")?;
-        let rows = stmt.query_map([id.to_string()], |r| r.get::<_, String>(0))?;
+            .execute("DELETE FROM vault_files WHERE view_id = ?1", [view_id])?;
+        let conflicts = inner
+            .conn
+            .execute("DELETE FROM vault_conflicts WHERE view_id = ?1", [view_id])?;
+        inner
+            .conn
+            .execute("DELETE FROM vault_views WHERE view_id = ?1", [view_id])?;
+        Ok((files, conflicts))
+    }
+
+    /// The views that still hold something of a note — a file or a conflict
+    /// copy (v0.4, P0.1): an unreachable view keeps a purge pending only
+    /// when it appears here.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_views_of_note(&self, id: &Ulid) -> Result<Vec<VaultView>, CellError> {
+        let inner = self.lock()?;
+        let mut stmt = inner.conn.prepare(
+            "SELECT v.view_id, v.root, v.bound_at, v.last_seen_at
+             FROM vault_views v
+             WHERE EXISTS (SELECT 1 FROM vault_files f
+                           WHERE f.view_id = v.view_id AND f.note_id = ?1)
+                OR EXISTS (SELECT 1 FROM vault_conflicts c
+                           WHERE c.view_id = v.view_id AND c.note_id = ?1)
+             ORDER BY v.bound_at, v.view_id",
+        )?;
+        let rows = stmt.query_map([id.to_string()], |r| {
+            Ok(VaultView {
+                view_id: r.get(0)?,
+                root: r.get(1)?,
+                bound_at: r.get(2)?,
+                last_seen_at: r.get(3)?,
+            })
+        })?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1557,16 +1703,40 @@ impl Cell {
         Ok(out)
     }
 
-    /// Every conflict copy the cell knows about: `(path, note_id)` pairs.
+    /// The paths (relative to the view root) of every `.conflitto` copy of
+    /// a note in ONE view (v0.4, P0.1).
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
-    pub fn vault_conflicts(&self) -> Result<Vec<(String, String)>, CellError> {
+    pub fn vault_conflicts_of(&self, view_id: &str, id: &Ulid) -> Result<Vec<String>, CellError> {
         let inner = self.lock()?;
-        let mut stmt = inner
-            .conn
-            .prepare("SELECT path, note_id FROM vault_conflicts ORDER BY path")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut stmt = inner.conn.prepare(
+            "SELECT path FROM vault_conflicts WHERE view_id = ?1 AND note_id = ?2 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![view_id, id.to_string()], |r| {
+            r.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every conflict copy ONE view knows about: `(path, note_id)` pairs
+    /// (v0.4, P0.1: the sync's cleaner works per view).
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_conflicts_of_view(
+        &self,
+        view_id: &str,
+    ) -> Result<Vec<(String, String)>, CellError> {
+        let inner = self.lock()?;
+        let mut stmt = inner.conn.prepare(
+            "SELECT path, note_id FROM vault_conflicts WHERE view_id = ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map([view_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1576,11 +1746,17 @@ impl Cell {
 
     /// Register a `.conflitto` copy the engine just created (v0.3.2, P1.6):
     /// the scanner ignores it, so this registry is the only thing that lets
-    /// a purge take it away.
+    /// a purge take it away. v0.4: it belongs to a view, and `note_id: None`
+    /// is the orphan marker of P0.2 (a copy whose base file is not bound).
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
-    pub fn vault_conflict_put(&self, path: &str, note_id: &Ulid) -> Result<(), CellError> {
+    pub fn vault_conflict_put(
+        &self,
+        view_id: &str,
+        path: &str,
+        note_id: Option<&Ulid>,
+    ) -> Result<(), CellError> {
         let _guard = self
             .write_lock
             .lock()
@@ -1592,26 +1768,56 @@ impl Cell {
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default();
         inner.conn.execute(
-            "INSERT INTO vault_conflicts (path, note_id, created_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(path) DO UPDATE SET note_id = ?2, created_at = ?3",
-            rusqlite::params![path, note_id.to_string(), now],
+            "INSERT INTO vault_conflicts (view_id, path, note_id, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(view_id, path) DO UPDATE SET note_id = ?3, created_at = ?4",
+            rusqlite::params![
+                view_id,
+                path,
+                note_id.map(Ulid::to_string).unwrap_or_default(),
+                now
+            ],
         )?;
         Ok(())
+    }
+
+    /// The note a conflict copy is registered to (None: not registered, or
+    /// the orphan marker of P0.2).
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn vault_conflict_note(
+        &self,
+        view_id: &str,
+        path: &str,
+    ) -> Result<Option<Ulid>, CellError> {
+        let inner = self.lock()?;
+        let note: Option<String> = inner
+            .conn
+            .query_row(
+                "SELECT note_id FROM vault_conflicts WHERE view_id = ?1 AND path = ?2",
+                rusqlite::params![view_id, path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // an unparseable id is the P0.2 orphan marker (''): no note
+        Ok(note.and_then(|s| Ulid::from_string(&s).ok()))
     }
 
     /// Forget one conflict copy's row.
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
-    pub fn vault_conflict_delete(&self, path: &str) -> Result<(), CellError> {
+    pub fn vault_conflict_delete(&self, view_id: &str, path: &str) -> Result<(), CellError> {
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
         let inner = self.lock()?;
-        inner
-            .conn
-            .execute("DELETE FROM vault_conflicts WHERE path = ?1", [path])?;
+        inner.conn.execute(
+            "DELETE FROM vault_conflicts WHERE view_id = ?1 AND path = ?2",
+            rusqlite::params![view_id, path],
+        )?;
         Ok(())
     }
 
@@ -1619,15 +1825,16 @@ impl Cell {
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
-    pub fn vault_file_delete(&self, path: &str) -> Result<(), CellError> {
+    pub fn vault_file_delete(&self, view_id: &str, path: &str) -> Result<(), CellError> {
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
         let inner = self.lock()?;
-        inner
-            .conn
-            .execute("DELETE FROM vault_files WHERE path = ?1", [path])?;
+        inner.conn.execute(
+            "DELETE FROM vault_files WHERE view_id = ?1 AND path = ?2",
+            rusqlite::params![view_id, path],
+        )?;
         Ok(())
     }
 
@@ -1762,7 +1969,7 @@ impl Cell {
                     tx.execute("DELETE FROM note_vectors", [])?;
                     tx.execute("DELETE FROM embedding_models", [])?;
                     tx.execute("DELETE FROM vault_files", [])?;
-                    tx.execute("DELETE FROM vault_roots", [])?;
+                    tx.execute("DELETE FROM vault_views", [])?;
                     tx.execute("DELETE FROM vault_conflicts", [])?;
                     tx.execute("DELETE FROM snapshots", [])?;
                     // external-content FTS5: `delete-all` empties the index

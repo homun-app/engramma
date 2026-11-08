@@ -59,6 +59,14 @@ pub enum VaultError {
         /// The enforced percentage.
         pct: f64,
     },
+    /// The view's folder is not there (v0.4, P0.1): unmounted, renamed
+    /// away, permissions. A purge reports it pending only when this view
+    /// still holds bytes of a note.
+    #[error("la vista {root} non è raggiungibile")]
+    Unreachable {
+        /// The folder that was not there.
+        root: String,
+    },
 }
 
 /// What one reconciliation did.
@@ -153,15 +161,39 @@ impl Vault {
     /// the export reads the cell.
     pub fn init(&self) -> Result<SyncReport, VaultError> {
         std::fs::create_dir_all(&self.root)?;
-        self.bind_root()?;
+        // the manifest's id survives the export that is about to overwrite
+        // it (a re-init of a known view keeps its identity, v0.4 P0.1)
+        let preferred: Option<String> = std::fs::read_to_string(self.root.join("engramma.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| {
+                v.get("view_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|s| ulid::Ulid::from_string(s).ok().map(|u| u.to_string()))
+            });
+        let view_id = self.bind_view(preferred)?;
         let out = engramma_core::port::export(&self.cell, &self.root)?;
+        // export rewrote the manifest without the id: put it back
+        let mut v: serde_json::Value = std::fs::read_to_string(self.root.join("engramma.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(serde_json::json!({
+                "format_version": engramma_core::port::FORMAT_VERSION
+            }));
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("view_id".into(), serde_json::Value::String(view_id.clone()));
+        }
+        std::fs::write(
+            self.root.join("engramma.json"),
+            serde_json::to_string_pretty(&v).unwrap_or_default(),
+        )?;
         let mut report = SyncReport::default();
         report.warnings.extend(out.errors);
         for file in self.scan()? {
             if let Some(id) = id_of(&file.text)
                 && let Ok(note) = self.cell.get(&Ulid::from_string(&id).unwrap_or_default())
             {
-                self.record(&file, &note.id, note.status)?;
+                self.record(&view_id, &file, &note.id, note.status)?;
             }
         }
         Ok(report)
@@ -171,20 +203,22 @@ impl Vault {
     /// bound file of the note and every `.conflitto` copy of it go, then
     /// their rows. The core never writes into the view — this is the one
     /// place that does, called by the CLI's `purge` for every registered
-    /// root. A view that cannot be reached (unmounted folder, permissions)
-    /// is an error: the caller reports `pending: ["vault"]` and the next
-    /// `sync` finishes the work.
+    /// view. A view that cannot be reached (unmounted folder, permissions)
+    /// is [`VaultError::Unreachable`]: the caller reports `pending:
+    /// ["vault"]` only when this view still HOLDS something of the note
+    /// (v0.4, P0.1), and the next `sync` finishes the work.
     ///
     /// # Errors
-    /// [`VaultError::Io`] when the view is unreachable or a removal fails;
-    /// [`VaultError::Cell`] on cell failures.
+    /// [`VaultError::Unreachable`] when the view is not on disk;
+    /// [`VaultError::Io`] when a removal fails; [`VaultError::Cell`] on
+    /// cell failures.
     pub fn forget_note(&self, id: &Ulid) -> Result<(), VaultError> {
         if !self.root.exists() {
-            return Err(VaultError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("la vista {} non è raggiungibile", self.root.display()),
-            )));
+            return Err(VaultError::Unreachable {
+                root: self.root.display().to_string(),
+            });
         }
+        let view = self.view_by_root()?;
         let gone = |p: &Path| -> Result<(), VaultError> {
             match std::fs::remove_file(p) {
                 Ok(()) => Ok(()),
@@ -192,32 +226,89 @@ impl Vault {
                 Err(e) => Err(VaultError::Io(e)),
             }
         };
-        // the bound file, when this note has one
-        if let Some(row) = self
-            .cell
-            .vault_files()?
-            .into_iter()
-            .find(|r| r.note_id == id.to_string())
-        {
-            gone(&self.root.join(&row.path))?;
-            self.cell.vault_file_delete(&row.path)?;
-        }
-        // every conflict copy of the note
-        for rel in self.cell.vault_conflicts_of(id)? {
-            gone(&self.root.join(&rel))?;
-            self.cell.vault_conflict_delete(&rel)?;
+        // the bound file, when this note has one IN THIS VIEW
+        if let Some(view_id) = &view {
+            for row in self.cell.vault_files_of_view(view_id)? {
+                if row.note_id == id.to_string() {
+                    gone(&self.root.join(&row.path))?;
+                    self.cell.vault_file_delete(view_id, &row.path)?;
+                }
+            }
+            // every conflict copy of the note in this view
+            for rel in self.cell.vault_conflicts_of(view_id, id)? {
+                gone(&self.root.join(&rel))?;
+                self.cell.vault_conflict_delete(view_id, &rel)?;
+            }
         }
         Ok(())
     }
 
-    /// Bind this folder in the cell (`vault_roots`, v0.3.2, P1.6): the
-    /// canonical absolute path, so a purge reaches every view without being
-    /// told again. Called by every `init`/`sync`.
-    fn bind_root(&self) -> Result<(), VaultError> {
-        if let Ok(canon) = std::fs::canonicalize(&self.root) {
-            self.cell.vault_root_put(&canon.to_string_lossy())?;
+    /// The view bound at this folder's canonical path, if any (v0.4, P0.1):
+    /// how `forget_note` finds the rows of THIS view without a sync. An
+    /// unreadable cell is an ERROR here, not a silent empty view: a purge
+    /// that cannot know what this view holds is not complete.
+    fn view_by_root(&self) -> Result<Option<String>, VaultError> {
+        let Some(canon) = std::fs::canonicalize(&self.root).ok() else {
+            return Ok(None);
+        };
+        Ok(self
+            .cell
+            .vault_view_by_root(&canon.to_string_lossy())?
+            .map(|v| v.view_id))
+    }
+
+    /// Resolve this folder's view id (v0.4, P0.1) and bind it in the cell.
+    /// The identity travels in `engramma.json`: a manifest with a KNOWN id
+    /// found at a new path UPDATES the root (one view, not two); a manifest
+    /// without one (a v0.3.x view) adopts the id the root already owns, or
+    /// a fresh id lands in the manifest. `preferred` is an id read before
+    /// an export overwrote the manifest (init's case).
+    fn bind_view(&self, preferred: Option<String>) -> Result<String, VaultError> {
+        let manifest = self.root.join("engramma.json");
+        let in_manifest: Option<String> = std::fs::read_to_string(&manifest)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| {
+                v.get("view_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|s| ulid::Ulid::from_string(s).ok().map(|u| u.to_string()))
+            });
+        let canon = std::fs::canonicalize(&self.root)
+            .map(|c| c.to_string_lossy().to_string())
+            .ok();
+        let view_id = match in_manifest.clone().or(preferred) {
+            Some(vid) => vid,
+            None => {
+                let by_root = match &canon {
+                    Some(c) => self.cell.vault_view_by_root(c)?.map(|v| v.view_id),
+                    None => None,
+                };
+                match by_root {
+                    Some(vid) => vid,
+                    None => engramma_core::id::new_ulid()?.to_string(),
+                }
+            }
+        };
+        if let Some(c) = &canon {
+            self.cell.vault_view_put(&view_id, c)?;
         }
-        Ok(())
+        // the manifest keeps the id, so the view can move and stay itself
+        if in_manifest.as_deref() != Some(view_id.as_str()) {
+            let mut v: serde_json::Value = std::fs::read_to_string(&manifest)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_else(
+                    || serde_json::json!({ "format_version": engramma_core::port::FORMAT_VERSION }),
+                );
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("view_id".into(), serde_json::Value::String(view_id.clone()));
+            }
+            std::fs::write(
+                &manifest,
+                serde_json::to_string_pretty(&v).unwrap_or_default(),
+            )?;
+        }
+        Ok(view_id)
     }
 
     /// Walk the folder for markdown files: `.obsidian/`, `.trash/` and hidden
@@ -299,34 +390,45 @@ impl Vault {
     }
 
     /// Record what the scan saw for one note (or forget it).
-    fn record(&self, file: &Scanned, id: &Ulid, status: Status) -> Result<(), VaultError> {
+    fn record(
+        &self,
+        view_id: &str,
+        file: &Scanned,
+        id: &Ulid,
+        status: Status,
+    ) -> Result<(), VaultError> {
         if status == Status::Deleted {
-            self.cell.vault_file_delete(&file.path)?;
+            self.cell.vault_file_delete(view_id, &file.path)?;
             return Ok(());
         }
-        self.cell.vault_file_put(&engramma_core::VaultFile {
-            path: file.path.clone(),
-            note_id: id.to_string(),
-            file_hash: file.hash.clone(),
-            note_version: self.cell.note_version(id).unwrap_or(0),
-            mtime: file.mtime,
-            size: file.size,
-        })?;
+        self.cell.vault_file_put(
+            view_id,
+            &engramma_core::VaultFile {
+                path: file.path.clone(),
+                note_id: id.to_string(),
+                file_hash: file.hash.clone(),
+                note_version: self.cell.note_version(id).unwrap_or(0),
+                mtime: file.mtime,
+                size: file.size,
+            },
+        )?;
         Ok(())
     }
 
     /// One reconciliation. Deterministic: the same folder and the same cell
-    /// produce the same report and the same end state.
+    /// produce the same report and the same end state. The view resolves
+    /// FIRST (v0.4, P0.1): the scan compares against THIS view's rows.
     ///
     /// # Errors
     /// [`VaultError::MassDelete`] when the deletion guard fires (nothing was
     /// deleted); single-file failures ride the report instead.
     pub fn sync_once(&self, allow_deletions: bool) -> Result<SyncReport, VaultError> {
         let mut report = SyncReport::default();
+        let view_id = self.bind_view(None)?;
         let scanned = self.scan()?;
         let known: BTreeMap<String, engramma_core::VaultFile> = self
             .cell
-            .vault_files()?
+            .vault_files_of_view(&view_id)?
             .into_iter()
             .map(|f| (f.path.clone(), f))
             .collect();
@@ -357,7 +459,7 @@ impl Vault {
 
         // 2. per-file reconciliation
         for file in &scanned {
-            self.reconcile_file(file, &known, &scanned_paths, &mut report)?;
+            self.reconcile_file(&view_id, file, &known, &scanned_paths, &mut report)?;
         }
 
         // 3. living notes no file is bound to: the cell moved first — write
@@ -367,7 +469,7 @@ impl Vault {
         //    would give it two files to bounce between.
         let bound_now: BTreeMap<String, String> = self
             .cell
-            .vault_files()?
+            .vault_files_of_view(&view_id)?
             .into_iter()
             .map(|f| (f.note_id, f.path))
             .collect();
@@ -382,7 +484,7 @@ impl Vault {
             let target = self.file_for(&note)?;
             self.write_file(&target, &note)?;
             let fresh = self.snapshot(&target)?;
-            self.record(&fresh, &id, note.status)?;
+            self.record(&view_id, &fresh, &id, note.status)?;
             report.updated_files.push(fresh.path.clone());
         }
 
@@ -394,17 +496,21 @@ impl Vault {
                 self.cell.delete_note(&id, "vault")?;
                 report.deleted.push(row.path.clone());
             }
-            self.cell.vault_file_delete(&row.path)?;
+            self.cell.vault_file_delete(&view_id, &row.path)?;
         }
 
         // 5. v0.3.2 (P1.6): finish a purge's work — the `.conflitto` copies
         //    of notes that no longer exist (a purge that could not reach
         //    this view left them, with their rows). Copies of LIVING notes
         //    stay: they are the user's safety copies, and a tombstone is
-        //    not a purge.
-        for (path, note_id) in self.cell.vault_conflicts()? {
+        //    not a purge. v0.4 (P0.2): the rows with NO note are the orphan
+        //    markers of pre-v0.3.2 copies — they keep the file (the user's)
+        //    and only lose their row when the file itself is gone.
+        for (path, note_id) in self.cell.vault_conflicts_of_view(&view_id)? {
             let Ok(id) = Ulid::from_string(&note_id) else {
-                self.cell.vault_conflict_delete(&path)?;
+                if !self.root.join(&path).exists() {
+                    self.cell.vault_conflict_delete(&view_id, &path)?;
+                }
                 continue;
             };
             if self.cell.get(&id).is_ok() {
@@ -419,11 +525,9 @@ impl Vault {
                     continue;
                 }
             }
-            self.cell.vault_conflict_delete(&path)?;
+            self.cell.vault_conflict_delete(&view_id, &path)?;
         }
 
-        // and this folder is one of the cell's views now
-        self.bind_root()?;
         Ok(report)
     }
 
@@ -439,13 +543,14 @@ impl Vault {
 
     fn reconcile_file(
         &self,
+        view_id: &str,
         file: &Scanned,
         known: &BTreeMap<String, engramma_core::VaultFile>,
         scanned_paths: &BTreeSet<&str>,
         report: &mut SyncReport,
     ) -> Result<(), VaultError> {
         let Some(header_id) = id_of(&file.text) else {
-            return self.import_new(file, report);
+            return self.import_new(view_id, file, report);
         };
         let Ok(note_id) = Ulid::from_string(&header_id) else {
             report.errors.push(format!(
@@ -485,12 +590,12 @@ impl Vault {
             Err(_) => None,
         };
         let Some(live_note) = live else {
-            if let Some(old) = known.values().find(|r| r.note_id == header_id) {
+            if let Some((old_view, old)) = self.cell.vault_file_of_note(&note_id)? {
                 // the note was purged or tombstoned elsewhere: the file goes
                 // with it (purge deletes the file of its note; a tombstone
                 // is the cell saying the note is gone)
                 std::fs::remove_file(&file.abs)?;
-                self.cell.vault_file_delete(&old.path)?;
+                self.cell.vault_file_delete(&old_view, &old.path)?;
                 report.deleted.push(file.path.clone());
             } else {
                 report.warnings.push(format!(
@@ -505,9 +610,10 @@ impl Vault {
         // file is still on disk this is a second COPY of the same note, not
         // a move: the binding wins (one file per note is structural,
         // v0.3.1), the duplicate is reported and left alone — re-binding it
-        // would bounce every edit between the two copies forever.
+        // would bounce every edit between the two copies forever. The
+        // lookup crosses views (v0.4): a note has ONE file, wherever it is.
         if !known.contains_key(&file.path)
-            && let Some(old) = known.values().find(|r| r.note_id == header_id)
+            && let Some((old_view, old)) = self.cell.vault_file_of_note(&note_id)?
         {
             if scanned_paths.contains(old.path.as_str()) {
                 report.warnings.push(format!(
@@ -518,7 +624,7 @@ impl Vault {
                 ));
                 return Ok(());
             }
-            self.cell.vault_file_delete(&old.path)?;
+            self.cell.vault_file_delete(&old_view, &old.path)?;
             report.moved.push(format!("{} ← {}", file.path, old.path));
         }
 
@@ -540,14 +646,14 @@ impl Vault {
             (false, false) => {
                 if row.is_none() {
                     // first sight of a file that already matches the note
-                    self.record(file, &note_id, live_note.status)?;
+                    self.record(view_id, file, &note_id, live_note.status)?;
                 }
             }
             (false, true) => {
                 // the cell moved: rewrite the file atomically
                 self.write_file(&file.abs, &live_note)?;
                 let fresh = self.snapshot(&file.abs)?;
-                self.record(&fresh, &note_id, live_note.status)?;
+                self.record(view_id, &fresh, &note_id, live_note.status)?;
                 report.updated_files.push(file.path.clone());
             }
             (true, false) => {
@@ -556,7 +662,7 @@ impl Vault {
                     report.errors.push(format!("{}: {e}", file.path));
                     return Ok(());
                 }
-                self.record(file, &note_id, file_note.status)?;
+                self.record(view_id, file, &note_id, file_note.status)?;
                 report.updated_from_file.push(file.path.clone());
             }
             (true, true) => {
@@ -584,10 +690,11 @@ impl Vault {
                     .unwrap_or(&conflict)
                     .to_string_lossy()
                     .replace('\\', "/");
-                self.cell.vault_conflict_put(&conflict_rel, &note_id)?;
+                self.cell
+                    .vault_conflict_put(view_id, &conflict_rel, Some(&note_id))?;
                 self.write_file(&file.abs, &live_note)?;
                 let fresh = self.snapshot(&file.abs)?;
-                self.record(&fresh, &note_id, live_note.status)?;
+                self.record(view_id, &fresh, &note_id, live_note.status)?;
                 report.conflicts.push(file.path.clone());
             }
         }
@@ -599,7 +706,12 @@ impl Vault {
     /// v0.3.1 (P1.5): a header that is not Engramma's is READ (title, tags,
     /// aliases, a valid type, dates) and the rewrite MERGES it — one `---`
     /// block with the user's fields kept, the body after the header.
-    fn import_new(&self, file: &Scanned, report: &mut SyncReport) -> Result<(), VaultError> {
+    fn import_new(
+        &self,
+        view_id: &str,
+        file: &Scanned,
+        report: &mut SyncReport,
+    ) -> Result<(), VaultError> {
         let parsed = engramma_core::format::parse(&file.text, ParseMode::Import);
         let mut note = match parsed {
             Ok(p) => p.note,
@@ -646,7 +758,7 @@ impl Vault {
         }
         self.write_file(&file.abs, &note)?;
         let fresh = self.snapshot(&file.abs)?;
-        self.record(&fresh, &note.id, note.status)?;
+        self.record(view_id, &fresh, &note.id, note.status)?;
         report.created.push(file.path.clone());
         Ok(())
     }

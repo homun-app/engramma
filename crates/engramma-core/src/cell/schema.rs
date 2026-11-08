@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 11] = [
+pub const MIGRATIONS: [&str; 12] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -158,6 +158,39 @@ CREATE TABLE vault_conflicts (path TEXT PRIMARY KEY,  -- relative to the root
                               created_at TEXT NOT NULL);
 CREATE INDEX idx_vault_conflicts_note ON vault_conflicts(note_id);
 "#,
+    r#"
+-- v12 (v0.4, P0.1): a view has an identity, not a path. `vault_roots` keyed
+-- views by their absolute path — a moved folder looked like a view nobody
+-- could reach, forever, and every purge after it exited incomplete. The
+-- identity is a ULID in the view's `engramma.json`; the cell binds rows of
+-- `vault_views` to it, and a sync that finds a known id at a new path
+-- UPDATES the root instead of adding a view. Files and conflict copies
+-- belong to a view now (their paths are relative to ITS root), so a purge
+-- knows exactly which unreachable folder still holds bytes of a note — and
+-- `vault unbind` can detach a view with everything it owns. The Rust side
+-- of this migration mints the ids and adopts the legacy rows (see
+-- `migrate_views_v12`).
+CREATE TABLE vault_views (view_id TEXT PRIMARY KEY,   -- ULID, from the manifest
+                          root TEXT NOT NULL,          -- canonical absolute path
+                          bound_at TEXT NOT NULL,
+                          last_seen_at TEXT NOT NULL);
+CREATE TABLE vault_files_v12 (view_id TEXT NOT NULL,
+                              path TEXT NOT NULL,     -- relative to the view root
+                              note_id TEXT NOT NULL,
+                              file_hash TEXT NOT NULL,
+                              note_version INTEGER NOT NULL,
+                              mtime INTEGER NOT NULL,
+                              size INTEGER NOT NULL,
+                              PRIMARY KEY (view_id, path));
+CREATE UNIQUE INDEX idx_vault_files_note_v12 ON vault_files_v12(note_id);
+CREATE INDEX idx_vault_files_view ON vault_files_v12(view_id);
+CREATE TABLE vault_conflicts_v12 (view_id TEXT NOT NULL,
+                                  path TEXT NOT NULL,
+                                  note_id TEXT NOT NULL,
+                                  created_at TEXT NOT NULL,
+                                  PRIMARY KEY (view_id, path));
+CREATE INDEX idx_vault_conflicts_note_v12 ON vault_conflicts_v12(note_id);
+"#,
 ];
 
 /// Rust-side migration steps, run right after the SQL of version `v`.
@@ -187,6 +220,62 @@ fn migrate_rust(tx: &rusqlite::Transaction<'_>, v: i64) -> Result<(), crate::err
     if v == 5 {
         migrate_log_v2(tx)?;
     }
+    if v == 12 {
+        migrate_views_v12(tx)?;
+    }
+    Ok(())
+}
+
+/// The Rust side of migration v12 (v0.4, P0.1): mint a ULID per registered
+/// root (a v0.3.x manifest has no id to adopt — the first sync of such a
+/// view finds its root and adopts the id minted here), copy the legacy
+/// file and conflict rows onto the OLDEST view (the one-folder reality;
+/// every other view re-records what it sees at its next sync), then drop
+/// the legacy tables. A cell with files bound but no root at all (the
+/// canonicalize failure edge) keeps them under the empty view id: the
+/// first sync that binds their paths adopts them via the note conflict
+/// clause of `vault_file_put`.
+fn migrate_views_v12(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
+    let roots: Vec<(String, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT root, bound_at FROM vault_roots ORDER BY bound_at, root")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut first: Option<String> = None;
+    for (root, bound_at) in &roots {
+        let view_id = crate::id::new_ulid()?.to_string();
+        tx.execute(
+            "INSERT INTO vault_views (view_id, root, bound_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?3)",
+            rusqlite::params![view_id, root, bound_at],
+        )?;
+        if first.is_none() {
+            first = Some(view_id);
+        }
+    }
+    let owner = first.unwrap_or_default();
+    tx.execute(
+        "INSERT INTO vault_files_v12 (view_id, path, note_id, file_hash, note_version, mtime, size)
+         SELECT ?1, path, note_id, file_hash, note_version, mtime, size FROM vault_files",
+        [&owner],
+    )?;
+    tx.execute(
+        "INSERT INTO vault_conflicts_v12 (view_id, path, note_id, created_at)
+         SELECT ?1, path, note_id, created_at FROM vault_conflicts",
+        [&owner],
+    )?;
+    tx.execute_batch(
+        "DROP TABLE vault_files;
+         ALTER TABLE vault_files_v12 RENAME TO vault_files;
+         DROP TABLE vault_conflicts;
+         ALTER TABLE vault_conflicts_v12 RENAME TO vault_conflicts;
+         DROP INDEX IF EXISTS idx_vault_files_note_v12;
+         DROP INDEX IF EXISTS idx_vault_conflicts_note_v12;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_vault_files_note ON vault_files(note_id);
+         CREATE INDEX IF NOT EXISTS idx_vault_conflicts_note ON vault_conflicts(note_id);
+         DROP TABLE vault_roots;",
+    )?;
     Ok(())
 }
 

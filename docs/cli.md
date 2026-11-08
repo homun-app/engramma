@@ -218,15 +218,23 @@ purge's own payload keeps only the id and the reason, never content.
 `[[Mentions]]` of the note in OTHER notes stay (they are other notes).
 **Exports made before the purge are outside the engine's control.**
 
-v0.3.2: the cell remembers its views (`vault init`/`sync` register the
-folder's canonical absolute path) and the purge reaches every one of them
-right away — the note's file AND every `.conflitto` copy of it go in the
-same command (`Vault::forget_note`; the MCP server is read-only and does
-not expose purge, but the call is there for when it does). A view that
-cannot be reached (unmounted folder, permissions) makes the purge exit
-with code **5** and `pending: ["vault"]`, like the WAL case; the next
-`vault sync` finishes the work. A `delete_note` (tombstone, reversible)
-does NOT remove conflict copies.
+v0.3.2: the cell remembers its views and the purge reaches every one of
+them right away — the note's file AND every `.conflitto` copy of it go in
+the same command (`Vault::forget_note`; the MCP server is read-only and
+does not expose purge, but the call is there for when it does). A
+`delete_note` (tombstone, reversible) does NOT remove conflict copies.
+
+v0.4: a view has an **identity**, not a path. `vault init` writes a
+`view_id` (ULID) into the folder's `engramma.json`; the cell binds its
+`vault_views` row (and the view's file and conflict-copy rows) to that
+id. Moving the folder and syncing from the new place UPDATES the root —
+one view, not two — and a purge reaches the view at its new place. An
+unreachable view keeps the purge pending (exit **5**,
+`pending: ["vault"]`) **only while it still holds something of the note**
+(a bound file or a conflict copy); the message names the view and offers
+both ways out — `vault sync` to reach it again, `vault unbind` to detach
+it. A cell whose views cannot even be read is not a completed forgetting
+either.
 
 The WAL is truncated after the vacuum (`wal_checkpoint(TRUNCATE)`). When
 another process holds a read transaction open, the truncation cannot
@@ -262,7 +270,7 @@ state that contained the purged note).
 `snapshot` (null for a checkpoint), `bytes_before`/`bytes_after` — the
 latter measured over cell + WAL + snapshot files.
 
-### `engramma vault init <dir> | sync [dir] [--allow-deletions] | watch [dir]`
+### `engramma vault init <dir> | sync [dir] [--allow-deletions] | watch [dir] | unbind <dir|view_id>`
 
 The markdown view: `init` exports the cell into the folder; `sync` runs
 one scan-based reconciliation and prints the report (new notes from
@@ -274,6 +282,11 @@ file is bound to its note by the `id` in the header, never by its path:
 renaming or moving a file moves the note's binding. More than 20 files
 (or 10% of the notes) vanishing at once stops the sync with an error —
 an unmounted folder — unless `--allow-deletions`.
+
+`unbind` (v0.4) detaches a view: the cell forgets it and ITS bindings
+(files and conflict copies); the files stay on disk, they were never the
+engine's. Accepts the folder or the view id — even just its first 8
+characters.
 
 ### `engramma consolidate [--limit N] [--json]`
 
