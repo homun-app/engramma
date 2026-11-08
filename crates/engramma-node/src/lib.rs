@@ -282,6 +282,17 @@ pub struct PurgeView {
     /// forgetting (another embedPending/write retries the checkpoint, a
     /// sync reaches the view).
     pub pending: Vec<String>,
+    /// v0.4.1 (P0.2): the views that could not be reached (or asked),
+    /// one entry per problem — no note contents ride in them.
+    pub views: Vec<PurgeProblemView>,
+}
+
+#[napi(object)]
+pub struct PurgeProblemView {
+    /// The view's ULID, `null` when the cell could not even list its views.
+    pub view_id: Option<String>,
+    pub root: String,
+    pub reason: String,
 }
 
 #[napi(object)]
@@ -1509,7 +1520,8 @@ pub struct PurgeTask {
 }
 
 impl Task for PurgeTask {
-    type Output = PurgeReport;
+    type Output = (PurgeReport, Vec<engramma_vault::ViewProblem>);
+
     type JsValue = PurgeView;
 
     fn compute(&mut self) -> Result<Self::Output> {
@@ -1517,16 +1529,31 @@ impl Task for PurgeTask {
             return Err(invalid("reason è obbligatoria"));
         }
         let id = resolve_id(&self.cell, &self.id)?;
-        self.cell
-            .purge(&id, &self.reason, &self.actor)
-            .map_err(cell_error)
+        // v0.4.1 (P0.2): the SAME purge the CLI runs — the views included.
+        // Before, the binding forgot only the cell and answered `scrubbed:
+        // true` while the note's file stayed in a bound view until the next
+        // sync.
+        engramma_vault::purge_everywhere(&self.cell, &id, &self.reason, &self.actor).map_err(|e| {
+            match e {
+                engramma_vault::VaultError::Cell(c) => cell_error(c),
+                other => transport_err("IO", format!("purge: {other}")),
+            }
+        })
     }
 
-    fn resolve(&mut self, _env: Env, r: PurgeReport) -> Result<PurgeView> {
+    fn resolve(&mut self, _env: Env, (r, problems): Self::Output) -> Result<PurgeView> {
         Ok(PurgeView {
             forgotten_payloads: i32::try_from(r.forgotten_payloads).unwrap_or(i32::MAX),
             scrubbed: r.scrubbed,
             pending: r.pending.iter().map(|s| s.to_string()).collect(),
+            views: problems
+                .into_iter()
+                .map(|p| PurgeProblemView {
+                    view_id: p.view_id,
+                    root: p.root,
+                    reason: p.reason,
+                })
+                .collect(),
         })
     }
 

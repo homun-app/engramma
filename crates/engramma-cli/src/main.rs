@@ -602,68 +602,20 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     return Ok(());
                 }
             }
-            let mut report = cell.purge(&note_id, reason, "cli-user")?;
-            // v0.3.2 (P1.6): reach every registered view — the note's file
-            // and every `.conflitto` copy of it go NOW, not at the next
-            // sync. The core never writes into a view; `forget_note` does.
-            // v0.4 (P0.1): the views are IDENTITIES; an unreachable view
-            // keeps the purge pending only while it still holds something
-            // of THIS note (a bound file or a conflict copy), and the
-            // message names it and offers both ways out — `sync` to reach
-            // it again, `unbind` to let it go. A cell whose views cannot
-            // even be read is NOT a completed forgetting either.
-            let mut view_errors: Vec<String> = Vec::new();
-            match cell.vault_views() {
-                Ok(views) => {
-                    for view in &views {
-                        let vault = engramma_vault::Vault::open(
-                            cell.clone(),
-                            std::path::Path::new(&view.root),
-                        );
-                        match vault.and_then(|v| v.forget_note(&note_id)) {
-                            Ok(()) => {}
-                            Err(engramma_vault::VaultError::Unreachable { .. }) => {
-                                let holds = cell
-                                    .vault_views_of_note(&note_id)
-                                    .map_or(true, |v| v.iter().any(|x| x.view_id == view.view_id));
-                                if !holds {
-                                    // nothing of this note lives there:
-                                    // the forgetting is complete
-                                    continue;
-                                }
-                                view_errors.push(format!(
-                                    "la vista {} ({}) non è raggiungibile e la cella vi lega \
-                                     ancora file o copie della nota: `engramma vault sync {}` \
-                                     per finire, o `engramma vault unbind {}` per sganciarla \
-                                     (i file restano)",
-                                    view.root,
-                                    engramma_core::id::id8(
-                                        &ulid::Ulid::from_string(&view.view_id).unwrap_or_default()
-                                    ),
-                                    view.root,
-                                    view.root,
-                                ));
-                            }
-                            Err(e) => {
-                                view_errors.push(format!("vista {}: {e}", view.root));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    // the swallowed `unwrap_or_default` of v0.3.2 (P0.1): a
-                    // purge that cannot know what the views hold is not
-                    // complete — pending says so
-                    view_errors.push(format!("viste non leggibili: {e}"));
-                }
+            // v0.4.1 (P0.2): the purge that knows about the views lives in
+            // one place now — `engramma_vault::purge_everywhere`, shared
+            // with the Node binding. The messages and the exit codes are
+            // the ones the CLI has printed since v0.3.2/v0.4.
+            let (report, problems) = engramma_vault::purge_everywhere(
+                &cell, &note_id, reason, "cli-user",
+            )
+            .map_err(|e| match e {
+                engramma_vault::VaultError::Cell(c) => c.into(),
+                other => CliError::internal(format!("purge: {other}")),
+            })?;
+            for problem in &problems {
+                eprintln!("engramma: {}", problem.reason);
             }
-            for why in &view_errors {
-                eprintln!("engramma: {why}");
-                if !report.pending.contains(&"vault") {
-                    report.pending.push("vault");
-                }
-            }
-            report.scrubbed = report.pending.is_empty();
             if cli.json {
                 print_json(&serde_json::json!({
                     "purged": note_id.to_string(),

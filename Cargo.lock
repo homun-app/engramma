@@ -733,6 +733,7 @@ version = "0.1.0-dev"
 dependencies = [
  "engramma-core",
  "engramma-embed",
+ "engramma-vault",
  "napi",
  "napi-build",
  "napi-derive",

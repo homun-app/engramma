@@ -276,6 +276,75 @@ test('modelStatus reports the builtin model (when present)', async () => {
   await e.close();
 });
 
+// v0.4.1 (P0.2): a purge from Node reaches the views too — the file of the
+// note goes NOW, not at the next sync, and a view nobody can reach is said
+// honestly (`pending: ['vault']`, `scrubbed: false`, the problems listed).
+// The view is bound with the CLI, like the spec's hand proof.
+test('purge reaches a bound view (P0.2)', async () => {
+  const cli =
+    process.env.ENGRAMMA_BIN ||
+    ['../../../target/release/engramma', '../../../target/debug/engramma']
+      .map((p) => path.resolve(__dirname, p))
+      .find((p) => fs.existsSync(p));
+  assert.ok(cli, 'engramma binary not found: build it or set ENGRAMMA_BIN');
+  const run = (args) => {
+    const r = require('node:child_process').spawnSync(cli, args, { encoding: 'utf8' });
+    assert.equal(r.status, 0, `${args.join(' ')}\n${r.stdout}${r.stderr}`);
+    return r;
+  };
+
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  const cell = await e.cell('vista');
+  const n = await cell.put({
+    body: 'il pin del lucchetto e quokkaviolace3',
+    title: 'Segreto di prova',
+    noteType: 'fact',
+    source: 's',
+    confidence: 'stated',
+  });
+  const viewDir = path.join(path.dirname(rootDir), 'vista-md');
+  run(['--root', rootDir, '--cell', 'vista', 'vault', 'init', viewDir]);
+  const bound = await cell.vaultViews();
+  assert.equal(bound.length, 1, `${JSON.stringify(bound)}`);
+  const exported = fs.readdirSync(path.join(viewDir, 'fact'));
+  assert.equal(exported.length, 1, `${exported}`);
+
+  // the purge forgets the note AND its file in the view, now
+  const p = await cell.purge(n.id, 'prova oblio');
+  assert.equal(p.forgottenPayloads, 1);
+  assert.equal(p.scrubbed, true);
+  assert.deepEqual(p.pending, []);
+  assert.equal(fs.readdirSync(path.join(viewDir, 'fact')).length, 0, 'the file stayed');
+
+  // a second note in a view that goes away: the purge says what it could
+  // not reach, without throwing
+  const n2 = await cell.put({
+    body: 'secondo segreto zibellinotrem9',
+    title: 'Altro segreto',
+    noteType: 'fact',
+    source: 's',
+    confidence: 'stated',
+  });
+  const awayDir = path.join(path.dirname(rootDir), 'vista-away');
+  run(['--root', rootDir, '--cell', 'vista', 'vault', 'init', awayDir]);
+  const views2 = await cell.vaultViews();
+  assert.equal(views2.length, 2, `${JSON.stringify(views2)}`);
+  fs.renameSync(awayDir, `${awayDir}-moved`);
+  const p2 = await cell.purge(n2.id, 'oblio con la vista via');
+  assert.equal(p2.scrubbed, false);
+  assert.deepEqual(p2.pending, ['vault']);
+  assert.ok(Array.isArray(p2.views) && p2.views.length === 1, `${JSON.stringify(p2.views)}`);
+  const away = views2.find((v) => v.root.endsWith('vista-away'));
+  assert.ok(away, `${JSON.stringify(views2)}`);
+  assert.equal(p2.views[0].viewId, away.viewId);
+  assert.ok(p2.views[0].root.endsWith('vista-away'), `${p2.views[0].root}`);
+  assert.ok(p2.views[0].reason.length > 0);
+  // no note content rides in the problem
+  assert.ok(!JSON.stringify(p2.views).includes('zibellinotrem'));
+  await e.close();
+});
+
 // the test root goes away with the last engine: no temp left behind
 process.on('exit', () => {
   if (!process.env.ENGRAMMA_TEST_TMP) {

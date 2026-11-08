@@ -970,6 +970,95 @@ impl Vault {
     }
 }
 
+/// Why a view could not finish a purge (v0.4.1, P0.2). The `reason` is a
+/// human sentence WITHOUT note contents; `view_id` is `None` when the cell
+/// could not even list its views.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewProblem {
+    /// The view's ULID, when the problem is about one view.
+    pub view_id: Option<String>,
+    /// The view's folder, when known.
+    pub root: String,
+    /// What went wrong, in words a human can act on.
+    pub reason: String,
+}
+
+/// The purge that knows about the views (v0.4.1, P0.2): the cell's own
+/// forgetting FIRST ([`Cell::purge`]), then every registered view's
+/// [`Vault::forget_note`]. One function, used by the CLI and by the Node
+/// binding — a purge that cannot reach a view no longer reports a done
+/// forgetting it did not do.
+///
+/// The report's `pending` gains `"vault"` for every view that still holds
+/// bytes of the note (or that could not be asked), and `scrubbed` is
+/// recomputed. The problems carry no note contents.
+///
+/// # Errors
+/// [`VaultError::Cell`] when the cell's purge itself fails.
+pub fn purge_everywhere(
+    cell: &Cell,
+    id: &Ulid,
+    reason: &str,
+    actor: &str,
+) -> Result<(engramma_core::PurgeReport, Vec<ViewProblem>), VaultError> {
+    let mut report = cell.purge(id, reason, actor)?;
+    let mut problems: Vec<ViewProblem> = Vec::new();
+    match cell.vault_views() {
+        Ok(views) => {
+            for view in &views {
+                let vault = Vault::open(cell.clone(), std::path::Path::new(&view.root));
+                match vault.and_then(|v| v.forget_note(id)) {
+                    Ok(()) => {}
+                    Err(VaultError::Unreachable { .. }) => {
+                        // pending only while THIS view still holds something
+                        // of the note: a bound file or a conflict copy
+                        let holds = cell
+                            .vault_views_of_note(id)
+                            .map_or(true, |v| v.iter().any(|x| x.view_id == view.view_id));
+                        if !holds {
+                            continue;
+                        }
+                        let short = ulid::Ulid::from_string(&view.view_id)
+                            .map(|u| engramma_core::id::id8(&u))
+                            .unwrap_or_default();
+                        problems.push(ViewProblem {
+                            view_id: Some(view.view_id.clone()),
+                            root: view.root.clone(),
+                            reason: format!(
+                                "la vista {} ({short}) non è raggiungibile e la cella vi lega \
+                                 ancora file o copie della nota: `engramma vault sync {}` per \
+                                 finire, o `engramma vault unbind {}` per sganciarla \
+                                 (i file restano)",
+                                view.root, view.root, view.root,
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        problems.push(ViewProblem {
+                            view_id: Some(view.view_id.clone()),
+                            root: view.root.clone(),
+                            reason: format!("vista {}: {e}", view.root),
+                        });
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            // a purge that cannot know what the views hold is not complete
+            problems.push(ViewProblem {
+                view_id: None,
+                root: String::new(),
+                reason: format!("viste non leggibili: {e}"),
+            });
+        }
+    }
+    if !problems.is_empty() && !report.pending.contains(&"vault") {
+        report.pending.push("vault");
+    }
+    report.scrubbed = report.pending.is_empty();
+    Ok((report, problems))
+}
+
 fn mtime_of(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
         .ok()
