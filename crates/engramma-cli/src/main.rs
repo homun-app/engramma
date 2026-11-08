@@ -1382,7 +1382,9 @@ fn run_vault(cli: &Cli, action: &VaultAction) -> Result<(), CliError> {
                     let hits: Vec<_> = cell
                         .vault_views()?
                         .into_iter()
-                        .filter(|v| v.view_id == arg || (arg.len() == 8 && v.view_id.ends_with(arg)))
+                        .filter(|v| {
+                            v.view_id == arg || (arg.len() == 8 && v.view_id.ends_with(arg))
+                        })
                         .collect();
                     match hits.len() {
                         1 => Some(hits[0].clone()),

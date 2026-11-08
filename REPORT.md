@@ -2726,3 +2726,210 @@ compreso).
 4. **Homun**: il contratto del punto 7 è pronto e provato nel suo
    Electron; l'integrazione (migrazione delle note, `storia`, la
    sezione Memoria) è la fase prossima, su un altro repo.
+
+---
+
+# REPORT — Engramma v0.4.1 (il contratto JS regge per Homun)
+
+Data: 2026-11-08. Base: `main` @ `e69deaa` (tag `fase-v0.4`). Un commit
+per punto, con il test che fallisce prima della correzione (per la
+funzione nuova `purge_everywhere` il rosso è stato il non-compilare del
+test stesso che la chiama, come nelle fasi precedenti; il rosso VERO del
+punto è nel test JS, trascritto sotto). Tutto offline, Rust 1.95, macOS
+arm64, nessuna crate nuova (`Cargo.lock`: unica variazione l'arco
+`engramma-node → engramma-vault`, come da vincoli), nessun `unsafe`
+fuori da napi-derive, nessun `unwrap`/`expect` fuori dai test, clippy
+`-D warnings` verde. Il grafo adattivo non è stato toccato.
+
+## Punto 1 — una riscrittura non lava la quarantena (P0)
+
+**Prova a mano (Node 24, `embedder: 'none'`), trascritta:**
+
+```console
+$ node prova-p1.js            # il caso della spec, parola per parola
+1) nascita external       → quarantined
+2) riscrittura stated      → quarantined
+3) search «PIN Fabio»      → 0 risultati
+4) riscrittura status:active → CONFLICT — una riscrittura conserva lo stato
+   della nota: lo cambia `setStatus`, `confirm` o `delete`
+5) put sulla lapide        → CONFLICT — la nota è una lapide: si ripristina
+   dallo storico, una riscrittura non la resuscita
+```
+
+La regola vive **nel core** (`apply_put`/`apply_patch` in
+`cell/ops.rs`), quindi CLI, `vault sync` e collegamento Node la ereditano
+dallo stesso posto — e la eredita anche il rigioco, perché la decisione è
+deterministica sul payload + stato:
+
+- lo stato cambia solo con `setStatus`, `confirm`, `delete` (e `restore`);
+  `put` con id esistente e `patch` lo conservano;
+- l'unica deriva consentita: la nuova versione è `external` e la nota è
+  attiva → quarantena (mai il contrario); una `external` riscritta
+  `stated` resta in quarantena;
+- chiedere per iscritto uno stato diverso da quello conservato è
+  `Invalid` → `CONFLICT` in Node (mappato sul messaggio, il code viaggia
+  nel prefisso «[CODE] » come tutto il resto);
+- una riscrittura di una supersede conserva anche la chiusura di validità
+  (l'invariante «superseded implica valid_to» attraversa la riscrittura;
+  il test v0.1.1 che si aspettava l'errore è stato aggiornato alla
+  semantica nuova);
+- una **lapide** non resuscita: `put` e `patch` con il suo id → `CONFLICT`;
+  la CLI `add` non ha `--id` (decisione: niente da cambiare — le
+  riscrittture della CLI passano da `edit`, cioè da `patch`, che conserva
+  lo stato per la regola del core).
+
+Il collegamento legge la nota prima di costruire la riscrittura: senza
+`status` costruisce quello conservato (la prova a mano qui sopra funziona
+senza sorprese); con `status` esplicito la richiesta arriva al core, che
+decide. La `vault sync` fa lo stesso dall'altra parte: **un file
+modificato a mano non cambia lo stato della nota** — la cella vince quel
+campo come vince i conflitti, l'avviso lo dice, e il file che mente
+(`status: active` su una nota in quarantena) viene riscritto col vero,
+sennò il punto fisso non tornerebbe più (test `a_hand_edited_file_cannot_
+launder_a_quarantined_note`, rosso prima: il file lavava la nota).
+
+Test: `core/tests/state.rs` (4, rossi prima), `vault/tests/sync.rs`
+(rosso prima), `engine.test.js` `a rewrite preserves the quarantine`.
+
+## Punto 2 — la purge da Node raggiunge le viste (P0)
+
+**Prova a mano, trascritta** (vista legata dalla CLI, purge da Node):
+
+```console
+$ engramma --root $T init && engramma --root $T add - … "Nota segreta"
+nota: 01M6YDC9C49E2YHP3V868DZ7QB
+$ engramma --root $T vault init $T/vista
+vista legata dalla CLI, file: nota-segreta-868DZ7QB.md
+$ node -e '…cell.purge(id, "prova")…'
+purge da Node   → {"forgottenPayloads":1,"scrubbed":true,"pending":[],"views":[]}
+file della nota dopo la purge: 0
+nessuna radice di quokkaviolace in tutta la root
+```
+
+Il blocco della CLI (forget_note per ogni vista legata, viste
+irraggiungibili = pending) diventa **una funzione sola**:
+`engramma_vault::purge_everywhere(cell, id, reason, actor) ->
+(PurgeReport, Vec<ViewProblem>)`, usata da CLI e Node.
+
+- la CLI stampa gli stessi messaggi ed esce con gli stessi codici: i test
+  di `purge.rs` sono rimasti verdi senza ritocchi;
+- in Node `PurgeView` porta `views: [{ viewId, root, reason }]` senza
+  contenuti di note; una vista irraggiungibile che lega file o copie della
+  nota → `pending: ['vault']`, `scrubbed: false` (test JS con la cartella
+  spostata via).
+
+## Punti 3–9 — il contratto che serve a Homun
+
+- **P1.3 `extensions`**: `NoteView.extensions: Record<string, unknown>`
+  (solo chiavi `x-*`, valori JSON, la conversione inversa esatta);
+  `NotePatchInput.extensions?: Record<string, unknown | null>` tocca **per
+  chiave** (`null` toglie), perché il patch del core rimpiazza la lista
+  intera e il merge vive nel collegamento. `aliases` resta un campo a
+  sé. Scelta dichiarata: `json_to_yaml` ora usa `YamlValue::from_json`,
+  quindi gli oggetti diventano `Map` vere nel frontmatter (la v0.4 li
+  metteva come lista di coppie YAML; `yaml_to_json` rilegge entrambe le
+  forme, così le note scritte dalla v0.4 si rileggono bene lo stesso).
+- **P1.4 le date**: la data di nascita è della nota, non della versione —
+  la sostituzione conserva `createdAt` nel core (il registro continua col
+  suo HLC: queste sono date della nota, non delle operazioni).
+  `NoteInput.createdAt?/updatedAt?` (RFC 3339) servono
+  **all'importazione**: accettati solo per una nota nuova, mai nel futuro
+  (5 minuti di tolleranza → `INVALID_NOTE`); su una sostituzione entrambi
+  ignorati.
+- **P1.5 `SearchHit`** porta `noteType`, `tags`, `updatedAt`, `status`
+  (`active` fuori da `includeQuarantined`): la riga di risultato senza un
+  `get` per colpo.
+- **P1.6 `CellOpts.actor`**: `e.cell(name, { actor: 'homun:bot-7' })`
+  timbra le scritture di quella `Cell`; due `Cell` sulla stessa cella con
+  attori diversi sono la stessa cella sotto, e il registro dice chi ha
+  scritto cosa.
+- **P1.7 `CLOSED`**: dopo `close` ogni metodo di `Engine` e di ogni sua
+  `Cell` risponde `CLOSED` (chiamare `close` due volte non è un errore).
+  Il conteggio degli in-flight parte **alla chiamata**, sul thread JS,
+  sotto lo stesso mutex del sigillo: ogni promessa che esiste quando
+  `close` arriva finisce il suo lavoro, e `close` aspetta che si siano
+  assestate — nessuna finestra in cui una put in coda venga chiusa a metà
+  o scivoli dentro dopo il sigillo.
+- **P1.8**: `put({ confidence: 'external', status: 'active' })` →
+  `CONFLICT` come diceva già il REPORT v0.4 (il collegamento smette di
+  metterla in quarantena in silenzio); senza `status` si nasce in
+  quarantena come sempre.
+- **P2.9 l'id corto di una vista**: le **ultime 8** cifre ovunque
+  (messaggi, `unbind`, `vaultUnbind`), l'id intero sempre accettato, lo
+  corto ambiguo elenca i candidati. Le prime 8 (il timestamp, condivise
+  da viste di pochi minuti distanti) non accettate più. Il test CLI di
+  `purge.rs` passa alle ultime 8 (era l'unico uso documentato delle
+  prime 8); `docs/cli.md` allineato. Dichiarato: l'ambiguità vera (due
+  viste con le stesse ultime 8) non è riproducibile in un test end-to-end
+  con ULID casuali — il ramo è coperto dal codice, non da un test.
+- **P2.10 `docs/node.md`**: la regola dello stato (chi può cambiarlo),
+  `CLOSED`, le date d'importazione, `extensions`, `actor` per cella — e
+  perché `purge` **non lancia** per un oblio incompleto ma risponde con
+  `pending` e `views`: un oblio che non può nemmeno cominciare è un
+  errore normale, uno che comincia e non finisce è un dato di ritorno che
+  il demone mostra e riprova. Il codice `INCOMPLETE_FORGETTING` della
+  spec v0.4 non serve e non c'è.
+
+## Il processo principale di Electron
+
+`npm run test:electron-main`: `__test__/electron-main.js` fa
+`app.whenReady()`, apre un motore (con `actor` per cella), scrive con le
+`extensions`, cerca, controlla i campi della riga, chiude e verifica
+`CLOSED`, esce con 0 — **non** `ELECTRON_RUN_AS_NODE`, perché il demone
+di Homun è un processo Electron senza finestra. Verde nell'Electron 45
+di Homun (`uscita 0`). Il repo di Homun non è stato toccato.
+
+## Chiusura
+
+- `cargo fmt --check`, `cargo clippy --all-targets --offline -- -D
+  warnings`, `cargo test --offline --workspace` in debug e `--release`
+  (**230 test** per entrambi, zero falliti), `cargo deny check licenses
+  bans`: verdi;
+- test JS: **17/17 in Node 24**, **17/17 nell'Electron di Homun**
+  (`ELECTRON_RUN_AS_NODE`), più il test del processo principale
+  (uscita 0);
+- `npm run build` rifatto: `engramma.darwin-arm64.node` release =
+  **33 356 096 byte** (33,4 MB; il modello NON è incorporato),
+  `index.js`/`index.d.ts` rigenerati sul contratto di questa fase;
+- **il banco**: il percorso di ricerca non è cambiato e il giro a 10k
+  (mediana di 3) lo conferma — **le righe di qualità della fusione
+  predefinita sono identiche al bit** a quelle della v0.4 in
+  `bench/RESULTS.md` (97M: fattuali 1.000/0.965, parafrasi 0.976/0.882,
+  multi-salto 0.917/0.426, inglese 0.994/0.948; 311M:
+  1.000/0.989, 0.972/0.881, 1.000/0.576, 1.000/0.949), e le righe
+  `viva`/`uniform` del solo testo pure (richiamo 0.997/0.790 e
+  1.000/0.774). Le latenze del giro (p50 testo 1,4 ms a 10k) sono quelle
+  della macchina di sviluppo a macchina ferma, come sempre nei REPORT;
+  il 100k non è stato rifatto, come da spec;
+- temporanei cancellati; tag `fase-v0.4.1`. Nessun push.
+
+## Scelte e dichiarazioni di questa fase
+
+1. **La regola dello stato vive in `apply`**: anche il rigioco la impone.
+   Conseguenza onesta: una cella scritta dalla v0.4 con una riscrittura
+   che cambiava stato (il bug del punto 1, esercitato a mano nella
+   verifica v0.4) non supera più `verify` — il rigioco rifiuta
+   quell'operazione. Nessuna cella di Homun esiste (la fase Homun deve
+   ancora cominciare) e nessun test del repo è in questo caso; le celle
+   della verifica v0.4 erano temporanee.
+2. **Il file che mente viene riscritto dalla sync**: la cella vince il
+   campo stato (come vince i conflitti), l'avviso lo dice, il file viene
+   riscritto dal vivo — sennò il punto fisso non tornerebbe e l'avviso
+   si ripeterebbe a ogni sync.
+3. **CLI `add --id`**: non esiste (decisione: resta così); le
+   riscrittture della CLI passano da `edit` → `patch`, che conserva lo
+   stato per la regola del core.
+4. **Le estensioni come `Map`**: la v0.4 scriveva gli oggetti come liste
+   di coppie (una lista YAML nel file); ora diventano mappe vere. La
+   lettura capisce entrambe, la scrittura usa quella giusta.
+
+## Cosa non ho potuto provare
+
+- **Windows e Linux**: solo macOS arm64, come nelle fasi precedenti.
+- **cargo deny advisories**: richiedono rete; eseguito `licenses bans`.
+- **L'ambiguità delle ultime 8 di una vista** (punto 9): due ULID
+  casuali con le stesse ultime 8 cifre non si fanno riprodurre in un
+  test end-to-end; il ramo esiste, il test no.
+- **Il 100k del banco**: non richiesto (il percorso di ricerca non
+  cambia); le righe 100k di `bench/RESULTS.md` restano quelle della
+  v0.4, valide per confronto proprio perché identiche.

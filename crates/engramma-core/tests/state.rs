@@ -226,8 +226,7 @@ fn a_rewrite_preserves_the_birth_date() {
 
     let back = cell.get(&a.id).unwrap(/* test-only */);
     assert_eq!(
-        back.created_at,
-        birth,
+        back.created_at, birth,
         "the rewrite moved the birth date: {:?}",
         back.created_at
     );
