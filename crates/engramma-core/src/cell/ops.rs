@@ -902,6 +902,9 @@ fn apply_put(tx: &Transaction<'_>, op: &Op, note: &Note) -> Result<(), CellError
         if preserved == Status::Superseded && note.valid_to.is_none() {
             note.valid_to = row.note.valid_to;
         }
+        // v0.4.1 (P1.4): the birth date belongs to the NOTE, not to the
+        // version — a rewrite keeps it; the edit time (`updated_at`) moves
+        note.created_at = row.note.created_at;
         snapshot(tx, &note.id, row.version, &op.op_id)?;
     }
     write_note(tx, &note, old.is_some(), false)?;

@@ -207,3 +207,33 @@ fn a_tombstone_is_not_resurrected_by_a_rewrite() {
         "the tombstone is intact"
     );
 }
+
+/// v0.4.1 (P1.4): the birth date belongs to the NOTE, not to the version —
+/// a rewrite keeps it (the edit time is `updated_at`).
+#[test]
+fn a_rewrite_preserves_the_birth_date() {
+    let (_d, cell) = cell();
+    let mut a = note(7, "nota migrata", Confidence::Stated, Status::Active);
+    let birth = At(time::OffsetDateTime::from_unix_timestamp(1_600_000_000).unwrap(/* t */));
+    a.created_at = birth;
+    a.updated_at = birth;
+    cell.put_note(&a, "t").unwrap(/* test-only */);
+
+    let mut b = note(7, "nota riscritta", Confidence::Stated, Status::Active);
+    b.created_at = At(time::OffsetDateTime::now_utc());
+    b.updated_at = At(time::OffsetDateTime::now_utc());
+    cell.put_note(&b, "t").unwrap(/* test-only */);
+
+    let back = cell.get(&a.id).unwrap(/* test-only */);
+    assert_eq!(
+        back.created_at,
+        birth,
+        "the rewrite moved the birth date: {:?}",
+        back.created_at
+    );
+    assert!(
+        back.updated_at > birth,
+        "the edit time moved: {:?}",
+        back.updated_at
+    );
+}

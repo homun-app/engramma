@@ -169,6 +169,12 @@ pub struct NoteInput {
     pub valid_to: Option<String>,
     /// Free `x-*` extensions, JSON values.
     pub extensions: Option<HashMap<String, serde_json::Value>>,
+    /// v0.4.1 (P1.4): import dates (RFC 3339), for a NEW note only — the
+    /// migration needs a note to be born in its past. Never in the future
+    /// (5 minutes of tolerance); a rewrite ignores both (the birth date is
+    /// the note's own).
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[napi(object)]
@@ -544,6 +550,16 @@ fn build_note(input: &NoteInput, id: Ulid) -> Result<Note> {
         }
     };
     let now = At(OffsetDateTime::now_utc());
+    // v0.4.1 (P1.4): the import dates, when given (the future check lives in
+    // the put path, which knows whether the note is new)
+    let created_at = match &input.created_at {
+        Some(s) => parse_import_at(s, "createdAt")?,
+        None => now,
+    };
+    let updated_at = match &input.updated_at {
+        Some(s) => parse_import_at(s, "updatedAt")?,
+        None => now,
+    };
     let mut extensions: Vec<(String, engramma_core::format::yaml::YamlValue)> = Vec::new();
     if let Some(aliases) = input.aliases.as_ref().filter(|a| !a.is_empty()) {
         extensions.push((
@@ -584,10 +600,35 @@ fn build_note(input: &NoteInput, id: Ulid) -> Result<Note> {
             None => None,
         },
         supersedes: vec![],
-        created_at: now,
-        updated_at: now,
+        created_at,
+        updated_at,
         extensions,
     })
+}
+
+/// v0.4.1 (P1.4): an RFC 3339 instant from the JS side.
+fn parse_import_at(s: &str, field: &str) -> Result<At> {
+    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .map(At)
+        .map_err(|e| invalid(format!("{field} non è un istante RFC 3339 valido: {e}")))
+}
+
+/// The import dates are for the past: a note the migration brings in was
+/// written before now. Five minutes of tolerance, then INVALID_NOTE.
+fn reject_future_import_dates(input: &NoteInput) -> Result<()> {
+    let limit = OffsetDateTime::now_utc() + time::Duration::minutes(5);
+    for (field, v) in [
+        ("createdAt", &input.created_at),
+        ("updatedAt", &input.updated_at),
+    ] {
+        if let Some(s) = v {
+            let at = parse_import_at(s, field)?;
+            if at.0 > limit {
+                return Err(invalid(format!("{field} non può essere nel futuro: {s}")));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn json_to_yaml(v: &serde_json::Value) -> Result<engramma_core::format::yaml::YamlValue> {
@@ -1182,25 +1223,34 @@ impl Task for PutTask {
             Some(s) => parse_ulid(s)?,
             None => engramma_core::id::new_ulid().map_err(cell_error)?,
         };
+        let existing = self.cell.get(&id).ok();
+        // v0.4.1 (P1.4): the import dates are for a NEW note (never in the
+        // future); a rewrite ignores both — the birth date is the note's own
+        if existing.is_none() {
+            reject_future_import_dates(&self.input)?;
+        }
         let mut note = build_note(&self.input, id)?;
         // v0.4.1 (P0.1): a rewrite PRESERVES the note's state. The caller
         // that does not ask for a status gets the preserved one (the core
         // recomputes and enforces it); an explicit request that disagrees
         // with the preserved state is the caller's CONFLICT to hear about.
-        if self.input.id.is_some()
-            && let Some(old) = self.cell.get(&note.id).ok()
+        if let Some(old) = &existing
             && old.status != NoteStatus::Deleted
-            && self.input.status.is_none()
         {
-            note.status =
-                if old.status == NoteStatus::Active && note.confidence == Confidence::External {
+            if self.input.status.is_none() {
+                note.status = if old.status == NoteStatus::Active
+                    && note.confidence == Confidence::External
+                {
                     NoteStatus::Quarantined
                 } else {
                     old.status
                 };
-            if note.status == NoteStatus::Superseded && note.valid_to.is_none() {
-                note.valid_to = old.valid_to;
+                if note.status == NoteStatus::Superseded && note.valid_to.is_none() {
+                    note.valid_to = old.valid_to;
+                }
             }
+            note.created_at = old.created_at;
+            note.updated_at = At(OffsetDateTime::now_utc());
         }
         self.cell.put_note(&note, &self.actor).map_err(cell_error)?;
         // the view comes from the cell, the single source of truth (the

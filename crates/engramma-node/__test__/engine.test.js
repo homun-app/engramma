@@ -276,6 +276,53 @@ test('modelStatus reports the builtin model (when present)', async () => {
   await e.close();
 });
 
+// v0.4.1 (P1.4): import dates. A new note can be born in the past
+// (createdAt/updatedAt, RFC 3339 — the migration needs them), never in the
+// future; a rewrite keeps the birth date and moves only updated_at.
+test('import dates: new notes in the past, rewrites keep the birth (P1.4)', async () => {
+  const e = await engine();
+  const cell = await e.cell('date');
+  const birth = '2024-03-01T10:00:00Z';
+  const n = await cell.put({
+    body: 'memoria migrata da Homun',
+    source: 'migrated:homun',
+    confidence: 'stated',
+    createdAt: birth,
+    updatedAt: '2024-03-02T10:00:00Z',
+  });
+  assert.equal(n.createdAt, birth);
+  assert.equal(n.updatedAt, '2024-03-02T10:00:00Z');
+  // the rewrite a second later keeps the birth date
+  const r = await cell.put({
+    id: n.id,
+    body: 'memoria riscritta dal bot',
+    source: 'homun:bot-7',
+    confidence: 'stated',
+  });
+  assert.equal(r.createdAt, birth, 'the rewrite moved the birth date');
+  assert.ok(r.updatedAt > '2024-03-02T10:00:00Z', 'the edit time moved');
+  // a date in the future is refused (5 minutes of tolerance)
+  const future = new Date(Date.now() + 60 * 60 * 1000).toISOString().replace('.000Z', 'Z');
+  await assert.rejects(
+    cell.put({ body: 'x', source: 's', confidence: 'stated', createdAt: future }),
+    (err) => err.code === 'INVALID_NOTE',
+  );
+  await assert.rejects(
+    cell.put({ body: 'x', source: 's', confidence: 'stated', updatedAt: future }),
+    (err) => err.code === 'INVALID_NOTE',
+  );
+  // on a rewrite createdAt is ignored (the note keeps its own)
+  const r2 = await cell.put({
+    id: n.id,
+    body: 'di nuovo',
+    source: 'homun:bot-7',
+    confidence: 'stated',
+    createdAt: '2030-01-01T00:00:00Z',
+  });
+  assert.equal(r2.createdAt, birth);
+  await e.close();
+});
+
 // v0.4.1 (P1.3): x-* extensions ride through: Homun saves `x-homun` in the
 // migration and must be able to read it back. `aliases` stays its own
 // field; a patch sets keys one by one, `null` removes one.
