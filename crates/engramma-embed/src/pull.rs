@@ -37,20 +37,46 @@ pub fn pull(
     base: Option<&str>,
     timeout: Duration,
 ) -> Result<PullReport, EmbedError> {
+    // no progress interest: the callback is free when unused
+    pull_progress(root, spec, base, timeout, &mut |_, _| {})
+}
+
+/// [`pull`] with a progress callback (v0.4, the Node binding): called
+/// after every verified byte chunk with `(done_bytes, total_bytes)` over
+/// the WHOLE model — already-present files count as done from the start.
+/// The revision and the sha256 of each file stay pinned, exactly as `pull`.
+///
+/// # Errors
+/// See [`pull`].
+pub fn pull_progress(
+    root: &Path,
+    spec: &ModelSpec,
+    base: Option<&str>,
+    timeout: Duration,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<PullReport, EmbedError> {
     let base = base.unwrap_or(HF_BASE);
     let mut report = PullReport::default();
+    let total: u64 = spec.files.iter().map(|f| f.bytes).sum();
+    let mut done: u64 = 0;
     for file in &spec.files {
         let target = spec.file_path(root, file);
         if target.is_file() && verify_one(&target, &file.sha256)? {
             report.skipped.push(file.path.clone());
+            done += file.bytes;
+            progress(done, total);
             continue;
         }
         let url = format!(
             "{}/{}/resolve/{}/{}",
             base, spec.repo, spec.revision, file.path
         );
-        download_verified(&url, &target, &file.sha256, timeout)?;
+        download_verified_progress(&url, &target, &file.sha256, timeout, &mut |n| {
+            progress(done + n, total)
+        })?;
         report.downloaded.push(file.path.clone());
+        done += file.bytes;
+        progress(done, total);
     }
     Ok(report)
 }
@@ -66,11 +92,16 @@ fn verify_one(path: &Path, sha256: &str) -> Result<bool, EmbedError> {
 /// Stream `url` into a sibling temporary file, hashing while downloading;
 /// rename over `target` only when the hash matches. On any failure the
 /// temporary file is removed — nothing partial is ever left behind.
-fn download_verified(
+/// Stream `url` into a sibling temporary file, hashing while downloading
+/// and reporting the downloaded-so-far bytes; rename over `target` only
+/// when the hash matches. On any failure the temporary file is removed —
+/// nothing partial is ever left behind.
+fn download_verified_progress(
     url: &str,
     target: &Path,
     sha256: &str,
     timeout: Duration,
+    progress: &mut dyn FnMut(u64),
 ) -> Result<(), EmbedError> {
     use ring::digest::{Context, SHA256};
 
@@ -116,6 +147,7 @@ fn download_verified(
     };
     let mut ctx = Context::new(&SHA256);
     let mut buf = vec![0_u8; 1 << 20];
+    let mut so_far: u64 = 0;
     loop {
         let n = match reader.read(&mut buf) {
             Ok(n) => n,
@@ -134,6 +166,8 @@ fn download_verified(
             cleanup(&temp);
             return Err(EmbedError::BadModel(format!("{}: {e}", temp.display())));
         }
+        so_far += n as u64;
+        progress(so_far);
     }
     let got = crate::verify::hex(ctx.finish().as_ref());
     if got != sha256 {

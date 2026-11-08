@@ -40,7 +40,7 @@ tempfile = "3"
 tract-onnx = "0.23.10"
 # v0.4 Node binding for Homun (verified 2026-11-08: a napi-rs 3 addon with a
 # class and an AsyncTask loads in Node 24 and in Homun's Electron 45, N-API 10).
-napi = { version = "3.16.1", default-features = false, features = ["napi8"] }
+napi = { version = "3.16.1", default-features = false, features = ["napi8", "serde-json"] }
 napi-derive = "3"
 napi-build = "2"
 # `fancy-regex` instead of the default `onig`: no C code, same token ids.
