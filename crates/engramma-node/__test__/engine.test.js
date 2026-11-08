@@ -276,6 +276,29 @@ test('modelStatus reports the builtin model (when present)', async () => {
   await e.close();
 });
 
+// v0.4.1 (P1.8): the REPORT v0.4 already said it — "CONFLICT: una nota
+// external non può nascere attiva" — but the binding silently quarantined
+// an explicit `status: 'active'`. Now it is the caller's conflict; without
+// a status the note is born quarantined, as ever.
+test('external cannot be born active: CONFLICT (P1.8)', async () => {
+  const e = await engine();
+  const cell = await e.cell('ext');
+  await assert.rejects(
+    cell.put({ body: 'voci dal web', source: 'web', confidence: 'external', status: 'active' }),
+    (err) => err.code === 'CONFLICT',
+  );
+  const q = await cell.put({ body: 'voci dal web', source: 'web', confidence: 'external' });
+  assert.equal(q.status, 'quarantined');
+  const q2 = await cell.put({
+    body: 'altre voci',
+    source: 'web',
+    confidence: 'external',
+    status: 'quarantined',
+  });
+  assert.equal(q2.status, 'quarantined');
+  await e.close();
+});
+
 // v0.4.1 (P1.7): after close, nothing reopens silently. Every method of the
 // engine and of every one of its cells answers CLOSED; closing twice is not
 // an error; operations already in flight finish before close resolves.

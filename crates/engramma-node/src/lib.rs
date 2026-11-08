@@ -548,6 +548,11 @@ fn build_note(input: &NoteInput, id: Ulid) -> Result<Note> {
         None => NoteType::Note,
     };
     let status = match input.status.as_deref() {
+        // v0.4.1 (P1.8): an EXPLICIT `active` on an `external` note is the
+        // caller's CONFLICT (the core's guard answers, only `confirm`
+        // promotes) — the v0.4 binding quarantined it in silence. Without a
+        // status the note is born quarantined, as ever.
+        Some("active") if confidence == Confidence::External => NoteStatus::Active,
         None | Some("") | Some("active") => {
             if confidence == Confidence::External {
                 NoteStatus::Quarantined
