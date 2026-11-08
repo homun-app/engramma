@@ -188,6 +188,9 @@ pub struct NoteView {
     pub created_at: String,
     pub updated_at: String,
     pub version: i64,
+    /// v0.4.1 (P1.3): the `x-*` extensions as JSON values (`aliases` has its
+    /// own field). What Homun writes in the migration, Homun reads back.
+    pub extensions: HashMap<String, serde_json::Value>,
 }
 
 #[napi(object)]
@@ -201,6 +204,9 @@ pub struct NotePatchInput {
     /// `null` clears the validity bound.
     pub valid_from: Option<Option<String>>,
     pub valid_to: Option<Option<String>>,
+    /// v0.4.1 (P1.3): per-key `x-*` extensions — a JSON value sets the key,
+    /// `null` removes it. Keys without the `x-` prefix get it, like `put`.
+    pub extensions: Option<HashMap<String, Option<serde_json::Value>>>,
 }
 
 #[napi(object)]
@@ -444,7 +450,42 @@ fn aliases_of(note: &Note) -> Vec<String> {
         .collect()
 }
 
+/// v0.4.1 (P1.3): a YAML extension value back to JSON — the exact inverse
+/// of `json_to_yaml` below. A sequence of `[key, value]` pairs reads as an
+/// object too: that is how a structured `x-*` value rode in the v0.4
+/// binding, and those notes must read well as much as the new ones.
+fn yaml_to_json(v: &engramma_core::format::yaml::YamlValue) -> serde_json::Value {
+    use engramma_core::format::yaml::YamlValue;
+    match v {
+        YamlValue::Seq(items)
+            if !items.is_empty()
+                && items.iter().all(|i| {
+                    matches!(i, YamlValue::Seq(pair)
+                        if pair.len() == 2
+                            && matches!(pair[0], YamlValue::Str(_)))
+                }) =>
+        {
+            let mut m = serde_json::Map::new();
+            for item in items {
+                if let YamlValue::Seq(pair) = item
+                    && let YamlValue::Str(k) = &pair[0]
+                {
+                    m.insert(k.clone(), yaml_to_json(&pair[1]));
+                }
+            }
+            serde_json::Value::Object(m)
+        }
+        other => other.to_json(),
+    }
+}
+
 fn note_view(cell: &CoreCell, note: &Note) -> Result<NoteView> {
+    let mut extensions = HashMap::with_capacity(note.extensions.len());
+    for (k, v) in &note.extensions {
+        if k.starts_with("x-") {
+            extensions.insert(k.clone(), yaml_to_json(v));
+        }
+    }
     Ok(NoteView {
         id: note.id.to_string(),
         note_type: note.note_type.as_str().to_string(),
@@ -461,6 +502,7 @@ fn note_view(cell: &CoreCell, note: &Note) -> Result<NoteView> {
         created_at: rfc3339(note.created_at),
         updated_at: rfc3339(note.updated_at),
         version: cell.note_version(&note.id).unwrap_or(0),
+        extensions,
     })
 }
 
@@ -520,7 +562,7 @@ fn build_note(input: &NoteInput, id: Ulid) -> Result<Note> {
         } else {
             format!("x-{k}")
         };
-        extensions.push((key, json_to_yaml(v)));
+        extensions.push((key, json_to_yaml(v)?));
     }
     Ok(Note {
         id,
@@ -548,27 +590,12 @@ fn build_note(input: &NoteInput, id: Ulid) -> Result<Note> {
     })
 }
 
-fn json_to_yaml(v: &serde_json::Value) -> engramma_core::format::yaml::YamlValue {
-    use engramma_core::format::yaml::YamlValue;
-    use serde_json::Value as J;
-    match v {
-        J::Null => YamlValue::Null,
-        J::Bool(b) => YamlValue::Bool(*b),
-        J::Number(n) => n
-            .as_i64()
-            .map(YamlValue::Int)
-            .or_else(|| n.as_f64().map(YamlValue::Float))
-            .unwrap_or(YamlValue::Null),
-        J::String(s) => YamlValue::Str(s.clone()),
-        J::Array(items) => YamlValue::Seq(items.iter().map(json_to_yaml).collect()),
-        J::Object(map) => YamlValue::Seq(
-            // key-value pairs ride as [k, v] sequences, the format's own
-            // representation of structured extensions
-            map.iter()
-                .map(|(k, v)| YamlValue::Seq(vec![YamlValue::Str(k.clone()), json_to_yaml(v)]))
-                .collect(),
-        ),
-    }
+fn json_to_yaml(v: &serde_json::Value) -> Result<engramma_core::format::yaml::YamlValue> {
+    // v0.4.1 (P1.3): the format's own inverse conversion — objects become
+    // `YamlValue::Map` (v0.4 rode them as pair lists, a YAML list in the
+    // file; `yaml_to_json` above still reads both forms)
+    engramma_core::format::yaml::YamlValue::from_json(v)
+        .map_err(|e| invalid(format!("valore di estensione non valido: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1201,6 +1228,34 @@ impl Task for PatchTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         let id = resolve_id(&self.cell, &self.id)?;
+        // v0.4.1 (P1.3): extensions patch PER KEY — a JSON value sets it,
+        // `null` removes it, everything the note already carries stays. The
+        // core's patch replaces the whole list, so the merge happens here.
+        let extensions = match &self.patch.extensions {
+            None => None,
+            Some(ops) => {
+                let old = self.cell.get(&id).map_err(cell_error)?;
+                let mut list = old.extensions.clone();
+                for (k, v) in ops {
+                    let key = if k.starts_with("x-") {
+                        k.clone()
+                    } else {
+                        format!("x-{k}")
+                    };
+                    match v {
+                        None => list.retain(|(ek, _)| *ek != key),
+                        Some(val) => {
+                            let yv = json_to_yaml(val)?;
+                            match list.iter_mut().find(|(ek, _)| *ek == key) {
+                                Some(slot) => slot.1 = yv,
+                                None => list.push((key, yv)),
+                            }
+                        }
+                    }
+                }
+                Some(list)
+            }
+        };
         let patch = NotePatch {
             title: self.patch.title.clone(),
             body: self.patch.body.clone(),
@@ -1224,7 +1279,7 @@ impl Task for PatchTask {
                 Some(None) => Some(None),
                 Some(Some(s)) => Some(rfc_to_validity(s)?),
             },
-            extensions: None,
+            extensions,
         };
         self.cell
             .patch_note(&id, &patch, &self.actor)

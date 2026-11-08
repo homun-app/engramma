@@ -276,6 +276,43 @@ test('modelStatus reports the builtin model (when present)', async () => {
   await e.close();
 });
 
+// v0.4.1 (P1.3): x-* extensions ride through: Homun saves `x-homun` in the
+// migration and must be able to read it back. `aliases` stays its own
+// field; a patch sets keys one by one, `null` removes one.
+test('extensions round-trip, also through a patch (P1.3)', async () => {
+  const e = await engine();
+  const cell = await e.cell('estensioni');
+  const n = await cell.put({
+    body: 'nota migrata da Homun',
+    source: 'migrated:homun',
+    confidence: 'stated',
+    aliases: ['Fabio C.'],
+    extensions: {
+      'x-homun': { id: 'mem-42', tier: 'core', scope: 'user', source: 'template' },
+      'x-count': 3,
+      'x-tags': ['a', 'b'],
+    },
+  });
+  assert.deepEqual(n.extensions, {
+    'x-homun': { id: 'mem-42', tier: 'core', scope: 'user', source: 'template' },
+    'x-count': 3,
+    'x-tags': ['a', 'b'],
+  });
+  assert.deepEqual(n.aliases, ['Fabio C.'], 'aliases stays its own field');
+  const got = await cell.get(n.id);
+  assert.deepEqual(got.extensions['x-homun'], { id: 'mem-42', tier: 'core', scope: 'user', source: 'template' });
+
+  // patch: one key in, one key out, the rest untouched
+  const p1 = await cell.patch(n.id, {
+    extensions: { 'x-homun': { id: 'mem-42', tier: 'log' }, 'x-count': null },
+  });
+  assert.deepEqual(p1.extensions['x-homun'], { id: 'mem-42', tier: 'log' });
+  assert.equal(p1.extensions['x-count'], undefined);
+  assert.deepEqual(p1.extensions['x-tags'], ['a', 'b']);
+  assert.deepEqual(p1.aliases, ['Fabio C.'], 'the aliases survive the patch');
+  await e.close();
+});
+
 // v0.4.1 (P0.2): a purge from Node reaches the views too — the file of the
 // note goes NOW, not at the next sync, and a view nobody can reach is said
 // honestly (`pending: ['vault']`, `scrubbed: false`, the problems listed).
