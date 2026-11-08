@@ -2431,3 +2431,298 @@ fusione predefinita c'è finalmente: `mm-0.7-g0.35`, accanto alla
    è pronta per quando servirà.
 
 Tag: `fase-v0.3.2`. Nessun push (repo locale).
+
+# REPORT — Engramma v0.4 (pronto per Homun: grafo adattivo, collegamento Node, residui della v0.3.2)
+
+Data: 2026-11-08. Base: `main` @ `8dcf37c` (tag `fase-v0.3.2`). Un commit
+per punto, test rosso prima della correzione (per i punti la cui
+correzione è un'API nuova, il rosso è stato il non-compilare dei test
+stessi: dichiarato qui, come nelle fasi precedenti). Tutto offline,
+Rust 1.95, macOS arm64, nessuna crate nuova (napi era già nel lock del
+commit base; le feature `serde-json` di napi e `rusqlite` come
+dev-dipendenza di engramma-vault compilano solo crates già presenti),
+nessun `unsafe` fuori da napi-derive, nessun `unwrap`/`expect` fuori dai
+test, `clippy -D warnings` verde.
+
+## Punto 1 — una vista ha un'identità, e si può sganciare
+
+- Migrazione **v12**: `vault_roots` diventa `vault_views(view_id PRIMARY
+  KEY, root, bound_at, last_seen_at)`; `vault_files` e `vault_conflicts`
+  appartengono a una vista (`PRIMARY KEY (view_id, path)`, l'unicità
+  globale `UNIQUE(note_id)` del v0.3.1 resta). Il lato Rust della
+  migrazione conia un ULID per ogni root registrata e adotta le righe
+  file/conflitto esistenti alla vista più anziana.
+- L'identità viaggia in `engramma.json` (`view_id`, ULID): `vault init`
+  lo scrive (e lo conserva attraverso l'export che riscrive il
+  manifest); una `sync` che trova un `view_id` noto in un percorso nuovo
+  **aggiorna la root** — una vista, non due; un manifest senza `view_id`
+  (vista v0.3.x) lo adotta alla prima sync dalla root; una cella v0.3.2
+  (schema 11) migra e la prima sync della cartella adotta l'id coniato.
+- **`engramma vault unbind <dir|view_id>`**: sgancia la vista e i SUOI
+  legami (file, copie di conflitto); i file restano — non sono mai stati
+  del motore. Accetta la cartella o l'id, anche di 8 caratteri.
+- **`purge` per vista**: una vista irraggiungibile resta `pending:
+  ["vault"]` (uscita 5) **solo se nella cella risultano file o copie di
+  conflitto di quella nota legati a quella vista**; altrimenti là non
+  c'è niente da cancellare e l'oblio è completo. Il messaggio nomina la
+  vista e suggerisce sia `vault sync` sia `vault unbind`. E il
+  `vault_roots().unwrap_or_default()` della v0.3.2 non inghiotte più
+  nulla: viste non leggibili ⇒ `pending`.
+- Il percorso della vista poteva anche appartenere a un'altra vista: la
+  seconda copia di una nota resta tale anche attraverso viste diverse
+  (la ricerca per nota è globale), mentre il confronto per percorso è
+  per vista.
+
+Test: vista spostata e sincronizzata altrove (una riga sola, root nuovo,
+purge 0); cancellata poi unbind (purge 0); irraggiungibile con file
+legato (5, messaggio che nomina la vista); senza file (0); migrazione
+v11→v12 con adozione. La prova a mano è sotto.
+
+## Punto 2 — le copie `.conflitto` di prima della v0.3.2
+
+Lo scanner registra un `<nome>.conflitto-<ts>.md` non registrato il cui
+`<nome>.md` è legato a una nota, per quella nota: la purge le raggiunge.
+Le copie orfane (base non legato) restano dell'utente, elencate in un
+avviso **una volta sola** — la riga marcatore (senza nota) zittisce le
+sync successive e se ne va quando il file sparisce. Rosso prima: la
+copia creata a mano sopravviveva alla purge e l'orfano non era segnalato.
+
+## Punto 3 — il banco riporta l'MRR per categoria
+
+La taratura stampa, per OGNI configurazione, le quattro categorie, la
+loro media semplice (`category_mean`, con test) e resta l'MRR pesato col
+caso peggiore dei vicini. Il criterio del punto 6 decide sulla media per
+categoria: l'MRR pesato per numero di domande nascondeva il multi-salto,
+che è il 5% delle domande.
+
+## Punti 4–6 — il grafo adattivo
+
+**Semi dalla domanda (P1.4, stile HippoRAG 2).** Il vettore di partenza
+del PageRank sono le entità che la domanda nomina: gruppi di 1–3 parole
+consecutive, normalizzati come l'indice (minuscole, senza accenti, **niente
+stemming**: i nomi propri non si stemmano), corrispondenza esatta contro
+`entities.name` e gli `aliases` delle note-entità. La corrispondenza più
+lunga si tiene il suo span («anna rossi 2» non semina anche un'eventuale
+«anna»). `GraphIndex` costruisce la mappa nomi/alias insieme all'indice
+e la aggiusta in `patch_note`. I candidati della fusione testo+vettori
+entrano con punteggio normalizzato × `seed_passage_weight` (0,05, come
+HippoRAG 2). **Porta**: la domanda che non nomina nessuna entità del
+grafo non sveglia il grafo — lista grafo vuota, explain «grafo spento:
+nessuna entità nominata».
+
+**Peso per domanda (P1.5).** `w_g(q) = w_max · gate(q) · incertezza(q)`
+con incertezza in `[u_min, 1]` da due segnali gratis sui candidati in
+mano (linea QPP): lo **stacco** primo-secondo della lista fusa
+(riferimento `GRAPH_GAP_REF` = 0,25 sulla scala normalizzata) e
+l'**accordo** testo/vettori sul primo risultato (metà e mezzo quando ci
+sono entrambe le liste, solo lo stacco nel modo testo). Monotona,
+limitata, spiegata: `explain.graph` porta peso, perché è spento, stacco
+e accordo. `Weights.graph_policy` (`Fixed` = v0.3.2 | `Adaptive{w_max,
+u_min}`), `GraphSeeding` (`Fused` = v0.3.2 | `Question{spw}`), e
+`Fusion::Adaptive { alpha, cos_norm, w_max, u_min }` che soprassiede la
+policy della query (la manopola della griglia).
+
+### La sonda: perché le soglie non si raggiungono
+
+`--probe-seeding` misura la semina dalla domanda a peso FISSO e stampa i
+due segnali per categoria. Due fatti, a 10k (97M):
+
+- la semina dalla domanda vale quanto la fusa (multi-salto 0,611 vs
+  0,607 a g 0,40/α 0,7): la qualità multi-salto la decide il PESO, non i
+  semi;
+- **i due segnali non separano le categorie**: gli stacchi multi-salto
+  (0,12–0,47) sovrappongono quelli fattuali (0,005–0,50), e l'accordo
+  sulle domande multi-salto è spesso VERO — le liste concordano sul
+  candidato sbagliato (le note del soggetto). Nessuna formula monotona
+  e limitata può dare peso alto alle une e basso alle altre.
+
+### La griglia (32 punti + 2 riferimenti, 97M; 10k mediana di 3, 100k un giro)
+
+Criterio: media per categoria dell'MRR, nel caso peggiore tra le
+dimensioni. Righe selezionate (tutte nell'uscita della taratura):
+
+| configurazione | media@10k | media@100k | peggiore |
+|---|---|---|---|
+| ad α0,6 w0,40 u0,15 spw0,05 (**vincitore**) | 0,7646 | 0,8080 | 0,7646 |
+| ad α0,7 w0,40 u0,15 spw0,05 | 0,7593 | 0,7608 | 0,7593 |
+| ad α0,7 w0,45 u0,15 spw0,05 | 0,7197 | 0,8069 | 0,7197 |
+| rif α0,7/g0,35 (v0.3.2) | **0,8050** | 0,7419 | 0,7419 |
+| rif α0,6/g0,40 (v0.3.1) | 0,7234 | **0,8425** | 0,7234 |
+
+Il vincitore e i riferimenti rifatti a 100k (mediana di 3, ibrido caldo):
+
+| configurazione | fattuali | parafrasi | multi-salto | inglese | media | p50/p95 (ms) |
+|---|---|---|---|---|---|---|
+| vincitore α0,6 w0,40 u0,15 spw0,05 | 0,928 | 0,914 | 0,458 | 0,932 | 0,808 | 11,8 / 15,1 |
+| rif α0,7/g0,35 (v0.3.2) | 0,912 | 0,873 | 0,356 | 0,827 | 0,742 | 11,6 / 14,7 |
+| rif α0,6/g0,40 (v0.3.1) | 0,910 | 0,862 | 0,795 | 0,802 | 0,842 | 11,6 / 14,8 |
+
+**Soglie (spec, non abbassate):**
+
+- a 100k: fattuali +0,016, parafrasi +0,041, inglese +0,105 (tutte OK),
+  p95 +2,7% (OK), **multi-salto 0,458 < 0,75: NO**;
+- a 10k il vincitore perde parafrasi (0,840 vs 0,882, −0,042) e inglese
+  (0,893 vs 0,948, −0,055) oltre soglia, e multi-salto 0,349: NO.
+
+**Sentenza (quella prevista dalla spec): il predefinito resta α 0,7 /
+grafo 0,35** (seme fuso, il comportamento v0.3.2 esatto), la variante
+adattiva resta come opzione, e questi sono i numeri. Cosa manca, detto
+onesta mente: (1) un segnale che riconosca le domande multi-salto — i
+due segnali QPP dichiarati non lo fanno, su questo corpus; (2) una lista
+grafo che non normalizzi sul massimo (HippoRAG 2 ORDINA per PageRank,
+non fonde per peso: lì il multi-salto non paga dazio alle categorie
+dirette). A 100k, intanto, il vincitore adattivo batte il predefinito
+SU TUTTE le categorie — il costo dell'adattivo è a 10k, dove il corpus è
+piccolo e i segnali più rumorosi.
+
+Controprova sui test dorati: il predefinito non è cambiato, i 66 file
+passano con le attese non ritoccate (225 test in debug e release).
+
+## Punti 7–9 — il collegamento Node per Homun
+
+`crates/engramma-node`, napi-rs 3, tutto asincrono sul pool di libuv:
+`Engine` (open/cell/cells/modelStatus/pullModel con progresso per byte
+verificato — `pull_progress` in engramma-embed — /search su più celle
+con RRF k=60 dichiarata approssimata/close) e `Cell` (put/patch/get/
+list/search/history/neighbors/setStatus/confirm/delete/purge/
+embedPending/changesSince/verify/compact/vaultViews/vaultUnbind). Gli
+errori sono `Error` JS con `code` stabile (`NOT_FOUND`, `QUARANTINED`,
+`INVALID_NOTE`, `CONFLICT`, `IO`, `MODEL_MISSING`, `COMPACTED`): il code
+viaggia nel prefisso «[CODE] » attraverso la barriera asincrona e ogni
+`reject` ricostruisce l'errore con la proprietà `code` (napi rigetta
+verbatim un valore trattenuto — dichiarato nel codice). L'oracolo chiuso
+vale anche per `get`: quarantena e lapide rispondono `null`. Ibrido senza
+modello degrada a testo+grafo (dichiarato), `vector` senza modello è
+`MODEL_MISSING`. `CONFLICT`: una nota `external` non può nascere attiva.
+
+- **Test JS** (`node:test`, nessuna dipendenza, `embedder: 'none'`):
+  ciclo completo, quarantena, errori col code, 200 put + 200 search in
+  parallelo, changesSince con compattazione, Engine.search su due celle:
+  **8/8 in Node 24, 8/8 nell'Electron 45 di Homun** (`npm run
+  test:electron`, `ELECTRON_RUN_AS_NODE=1`, percorso da `HOMUN_ELECTRON`;
+  il repo di Homun non è stato toccato).
+- **`npm run build`**: `engramma.darwin-arm64.node` release =
+  **33 240 320 byte** (33,2 MB; il modello NON è incorporato), più
+  `index.js` e `index.d.ts` generati. Il CI del workspace non richiede
+  Node: la crate compila e clippy passa con `cargo test`.
+- `docs/node.md`: costruzione, contratto (camelCase, oracolo chiuso,
+  purge che non mente), l'esempio per un assistente e la firma del
+  `.node` in un'app macOS notarizzata (fuori dall'asar,
+  `codesign --options runtime`).
+
+## Prove a mano (uscite trascritte)
+
+**La vista spostata (punto 1):**
+
+```console
+$ engramma --root $T vault init $T/vista-vecchia
+vault inizializzato: …/vista-vecchia
+$ mv $T/vista-vecchia $T/vista-nuova
+$ engramma --root $T vault sync $T/vista-nuova
+nulla da fare                        # la cartella è identica: una vista, root aggiornato
+$ engramma --root $T purge R4PMXB5H --reason "prova v0.4" --yes
+purgata: 01M6XAJHSGBSMYJPJXR4PMXB5H (1 payload dimenticati)   # exit 0
+$ find $T/vista-nuova -type f
+…/vista-nuova/engramma.json         # il file della nota: andato subito, al NUOVO posto
+$ grep -rl quokkaviolaceo $T/vista-nuova || echo pulita
+pulita
+```
+
+**Tre domande dal vault dorato con explain (66 file, celle ibride).**
+Col predefinito (α 0,7 / g 0,35 fisso) e con la variante adattiva
+(`ENGRAMMA_GRAPH=adaptive:0.5,0.1,0.05`), il peso del grafo per domanda:
+
+| domanda | predefinito | adattivo | prima risposta |
+|---|---|---|---|
+| «dove abita Fabio» (diretta) | 0,35 | **0,05** (stacco 0,27, concordi) | Fabio abita a Milano |
+| «dove lavora il partner di Fabio» (multi-salto) | 0,35 | **0,47** (stacco 0,04, discordi) | Giulia |
+| «dove vive Fabio dopo il trasloco» (parafrasi) | 0,35 | 0,28 (stacco 0,37, discordi) | Fabio abita a Milano* |
+
+\* con l'adattivo la parafrasi trova la NOTA giusta in cima (col
+predefinito saliva prima la persona). Il percorso del multi-salto
+dell'adattivo è quello giusto: `via [[Fabio]] -partner_of-> (nota
+00000002)`. E la porta, su una domanda che non nomina entità:
+
+```console
+$ ENGRAMMA_GRAPH=adaptive:0.5,0.1,0.05 engramma --root $T search "ha vinto una gara di crossfit"
+1. [active] Palestra la mattina (00000064)
+   grafo: grafo spento: nessuna entità nominata
+```
+
+**Lo script dell'esempio di `docs/node.md`, con l'Electron di Homun:**
+
+```console
+$ ELECTRON_RUN_AS_NODE=1 …/node_modules/electron/dist/…/Electron \
+    crates/engramma-node/example/assistente.js
+engramma-node 0.1.0-dev — esempio docs/node.md
+modello: granite-embedding-97m-multilingual-r2@835ad140
+scritta: FX7GDYZ2 [active] Casa di Fabio
+dedotta: ZAQEVN7P [quarantined] (in quarantena)
+ricerca «dove abita Fabio?» (embedding: 2 note):
+  1.000 strong «Casa di Fabio» — Fabio vive a [[Milano]] dal 2024. grafo 0.35
+la quarantena per get(): null (oracolo chiuso)
+confermata: active
+purga: 1 payload dimenticati, scrubbed=true
+verify: ok=true replay=full ops=5
+esempio completato
+```
+
+## Chiusura
+
+`cargo fmt --check`, `cargo clippy --all-targets --offline -- -D
+warnings`, `cargo test --offline --workspace` (**225 test** in debug,
+**225** in `--release`, zero falliti), `cargo deny check licenses bans`:
+verdi. I test JS: 8/8 in Node 24, 8/8 nell'Electron di Homun.
+
+### Il banco (10k e 100k, viva/uniform/97M/311M, mediana di 3, cache calda vera)
+
+Il percorso di ricerca non è cambiato (il predefinito è intatto) e il
+banco lo conferma: le righe di qualità della fusione predefinita sono
+**identiche al bit** a quelle della v0.3.2 (mm-0.7-g0.35 a 100k:
+0,912/0,873/0,356/0,827) e l'impronta è la stessa (100k+97M: 465,0 MB →
+407,1 base / 586,1 con istantanea; compact 2,2 s / 5,5 s; purge 4,6 s).
+
+Like-for-like con la v0.3.2 (100k, 97M):
+
+| misura | v0.3.2 | v0.4 | Δ |
+|---|---|---|---|
+| ibrido caldo p50 / p95 (ms) | 11,7 / 14,9 | 11,6 / 14,7 | −0,9% / −1,3% |
+| ibrido + embedding p50 / p95 (ms) | 20,6 / 23,7 | 20,3 / 23,4 | −1,5% / −1,3% |
+| solo vettori p50 / p95 (ms) | 4,5 / 5,1 | 4,5 / 5,0 | 0 / −2,0% |
+| embedding (note/s) | 188 | 191 | +1,6% |
+| inserimento (note/s) | 2 144 | 2 470 | +15% (la riga v0.3.2 attraversò un picco di carico; il suo giro di controllo dava 1 906–2 171) |
+
+**Soglia del ≤10%: rispettata ovunque.** Le latenze della variante
+adattiva vincente sono nella tabella della taratura (p95 15,1 ms,
++2,7%). Tabella completa e per-modalità in `bench/RESULTS.md` (colonne
+della v0.3.2 e riga della fusione predefinita incluse, 311M a 10k
+compreso).
+
+## Cosa non ho potuto provare
+
+- **Windows e Linux**: solo macOS arm64, come nelle fasi precedenti.
+- **cargo deny advisories**: richiedono rete; eseguito `licenses bans`.
+- **Il grafo adattivo come predefinito**: le soglie non si raggiungono
+  (sopra, i numeri); la variante è documentata e provabile.
+- **pullModel di rete**: offline — il percorso è esercitato dai test
+  della v0.3 con il server locale di engramma-embed (`pull_progress` ne
+  riusa la logica verificandone gli sha per chunk); con il modello già
+  presente, `pullModel` verifica e salta senza rete (provato
+  nell'esempio).
+
+## Domande aperte per la v0.5
+
+1. **Un segnale per il multi-salto**: lo stacco e l'accordo non bastano
+   (sonda del punto 6); i candidati sono la densità del grafo attorno
+   ai semi (quanta massa il PPR lascia entro due salti) o la posizione
+   del migliore candidato del grafo rispetto alla fusione.
+2. **La lista grafo normalizzata sul massimo**: è ciò che la fa
+   competere col punteggio fuso; HippoRAG 2 ordina per PageRank e non
+   paga questo dazio. Un esperimento dichiarato: massa assoluta invece
+   che relativa al massimo.
+3. **Il costo a 10k dell'adattivo** (parafrasi −0,042, inglese −0,055
+   contro il predefinito): corpus piccolo, segnali più rumorosi — da
+   ritarare su un secondo corpus, quando ci sarà.
+4. **Homun**: il contratto del punto 7 è pronto e provato nel suo
+   Electron; l'integrazione (migrazione delle note, `storia`, la
+   sezione Memoria) è la fase prossima, su un altro repo.

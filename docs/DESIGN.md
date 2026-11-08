@@ -207,14 +207,13 @@ query {
 
 1. **Candidati in parallelo:** 50 dal testo (BM25), 50 dal significato (dalla v0.2).
 2. **Fusione RRF** (somma di `1/(60 + posizione)` per ogni elenco): non serve calibrare i punteggi tra loro.
-3. **Grafo come terza lista** (*rivisto il 2026-11-06, v0.3*): un **PageRank personalizzato a spinta** (Andersen–Chung–Lang) parte dai primi risultati fusi e già filtrati. Corre su un grafo note↔entità **in memoria** (`GraphIndex`: CSR derivato, costruito pigramente, aggiornato dalle scritture) e i suoi punteggi entrano nella fusione come terza lista.
-   - Era: un allargamento a passi fissi (0,6 / 0,36), con gli archi letti da SQLite a ogni domanda.
-   - Motivo, misurato sulla v0.2.1 a 100k: il grafo prendeva il 59% del tempo (p95 ibrido 59,8 ms) e in ibrido il multi-salto crollava a 0,063.
-   - Il prototipo di spinta: con ε = 10⁻³ tocca ~157 archi per domanda anche con hub da 16 741 archi, perché la soglia proporzionale al grado non espande gli hub, e trova la nota a due salti prima in 200 domande su 200.
-   - È la linea di HippoRAG 2.
+3. **Grafo come terza lista** (*rivisto il 2026-11-06, v0.3; semi e peso per domanda il 2026-11-08, v0.4*): un **PageRank personalizzato a spinta** (Andersen–Chung–Lang) corre su un grafo note↔entità **in memoria** (`GraphIndex`: CSR derivato, costruito pigramente, aggiornato dalle scritture) e i suoi punteggi entrano nella fusione come terza lista.
+   - Era v0.2: un allargamento a passi fissi (0,6 / 0,36), con gli archi letti da SQLite a ogni domanda. Motivo, misurato a 100k: il grafo prendeva il 59% del tempo (p95 ibrido 59,8 ms) e in ibrido il multi-salto crollava a 0,063. La spinta: con ε = 10⁻⁴ tocca ~157 archi per domanda anche con hub da 16 741 archi, e trova la nota a due salti prima in 200 domande su 200. È la linea di HippoRAG 2.
+   - **Semi dalla domanda (v0.4):** il vettore di partenza sono le **entità che la domanda nomina** — gruppi di 1–3 parole consecutive, normalizzati come l'indice (minuscole, senza accenti, niente stemming: i nomi propri non si stemmano), corrispondenza esatta contro `entities.name` e gli `aliases` delle note-entità (`GraphIndex` costruisce la mappa con l'indice e la aggiusta con le scritture) — più i candidati della fusione con punteggio normalizzato × `seed_passage_weight` (0,05, come HippoRAG 2). **Porta:** la domanda che non nomina nessuna entità del grafo non sveglia il grafo; l'explain dice «grafo spento: nessuna entità nominata».
+   - **Peso per domanda (v0.4):** il peso della lista grafo non è più una costante ma `w_g(q) = w_max · gate(q) · incertezza(q)`, con l'incertezza in `[u_min, 1]` da due segnali gratis sui candidati in mano (linea QPP): lo **stacco** tra il primo e il secondo punteggio della fusione testo+vettori e l'**accordo** tra le due liste sul primo risultato. Prima netto e liste concordi → incertezza bassa → il grafo pesa poco. È `Weights.graph_policy` (`Fixed` = il comportamento v0.3.2, che resta il **predefinito**: la taratura v0.4 ha mostrato che i due segnali, su quel corpus, non separano le domande multi-salto dalle dirette — REPORT v0.4); la variante completa è `Fusion::Adaptive { alpha, cos_norm, w_max, u_min }`, e la CLI la prova con `ENGRAMMA_GRAPH=adaptive:<w_max>,<u_min>,<spw>`.
 4. **Filtri temporali:** con `as_of` vale solo ciò che era valido in quella data. Di norma, solo ciò che vale oggi.
-5. **Riordino:** `punteggio = RRF × peso_affidabilità × peso_recenza × peso_grafo`. I pesi sono configurabili e i valori predefiniti vanno tarati sul benchmark (§ 11).
-6. **Spiegazione per ogni risultato:** `matched_terms`, `semantic_rank`, `via: [[Giulia]] → lives_in`, `confidence`, `valid_from`, `source`.
+5. **Riordino:** `punteggio = (1−w_g)·fusione + w_g·massa_grafo` (la convessa v0.2.1; la RRF resta un'opzione) `× peso_affidabilità × peso_recenza` (solo modo testo). I pesi sono configurabili e i valori predefiniti sono tarati sul benchmark (§ 11).
+6. **Spiegazione per ogni risultato:** `matched_terms`, `semantic_rank`, `via: [[Giulia]] → lives_in`, `confidence`, `valid_from`, `source` — e, per domanda, il **peso del grafo** con i suoi due segnali (`explain.graph`: peso, perché è spento, stacco, accordo).
 
 ### 6.4 Altre interrogazioni
 - `get(id)`, `history(id)`, `neighbors(entity|note, depth, rels[])`, `path(a, b)`.
@@ -279,15 +278,17 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 - **Ambiti:** il server si avvia con l'elenco delle celle esposte (`engramma mcp --cells famiglia,preferenze`). In HTTP si usano token per ambito. Ogni lettura finisce nel registro di audit della cella.
 
 ### 8.4 Homun (v0.4)
-- **Collegamento in-process:** il daemon carica il modulo `napi-rs`.
+- **Collegamento in-process:** il daemon carica il modulo `napi-rs` — `crates/engramma-node`, **N-API** (stabile tra versioni di Node ed Electron: il `.node` non si ricompila a ogni aggiornamento). Il contratto JS (`Engine`, `Cell`) è in `docs/node.md`: ogni metodo che tocca disco o modello è asincrono sul pool di libuv, gli errori sono `Error` con `code` stabile e senza contenuti di note (l'oracolo chiuso vale anche per `get`: una nota in quarantena risponde `null`). Il modello sta nel demone, una volta (~400 MB); la ricerca su più celle fonde le classifiche con RRF k=60, dichiarata approssimata.
+- **Firma su macOS:** il `.node` va **fuori dall'asar** e firmato con l'identità dell'app prima della notarizzazione (`codesign --options runtime`; `docs/node.md`).
 - **Migrazione:** le note di oggi (`agents/<id>/memory`, `user/memory`) diventano celle:
   - `bot-<id>` per le note di un bot;
   - `utente` per quelle condivise;
   - `core` diventa un tag;
   - `source` vale `migrated:homun`.
 - **Strumenti del bot:** `recall_memory` e `update_memory` restano nell'interfaccia, ma usano il motore. Nascono `search_history` e `read_history`, che usano un indice delle conversazioni in una cella `storia` dedicata.
-- **Quarantena:** ciò che il bot ricava in un turno contaminato si scrive come `external`.
-- **La sezione Memoria di Homun** è un'interfaccia sul motore: elenco, ricerca, grafo, «perché lo so?», conferma della quarantena, storico.
+- **Quarantena:** ciò che il bot ricava in un turno contaminato si scrive come `external` — nasce in quarantena e la ricerca non la vede finché qualcuno non la conferma.
+- **Oblio:** `purge` non mente — se il WAL o una vista markdown trattengono ancora byte, la risposta lo dice (`pending`) e il chiamante finisce il lavoro.
+- **La sezione Memoria di Homun** è un'interfaccia sul motore: elenco, ricerca, grafo, «perché lo so?» (l'explain, peso del grafo compreso), conferma della quarantena, storico.
 
 ## 9. Server e cluster (architettura, non costruita prima della v0.6)
 

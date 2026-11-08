@@ -25,8 +25,8 @@ pub use format::{Confidence, Lang, Note, NoteType, ParseMode, Status, Validity};
 pub use hlc::{Hlc, HlcClock};
 pub use port::{export, import_cell, import_obsidian};
 pub use search::{
-    CosNorm, Explain, Filters, Fusion, GraphExplain, GraphOverride, GraphPolicy, GraphSeeding,
-    Hit, Mode, Query, SearchOutcome, Semantic, Weights,
+    CosNorm, Explain, Filters, Fusion, GraphExplain, GraphOverride, GraphPolicy, GraphSeeding, Hit,
+    Mode, Query, SearchOutcome, Semantic, Weights,
 };
 pub use vector::{FlatI8, IndexHit, IndexRow, VectorIndex};
 

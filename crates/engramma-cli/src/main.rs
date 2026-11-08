@@ -1769,7 +1769,7 @@ fn run_model(cli: &Cli, action: &ModelAction) -> Result<(), CliError> {
 /// (the v0.3.2 behavior with an explicit weight). The manual proofs of
 /// the REPORT run on it.
 fn parse_graph_env(spec: &str) -> Result<engramma_core::search::GraphOverride, CliError> {
-    use engramma_core::search::{GraphPolicy, GraphSeeding, GraphOverride};
+    use engramma_core::search::{GraphOverride, GraphPolicy, GraphSeeding};
     if let Some(w) = spec.strip_prefix("fixed:") {
         let w: f64 = w
             .replace(',', ".")
@@ -1797,9 +1797,10 @@ fn parse_graph_env(spec: &str) -> Result<engramma_core::search::GraphOverride, C
             .map_err(|_| CliError::usage(format!("ENGRAMMA_GRAPH: numero non valido {v:?}")))
     };
     let in_unit = |v: f64, name: &str| -> Result<f64, CliError> {
-        (0.0..=1.0).contains(&v).then_some(v).ok_or_else(|| {
-            CliError::usage(format!("ENGRAMMA_GRAPH: {name}={v} fuori da [0, 1]"))
-        })
+        (0.0..=1.0)
+            .contains(&v)
+            .then_some(v)
+            .ok_or_else(|| CliError::usage(format!("ENGRAMMA_GRAPH: {name}={v} fuori da [0, 1]")))
     };
     let w_max = in_unit(parse(nums[0])?, "w_max")?;
     let u_min = in_unit(parse(nums[1])?, "u_min")?;
