@@ -87,6 +87,19 @@ pub struct Weights {
     pub graph_policy: GraphPolicy,
 }
 
+/// The graph knobs a caller overrides in one breath (v0.4, P1.6): what
+/// `ENGRAMMA_GRAPH` parses into on the CLI.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GraphOverride {
+    /// The weight policy.
+    pub policy: GraphPolicy,
+    /// The weight for the `Fixed` policy (and the fallback the adaptive
+    /// path never reads).
+    pub weight: f64,
+    /// The seeding.
+    pub seeding: GraphSeeding,
+}
+
 /// How much the graph list weighs in the fusion (v0.4, P1.5).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GraphPolicy {

@@ -769,6 +769,14 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             if let Some(l) = lang {
                 q.lang = Some(Lang::parse(l).map_err(|e| CliError::usage(e.to_string()))?);
             }
+            if let Ok(spec) = std::env::var("ENGRAMMA_GRAPH")
+                && !spec.is_empty()
+            {
+                let o = parse_graph_env(&spec)?;
+                q.weights.graph_policy = o.policy;
+                q.weights.graph_weight = o.weight;
+                q.weights.graph_seeding = o.seeding;
+            }
             // Semantic side: the configured embedder decides what "hybrid"
             // (the default) can do.
             let embedder = load_embedder_or_warn(cli)?;
@@ -1755,6 +1763,56 @@ fn run_model(cli: &Cli, action: &ModelAction) -> Result<(), CliError> {
 /// Parse `--fusion`: `rrf`, or the convex combination as
 /// `convex[-mm|-th]-α` — `mm` min-maxes the cosine over the candidates
 /// (the default), `th` uses the theoretical −1..1 limits.
+/// v0.4 (P1.6): `ENGRAMMA_GRAPH` overrides the graph's knobs of a search
+/// without touching the defaults — `adaptive:<w_max>,<u_min>,<spw>`
+/// (question-entity seeding, gate, per-question weight) or `fixed:<w>`
+/// (the v0.3.2 behavior with an explicit weight). The manual proofs of
+/// the REPORT run on it.
+fn parse_graph_env(spec: &str) -> Result<engramma_core::search::GraphOverride, CliError> {
+    use engramma_core::search::{GraphPolicy, GraphSeeding, GraphOverride};
+    if let Some(w) = spec.strip_prefix("fixed:") {
+        let w: f64 = w
+            .replace(',', ".")
+            .parse()
+            .map_err(|_| CliError::usage(format!("ENGRAMMA_GRAPH: fixed:<peso> — {spec:?}")))?;
+        return Ok(GraphOverride {
+            policy: GraphPolicy::Fixed,
+            weight: w,
+            seeding: GraphSeeding::Fused,
+        });
+    }
+    let Some(rest) = spec.strip_prefix("adaptive:") else {
+        return Err(CliError::usage(
+            "ENGRAMMA_GRAPH: adaptive:<w_max>,<u_min>,<spw> | fixed:<peso>",
+        ));
+    };
+    let nums: Vec<&str> = rest.split(',').map(str::trim).collect();
+    if nums.len() != 3 {
+        return Err(CliError::usage(
+            "ENGRAMMA_GRAPH: adaptive:<w_max>,<u_min>,<spw> (tre numeri col punto decimale)",
+        ));
+    }
+    let parse = |v: &str| -> Result<f64, CliError> {
+        v.parse::<f64>()
+            .map_err(|_| CliError::usage(format!("ENGRAMMA_GRAPH: numero non valido {v:?}")))
+    };
+    let in_unit = |v: f64, name: &str| -> Result<f64, CliError> {
+        (0.0..=1.0).contains(&v).then_some(v).ok_or_else(|| {
+            CliError::usage(format!("ENGRAMMA_GRAPH: {name}={v} fuori da [0, 1]"))
+        })
+    };
+    let w_max = in_unit(parse(nums[0])?, "w_max")?;
+    let u_min = in_unit(parse(nums[1])?, "u_min")?;
+    let spw = in_unit(parse(nums[2])?, "spw")?;
+    Ok(GraphOverride {
+        policy: GraphPolicy::Adaptive { w_max, u_min },
+        weight: w_max,
+        seeding: GraphSeeding::Question {
+            seed_passage_weight: spw,
+        },
+    })
+}
+
 fn parse_fusion(s: &str) -> Result<engramma_core::search::Fusion, CliError> {
     use engramma_core::search::{CosNorm, Fusion};
     if s == "rrf" {
@@ -1790,6 +1848,32 @@ fn fusion_usage(s: &str) -> String {
 mod tests {
     use super::*;
     use engramma_core::search::{CosNorm, Fusion};
+
+    #[test]
+    fn graph_env_parsing() {
+        use engramma_core::search::{GraphPolicy, GraphSeeding};
+        let fixed = parse_graph_env("fixed:0,35").unwrap(/* test-only */);
+        assert_eq!(fixed.policy, GraphPolicy::Fixed);
+        assert!((fixed.weight - 0.35).abs() < 1e-12);
+        assert_eq!(fixed.seeding, GraphSeeding::Fused);
+        let ad = parse_graph_env("adaptive:0.5,0.1,0.05").unwrap(/* test-only */);
+        assert_eq!(
+            ad.policy,
+            GraphPolicy::Adaptive {
+                w_max: 0.5,
+                u_min: 0.1
+            }
+        );
+        assert!(matches!(
+            ad.seeding,
+            GraphSeeding::Question {
+                seed_passage_weight: 0.05
+            }
+        ));
+        // a comma decimal inside the numbers would eat a field: refused
+        assert!(parse_graph_env("adaptive:0,5,0.1").is_err());
+        assert!(parse_graph_env("bogus").is_err());
+    }
 
     #[test]
     fn fusion_parsing_covers_norms_and_comma_decimals() {
