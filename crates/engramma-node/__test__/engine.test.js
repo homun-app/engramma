@@ -276,6 +276,34 @@ test('modelStatus reports the builtin model (when present)', async () => {
   await e.close();
 });
 
+// v0.4.1 (P1.5): a search hit carries what a result row needs — the id
+// short form, the cell, the date, the tags, the type, the state — without a
+// get per result.
+test('SearchHit carries the row fields (P1.5)', async () => {
+  const e = await engine();
+  const cell = await e.cell('righe');
+  const n = await cell.put({
+    body: 'il compleanno di Giulia è a marzo',
+    title: 'Compleanno',
+    noteType: 'event',
+    tags: ['famiglia/compleanni'],
+    source: 'chat:2026-11-08',
+    confidence: 'stated',
+  });
+  const hits = await cell.search({ text: 'compleanno Giulia', k: 3 });
+  assert.equal(hits.length, 1);
+  const h = hits[0];
+  assert.equal(h.id, n.id);
+  assert.equal(h.cell, 'righe');
+  assert.equal(h.noteType, 'event');
+  assert.deepEqual(h.tags, ['famiglia/compleanni']);
+  assert.equal(h.status, 'active');
+  assert.equal(typeof h.updatedAt, 'string');
+  assert.match(h.updatedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.ok(h.updatedAt >= n.createdAt);
+  await e.close();
+});
+
 // v0.4.1 (P1.4): import dates. A new note can be born in the past
 // (createdAt/updatedAt, RFC 3339 — the migration needs them), never in the
 // future; a rewrite keeps the birth date and moves only updated_at.

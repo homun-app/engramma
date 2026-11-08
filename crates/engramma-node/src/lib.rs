@@ -265,6 +265,14 @@ pub struct SearchHit {
     pub score: f64,
     pub support: Option<String>,
     pub explain: Option<HitExplain>,
+    /// v0.4.1 (P1.5): what a result row needs, without a `get` per hit.
+    pub note_type: String,
+    pub tags: Vec<String>,
+    /// RFC 3339 — when the note last changed.
+    pub updated_at: String,
+    /// `active` outside `includeQuarantined` (which can surface
+    /// `quarantined`).
+    pub status: String,
 }
 
 #[napi(object)]
@@ -695,6 +703,10 @@ fn hits_to_js(
                 score: h.score,
                 support: h.explain.support.map(str::to_string),
                 explain,
+                note_type: h.note.note_type.as_str().to_string(),
+                tags: h.note.tags.clone(),
+                updated_at: rfc3339(h.note.updated_at),
+                status: h.note.status.as_str().to_string(),
             }
         })
         .collect()
