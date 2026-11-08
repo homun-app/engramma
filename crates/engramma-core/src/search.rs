@@ -80,6 +80,30 @@ pub struct Weights {
     /// v0.4 (P1.4): how the graph walk starts. The default until this phase
     /// is retuned is [`GraphSeeding::Fused`] — exactly the v0.3.2 behavior.
     pub graph_seeding: GraphSeeding,
+    /// v0.4 (P1.5): how much the graph list weighs. `Fixed` keeps
+    /// [`Weights::graph_weight`] (the v0.3.2 behavior); `Adaptive` computes
+    /// `w_g(q) = w_max · gate(q) · incertezza(q)` per question. The default
+    /// until this phase is retuned is `Fixed`.
+    pub graph_policy: GraphPolicy,
+}
+
+/// How much the graph list weighs in the fusion (v0.4, P1.5).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GraphPolicy {
+    /// The fixed [`Weights::graph_weight`] — the v0.3.2 behavior, kept for
+    /// the benchmark comparisons and as the way back.
+    Fixed,
+    /// `w_g(q) = w_max · gate(q) · incertezza(q)`: the gate is P1.4's
+    /// (0 when the question names no entity), and `incertezza(q)` sits in
+    /// `[u_min, 1]` on two free signals of the fused list — the first to
+    /// second gap and the text/vector agreement on the first result. A
+    /// clear, agreed first result needs no graph; a thin one does.
+    Adaptive {
+        /// The ceiling of `w_g`.
+        w_max: f64,
+        /// The floor of `incertezza`.
+        u_min: f64,
+    },
 }
 
 /// How the personalised-PageRank walk is seeded (v0.4, P1.4).
@@ -112,6 +136,7 @@ impl Default for Weights {
             ppr_epsilon: 1e-4,
             hub_theta: 50.0,
             graph_seeding: GraphSeeding::Fused,
+            graph_policy: GraphPolicy::Fixed,
         }
     }
 }
@@ -249,6 +274,12 @@ pub struct GraphExplain {
     /// Why the graph stayed off, when it did («grafo spento: nessuna
     /// entità nominata», P1.4).
     pub off: Option<&'static str>,
+    /// The first-to-second gap of the fused list, on its [0, 1] scale
+    /// (P1.5's first signal; `None` when the graph never ran).
+    pub gap: Option<f64>,
+    /// Whether the text and vector lists agree on the first result
+    /// (P1.5's second signal; `None` without both lists).
+    pub agreement: Option<bool>,
 }
 
 /// One search result.
@@ -363,12 +394,29 @@ pub enum Fusion {
     /// Convex combination: `alpha·cos_norm(cos) + (1−alpha)·bm25_minmax`,
     /// both terms min-max normalised (BM25 and, with
     /// [`CosNorm::Candidates`], the cosine over the candidates); a note
-    /// missing from one list scores 0 for it.
+    /// missing from one list scores 0 for it. The graph list weighs
+    /// [`Weights::graph_weight`], fixed.
     Convex {
         /// Weight of the cosine (0–1).
         alpha: f64,
         /// How the cosine is normalised.
         cos_norm: CosNorm,
+    },
+    /// v0.4 (P1.5): the same convex text+vector fusion, but the graph list
+    /// weighs `w_g(q) = w_max · gate(q) · incertezza(q)` — per question,
+    /// from the two free signals of the fused list (the gap and the
+    /// agreement, QPP-style). This variant OVERRIDES the query's
+    /// [`GraphPolicy`] with its own `w_max`/`u_min`: it is the knob the
+    /// benchmark grid turns, and (from P1.6 on) the default.
+    Adaptive {
+        /// Weight of the cosine (0–1).
+        alpha: f64,
+        /// How the cosine is normalised.
+        cos_norm: CosNorm,
+        /// The ceiling of the graph weight.
+        w_max: f64,
+        /// The floor of `incertezza(q)`.
+        u_min: f64,
     },
 }
 
@@ -846,17 +894,35 @@ impl Cell {
         // carry mass unless asked for; `as_of` skips edges that were not
         // valid then. v0.4 (P1.4): with question-entity seeding a query
         // that names no entity gates the graph off.
-        let graph_ran = q.graph_hops > 0 && q.weights.graph_weight > 0.0;
-        let (glist, _pushed, graph_say) = if graph_ran {
+        // v0.4 (P1.5): the graph's weight is per question. The first signal
+        // is free: the first-to-second gap of the fused (here: BM25,
+        // max-normalised) list. No vector list, no agreement signal.
+        let norm_bm25: Vec<f64> = text_candidates
+            .iter()
+            .map(|(_, b, _, _)| *b / max_bm25)
+            .collect();
+        let gap = gap_of(&norm_bm25);
+        let (w_g, graph_say_gap, graph_say_agreement) = match q.weights.graph_policy {
+            GraphPolicy::Fixed => (q.weights.graph_weight.clamp(0.0, 1.0), gap, None),
+            GraphPolicy::Adaptive { w_max, u_min } => {
+                let conf = graph_confidence(gap, None);
+                let w = w_max.clamp(0.0, 1.0) * graph_uncertainty(u_min, conf);
+                (w, gap, None)
+            }
+        };
+        let graph_ran = q.graph_hops > 0 && w_g > 0.0;
+        let (glist, _pushed, mut graph_say) = if graph_ran {
             match q.weights.graph_seeding {
-                GraphSeeding::Question { .. } => graph_list(&inner, q, &seeds)?,
-                GraphSeeding::Fused if !seeds.is_empty() => graph_list(&inner, q, &seeds)?,
+                GraphSeeding::Question { .. } => graph_list(&inner, q, &seeds, w_g)?,
+                GraphSeeding::Fused if !seeds.is_empty() => graph_list(&inner, q, &seeds, w_g)?,
                 GraphSeeding::Fused => (
                     Vec::new(),
                     0,
                     GraphExplain {
                         weight: 0.0,
                         off: None,
+                        gap: None,
+                        agreement: None,
                     },
                 ),
             }
@@ -867,11 +933,16 @@ impl Cell {
                 GraphExplain {
                     weight: 0.0,
                     off: None,
+                    gap: None,
+                    agreement: None,
                 },
             )
         };
         let g_of: HashMap<&str, &GraphEntry> = glist.iter().map(|e| (e.id.as_str(), e)).collect();
-        let w_g = q.weights.graph_weight.clamp(0.0, 1.0);
+        if graph_ran {
+            graph_say.gap = Some(graph_say_gap);
+            graph_say.agreement = graph_say_agreement;
+        }
 
         // 5. Rerank: the convex three-weight fusion (text, graph — the vector
         // list joins in hybrid) × coverage × confidence × recency.
@@ -1435,6 +1506,42 @@ const GRAPH_SEEDS: usize = 3;
 /// of the graph, so the walk never starts.
 const GRAPH_OFF_NO_ENTITY: &str = "grafo spento: nessuna entità nominata";
 
+/// The reference first-to-second gap on the fused, [0, 1]-scaled list: at
+/// or above it the first result is "clear" (P1.5). The fused scale is
+/// min-max-ish by construction (best candidate = 1), so 0.25 means the
+/// runner-up sits at three quarters of the winner's distance from zero —
+/// declared, and part of what the REPORT's manual proofs show.
+pub const GRAPH_GAP_REF: f64 = 0.25;
+
+/// How much the fused list can be trusted (P1.5, QPP-style): the clamped
+/// first-to-second gap (over [`GRAPH_GAP_REF`]) plus the text/vector
+/// agreement on the first result — half each when both lists exist, the
+/// gap alone otherwise. In [0, 1], monotone in both signals.
+#[must_use]
+pub fn graph_confidence(gap: f64, agreement: Option<bool>) -> f64 {
+    let gap_term = (gap / GRAPH_GAP_REF).clamp(0.0, 1.0);
+    match agreement {
+        Some(true) => 0.5 * gap_term + 0.5,
+        Some(false) => 0.5 * gap_term,
+        None => gap_term,
+    }
+}
+
+/// The first-to-second gap of a score list sorted best-first (0.0 with
+/// fewer than two entries — one candidate says nothing about certainty).
+fn gap_of(scores_desc: &[f64]) -> f64 {
+    if scores_desc.len() < 2 {
+        return 0.0;
+    }
+    (scores_desc[0] - scores_desc[1]).max(0.0)
+}
+
+/// `incertezza(q)` in `[u_min, 1]`: 1 − confidence, floored.
+#[must_use]
+pub fn graph_uncertainty(u_min: f64, confidence: f64) -> f64 {
+    u_min + (1.0 - u_min) * (1.0 - confidence.clamp(0.0, 1.0))
+}
+
 /// The graph entities a question names (v0.4, P1.4): its 1–3-word groups,
 /// normalized like the index (lowercase, diacritics folded, no stemming —
 /// entity names are proper nouns), matched EXACTLY against entity names
@@ -1484,16 +1591,18 @@ fn graph_list(
     inner: &Inner,
     q: &Query,
     fused_seeds: &[(String, f64)],
+    w_g: f64,
 ) -> Result<(Vec<GraphEntry>, usize, GraphExplain), SearchError> {
     let w = &q.weights;
-    let w_g = w.graph_weight.clamp(0.0, 1.0);
-    if w.graph_weight <= 0.0 {
+    if w_g <= 0.0 {
         return Ok((
             Vec::new(),
             0,
             GraphExplain {
                 weight: 0.0,
                 off: None,
+                gap: None,
+                agreement: None,
             },
         ));
     }
@@ -1504,6 +1613,8 @@ fn graph_list(
             GraphExplain {
                 weight: w_g,
                 off: None,
+                gap: None,
+                agreement: None,
             },
         ));
     };
@@ -1536,6 +1647,8 @@ fn graph_list(
                     GraphExplain {
                         weight: 0.0,
                         off: Some(GRAPH_OFF_NO_ENTITY),
+                        gap: None,
+                        agreement: None,
                     },
                 ));
             }
@@ -1555,6 +1668,8 @@ fn graph_list(
             GraphExplain {
                 weight: w_g,
                 off: None,
+                gap: None,
+                agreement: None,
             },
         ));
     }
@@ -1575,6 +1690,8 @@ fn graph_list(
             GraphExplain {
                 weight: w_g,
                 off: None,
+                gap: None,
+                agreement: None,
             },
         ));
     }
@@ -1642,6 +1759,8 @@ fn graph_list(
         GraphExplain {
             weight: w_g,
             off: None,
+            gap: None,
+            agreement: None,
         },
     ))
 }
@@ -1820,7 +1939,10 @@ fn fuse(
                 *out.entry(v.id.clone()).or_default() += 1.0 / (k as f64 + v.rank as f64);
             }
         }
-        Fusion::Convex { alpha, cos_norm } => {
+        Fusion::Convex { alpha, cos_norm }
+        | Fusion::Adaptive {
+            alpha, cos_norm, ..
+        } => {
             // BM25 min-max over the union's present values
             let mut min = f64::INFINITY;
             let mut max = f64::NEG_INFINITY;
@@ -2085,17 +2207,53 @@ fn semantic_pipeline(
     let mut seeds: Vec<(String, f64)> = fused.iter().map(|(id, s)| (id.clone(), *s)).collect();
     seeds.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let seeds: Vec<(String, f64)> = seeds.into_iter().take(GRAPH_SEEDS).collect();
-    let graph_ran = q.graph_hops > 0 && q.weights.graph_weight > 0.0;
-    let (glist, pushed_edges, graph_say): (Vec<GraphEntry>, usize, GraphExplain) = if graph_ran {
+    // v0.4 (P1.5): the graph's weight is per question, on two free signals
+    // of the list in hand — the first-to-second gap, and whether the text
+    // and vector lists agree on the first result. A `Fusion::Adaptive`
+    // overrides the query's policy with its own w_max/u_min (the bench
+    // grid's knob).
+    let gap = {
+        let mut scores: Vec<f64> = fused.values().copied().collect();
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        gap_of(&scores)
+    };
+    let agreement = match (text_list.first(), vec_list.first()) {
+        (Some((t, _, _, _)), Some(v)) => Some(t == &v.id),
+        _ => None,
+    };
+    let adaptive_of = |w: &crate::search::Weights| -> Option<(f64, f64)> {
+        match &sem.fusion {
+            Fusion::Adaptive { w_max, u_min, .. } => Some((*w_max, *u_min)),
+            _ => match w.graph_policy {
+                GraphPolicy::Adaptive { w_max, u_min } => Some((w_max, u_min)),
+                GraphPolicy::Fixed => None,
+            },
+        }
+    };
+    let (w_g, graph_ran) = match adaptive_of(&q.weights) {
+        Some((w_max, u_min)) => {
+            let w =
+                w_max.clamp(0.0, 1.0) * graph_uncertainty(u_min, graph_confidence(gap, agreement));
+            (w, q.graph_hops > 0 && w > 0.0)
+        }
+        None => (
+            q.weights.graph_weight.clamp(0.0, 1.0),
+            q.graph_hops > 0 && q.weights.graph_weight > 0.0,
+        ),
+    };
+    let (glist, pushed_edges, mut graph_say): (Vec<GraphEntry>, usize, GraphExplain) = if graph_ran
+    {
         match q.weights.graph_seeding {
-            GraphSeeding::Question { .. } => graph_list(inner, q, &seeds)?,
-            GraphSeeding::Fused if !seeds.is_empty() => graph_list(inner, q, &seeds)?,
+            GraphSeeding::Question { .. } => graph_list(inner, q, &seeds, w_g)?,
+            GraphSeeding::Fused if !seeds.is_empty() => graph_list(inner, q, &seeds, w_g)?,
             GraphSeeding::Fused => (
                 Vec::new(),
                 0,
                 GraphExplain {
                     weight: 0.0,
                     off: None,
+                    gap: None,
+                    agreement: None,
                 },
             ),
         }
@@ -2106,11 +2264,16 @@ fn semantic_pipeline(
             GraphExplain {
                 weight: 0.0,
                 off: None,
+                gap: None,
+                agreement: None,
             },
         )
     };
     let g_of: HashMap<&str, &GraphEntry> = glist.iter().map(|e| (e.id.as_str(), e)).collect();
-    let w_g = q.weights.graph_weight.clamp(0.0, 1.0);
+    if graph_ran {
+        graph_say.gap = Some(gap);
+        graph_say.agreement = agreement;
+    }
     // How the graph list joins the fusion: RRF adds a weighted rank
     // reciprocal (in the same [0, 1] scale the fused scores were renormalised
     // to — the best graph note adds `w`, the 50th about `w·(k+1)/(k+50)`),
@@ -2122,7 +2285,7 @@ fn semantic_pipeline(
                     let k = k as f64;
                     w_g * ((k + 1.0) / (k + e.rank as f64))
                 }
-                Fusion::Convex { .. } => w_g * e.score,
+                Fusion::Convex { .. } | Fusion::Adaptive { .. } => w_g * e.score,
             },
             None => 0.0,
         }
@@ -2130,7 +2293,7 @@ fn semantic_pipeline(
     let scale_base = |_id: &str, fused_score: f64| -> f64 {
         match sem.fusion {
             Fusion::Rrf { .. } => fused_score,
-            Fusion::Convex { .. } => (1.0 - w_g) * fused_score,
+            Fusion::Convex { .. } | Fusion::Adaptive { .. } => (1.0 - w_g) * fused_score,
         }
     };
 
@@ -3230,6 +3393,61 @@ mod tests {
                 .as_ref()
                 .is_some_and(|g| g.off.is_none())
         );
+    }
+    // --- v0.4 (P1.5): the graph weighs in per question ------------------
+
+    #[test]
+    fn graph_confidence_is_monotone_and_bounded() {
+        // a clear first raises confidence, so does the lists' agreement
+        let thin = graph_confidence(0.0, Some(false));
+        let clear = graph_confidence(1.0, Some(true));
+        assert_eq!(thin, 0.0);
+        assert_eq!(clear, 1.0);
+        // monotone in the gap
+        assert!(graph_confidence(0.1, Some(true)) < graph_confidence(0.5, Some(true)));
+        // agreement alone is worth half
+        assert!((graph_confidence(0.0, Some(true)) - 0.5).abs() < 1e-12);
+        // without a vector list the gap carries it all
+        assert!((graph_confidence(1.0, None) - 1.0).abs() < 1e-12);
+        // uncertainty stays in [u_min, 1]
+        assert!((graph_uncertainty(0.1, 0.0) - 1.0).abs() < 1e-12);
+        assert!((graph_uncertainty(0.1, 1.0) - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn adaptive_weight_is_explained_and_self_consistent() {
+        let (_d, cell) = setup();
+        // a multi-salto question, thin text signal: the graph must weigh
+        // near its ceiling, and the explain must carry the two signals and
+        // the weight the formula produces from them
+        let mut q = Query::text("il partner di Fabio").k(10).graph_hops(2);
+        q.weights.graph_policy = GraphPolicy::Adaptive {
+            w_max: 0.6,
+            u_min: 0.05,
+        };
+        let hits = cell.search_with_now(&q, now()).unwrap(/* test-only */);
+        let say = hits[0]
+            .explain
+            .graph
+            .as_ref()
+            .expect(/* t */ "the graph ran");
+        let gap = say.gap.expect(/* t */ "the gap is a signal");
+        assert_eq!(say.agreement, None, "text mode has no vector list");
+        let expect = 0.6 * graph_uncertainty(0.05, graph_confidence(gap, None));
+        assert!(
+            (say.weight - expect).abs() < 1e-12,
+            "explain and formula agree: {} vs {expect}",
+            say.weight
+        );
+        // and with certainty forced to the floor (u_min = 1) the weight is
+        // the ceiling: the graph always weighs in fully
+        let mut forced = Query::text("Fabio").k(10).graph_hops(1);
+        forced.weights.graph_policy = GraphPolicy::Adaptive {
+            w_max: 0.6,
+            u_min: 1.0,
+        };
+        let hits2 = cell.search_with_now(&forced, now()).unwrap(/* t */);
+        assert_eq!(hits2[0].explain.graph.as_ref().unwrap(/* t */).weight, 0.6);
     }
 }
 

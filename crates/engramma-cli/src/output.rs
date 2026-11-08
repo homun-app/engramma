@@ -124,6 +124,8 @@ pub fn hit_json(h: &Hit) -> serde_json::Value {
             "graph": h.explain.graph.as_ref().map(|g| serde_json::json!({
                 "weight": g.weight,
                 "off": g.off,
+                "gap": g.gap,
+                "agreement": g.agreement,
             })),
             "confidence": h.explain.confidence.as_str(),
             "valid_from": h.explain.valid_from,
@@ -180,7 +182,17 @@ pub fn hit_human(h: &Hit, index: usize) -> String {
     if let Some(g) = &h.explain.graph {
         match g.off {
             Some(why) => out.push_str(&format!("\n   grafo: {why}")),
-            None => out.push_str(&format!("\n   peso grafo: {:.2}", g.weight)),
+            None => {
+                let signals = match (g.gap, g.agreement) {
+                    (Some(gap), Some(a)) => format!(
+                        "stacco {gap:.2}, liste {}",
+                        if a { "concordi" } else { "discordi" }
+                    ),
+                    (Some(gap), None) => format!("stacco {gap:.2}"),
+                    _ => "—".into(),
+                };
+                out.push_str(&format!("\n   peso grafo: {:.2} ({signals})", g.weight));
+            }
         }
     }
     out.push_str(&format!(
