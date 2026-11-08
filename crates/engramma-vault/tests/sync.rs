@@ -956,3 +956,47 @@ fn second_sync_of_a_quiet_view_is_empty_warnings_included() {
         "the second sync must be empty, warnings included: {r2:?}"
     );
 }
+
+/// v0.4.1 (P0.1): the file of a quarantined note, exported by the view and
+/// then edited by hand (status: active), does NOT make the note active when
+/// the sync applies it — a rewrite preserves the state, and the cell wins
+/// the state field like it wins conflicts.
+#[test]
+fn a_hand_edited_file_cannot_launder_a_quarantined_note() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let vault = setup(dir.path());
+    let mut n = note(1, "segreto", "il pin del lucchetto e quokkaviolaceo7");
+    n.confidence = Confidence::External;
+    n.status = Status::Quarantined;
+    vault.cell().put_note(&n, "t").unwrap(/* test-only */);
+    vault.sync_once(false).unwrap(/* test-only */);
+    let files = std::fs::read_dir(vault.root().join("fact")).unwrap(/* t */);
+    let name = files
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .find(|f| f.starts_with("segreto"))
+        .unwrap_or_default();
+    // the hand edit: a new body AND a laundered status
+    let text = read(&vault, &format!("fact/{name}"));
+    let edited = text
+        .replace("quokkaviolaceo7", "quokkaviolaceo9 scritto da fuori")
+        .replace("status: quarantined", "status: active");
+    assert_ne!(edited, text, "the file really said quarantined");
+    write(&vault, &format!("fact/{name}"), &edited);
+    let r = vault.sync_once(false).unwrap(/* test-only */);
+    assert_eq!(r.updated_from_file.len(), 1, "{r:?}");
+    assert!(
+        r.errors.is_empty(),
+        "the sync must not choke on the state change: {r:?}"
+    );
+    let back = vault.cell().get(&n.id).unwrap(/* test-only */);
+    assert_eq!(back.status, Status::Quarantined, "the file laundered it");
+    assert!(back.body.contains("quokkaviolaceo9"));
+    // the view goes back to a fixed point, file included
+    let r2 = vault.sync_once(false).unwrap(/* test-only */);
+    assert!(r2.is_noop(), "{r2:?}");
+    assert!(
+        read(&vault, &format!("fact/{name}")).contains("status: quarantined"),
+        "the rewritten file tells the truth again"
+    );
+}

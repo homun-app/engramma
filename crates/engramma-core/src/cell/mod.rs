@@ -2939,12 +2939,14 @@ mod tests {
             "tester",
         );
         assert!(err.is_err(), "superseded without valid_to came back");
-        // and so must a full replace
+        // a full replace no longer REFUSES: v0.4.1 (P0.1) a rewrite preserves
+        // the state, and a preserved `superseded` keeps the closing the old
+        // version had — the invariant survives the rewrite
         let mut again = old.clone();
         again.status = Status::Superseded;
         again.valid_to = None;
-        assert!(cell.put_note(&again, "tester").is_err());
-        // the note is untouched: still superseded with a closed validity
+        cell.put_note(&again, "tester").unwrap(/* test-only */);
+        // the note keeps its state and its closed validity
         let back = cell.get(&old.id).unwrap(/* test-only */);
         assert_eq!(back.status, Status::Superseded);
         assert!(back.valid_to.is_some());

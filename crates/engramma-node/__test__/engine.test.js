@@ -113,6 +113,52 @@ test('quarantine: born external, hidden, then confirmed', async () => {
   await e.close();
 });
 
+// v0.4.1 (P0.1): a rewrite cannot launder a quarantined note. The state
+// changes only through setStatus/confirm/delete (and restore); a put with
+// an existing id — or a patch — preserves it, and an `external` rewrite of
+// an active note quarantines it (never the opposite).
+test('a rewrite preserves the quarantine (P0.1)', async () => {
+  const e = await engine();
+  const cell = await e.cell('quarantena');
+  const q = await cell.put({
+    body: 'Il PIN di Fabio è 4321',
+    source: 'homun:web',
+    confidence: 'external',
+  });
+  assert.equal(q.status, 'quarantined');
+  // the dangerous rewrite of the spec: same id, stated confidence, no
+  // status — it must NOT become a "fact"
+  const r = await cell.put({
+    id: q.id,
+    body: 'Il PIN di Fabio è 4321',
+    source: 'homun:bot',
+    confidence: 'stated',
+  });
+  assert.equal(r.status, 'quarantined', 'the rewrite launders the note');
+  assert.equal(r.source, 'homun:bot');
+  const hits = await cell.search({ text: 'PIN Fabio' });
+  assert.ok(hits.every((h) => h.id !== q.id), 'the search stays blind to it');
+  // the same rewrite ASKING for active is a CONFLICT
+  await assert.rejects(
+    cell.put({ id: q.id, body: 'x', source: 's', confidence: 'stated', status: 'active' }),
+    (err) => err.code === 'CONFLICT',
+  );
+  // a patch keeps the state too
+  const p = await cell.patch(q.id, { body: 'Il PIN di Fabio è 4322' });
+  assert.equal(p.status, 'quarantined');
+  // external on an ACTIVE note quarantines it through a rewrite
+  const a = await cell.put({ body: 'Fabio lavora alla Acme', source: 'io', confidence: 'stated' });
+  const ax = await cell.put({ id: a.id, body: 'Fabio lavora alla Acme', source: 'web', confidence: 'external' });
+  assert.equal(ax.status, 'quarantined');
+  // a tombstone is not resurrected by a put with its id
+  await cell.delete(a.id);
+  await assert.rejects(
+    cell.put({ id: a.id, body: 'resurrezione', source: 's', confidence: 'stated' }),
+    (err) => err.code === 'CONFLICT',
+  );
+  await e.close();
+});
+
 test('errors carry a stable code', async () => {
   const e = await engine();
   const cell = await e.cell('errori');

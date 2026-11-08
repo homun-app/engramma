@@ -704,12 +704,32 @@ impl Vault {
         }
 
         // the cell's rule: a file cannot promote an external note to active
+        let as_written = file_note.status;
         if file_note.confidence == Confidence::External && file_note.status == Status::Active {
             file_note.status = Status::Quarantined;
             report.warnings.push(format!(
                 "{}: una nota external nasce in quarantena (`confirm` la promuove)",
                 file.path
             ));
+        }
+        // v0.4.1 (P0.1): a file cannot change the note's STATE either — the
+        // state moves only through `setStatus`/`confirm`/`delete` in the
+        // cell, and a rewrite (which is what applying a changed file is)
+        // preserves it. The one legal exception is the quarantine downgrade
+        // of an active note whose new version is `external`.
+        if file_note.status != live_note.status
+            && !(live_note.status == Status::Active
+                && file_note.confidence == Confidence::External
+                && file_note.status == Status::Quarantined)
+        {
+            report.warnings.push(format!(
+                "{}: il file non può cambiare lo stato della nota ({}): \
+                 resta {} — `setStatus`/`confirm`/`delete` in the cell",
+                file.path,
+                file_note.status.as_str(),
+                live_note.status.as_str(),
+            ));
+            file_note.status = live_note.status;
         }
 
         let row = known.get(&file.path);
@@ -737,7 +757,18 @@ impl Vault {
                     report.errors.push(format!("{}: {e}", file.path));
                     return Ok(());
                 }
-                self.record(view_id, file, &note_id, file_note.status)?;
+                let applied = self.cell.get(&note_id)?;
+                if as_written != applied.status {
+                    // v0.4.1 (P0.1): the file tells a state the cell would
+                    // not keep — a laundered quarantine, or an external
+                    // rewrite that went back to quarantine. Rewrite it from
+                    // the note, or the next sync would warn about it forever
+                    self.write_file(&file.abs, &applied)?;
+                    let fresh = self.snapshot(&file.abs)?;
+                    self.record(view_id, &fresh, &note_id, applied.status)?;
+                } else {
+                    self.record(view_id, file, &note_id, applied.status)?;
+                }
                 report.updated_from_file.push(file.path.clone());
             }
             (true, true) => {

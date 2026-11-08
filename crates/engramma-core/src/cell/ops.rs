@@ -865,10 +865,46 @@ fn apply_put(tx: &Transaction<'_>, op: &Op, note: &Note) -> Result<(), CellError
         ));
     }
     let old = read_note(tx, &note.id)?;
+    let mut note = note.clone();
     if let Some(row) = &old {
+        // v0.4.1 (P0.1): a rewrite PRESERVES the note's state — the state
+        // changes only through `set_status`, `confirm`, `delete` (and
+        // `restore`). The one exception is the quarantine: a new version
+        // with `external` confidence brings an active note to quarantine,
+        // never the opposite. Every caller builds the note it wants; this
+        // is the single place that decides, so the CLI, the vault sync and
+        // the Node binding all inherit it (and so does the replay).
+        if row.note.status == Status::Deleted {
+            return Err(CellError::Invalid(
+                "the note is a tombstone: restore it from its history instead \
+                 of rewriting it"
+                    .into(),
+            ));
+        }
+        let preserved = if row.note.status == Status::Active
+            && note.confidence == crate::format::Confidence::External
+        {
+            Status::Quarantined
+        } else {
+            row.note.status
+        };
+        if note.status != preserved {
+            return Err(CellError::Invalid(format!(
+                "a rewrite preserves the note's state (`{}` requested, `{}` is \
+                 the state): use `setStatus`, `confirm` or `delete` to change it",
+                note.status.as_str(),
+                preserved.as_str(),
+            )));
+        }
+        note.status = preserved;
+        // a superseded note must keep a closed validity, and the rewrite of
+        // one does not carry it: keep the closing the old version had
+        if preserved == Status::Superseded && note.valid_to.is_none() {
+            note.valid_to = row.note.valid_to;
+        }
         snapshot(tx, &note.id, row.version, &op.op_id)?;
     }
-    write_note(tx, note, old.is_some(), false)?;
+    write_note(tx, &note, old.is_some(), false)?;
     reindex_note(tx, &note.id, old.as_ref())?;
     for old_id in &note.supersedes {
         tx.execute(
@@ -885,6 +921,14 @@ fn apply_patch(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     let Some(old) = read_note(tx, &id)? else {
         return Err(CellError::NoteNotFound(id.to_string()));
     };
+    // v0.4.1 (P0.1): a tombstone is not edited either — restore it first
+    if old.note.status == Status::Deleted {
+        return Err(CellError::Invalid(
+            "the note is a tombstone: restore it from its history instead \
+             of rewriting it"
+                .into(),
+        ));
+    }
     snapshot(tx, &id, old.version, &op.op_id)?;
     let set = op
         .body

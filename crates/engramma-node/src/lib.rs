@@ -113,6 +113,16 @@ fn cell_error(e: CellError) -> Error {
             "CONFLICT",
             "una nota external nasce in quarantena: `confirm` la promuove",
         ),
+        CellError::Invalid(m) if m.contains("is a tombstone") => transport_err(
+            "CONFLICT",
+            "la nota è una lapide: si ripristina dallo storico, una riscrittura \
+             non la resuscita",
+        ),
+        CellError::Invalid(m) if m.contains("a rewrite preserves") => transport_err(
+            "CONFLICT",
+            "una riscrittura conserva lo stato della nota: lo cambia \
+             `setStatus`, `confirm` o `delete`",
+        ),
         CellError::Invalid(m) if m.contains("is not quarantined") => transport_err(
             "QUARANTINED",
             "la nota non è in quarantena: niente da confermare",
@@ -1134,9 +1144,30 @@ impl Task for PutTask {
             Some(s) => parse_ulid(s)?,
             None => engramma_core::id::new_ulid().map_err(cell_error)?,
         };
-        let note = build_note(&self.input, id)?;
+        let mut note = build_note(&self.input, id)?;
+        // v0.4.1 (P0.1): a rewrite PRESERVES the note's state. The caller
+        // that does not ask for a status gets the preserved one (the core
+        // recomputes and enforces it); an explicit request that disagrees
+        // with the preserved state is the caller's CONFLICT to hear about.
+        if self.input.id.is_some()
+            && let Some(old) = self.cell.get(&note.id).ok()
+            && old.status != NoteStatus::Deleted
+            && self.input.status.is_none()
+        {
+            note.status =
+                if old.status == NoteStatus::Active && note.confidence == Confidence::External {
+                    NoteStatus::Quarantined
+                } else {
+                    old.status
+                };
+            if note.status == NoteStatus::Superseded && note.valid_to.is_none() {
+                note.valid_to = old.valid_to;
+            }
+        }
         self.cell.put_note(&note, &self.actor).map_err(cell_error)?;
-        Ok(note)
+        // the view comes from the cell, the single source of truth (the
+        // state a rewrite preserves, the dates, the version)
+        self.cell.get(&note.id).map_err(cell_error)
     }
 
     fn resolve(&mut self, _env: Env, note: Note) -> Result<NoteView> {
