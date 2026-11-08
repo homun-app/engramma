@@ -1,9 +1,9 @@
 # engramma-node — il motore dentro Node.js ed Electron
 
-v0.4 (P2.7–P2.9). Il collegamento in-process per Homun: un modulo
-**N-API** (napi-rs 3) che carica il motore una volta per processo. L'N-API
-è stabile tra versioni di Node ed Electron: il `.node` non va ricompilato
-a ogni aggiornamento di Electron (Homun oggi non ha moduli nativi; questo
+v0.4.1. Il collegamento in-process per Homun: un modulo **N-API**
+(napi-rs 3) che carica il motore una volta per processo. L'N-API è
+stabile tra versioni di Node ed Electron: il `.node` non va ricompilato a
+ogni aggiornamento di Electron (Homun oggi non ha moduli nativi; questo
 è il primo, ed è il motivo della scelta).
 
 ## Costruzione
@@ -23,7 +23,9 @@ caricatore generato cerca il `.node` accanto a sé.
 
 I test: `npm test` (Node 24) e `npm run test:electron` (l'Electron di
 Homun in modo Node, `ELECTRON_RUN_AS_NODE=1`; il percorso si sovrascrive
-con `HOMUN_ELECTRON`). Nessuna dipendenza oltre a Node stesso.
+con `HOMUN_ELECTRON`). I test che legano una vista markdown usano il
+binario della CLI (`ENGRAMMA_BIN`, predefiniti `target/release` e
+`target/debug`). Nessuna dipendenza oltre a Node stesso.
 
 ## Il contratto
 
@@ -36,7 +38,7 @@ export interface EngineOptions {
 }
 export class Engine {
   static open(opts: EngineOptions): Promise<Engine>
-  cell(name: string, opts?: { create?: boolean }): Promise<Cell>
+  cell(name: string, opts?: { create?: boolean; actor?: string }): Promise<Cell>
   cells(): Promise<string[]>
   modelStatus(): Promise<{ present: boolean; id?: string; bytes?: number }>
   pullModel(onProgress?: (done: number, total: number) => void): Promise<void>
@@ -63,9 +65,41 @@ export class Cell {
   vaultViews(): Promise<VaultView[]>
   vaultUnbind(dirOrViewId: string): Promise<void>
 }
+export interface NoteInput {
+  id?: string                     // ULID; assente = nota nuova, presente = riscrittura
+  noteType?: string; title?: string; body?: string; tags?: string[]; aliases?: string[]
+  source: string; confidence: 'stated' | 'inferred' | 'external'
+  status?: 'active' | 'quarantined'
+  validFrom?: string; validTo?: string
+  extensions?: Record<string, unknown>          // chiavi x-*
+  createdAt?: string; updatedAt?: string        // RFC 3339, solo nota nuova (importazione)
+}
+export interface NoteView {
+  id: string; noteType: string; title: string | null; body: string
+  tags: string[]; aliases: string[]; scope: string | null
+  source: string; confidence: string; status: string
+  validFrom: string | null; validTo: string | null
+  createdAt: string; updatedAt: string; version: number
+  extensions: Record<string, unknown>           // chiavi x-*
+}
+export interface NotePatchInput {
+  title?: string | null; body?: string; tags?: string[]
+  source?: string; confidence?: string
+  validFrom?: string | null; validTo?: string | null
+  extensions?: Record<string, unknown | null>   // per chiave; null toglie
+}
 export interface SearchInput {
   text: string; k?: number; mode?: 'text' | 'vector' | 'hybrid'
   graphHops?: number; asOf?: string; includeQuarantined?: boolean; explain?: boolean
+}
+export interface SearchHit {
+  id: string; cell: string; title: string; snippet: string
+  score: number; support: string | null; explain?: HitExplain
+  noteType: string; tags: string[]; updatedAt: string; status: string
+}
+export interface PurgeView {
+  forgottenPayloads: number; scrubbed: boolean; pending: string[]
+  views: Array<{ viewId: string | null; root: string; reason: string }>
 }
 ```
 
@@ -74,24 +108,69 @@ Notevoli:
 - **i nomi dei campi sono camelCase** (`noteType`, `validFrom`,
   `graphHops`, `asOf`), come nell'`index.d.ts` generato; le date sono
   stringhe RFC 3339 (o `YYYY-MM-DD` dove ha senso);
-- `SearchHit` porta `id`, `cell`, `title`, `snippet`, `score`, `support`
-  e, con `explain: true`, il perché: liste, termini, ranghi, i salti del
-  grafo (`via`) e il **peso del grafo per quella domanda** con i suoi due
-  segnali (`explain.graph`: `{weight, off?, gap?, agreement?}` — «grafo
-  spento: nessuna entità nominata» quando la porta è chiusa);
+- **lo stato di una nota lo cambiano solo `setStatus`, `confirm` e
+  `delete`** (più il ripristino dallo storico): una riscrittura (`put`
+  con id esistente, `patch`) **conserva lo stato** — una nota in
+  quarantena riscritta resta in quarantena e fuori dalla ricerca, anche
+  se la nuova versione dice `stated`; chiedere `status: 'active'` per
+  iscritto è `CONFLICT`, come una nota `external` che chiede di nascere
+  attiva. L'unica deriva consentita: una riscrittura `external` porta
+  una nota attiva in quarantena, mai il contrario. Una **lapide** non
+  resuscita: `put` e `patch` col suo id rispondono `CONFLICT`, si
+  ripristina dallo storico. La regola vive nel core: CLI e `vault sync`
+  ereditano la stessa (un file markdown modificato a mano non cambia lo
+  stato della nota; la vista lo riscrive col vero);
+- **la data di nascita è della nota, non della versione**: una
+  riscrittura conserva `createdAt` e sposta solo `updatedAt`.
+  `NoteInput.createdAt`/`updatedAt` (RFC 3339) servono
+  **all'importazione** — una nota nuova può nascere nel passato, mai nel
+  futuro (5 minuti di tolleranza, poi `INVALID_NOTE`); su una
+  riscrittura entrambi sono ignorati. Il registro continua a usare il
+  suo orologio (HLC): queste sono date della nota, non delle operazioni;
+- **`extensions`**: `put` accetta `Record<string, unknown>` (le chiavi
+  prendono il prefisso `x-` se non l'hanno), `NoteView` le riporta come
+  valori JSON e `patch` le tocca **per chiave** (`null` toglie la chiave,
+  un valore la setta, il resto resta). `aliases` resta un campo a sé;
+- **`actor` per cella**: `e.cell(name, { actor: 'homun:bot-7' })` timbra
+  le scritture di quella `Cell` con quel bot, un solo `Engine`; due
+  `Cell` sulla stessa cella con attori diversi scrivono la stessa
+  memoria e il registro dice chi;
+- **`SearchHit` porta la riga intera**: `noteType`, `tags`, `updatedAt`,
+  `status` (`active` fuori da `includeQuarantined`) — niente `get` per
+  risultato — più `explain` quando chiesto: liste, termini, ranghi, i
+  salti del grafo (`via`) e il **peso del grafo per quella domanda**
+  (`explain.graph`: `{weight, off?, gap?, agreement?}`);
 - **`get` è un oracolo chiuso**: una nota inesistente, in quarantena o
   lapidata risponde `null`, sempre — lo stesso principio del motore;
-- **`purge` non mente**: se qualcosa trattiene ancora byte, la risposta
-  lo dice (`pending: ['wal', …]`, `scrubbed: false`) e il chiamante finisce
-  il lavoro; `INCOMPLETE_FORGETTING` è la forma estrema, quando l'oblio
-  non può nemmeno cominciare;
-- **`hybrid` senza modello degrada a testo+grafo**; `vector` senza model—lo
-  è un errore `MODEL_MISSING`; `pullModel` scarica la revisione fissata
-  verificando lo sha256 a chunk (già presente: verifica e salta);
+- **`purge` non lancia per un oblio incompleto: risponde**. La vista dice
+  cosa trattiene ancora byte (`pending: ['wal', 'vault']`,
+  `scrubbed: false`) e **quale vista** non ha potuto raggiungere
+  (`views: [{viewId, root, reason}]`, senza contenuti di note); il file
+  della nota in una vista raggiungibile sparisce subito, non alla sync
+  dopo. Il codice `INCOMPLETE_FORGETTING` previsto dalla spec v0.4 **non
+  serve e non c'è**: un oblio che non può nemmeno cominciare è un errore
+  normale (`IO`, `NOT_FOUND`), e un oblio che comincia ma non finisce è
+  un dato di ritorno, non un'eccezione — il chiamante (il demone di
+  Homun, l'interfaccia) deve poter mostrare «quasi dimenticato» e
+  riprovare, non gestire un lancio;
+- **dopo `close`, niente riaperture silenziose**: ogni metodo di
+  `Engine` e di ogni sua `Cell` risponde `CLOSED` (chiamare due volte
+  `close` non è un errore). Le operazioni già in corso finiscono, e
+  `close` aspetta che si siano assestate: una promessa ritardataria del
+  demone non può scrivere a motore chiuso;
+- **`vaultUnbind` e i messaggi delle viste** usano l'id corto = **ultime
+  8** cifre dell'ULID (la parte casuale, come le note; le prime 8 sono il
+  timestamp e due viste di pochi minuti distanti lo condividono); l'id
+  intero è sempre accettato, uno corto ambiguo è un errore che elenca i
+  candidati;
+- **`hybrid` senza modello degrada a testo+grafo**; `vector` senza
+  modello è un errore `MODEL_MISSING`; `pullModel` scarica la revisione
+  fissata verificando lo sha256 a chunk (già presente: verifica e
+  salta);
 - gli **errori** sono `Error` con `code` stabile: `NOT_FOUND`,
-  `QUARANTINED`, `INVALID_NOTE`, `CONFLICT` (per esempio una nota
-  `external` non può nascere attiva), `IO`, `MODEL_MISSING`, `COMPACTED`.
-  I messaggi non rivelano contenuti di note;
+  `QUARANTINED`, `INVALID_NOTE`, `CONFLICT`, `CLOSED`, `IO`,
+  `MODEL_MISSING`, `COMPACTED`. I messaggi non rivelano contenuti di
+  note;
 - **concorrenza**: `Engine` e `Cell` si usano da molte promesse in
   parallelo; le scritture sulla stessa cella si serializzano nel motore.
   Due processi sulla stessa cella restano possibili (WAL), ma Homun ne
