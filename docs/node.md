@@ -21,11 +21,15 @@ $ ls -la engramma.darwin-arm64.node index.js index.d.ts
 `ENGRAMMA_MODEL_DIR`, predefinito `~/.cache/engramma/models`). Il
 caricatore generato cerca il `.node` accanto a sé.
 
-I test: `npm test` (Node 24) e `npm run test:electron` (l'Electron di
-Homun in modo Node, `ELECTRON_RUN_AS_NODE=1`; il percorso si sovrascrive
-con `HOMUN_ELECTRON`). I test che legano una vista markdown usano il
-binario della CLI (`ENGRAMMA_BIN`, predefiniti `target/release` e
-`target/debug`). Nessuna dipendenza oltre a Node stesso.
+I test: `npm test` (Node 24), `npm run test:electron` (l'Electron di
+Homun in modo Node, `ELECTRON_RUN_AS_NODE=1`) e `npm run
+test:electron-main` — il demone di Homun è un processo Electron **senza
+finestra**, quindi il modulo va provato nel processo principale vero:
+`app.whenReady()`, un motore che apre, scrive, cerca e chiude, uscita 0.
+Il percorso dell'Elettron si sovrascrive con `HOMUN_ELECTRON`; i test
+che legano una vista markdown usano il binario della CLI (`ENGRAMMA_BIN`,
+predefiniti `target/release` e `target/debug`). Nessuna dipendenza oltre
+a Node stesso.
 
 ## Il contratto
 
