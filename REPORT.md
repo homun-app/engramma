@@ -3250,3 +3250,207 @@ ricerca non è cambiato; le prove di velocità sono nei tempi qui sopra
   che l'arena viene riusata (tre giri) e che gli oggetti vivi non
   crescono; il comportamento page-per-page del malloc di macOS non è
   osservabile da qui.
+
+# REPORT — Engramma v0.4.3 (dropCell non tocca le celle vicine, chiude la connessione, nessuna Cell nata morta)
+
+Data: 2026-11-09. Base: `main` @ `dd867e0` (tag `fase-v0.4.2`). Un commit
+per punto, il test che fallisce prima della correzione (trascritto). Tutto
+costruito con `cargo --offline`, Rust 1.95.0, macOS arm64, nessuna crate
+nuova (`Cargo.lock` invariato), nessun `unsafe` fuori da napi-derive,
+nessun `unwrap`/`expect` fuori dai test, clippy `-D warnings` verde.
+Il repo di Homun NON è stato toccato.
+
+## Punto 1 — le istantanee e le celle condividono il nome: `dropCell` cancellava le celle vicine (P0)
+
+**Il bug provato** (lo scenario della verifica v0.4.2, riprodotto): le
+celle `storia`, `storia-snap-2` e `storia-snap-archivio`, una nota
+ciascuna. `dropCell('storia', 'prova')` → `cells()` vuota: sparite tutte
+e tre, e nella cartella restano orfani `storia-snap-2.sqlite-wal`/`-shm`
+e `storia-snap-archivio.sqlite-wal`/`-shm`. La causa: tre punti
+riconoscevano un'istantanea con lo stesso controllo lento
+`starts_with("{stem}-snap-") && ends_with(".sqlite")` — `cell_files`
+(Node), `cell drop` (CLI) e il calcolo della dimensione su disco del
+core (`dir_footprint`). Difetto collegato, già presente prima:
+`cells()` e l'elenco della CLI mostravano come celle anche le
+istantanee vere scritte da `compact --keep-snapshot`.
+
+**La correzione.** Un solo predicato nel core,
+`engramma_core::snapshot_of(file_name) -> Option<(&str, u64)>`: riconosce
+**solo** il formato esatto che `compact` scrive
+(`{}-snap-{head_seq}.sqlite`), con le cifre tutte in fondo (l'ultimo
+`-snap-` separa: una cella può chiamarsi `a-snap-b`). I tre punti lo
+usano tutti. In più:
+
+- il nome a forma di istantanea è **riservato**: `<qualcosa>-snap-<cifre>`
+  → `INVALID_ARGUMENT` in `cell_path` (Node, quindi `cell()` e
+  `dropCell`) ed errore di uso (exit 2) nella `cell create` della CLI.
+  `storia-snap-archivio` resta valido: non finisce con cifre;
+- `cells()` e `cell list` saltano le istantanee: una cella non può più
+  avere quel nome, quindi un file così è sempre un'istantanea;
+- `dir_footprint` (il conto onesto di `compact`) porta solo le istantanee
+  **proprie**: prima il vicino `storia-snap-archivio.sqlite` finiva nel
+  conto di `storia`.
+
+**Test prima della correzione** (CLI, 4 rossi; JS, 2 rossi):
+
+```console
+✖ cell_drop_spares_the_snapshot_named_neighbor
+  panicked: the neighbor went too: ["storia2.sqlite"]        # restava solo storia2
+✖ cell_list_skips_the_real_snapshots_and_they_go_with_their_cell
+✖ compact_footprint_counts_only_the_cells_own_snapshots
+✖ snapshot_shaped_cell_names_are_refused_at_creation
+  left: Some(0)  right: Some(2)                              # x-snap-7 veniva creata
+
+✖ dropCell spares the neighbors; a snapshot is not a cell (P0.1)
+  AssertionError: the snapshot is listed: storia,storia-snap-2,storia-snap-archivio,storia2
+✖ a cell name that looks like a snapshot is reserved (P0.1)
+  AssertionError: Missing expected rejection                  # cell('x-snap-7') accettata
+```
+
+Dopo: 4/4 e 27/27 (poi 29/29 con i punti seguenti). Il test JS rilegge i
+vicini da un **motore nuovo** (create: false): i dati su disco, non il
+fantasma in RAM della connessione cancellata.
+
+## Punto 2 — `dropCell` chiude subito la connessione condivisa (P1)
+
+**Il bug provato:** una `Cell` aperta prima del drop e ancora viva in JS
+tiene aperti il `.sqlite`, il `-wal` e lo `-shm` della generazione
+cancellata, sui file già scollegati; i byte restano sul disco finché il
+GC non raccoglie il wrapper (Homun tiene le `Cell` in cache: ore). Il
+gate rispondeva già `NOT_FOUND` — nessun dato a rischio, solo un oblio
+che finiva più tardi di quanto il `DropView` lasciava intendere.
+
+**La correzione.** `Cell::retire()` nel core: sostituisce la
+`Connection` condivisa in `Inner` con una in memoria e chiude quella
+vera — i cloni condividono `Inner`, quindi si chiude **per tutti** in un
+colpo (SQLite riassorbe il WAL e lascia andare i descrittori). Le cache
+(vettori, grafo, query) e il registro dello scrub pendente vanno con la
+connessione. `dropCell` (Node) la chiama dopo il seal e prima di
+cancellare i file; la CLI `cell drop` uguale.
+
+**Test prima della correzione** (lsof, senza alcun gc()): dopo il drop
+con la `Cell` viva — 5 descrittori sui file della cella cancellata:
+
+```console
+✖ dropCell closes the connection a live Cell still shares (P1.2)
+  AssertionError: descrittori ancora aperti:
+  node … txt REG  32768 …/cells/tenuta.sqlite-shm
+  node … txt REG   4096 …/cells/tenuta.sqlite
+  node … 14u REG   4096 …/cells/tenuta.sqlite
+  node … 15u REG 1306072 …/cells/tenuta.sqlite-wal
+  node … 16u REG  32768 …/cells/tenuta.sqlite-shm
+```
+
+Dopo: **zero** descrittori sui file di `tenuta`, e la `Cell` viva
+risponde ancora `NOT_FOUND` dal gate. Nel core,
+`retire_closes_the_connection_under_live_clones`: il WAL sparisce sotto
+un clone ancora vivo.
+
+## Punto 3 — nessuna `Cell` nata morta (P2)
+
+**Il bug provato:** `CellOpenTask` prendeva il gate della generazione
+con `tracker_for` e solo dopo apriva la cella, lock rilasciato in mezzo.
+Un `dropCell` entrato in quella finestra sigillava proprio il gate che
+l'apertura stava per consegnare: la `cell(name)` di ritorno rispondeva
+`NOT_FOUND` per sempre — Cell fresca su file fresco, nata morta. Nella
+stessa finestra l'apertura poteva **creare** il file mentre il drop lo
+cancellava: il drop moriva sul database a metà.
+
+**La scelta (dichiarata):** `open_tracked_cell` tiene il lock delle
+generazioni per gate **e** apertura — l'alternativa «riprova col gate
+nuovo» lasciava una finestra a ogni tentativo. Un drop di quel nome o
+finisce **prima** dell'apertura (che allora conia un gate fresco su una
+cella fresca) o aspetta e prende la generazione che QUESTA apertura ha
+creato: una `Cell` può morire solo di un oblio iniziato **dopo** che
+esisteva. Il lock è per motore, non per nome: un drop di un nome aspetta
+brevemente un'apertura non collegata — entrambe cose rare nel demone.
+
+**Test prima della correzione** — 200 coppie `cell(name)`/`dropCell(name)`
+lanciate insieme (più una nota seminata, perché ogni drop abbia qualcosa
+da dimenticare): **6/6 rosse**, tutte con la stessa finestra:
+
+```console
+✖ no Cell is born dead: 200 cell()/dropCell() pairs (P2.3)
+  [Error: database error: disk I/O error] { code: 'IO' }
+```
+
+Dopo: 12/12 verdi. Ogni `Cell` restituita risponde a `list()` con
+successo, oppure è morta di un drop **completato dopo** la sua creazione
+(un orologio a tick monotono scritto alla risoluzione di ogni promessa,
+per indice di chiamata); finite le 200 coppie, l'ultima `cell(name)` è
+viva e la sua lista è vuota.
+
+## Prove a mano (trascritte, probe Node + CLI in /var/folders/…/T/, cancellato)
+
+```console
+files: storia-snap-2.sqlite storia-snap-archivio.sqlite* storia.sqlite* storia2.sqlite*
+cells(): ["storia","storia-snap-archivio","storia2"]        # l'istantanea NON si elenca
+cell(x-snap-7): INVALID_ARGUMENT — nome cella riservato: "x-snap-7" (il formato `-snap-<cifre>` è delle istantanee di compattazione)
+dropCell(storia): {"notes":1,"scrubbed":true,"pending":[],"views":[]}
+files dopo: storia-snap-archivio.sqlite* storia2.sqlite*    # solo storia e la SUA istantanea sono andate
+cells() dopo: ["storia-snap-archivio","storia2"]
+rilette: 1 1                                                 # i vicini interi, da file
+lsof dopo drop (Cell viva): 10 descrittori su storia2/storia-snap-archivio (celle VIVE, giusto), ZERO su tenuta.*
+cli create x-snap-7 → 2 (exit 2 = uso)
+cell list: sorgente-cli storia-snap-archivio storia2         # x-snap-7 non si elenca
+cli --cell x-snap-7 verify → 0 { "hash_chain_ok": true, … }  # la legacy si apre per nome
+e.cell(x-snap-7): INVALID_ARGUMENT
+cli cell drop x-snap-7 → 0 dimenticata: x-snap-7 — via dalla CLI (1 note, 0 file di viste)
+stress: 40 coppie, Cell morte (di drop successivi): 36 — l'ultima cell(name) è viva: true
+```
+
+## Chiusura
+
+- `cargo fmt --check` verde; `cargo clippy --all-targets --offline --
+  -D warnings` verde; `cargo test --offline --workspace` **26 suite ok**
+  (la 26ª è `celldrop`, nuova: 4 test); `cargo deny check licenses
+  bans` ok;
+- `node --test` (Node 24.22.1) **29/29**; `npm run test:electron`
+  (l'Electron di Homun in modo Node) **29/29**; `npm run
+  test:electron-main` ok (il modulo nel processo principale vero);
+- `npm run build` rifatto: `engramma.darwin-arm64.node`, `index.js` e
+  `index.d.ts` corrispondono al tag;
+- `docs/node.md`: i nomi riservati, `cells()` senza istantanee,
+  `dropCell` che chiude la connessione, nessuna Cell nata morta;
+- temporanei solo in `/var/folders/nb/r6fbsdsn3z58bkbb9w55nn780000gn/T/`
+  e cancellati a fine fase (probe compreso);
+- tag `fase-v0.4.3`. Nessun push.
+
+## Scelte e dichiarazioni di questa fase
+
+1. **Una cella già esistente col nome riservato** (creata prima della
+   regola): si apre ancora **per nome dalla CLI** (`--cell x-snap-7 …`),
+   risponde a ogni comando e si può dimenticare con `cell drop x-snap-7
+   --reason …` — la via d'uscita è la CLI, perché il collegamento Node
+   rifiuta quel nome ovunque (`cell()` e `dropCell`:
+   `INVALID_ARGUMENT`). `cells()` e `cell list` non la elencano: un file
+   in quella forma è ormai sempre un'istantanea, e listarla come cella
+   è l'ambiguità che ha causato il punto 1. Prova a mano sopra.
+2. **Il lock delle generazioni durante l'apertura** (punto 3) invece
+   della riprova: la riprova riapriva la finestra a ogni tentativo, e
+   una catena di drop (lo stress test la produce davvero) poteva
+   comunque consegnare una Cell morta. Con il lock la garanzia è
+   strutturale, non probabilistica.
+3. **Una cella ritirata non è utilizzabile** (`retire` mette una
+   connessione in memoria senza tabelle): è voluto. Al `retire` si
+   arriva solo dal percorso del drop, dopo il seal: il gate risponde
+   `NOT_FOUND` prima che qualunque operazione tocchi il segnaposto.
+4. **Il conto di `compact` si stringe** con lo stesso predicato: la
+   footprint di una cella porta le sue istantanee, non i vicini che si
+   chiamano quasi come lei. Il numero `bytes_before/after` della
+   `CompactView` cambia solo in quel caso (prima gonfio, ora onesto).
+5. **`INVALID_ARGUMENT` per il nome riservato in Node, uso (exit 2) in
+   CLI**: il confine è quello della v0.4.2 — gli argomenti della
+   chiamata sono `INVALID_ARGUMENT` nel collegamento; la CLI risponde
+   col suo codice di uso, come ogni altro nome malformato.
+
+## Cosa non ho potuto provare
+
+- **Il salto esplicito del test lsof** (ramo «lsof non c'è»): qui c'è;
+  il ramo esiste ed è `t.skip`, non un silenzio.
+- **La forma `NOT_FOUND` del punto 3 da sola**: nelle 6 corse rosse ha
+  dominato la forma `disk I/O error` della stessa finestra (il drop sul
+  file che l'apertura creava); il test asserisce entrambe (codice
+  `NOT_FOUND` per la Cell morta, qualunque altro errore fa fallire).
+- **Windows e Linux**: solo macOS arm64, come nelle fasi precedenti.
+- **cargo deny advisories**: richiedono rete; eseguito `licenses bans`.

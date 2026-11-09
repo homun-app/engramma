@@ -1,6 +1,6 @@
 # engramma-node — il motore dentro Node.js ed Electron
 
-v0.4.2. Il collegamento in-process per Homun: un modulo **N-API**
+v0.4.3. Il collegamento in-process per Homun: un modulo **N-API**
 (napi-rs 3) che carica il motore una volta per processo. L'N-API è
 stabile tra versioni di Node ed Electron: il `.node` non va ricompilato a
 ogni aggiornamento di Electron (Homun oggi non ha moduli nativi; questo
@@ -222,6 +222,40 @@ Notevoli:
   cella non resta nulla in cui scriverlo — `reason` è obbligatoria e
   resta la traccia del chiamante (nessun contenuto). Nella CLI:
   `engramma cell drop <nome> --reason …`;
+- **`dropCell` chiude la connessione, il GC non decide lui** (v0.4.3):
+  le `Cell` già consegnate condividono una sola connessione; il drop la
+  **ritira** (`Cell::retire` nel core: al suo posto una in memoria, quella
+  vera chiusa) prima di cancellare i file. Senza questo, una `Cell` viva
+  in JS teneva aperti `.sqlite`/`-wal`/`-shm` della generazione cancellata
+  finché il GC non raccoglieva il wrapper (ore, nella cache di Homun).
+  Dopo il drop `lsof` non trova più nessun descrittore sui file della
+  cella, senza aspettare la GC;
+- **le istantanee di compattazione non sono celle** (v0.4.3): `compact`
+  con `keepSnapshot` scrive `<nome>-snap-<seq>.sqlite` accanto alla
+  cella. Quella forma esatta — un solo riconoscitore nel core,
+  `snapshot_of` — è l'**unica** cosa che conta come istantanea: la
+  portano via il `dropCell`/`cell drop` della **propria** cella e il
+  conto dei byte di `compact`, e `cells()`/`cell list` non la elencano
+  mai. Una cella che si chiama `storia-snap-archivio` resta una cella a
+  tutti gli effetti (il suffisso non sono cifre): il drop di `storia`
+  non la tocca;
+- **il nome a forma di istantanea è riservato** (v0.4.3): `<qualcosa>-snap-<cifre>`
+  è rifiutato con `INVALID_ARGUMENT` in `cell()` e `dropCell` (e uso,
+  exit 2, nella `cell create` della CLI) — una cella così chiamata sarebbe
+  indistinguibile da un'istantanea di `<qualcosa>`: il suo file andrebbe
+  via col drop dell'altra e non si potrebbe mai elencare. Una cella
+  **già esistente** con quel nome (precedente alla regola) si apre ancora
+  per nome dalla CLI (`--cell x-snap-7 …`, anche per `cell drop`: è la
+  via d'uscita), ma `cells()`/`cell list` non la elencano e il
+  collegamento Node la rifiuta;
+- **nessuna `Cell` nasce morta** (v0.4.3): `cell(name)` prende il gate
+  della generazione e apre la cella **sotto lo stesso lock** del drop.
+  Prima, un `dropCell` che entrava tra i due passaggi sigillava proprio
+  il gate che l'apertura stava per consegnare: la `Cell` di ritorno
+  rispondeva `NOT_FOUND` per sempre — fresca ma già morta. Ora una
+  `Cell` può morire solo di un oblio **iniziato dopo** che esisteva; se
+  `dropCell` e `cell(name)` corrono insieme, l'apertura aspetta il drop
+  e nasce su una cella nuova, viva;
 - **`pullModel` collega l'embedder al motore APERTO** (v0.4.2): finito
   il download (o trovati i file già presenti e verificati), il motore
   aperto carica il modello e da lì in poi `modelStatus().present` vale
