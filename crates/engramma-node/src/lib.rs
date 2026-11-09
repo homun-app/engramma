@@ -806,25 +806,58 @@ fn search_cell(
 }
 
 // ---------------------------------------------------------------------------
-// the closed gate (v0.4.1, P1.7)
+// the closed gate (v0.4.1, P1.7; a verdict per gate since v0.4.2, P0.3)
 // ---------------------------------------------------------------------------
+
+/// What a sealed gate answers: the engine's says `CLOSED`, a dropped cell
+/// generation's says `NOT_FOUND`.
+#[derive(Clone)]
+struct GateVerdict {
+    code: &'static str,
+    message: String,
+}
 
 /// v0.4.1 (P1.7): after `close`, no silent reopening. Every task ENTERS the
 /// gate before touching the engine (a closed gate answers `CLOSED`), holds
 /// it for the whole compute, and `close` seals the gate and WAITS until the
 /// last in-flight compute is done — a late promise in the daemon can never
-/// write to a closed engine.
-#[derive(Clone, Default)]
+/// write to a closed engine. v0.4.2 (P0.3): the same machinery seals a CELL
+/// generation — `dropCell` seals it with a `NOT_FOUND` verdict, so the
+/// `Cell` objects already handed out stop working without an exception in
+/// the dark, while a fresh `cell(name)` mints a new, open gate.
+#[derive(Clone)]
 pub struct Gate {
     closed: Arc<std::sync::atomic::AtomicBool>,
     in_flight: Arc<(Mutex<usize>, std::sync::Condvar)>,
+    verdict: Arc<GateVerdict>,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self::with_verdict(
+            "CLOSED",
+            "motore chiuso: `Engine.close` è già stato chiamato",
+        )
+    }
 }
 
 impl Gate {
-    fn closed_err() -> Error {
-        transport_err(
-            "CLOSED",
-            "motore chiuso: `Engine.close` è già stato chiamato",
+    fn with_verdict(code: &'static str, message: impl Into<String>) -> Self {
+        Gate {
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            in_flight: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
+            verdict: Arc::new(GateVerdict {
+                code,
+                message: message.into(),
+            }),
+        }
+    }
+
+    /// A dropped cell generation's gate (v0.4.2, P0.3).
+    fn dropped_cell(name: &str) -> Self {
+        Self::with_verdict(
+            "NOT_FOUND",
+            format!("cella «{name}» dimenticata da `dropCell`"),
         )
     }
 
@@ -840,7 +873,8 @@ impl Gate {
             .lock()
             .map_err(|_| transport_err("IO", "lock del gate avvelenato"))?;
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Self::closed_err());
+            let v = &self.verdict;
+            return Err(transport_err(v.code, v.message.clone()));
         }
         *n += 1;
         Ok(GateGuard {
@@ -905,6 +939,13 @@ pub struct EngineHandle {
     actor: Arc<String>,
     embedder: Option<Arc<dyn Embedder>>,
     cells: Arc<Mutex<HashMap<String, CoreCell>>>,
+    /// v0.4.2 (P0.3): one gate per cell GENERATION. `dropCell` removes the
+    /// entry holding this map's lock for the whole drop, so the in-flight
+    /// operations of that generation finish first and every Cell object of
+    /// it answers `NOT_FOUND` from the seal on; a `cell(name)` that arrives
+    /// mid-drop waits on the same lock and then mints a FRESH gate over a
+    /// fresh empty cell — there is no third state.
+    trackers: Arc<Mutex<HashMap<String, Arc<Gate>>>>,
     gate: Gate,
 }
 
@@ -951,6 +992,53 @@ impl EngineHandle {
             .insert(name.to_string(), cell.clone());
         Ok(cell)
     }
+
+    /// The generation gate of a cell name (v0.4.2, P0.3): the one the map
+    /// holds, or a fresh one installed now. CellOpenTask takes it BEFORE
+    /// opening the cell file, so a drop in flight serializes against every
+    /// open of that name.
+    fn tracker_for(&self, name: &str) -> Result<Arc<Gate>> {
+        let mut map = self
+            .trackers
+            .lock()
+            .map_err(|_| transport_err("IO", "lock delle generazioni avvelenato"))?;
+        Ok(map
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(Gate::dropped_cell(name)))
+            .clone())
+    }
+}
+
+/// Every file a cell owns on disk (v0.4.2, P0.3): the database, its WAL and
+/// shm, and the compaction snapshots (`<name>-snap-<seq>.sqlite`, written
+/// next to the cell by `compact`). A whole-cell forgetting deletes them all.
+fn cell_files(path: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = vec![path.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut p = path.to_path_buf().into_os_string();
+        p.push(suffix);
+        out.push(PathBuf::from(p));
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if let Some(dir) = path.parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        let mut snaps: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with(&format!("{stem}-snap-")) && n.ends_with(".sqlite")
+                })
+            })
+            .collect();
+        snaps.sort();
+        out.extend(snaps);
+    }
+    out
 }
 
 fn model_status_of(model_dir: Option<&std::path::Path>) -> ModelStatus {
@@ -1021,6 +1109,7 @@ impl Task for OpenTask {
             actor: Arc::new(self.opts.actor.clone()),
             embedder,
             cells: Arc::new(Mutex::new(HashMap::new())),
+            trackers: Arc::new(Mutex::new(HashMap::new())),
             gate: Gate::default(),
         })
     }
@@ -1041,10 +1130,22 @@ pub struct CellOpenTask {
 }
 
 impl Task for CellOpenTask {
-    type Output = (CoreCell, String, Option<Arc<dyn Embedder>>, String, Gate);
+    type Output = (
+        CoreCell,
+        String,
+        Option<Arc<dyn Embedder>>,
+        String,
+        Gate,
+        Arc<Gate>,
+    );
     type JsValue = Cell;
 
     fn compute(&mut self) -> Result<Self::Output> {
+        // v0.4.2 (P0.3): the generation gate comes FIRST — a dropCell in
+        // flight holds the trackers lock until the cell's files are gone,
+        // so this open waits and then creates a FRESH cell, never a ghost
+        // over a deleted file
+        let tracker = self.handle.tracker_for(&self.name)?;
         let cell = self.handle.open_cell(&self.name, self.create)?;
         let actor = match &self.actor {
             // v0.4.1 (P1.6): an empty actor is the same as none — the
@@ -1058,11 +1159,12 @@ impl Task for CellOpenTask {
             self.handle.embedder.clone(),
             actor,
             self.handle.gate.clone(),
+            tracker,
         ))
     }
 
     fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
-        Ok(Cell::from_parts(out.0, out.1, out.2, out.3, out.4))
+        Ok(Cell::from_parts(out.0, out.1, out.2, out.3, out.4, out.5))
     }
 
     reject_recode!();
@@ -1239,6 +1341,105 @@ impl Task for CloseTask {
     reject_recode!();
 }
 
+/// v0.4.2 (P0.3): what one whole-cell drop says — shaped like [`PurgeView`],
+/// for the same reason: an oblivion that cannot reach a view is a RETURN
+/// VALUE, never an exception.
+#[napi(object)]
+pub struct DropView {
+    /// The notes the cell carried — all of them, tombstones included.
+    pub notes: i32,
+    pub scrubbed: bool,
+    /// What still holds bytes (`vault`): the caller finishes the forgetting.
+    pub pending: Vec<String>,
+    /// The views that could not be reached (or asked), one entry per
+    /// problem — no note contents ride in them.
+    pub views: Vec<PurgeProblemView>,
+}
+
+pub struct DropCellTask {
+    handle: EngineHandle,
+    name: String,
+    reason: String,
+    _open: GateGuard,
+}
+
+impl Task for DropCellTask {
+    type Output = engramma_vault::DropReport;
+    type JsValue = DropView;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        if self.reason.trim().is_empty() {
+            return Err(invalid_argument("reason è obbligatoria"));
+        }
+        let path = self.handle.cell_path(&self.name)?;
+        if !path.exists() {
+            return Err(not_found(format!("cella {} inesistente", self.name)));
+        }
+        // The generations map stays LOCKED for the whole drop. The entry
+        // goes first and its gate is SEALED: the operations of that cell
+        // already in flight finish (the seal waits for them), and every
+        // Cell object of that generation answers NOT_FOUND from here on. A
+        // `cell(name)` that arrives now waits on this same lock and then
+        // mints a FRESH generation over a fresh cell — never a ghost over a
+        // deleted file.
+        let mut generations = self
+            .handle
+            .trackers
+            .lock()
+            .map_err(|_| transport_err("IO", "lock delle generazioni avvelenato"))?;
+        if let Some(tracker) = generations.remove(&self.name) {
+            tracker.seal_and_wait()?;
+        }
+        // the cell (from the cache when there, from disk otherwise), then
+        // OUT of the cache: the engine must not hand the doomed cell out
+        let cell = self.handle.open_cell(&self.name, false)?;
+        self.handle
+            .cells
+            .lock()
+            .map_err(|_| transport_err("IO", "lock delle celle avvelenato"))?
+            .remove(&self.name);
+        // every view loses the files it holds for this cell's notes, now —
+        // an unreachable view is a problem in the report, never a throw
+        let report = engramma_vault::drop_cell_everywhere(&cell).map_err(|e| match e {
+            engramma_vault::VaultError::Cell(c) => cell_error(c),
+            other => transport_err("IO", format!("drop: {other}")),
+        })?;
+        // the files: the cell, its WAL, its shm, every snapshot. The handle
+        // goes first (an open connection would keep writing a -wal nobody
+        // can reach anymore); other processes' handles are out of scope —
+        // one engine per process is the documented shape.
+        drop(cell);
+        for file in cell_files(&path) {
+            match std::fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(transport_err("IO", format!("{}: {e}", file.display()))),
+            }
+        }
+        drop(generations);
+        Ok(report)
+    }
+
+    fn resolve(&mut self, _env: Env, r: Self::Output) -> Result<DropView> {
+        Ok(DropView {
+            notes: i32::try_from(r.notes).unwrap_or(i32::MAX),
+            scrubbed: r.pending.is_empty(),
+            pending: r.pending.iter().map(|s| s.to_string()).collect(),
+            views: r
+                .problems
+                .into_iter()
+                .map(|p| PurgeProblemView {
+                    view_id: p.view_id,
+                    root: p.root,
+                    reason: p.reason,
+                })
+                .collect(),
+        })
+    }
+
+    reject_recode!();
+}
+
 #[napi]
 impl Engine {
     /// Open (or create) an engine at `root`. One per process: the model
@@ -1334,6 +1535,28 @@ impl Engine {
         }))
     }
 
+    /// v0.4.2 (P0.3): forget a WHOLE cell — its notes, its files (WAL and
+    /// snapshots included) and the note files of its bound views. The
+    /// `Cell` objects already handed out answer `NOT_FOUND`; a new
+    /// `cell(name)` creates a fresh empty one. Operations in flight on that
+    /// cell finish first, like `close`. The `reason` is the caller's audit
+    /// trail (the engine keeps no registry: nothing of the cell stays
+    /// behind to write one into).
+    #[napi(ts_return_type = "Promise<DropView>")]
+    pub fn drop_cell(
+        &self,
+        env: Env,
+        name: String,
+        reason: String,
+    ) -> Result<AsyncTask<DropCellTask>> {
+        Ok(AsyncTask::new(DropCellTask {
+            handle: self.handle.clone(),
+            name,
+            reason,
+            _open: self.handle.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
+    }
+
     /// Release the engine's cell handles. Outstanding Cell objects keep
     /// working until the GC drops them.
     #[napi(ts_return_type = "Promise<void>")]
@@ -1358,6 +1581,20 @@ pub struct Cell {
     embedder: Option<Arc<dyn Embedder>>,
     actor: String,
     gate: Gate,
+    /// v0.4.2 (P0.3): this cell's GENERATION gate — sealed (NOT_FOUND) by
+    /// `dropCell`, while a fresh `cell(name)` mints a new one. The Cell
+    /// objects of a dropped generation stop working without an exception
+    /// in the dark.
+    tracker: Arc<Gate>,
+}
+
+/// The two permits every Cell task holds (v0.4.2, P0.3): the engine's gate
+/// (`CLOSED` after close) and this cell generation's gate (`NOT_FOUND`
+/// after dropCell). Both taken at CALL time, on the JS thread — an
+/// operation already in flight when the drop arrives finishes first.
+struct CellPermits {
+    _engine: GateGuard,
+    _generation: GateGuard,
 }
 
 impl Cell {
@@ -1367,6 +1604,7 @@ impl Cell {
         embedder: Option<Arc<dyn Embedder>>,
         actor: String,
         gate: Gate,
+        tracker: Arc<Gate>,
     ) -> Self {
         Cell {
             cell,
@@ -1374,7 +1612,17 @@ impl Cell {
             embedder,
             actor,
             gate,
+            tracker,
         }
+    }
+
+    fn enter(&self, env: Env) -> Result<CellPermits> {
+        let engine = self.gate.enter_now().map_err(|e| recode(env, e))?;
+        let generation = self.tracker.enter_now().map_err(|e| recode(env, e))?;
+        Ok(CellPermits {
+            _engine: engine,
+            _generation: generation,
+        })
     }
 }
 
@@ -1382,7 +1630,7 @@ pub struct PutTask {
     cell: CoreCell,
     actor: String,
     input: NoteInput,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for PutTask {
@@ -1441,7 +1689,7 @@ pub struct PatchTask {
     actor: String,
     id: String,
     patch: NotePatchInput,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for PatchTask {
@@ -1519,7 +1767,7 @@ impl Task for PatchTask {
 pub struct GetTask {
     cell: CoreCell,
     id: String,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for GetTask {
@@ -1561,7 +1809,7 @@ pub struct ListTask {
     statuses: Option<Vec<String>>,
     limit: Option<u32>,
     offset: Option<u32>,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for ListTask {
@@ -1659,7 +1907,7 @@ pub struct SearchTask {
     name: String,
     embedder: Option<Arc<dyn Embedder>>,
     q: SearchInput,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for SearchTask {
@@ -1680,7 +1928,7 @@ impl Task for SearchTask {
 pub struct HistoryTask {
     cell: CoreCell,
     id: String,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for HistoryTask {
@@ -1713,7 +1961,7 @@ pub struct NeighborsTask {
     cell: CoreCell,
     id: String,
     depth: u8,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for NeighborsTask {
@@ -1760,7 +2008,7 @@ pub struct SetStatusTask {
     actor: String,
     id: String,
     status: String,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for SetStatusTask {
@@ -1797,7 +2045,7 @@ pub struct ConfirmTask {
     cell: CoreCell,
     actor: String,
     id: String,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for ConfirmTask {
@@ -1820,7 +2068,7 @@ pub struct DeleteTask {
     cell: CoreCell,
     actor: String,
     id: String,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for DeleteTask {
@@ -1844,7 +2092,7 @@ pub struct PurgeTask {
     actor: String,
     id: String,
     reason: String,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for PurgeTask {
@@ -1892,7 +2140,7 @@ pub struct EmbedPendingTask {
     cell: CoreCell,
     embedder: Option<Arc<dyn Embedder>>,
     limit: Option<u32>,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for EmbedPendingTask {
@@ -1942,7 +2190,7 @@ impl Task for EmbedPendingTask {
 pub struct ChangesSinceTask {
     cell: CoreCell,
     seq: i64,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for ChangesSinceTask {
@@ -1997,7 +2245,7 @@ impl Task for ChangesSinceTask {
 
 pub struct VerifyTask {
     cell: CoreCell,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for VerifyTask {
@@ -2047,7 +2295,7 @@ pub struct CompactTask {
     cell: CoreCell,
     keep_last: i64,
     keep_snapshot: bool,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for CompactTask {
@@ -2101,7 +2349,7 @@ impl Cell {
             cell: self.cell.clone(),
             actor: self.actor.clone(),
             input: note,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2118,7 +2366,7 @@ impl Cell {
             actor: self.actor.clone(),
             id,
             patch,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2130,7 +2378,7 @@ impl Cell {
         Ok(AsyncTask::new(GetTask {
             cell: self.cell.clone(),
             id,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2144,7 +2392,7 @@ impl Cell {
             statuses: f.as_ref().and_then(|f| f.status.clone()),
             limit: f.as_ref().and_then(|f| f.limit),
             offset: f.as_ref().and_then(|f| f.offset),
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2156,7 +2404,7 @@ impl Cell {
             name: self.name.clone(),
             embedder: self.embedder.clone(),
             q,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2167,7 +2415,7 @@ impl Cell {
         Ok(AsyncTask::new(HistoryTask {
             cell: self.cell.clone(),
             id,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2183,7 +2431,7 @@ impl Cell {
             cell: self.cell.clone(),
             id,
             depth: depth.unwrap_or(1),
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2200,7 +2448,7 @@ impl Cell {
             actor: self.actor.clone(),
             id,
             status,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2211,7 +2459,7 @@ impl Cell {
             cell: self.cell.clone(),
             actor: self.actor.clone(),
             id,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2222,7 +2470,7 @@ impl Cell {
             cell: self.cell.clone(),
             actor: self.actor.clone(),
             id,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2237,7 +2485,7 @@ impl Cell {
             actor: self.actor.clone(),
             id,
             reason,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2252,7 +2500,7 @@ impl Cell {
             cell: self.cell.clone(),
             embedder: self.embedder.clone(),
             limit,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2265,7 +2513,7 @@ impl Cell {
         Ok(AsyncTask::new(ChangesSinceTask {
             cell: self.cell.clone(),
             seq,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2274,7 +2522,7 @@ impl Cell {
     pub fn verify(&self, env: Env) -> Result<AsyncTask<VerifyTask>> {
         Ok(AsyncTask::new(VerifyTask {
             cell: self.cell.clone(),
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2291,7 +2539,7 @@ impl Cell {
             cell: self.cell.clone(),
             keep_last: keep_last.max(0),
             keep_snapshot: opts.and_then(|o| o.keep_snapshot).unwrap_or(false),
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2300,7 +2548,7 @@ impl Cell {
     pub fn vault_views(&self, env: Env) -> Result<AsyncTask<VaultViewsTask>> {
         Ok(AsyncTask::new(VaultViewsTask {
             cell: self.cell.clone(),
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 
@@ -2316,7 +2564,7 @@ impl Cell {
         Ok(AsyncTask::new(VaultUnbindTask {
             cell: self.cell.clone(),
             arg: dir_or_view_id,
-            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+            _open: self.enter(env)?,
         }))
     }
 }
@@ -2331,7 +2579,7 @@ pub struct VaultView {
 
 pub struct VaultViewsTask {
     cell: CoreCell,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for VaultViewsTask {
@@ -2363,7 +2611,7 @@ impl Task for VaultViewsTask {
 pub struct VaultUnbindTask {
     cell: CoreCell,
     arg: String,
-    _open: GateGuard,
+    _open: CellPermits,
 }
 
 impl Task for VaultUnbindTask {

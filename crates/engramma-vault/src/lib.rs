@@ -243,6 +243,51 @@ impl Vault {
         Ok(())
     }
 
+    /// The whole-view side of a CELL drop (v0.4.2, P0.3): every file this
+    /// view holds for the cell's notes and every registered `.conflitto`
+    /// copy go, then their rows. The view binding rows die with the cell's
+    /// own file; orphan copies (never bound to a note) stay, as ever — they
+    /// are the user's. Returns how many files went.
+    ///
+    /// # Errors
+    /// [`VaultError::Unreachable`] when the view is not on disk;
+    /// [`VaultError::Io`] when a removal fails; [`VaultError::Cell`] on
+    /// cell failures.
+    pub fn forget_all(&self) -> Result<usize, VaultError> {
+        if !self.root.exists() {
+            return Err(VaultError::Unreachable {
+                root: self.root.display().to_string(),
+            });
+        }
+        let Some(view_id) = self.view_by_root()? else {
+            return Ok(0);
+        };
+        let gone = |p: &Path| -> Result<(), VaultError> {
+            match std::fs::remove_file(p) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(VaultError::Io(e)),
+            }
+        };
+        let mut removed = 0_usize;
+        // every bound file of this view (they are all this cell's notes)
+        for row in self.cell.vault_files_of_view(&view_id)? {
+            gone(&self.root.join(&row.path))?;
+            self.cell.vault_file_delete(&view_id, &row.path)?;
+            removed += 1;
+        }
+        // every conflict copy registered for a note (orphans are the user's)
+        for (rel, note_id) in self.cell.vault_conflicts_of_view(&view_id)? {
+            if ulid::Ulid::from_string(&note_id).is_err() {
+                continue;
+            }
+            gone(&self.root.join(&rel))?;
+            self.cell.vault_conflict_delete(&view_id, &rel)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
     /// The view bound at this folder's canonical path, if any (v0.4, P0.1):
     /// how `forget_note` finds the rows of THIS view without a sync. An
     /// unreadable cell is an ERROR here, not a silent empty view: a purge
@@ -1057,6 +1102,99 @@ pub fn purge_everywhere(
     }
     report.scrubbed = report.pending.is_empty();
     Ok((report, problems))
+}
+
+/// What one whole-cell drop did (v0.4.2, P0.3).
+#[derive(Debug, Default, Clone)]
+pub struct DropReport {
+    /// The notes the cell carried — all of them, tombstones included: every
+    /// one of them is being forgotten.
+    pub notes: usize,
+    /// Files removed from the views (bound files and conflict copies).
+    pub files: usize,
+    /// What still holds bytes (`vault`): the caller finishes the forgetting.
+    pub pending: Vec<&'static str>,
+    /// The views that could not be fully reached.
+    pub problems: Vec<ViewProblem>,
+}
+
+/// The oblivion of a WHOLE cell (v0.4.2, P0.3), view side: the notes are
+/// forgotten not one by one (a purge per note, ~30 ms each) but all at
+/// once — the cell's own file, WAL and snapshots included, is the CALLER's
+/// to delete right after this returns (the engine binding's `dropCell` and
+/// the CLI's `cell drop` both do). Here every registered view loses the
+/// files it holds for this cell's notes, like [`purge_everywhere`] but for
+/// all of them at once. A view that cannot be reached is a problem, never
+/// an exception — and `pending` says the forgetting is not done.
+///
+/// The reasons registry is the caller's: nothing of the cell stays behind
+/// here to write one into.
+///
+/// # Errors
+/// [`VaultError::Cell`] when the cell cannot even be asked (its views, its
+/// notes).
+pub fn drop_cell_everywhere(cell: &Cell) -> Result<DropReport, VaultError> {
+    let mut report = DropReport {
+        notes: cell.note_ids_all()?.len(),
+        ..DropReport::default()
+    };
+    match cell.vault_views() {
+        Ok(views) => {
+            for view in &views {
+                let holds = cell
+                    .vault_files_of_view(&view.view_id)
+                    .map(|rows| !rows.is_empty())
+                    .unwrap_or(true)
+                    || cell
+                        .vault_conflicts_of_view(&view.view_id)
+                        .map(|rows| {
+                            rows.iter()
+                                .any(|(_, note)| ulid::Ulid::from_string(note).is_ok())
+                        })
+                        .unwrap_or(true);
+                let vault = Vault::open(cell.clone(), std::path::Path::new(&view.root));
+                match vault.and_then(|v| v.forget_all()) {
+                    Ok(removed) => report.files += removed,
+                    Err(VaultError::Unreachable { root }) => {
+                        // pending only while THIS view still holds something
+                        // of the cell (a bound file or a conflict copy)
+                        if !holds {
+                            continue;
+                        }
+                        report.problems.push(ViewProblem {
+                            view_id: Some(view.view_id.clone()),
+                            root,
+                            reason: format!(
+                                "la vista {} non è raggiungibile e la cella vi lega ancora \
+                                 file o copie delle sue note: i file restano lì finché la \
+                                 cartella non torna (il contenuto è cancellabile a mano)",
+                                view.root,
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        report.problems.push(ViewProblem {
+                            view_id: Some(view.view_id.clone()),
+                            root: view.root.clone(),
+                            reason: format!("vista {}: {e}", view.root),
+                        });
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            // a drop that cannot know what the views hold is not complete
+            report.problems.push(ViewProblem {
+                view_id: None,
+                root: String::new(),
+                reason: format!("viste non leggibili: {e}"),
+            });
+        }
+    }
+    if !report.problems.is_empty() {
+        report.pending.push("vault");
+    }
+    Ok(report)
 }
 
 fn mtime_of(meta: &std::fs::Metadata) -> i64 {

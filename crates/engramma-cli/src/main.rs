@@ -282,8 +282,15 @@ enum CellAction {
     List,
     /// Create a cell
     Create { name: String },
-    /// Delete a cell file (irreversible)
-    Drop { name: String },
+    /// Forget a whole cell: its notes, its files (WAL and snapshots
+    /// included) and the note files of its bound views (v0.4.2) —
+    /// irreversible
+    Drop {
+        name: String,
+        /// Why (the caller's audit trail; the engine keeps no registry)
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 fn root(cli: &Cli) -> PathBuf {
@@ -1488,17 +1495,69 @@ fn run_cell(cli: &Cli, action: &CellAction) -> Result<(), CliError> {
             report_ok(cli, "creata", name);
             Ok(())
         }
-        CellAction::Drop { name } => {
+        CellAction::Drop { name, reason } => {
+            if reason.trim().is_empty() {
+                return Err(CliError::usage("--reason è obbligatoria"));
+            }
             let path = cell_path(cli, name)?;
             if !path.exists() {
                 return Err(CliError::not_found(format!("cell {name} not found")));
             }
+            // v0.4.2 (P0.3): the whole-cell oblivion the engine binding's
+            // dropCell runs, one place for both — the views lose the note
+            // files they hold for this cell NOW, and the honest report says
+            // what could not be reached. The old code just unlinked the
+            // file: the bound views kept their copies forever.
+            let cell =
+                Cell::open(&path).map_err(|e| CliError::internal(format!("cell `{name}`: {e}")))?;
+            let report = engramma_vault::drop_cell_everywhere(&cell).map_err(|e| match e {
+                engramma_vault::VaultError::Cell(c) => c.into(),
+                other => CliError::internal(format!("drop: {other}")),
+            })?;
+            for problem in &report.problems {
+                eprintln!("engramma: {}", problem.reason);
+            }
+            drop(cell);
+            // the cell, its WAL, its shm and every snapshot file
             for suffix in ["", "-wal", "-shm"] {
                 let mut p = path.clone();
                 p.set_file_name(format!("{name}.sqlite{suffix}"));
                 std::fs::remove_file(&p).ok();
             }
-            report_ok(cli, "eliminata", name);
+            if let Some(dir) = path.parent() {
+                let prefix = format!("{name}-snap-");
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let file_name = entry.file_name();
+                        let n = file_name.to_string_lossy();
+                        if n.starts_with(&prefix) && n.ends_with(".sqlite") {
+                            std::fs::remove_file(entry.path()).ok();
+                        }
+                    }
+                }
+            }
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "dropped": name,
+                    "reason": reason,
+                    "notes": report.notes,
+                    "files": report.files,
+                    "scrubbed": report.pending.is_empty(),
+                    "pending": report.pending,
+                }));
+            } else {
+                println!(
+                    "dimenticata: {name} — {reason} ({} note, {} file di viste)",
+                    report.notes, report.files
+                );
+                if !report.pending.is_empty() {
+                    println!(
+                        "ATTENZIONE: l'oblio non è completo ({}): una vista \
+                         irraggiungibile tiene ancora i file delle note",
+                        report.pending.join(", ")
+                    );
+                }
+            }
             Ok(())
         }
     }

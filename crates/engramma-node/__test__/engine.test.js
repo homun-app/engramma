@@ -716,6 +716,184 @@ test('tombstones list; unknown statuses are INVALID_ARGUMENT (P0.2)', async () =
   }
 });
 
+// v0.4.2 (P0.3): Engine.dropCell — the oblivion of a whole cell. Homun
+// deletes a bot and with it its cells: a purge per note (~30 ms each, minutes
+// of queue with thousands of notes) was fragile (P0.1) and slow. dropCell
+// forgets the cell's files (WAL and snapshots included), takes the note
+// files out of the bound views, and the Cell objects already handed out
+// answer NOT_FOUND; a new cell(name) creates a fresh empty one.
+const NO_ROOTS = (dir, bodies) => {
+  // forgetting.rs's lesson from JS: the whole lowered words of an invented
+  // vocabulary (and their truncations, a poor man's stemming)
+  const needles = [];
+  for (const body of bodies) {
+    for (const tok of body.toLowerCase().split(/[^a-zà-ÿ]+/)) {
+      for (const len of [tok.length, tok.length - 1, tok.length - 2]) {
+        const stem = tok.slice(0, len);
+        if (stem.length >= 5 && !needles.includes(stem)) needles.push(stem);
+      }
+    }
+  }
+  const stack = [dir];
+  while (stack.length) {
+    const d = stack.pop();
+    if (!fs.existsSync(d)) continue;
+    for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+      const pp = path.join(d, ent.name);
+      if (ent.isDirectory()) {
+        stack.push(pp);
+        continue;
+      }
+      const raw = fs.readFileSync(pp);
+      for (const needle of needles) {
+        assert.ok(!raw.includes(needle), `«${needle}» sopravvive in ${pp}`);
+      }
+    }
+  }
+};
+
+test('dropCell forgets a whole cell, 1500 notes and 20 tombstones (P0.3)', async () => {
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  const cell = await e.cell('bot-a1');
+  const MARKER = 'quokkalapide';
+  for (let i = 0; i < 1500; i++) {
+    await cell.put({
+      body: `memoria segreta ${MARKER} numero ${i} del bot eliminato`,
+      source: 'homun:chat/bot-a1/e1',
+      confidence: 'stated',
+    });
+  }
+  const tombs = [];
+  for (let i = 0; i < 20; i++) {
+    const t = await cell.put({
+      body: `lapide segreta ${MARKER} numero ${i}`,
+      source: 'homun:chat/bot-a1/e1',
+      confidence: 'stated',
+    });
+    await cell.delete(t.id);
+    tombs.push(t);
+  }
+  assert.ok((await e.cells()).includes('bot-a1'));
+  const drop = await e.dropCell('bot-a1', 'bot eliminato dall\'utente');
+  assert.equal(drop.notes, 1520, `${JSON.stringify(drop)}`);
+  assert.equal(drop.scrubbed, true);
+  assert.deepEqual(drop.pending, []);
+  assert.deepEqual(drop.views, []);
+  // the cell is not listed anymore, and nothing under the root carries a
+  // root of any body (cell, WAL, snapshot — everything went)
+  assert.ok(!(await e.cells()).includes('bot-a1'));
+  NO_ROOTS(rootDir, [`memoria segreta ${MARKER}`, `lapide segreta ${MARKER}`]);
+  // a fresh cell(name) is born empty
+  const fresh = await e.cell('bot-a1');
+  assert.equal((await fresh.list()).length, 0);
+  await e.close();
+});
+
+test('dropCell with an open Cell: NOT_FOUND, in-flight ops finish (P0.3)', async () => {
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  const cell = await e.cell('bot-b2');
+  const n1 = await cell.put({ body: 'prima nota del bot b2', source: 's', confidence: 'stated' });
+  // an operation in flight while dropCell arrives: it was called first, it
+  // finishes (like close)
+  const inFlight = cell.put({ body: 'nota in volo', source: 's', confidence: 'stated' });
+  const drop = await e.dropCell('bot-b2', 'bot eliminato');
+  await inFlight; // no error: it entered before the drop
+  assert.equal(drop.notes, 2);
+  // the Cell object already handed out answers NOT_FOUND, every method
+  const notFound = async (call) => {
+    try {
+      await call();
+      assert.fail('expected NOT_FOUND');
+    } catch (err) {
+      assert.equal(err.code, 'NOT_FOUND', `message: ${err.message}`);
+    }
+  };
+  await notFound(() => cell.put({ body: 'x', source: 's', confidence: 'stated' }));
+  await notFound(() => cell.get(n1.id));
+  await notFound(() => cell.list());
+  await notFound(() => cell.search({ text: 'nota' }));
+  await notFound(() => cell.delete(n1.id));
+  await notFound(() => cell.purge(n1.id, 'dopo la cancellazione'));
+  // a new cell(name) is a FRESH one, not the old object's ghost
+  const fresh = await e.cell('bot-b2');
+  assert.equal((await fresh.list()).length, 0);
+  const born = await fresh.put({ body: 'nuova vita', source: 's', confidence: 'stated' });
+  assert.ok((await fresh.get(born.id)).body.includes('nuova vita'));
+  await e.close();
+});
+
+// dropCell reaches the bound views like purge_everywhere: the note files of
+// the cell go NOW; a view nobody can reach is said honestly
+// (pending: ['vault'], scrubbed: false, the problem listed, no contents).
+// Two scenarios, because a note has ONE file wherever it is (structural:
+// a second `vault init` REBINDS every note to the new view) — a reachable
+// view and an unreachable one cannot both hold bindings at once.
+test('dropCell reaches the views, and says the unreachable one (P0.3)', async () => {
+  const cli =
+    process.env.ENGRAMMA_BIN ||
+    [process.env.CARGO_TARGET_DIR, '../../../target']
+      .filter(Boolean)
+      .flatMap((t) => [`${t}/release/engramma`, `${t}/debug/engramma`])
+      .map((p) => path.resolve(__dirname, p))
+      .find((p) => fs.existsSync(p));
+  assert.ok(cli, 'engramma binary not found: build it or set ENGRAMMA_BIN');
+  const run = (args) => {
+    const r = require('node:child_process').spawnSync(cli, args, { encoding: 'utf8' });
+    assert.equal(r.status, 0, `${args.join(' ')}\n${r.stdout}${r.stderr}`);
+    return r;
+  };
+
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  const SECRET = 'quokkavista';
+  const fill = async (name, n) => {
+    const cell = await e.cell(name);
+    for (let i = 0; i < n; i++) {
+      await cell.put({
+        body: `segreto ${SECRET} numero ${i} da dimenticare`,
+        source: 's',
+        confidence: 'stated',
+      });
+    }
+    return cell;
+  };
+
+  // 1. a REACHABLE view: the drop takes its note files now
+  const here = path.join(path.dirname(rootDir), 'vista-drop-qui');
+  const c1 = await fill('bot-v3', 5);
+  run(['--root', rootDir, '--cell', 'bot-v3', 'vault', 'init', here]);
+  assert.equal((await c1.vaultViews()).length, 1);
+  const dropHere = await e.dropCell('bot-v3', 'bot eliminato');
+  assert.equal(dropHere.notes, 5);
+  assert.equal(dropHere.scrubbed, true, JSON.stringify(dropHere));
+  assert.deepEqual(dropHere.views, []);
+  // the note files went with the cell (the binding's default type is
+  // `note`, so they live under note/)
+  const left = fs.readdirSync(path.join(here, 'note'));
+  assert.equal(left.length, 0, `${left}`);
+  assert.ok(!(await e.cells()).includes('bot-v3'));
+
+  // 2. a view nobody can reach: the drop says so, it does not throw
+  const away = path.join(path.dirname(rootDir), 'vista-drop-via');
+  await fill('bot-v4', 4);
+  run(['--root', rootDir, '--cell', 'bot-v4', 'vault', 'init', away]);
+  fs.renameSync(away, `${away}-moved`);
+  const dropAway = await e.dropCell('bot-v4', 'bot eliminato');
+  assert.equal(dropAway.notes, 4);
+  assert.equal(dropAway.scrubbed, false);
+  assert.deepEqual(dropAway.pending, ['vault']);
+  assert.equal(dropAway.views.length, 1, `${JSON.stringify(dropAway.views)}`);
+  assert.ok(dropAway.views[0].root.includes('vista-drop-via'), dropAway.views[0].root);
+  assert.ok(dropAway.views[0].reason.length > 0);
+  // no note content rides in the problem
+  assert.ok(!JSON.stringify(dropAway.views).includes(SECRET));
+  // the cell went anyway (the folder that stayed is the caller's to finish)
+  assert.ok(!(await e.cells()).includes('bot-v4'));
+  await e.close();
+});
+
 // the test root goes away with the last engine: no temp left behind
 process.on('exit', () => {
   if (!process.env.ENGRAMMA_TEST_TMP) {
