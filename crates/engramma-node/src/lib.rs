@@ -1260,6 +1260,14 @@ impl Task for PullModelTask {
             .clone()
             .unwrap_or_else(engramma_embed::spec::model_root);
         let spec = engramma_embed::spec::ModelSpec::granite_97m();
+        // v0.4.2 (P1.5): ENGRAMMA_PULL_BASE replaces the download base —
+        // Homun's request 1: offline installs and closed-environment
+        // mirrors, like the CLI's tests already do with a local server.
+        // The pinned revision and the per-file sha256 stay attached: a
+        // different base can only deliver the SAME bytes or fail.
+        let base = std::env::var("ENGRAMMA_PULL_BASE")
+            .ok()
+            .filter(|b| !b.trim().is_empty());
         let mut cb = |done: u64, total: u64| {
             if let Some(p) = self.progress.as_mut() {
                 p(done, total);
@@ -1268,7 +1276,7 @@ impl Task for PullModelTask {
         engramma_embed::pull::pull_progress(
             &dir,
             &spec,
-            None,
+            base.as_deref(),
             std::time::Duration::from_secs(600),
             &mut cb,
         )

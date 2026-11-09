@@ -968,6 +968,78 @@ test('pullModel attaches the embedder to the OPEN engine (P1.4)', async (t) => {
   await e.close();
 });
 
+// v0.4.2 (P1.5): ENGRAMMA_PULL_BASE replaces the download base of
+// pullModel — Homun's request 1: offline installs and closed-environment
+// mirrors, like the CLI tests already do with a local server. The pinned
+// revision and the per-file sha256 stay attached: a different base can
+// only deliver the SAME bytes or fail. A local server serves the model
+// files from the real ENGRAMMA_MODEL_DIR; one file arrives ALTERED → the
+// pull is an error, nothing lands, the model is NOT present.
+test('ENGRAMMA_PULL_BASE: a local base, an altered file refuses to land (P1.5)', async (t) => {
+  const modelRoot = process.env.ENGRAMMA_MODEL_DIR
+    ? path.resolve(process.env.ENGRAMMA_MODEL_DIR)
+    : path.join(require('node:os').homedir(), '.cache', 'engramma', 'models');
+  const real = path.join(modelRoot, 'granite-embedding-97m-multilingual-r2');
+  if (!fs.existsSync(real)) {
+    return t.skip(`the builtin model is not in ${modelRoot}: pull it first`);
+  }
+  // the server serves the pinned paths ({repo}/resolve/{revision}/{file})
+  // straight from the real model folder, with ONE file altered
+  const requests = [];
+  const server = require('node:http').createServer((req, res) => {
+    requests.push(req.url);
+    const m = req.url.match(/^\/.+\/resolve\/([^/]+)\/(.+)$/);
+    const rev = m ? m[1] : '';
+    const rel = m ? m[2] : '';
+    // the on-disk layout is <id>/<revision>/<file>
+    const file = path.join(real, rev, rel);
+    if (!m || !fs.existsSync(file)) {
+      res.writeHead(404).end('gone');
+      return;
+    }
+    const raw = fs.readFileSync(file);
+    // the FIRST file (tokenizer.json, the spec's own order) arrives altered
+    const body = rel === 'tokenizer.json' ? Buffer.concat([raw, Buffer.from('X')]) : raw;
+    res.writeHead(200, { 'content-length': body.length }).end(body);
+  });
+  await new Promise((done) => server.listen(0, '127.0.0.1', done));
+  const { port } = server.address();
+  process.env.ENGRAMMA_PULL_BASE = `http://127.0.0.1:${port}`;
+
+  try {
+    const rootDir = root();
+    const modelDir = path.join(path.dirname(rootDir), 'modelli-base');
+    const e = await Engine.open({
+      root: rootDir,
+      modelDir,
+      embedder: 'none',
+      actor: 'homun',
+    });
+    assert.equal((await e.modelStatus()).present, false);
+    await assert.rejects(
+      e.pullModel(),
+      (err) => err.code === 'IO' && /sha256/.test(err.message),
+    );
+    // the base was OURS: the request hit the pinned path on 127.0.0.1
+    assert.ok(requests.length >= 1, 'the pull never asked our base');
+    assert.match(requests[0], /^\/ibm-granite\/granite-embedding-97m-multilingual-r2\/resolve\/835ad14087e140460703cf0fae09f97d469d65c2\//);
+    assert.ok(requests[0].endsWith('/tokenizer.json'));
+    // nothing landed: no partial file, the model is not present
+    assert.equal((await e.modelStatus()).present, false);
+    const leftovers = fs.existsSync(modelDir)
+      ? fs.readdirSync(path.join(modelDir, 'granite-embedding-97m-multilingual-r2'), { recursive: true })
+      : [];
+    assert.ok(
+      leftovers.every((p) => !String(p).includes('.part') && !String(p).endsWith('tokenizer.json')),
+      `${leftovers}`,
+    );
+    await e.close();
+  } finally {
+    delete process.env.ENGRAMMA_PULL_BASE;
+    server.close();
+  }
+});
+
 // the test root goes away with the last engine: no temp left behind
 process.on('exit', () => {
   if (!process.env.ENGRAMMA_TEST_TMP) {
