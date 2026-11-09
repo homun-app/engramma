@@ -958,6 +958,47 @@ test('a cell name that looks like a snapshot is reserved (P0.1)', async () => {
   await e.close();
 });
 
+// v0.4.3 (P1.2): a Cell kept alive in JS must not keep the dropped cell's
+// FILES open until the GC collects its wrapper. Homun caches Cell objects
+// for hours; dropCell retires the shared connection at once — lsof must
+// find no descriptor on the cell's files the moment the drop resolves,
+// without any gc() in between. Skipped explicitly when lsof is not there.
+test('dropCell closes the connection a live Cell still shares (P1.2)', async (t) => {
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  const held = await e.cell('tenuta');
+  for (let i = 0; i < 20; i++) {
+    await held.put({ body: `nota segreta quokkaaperta-${i} della cella tenuta`, source: 's', confidence: 'stated' });
+  }
+  await e.dropCell('tenuta', 'il GC non decide lui quando chiudere');
+  // the Cell object is STILL alive in JS — and yet no descriptor on the
+  // cell's files may survive the drop
+  const lsof = require('node:child_process').spawnSync(
+    'lsof',
+    ['-p', String(process.pid)],
+    { encoding: 'utf8' },
+  );
+  if (lsof.error) {
+    await e.close();
+    return t.skip(`lsof non disponibile: ${lsof.error.message}`);
+  }
+  assert.equal(lsof.status, 0, lsof.stderr);
+  const openOn = lsof.stdout
+    .split('\n')
+    .filter((l) => l.includes(path.join(rootDir, 'cells')));
+  assert.equal(openOn.length, 0, `descrittori ancora aperti: ${openOn.join(' | ')}`);
+  // and the live Cell object answers NOT_FOUND from the seal, as ever (the
+  // gate refuses at CALL time — a sync throw, which the async wrapper turns
+  // into the rejection assert.rejects waits for)
+  await assert.rejects(
+    async () => {
+      await held.list();
+    },
+    (err) => err.code === 'NOT_FOUND',
+  );
+  await e.close();
+});
+
 // v0.4.2 (P1.4): pullModel attaches the embedder to the OPEN engine. Until
 // v0.4.1 the embedder bound at open: after a pull the engine kept answering
 // text+graph and embedPending said MODEL_MISSING until close/open — Homun

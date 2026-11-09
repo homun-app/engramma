@@ -1480,7 +1480,12 @@ impl Task for DropCellTask {
         // the files: the cell, its WAL, its shm, every snapshot. The handle
         // goes first (an open connection would keep writing a -wal nobody
         // can reach anymore); other processes' handles are out of scope —
-        // one engine per process is the documented shape.
+        // one engine per process is the documented shape. v0.4.3 (P1.2):
+        // RETIRE, not just drop — the clones of this handle (a Cell object
+        // still alive in JS, for as long as the GC takes) share one Inner,
+        // and the unlinked .sqlite/-wal/-shm would stay open under them.
+        // retire closes the real connection for every clone at once
+        cell.retire().map_err(cell_error)?;
         drop(cell);
         for file in cell_files(&path) {
             match std::fs::remove_file(&file) {

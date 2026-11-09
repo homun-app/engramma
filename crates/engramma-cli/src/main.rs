@@ -1538,6 +1538,11 @@ fn run_cell(cli: &Cli, action: &CellAction) -> Result<(), CliError> {
             for problem in &report.problems {
                 eprintln!("engramma: {}", problem.reason);
             }
+            // v0.4.3 (P1.2): the connection closes before the files go —
+            // retire swaps in an in-memory placeholder and closes the real
+            // one (the engine binding needs it: its Cell clones outlive the
+            // drop; here it also lets SQLite drop the -wal/-shm cleanly)
+            cell.retire()?;
             drop(cell);
             // the cell, its WAL, its shm and every snapshot file
             for suffix in ["", "-wal", "-shm"] {

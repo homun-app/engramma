@@ -626,6 +626,36 @@ impl Cell {
         Self::open_raw(path, true)
     }
 
+    /// v0.4.3 (P1.2): close this cell's real connection NOW, not when the
+    /// last clone goes out of scope. [`Cell`] is cheap to clone and every
+    /// clone shares one [`Inner`]: a caller that keeps a clone alive (a JS
+    /// object waiting for its GC) would keep the database, its WAL and its
+    /// shm open for hours after a whole-cell drop unlinked them. `retire`
+    /// swaps in an in-memory placeholder and closes the real connection —
+    /// every clone sees the placeholder, and the descriptors go back to the
+    /// OS. The drop paths call it between their seal and the file removal;
+    /// a retired cell is NOT usable (the placeholder has no tables), which
+    /// is the point: nothing but a doomed generation ever reaches for it.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] when the placeholder or the close fails.
+    pub fn retire(&self) -> Result<(), CellError> {
+        let placeholder = Connection::open_in_memory()?;
+        let mut inner = self.lock()?;
+        let gone = std::mem::replace(&mut inner.conn, placeholder);
+        // the caches go with the connection: the vectors, the graph and the
+        // query embeddings of a cell whose files are about to be unlinked,
+        // and the pending-scrub bookkeeping (those WAL frames go too)
+        inner.index = None;
+        inner.graph = None;
+        inner.graph_dirt = GraphDirt::default();
+        inner.query_cache.clear();
+        inner.pending_scrub.clear();
+        drop(inner);
+        drop(gone); // the real close: SQLite checkpoints and lets the WAL go
+        Ok(())
+    }
+
     fn open_raw(path: &Path, expect_init: bool) -> Result<Cell, CellError> {
         let mut conn = Connection::open(path)?;
         configure(&conn)?;
@@ -2798,6 +2828,37 @@ fn compare_states(a: &Connection, b: &Connection) -> Result<Option<String>, Cell
 mod tests {
     use super::*;
     use crate::format::NoteType;
+
+    /// v0.4.3 (P1.2): retire closes the real connection while clones of the
+    /// handle are still alive — the WAL and the shm go back to the file
+    /// system NOW, not at the last clone's drop (a JS object can wait for
+    /// its GC for hours).
+    #[test]
+    fn retire_closes_the_connection_under_live_clones() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let path = dir.path().join("r.sqlite");
+        let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
+        for i in 1..=3_u16 {
+            cell.put_note(&note(i, "una nota che produce wal"), "t")
+                .unwrap(/* test-only */);
+        }
+        let mut wal = path.clone().into_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        assert!(wal.exists(), "the fixture must leave a WAL behind");
+        let mut shm = path.clone().into_os_string();
+        shm.push("-shm");
+        // a clone keeps Inner alive past the retire — like a Cell object in
+        // JS that the GC has not collected yet
+        let clone = cell.clone();
+        cell.retire().unwrap(/* test-only */);
+        assert!(!wal.exists(), "the WAL stayed open under a live clone");
+        assert!(
+            !PathBuf::from(shm).exists(),
+            "the shm stayed open under a live clone"
+        );
+        drop(clone);
+    }
 
     /// v0.4.3 (P0.1): the one snapshot recognizer — only the exact compact
     /// format, never a neighboring cell whose name merely looks like one.
