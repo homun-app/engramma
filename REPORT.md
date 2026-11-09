@@ -2933,3 +2933,320 @@ di Homun (`uscita 0`). Il repo di Homun non è stato toccato.
 - **Il 100k del banco**: non richiesto (il percorso di ricerca non
   cambia); le righe 100k di `bench/RESULTS.md` restano quelle della
   v0.4, valide per confronto proprio perché identiche.
+
+# REPORT — Engramma v0.4.2 (quello che Homun ha trovato: elenchi senza tetti nascosti, lapidi, oblio di una cella, modello a caldo)
+
+Data: 2026-11-09. Base: `main` @ `513dc59` (tag `fase-v0.4.1`). Un commit
+per punto, il test che fallisce prima della correzione (trascritto). Tutto
+costruito con `cargo --offline`, Rust 1.95.0, macOS arm64, nessuna crate
+nuova (`Cargo.lock` invariato), nessun `unsafe` fuori da napi-derive,
+nessun `unwrap`/`expect` fuori dai test, clippy `-D warnings` verde.
+Il repo di Homun NON è stato toccato (letto il suo `REPORT.md` e
+`src/main/memory/` per capire come usa il contratto). I punti 1 e 2 per
+primi, come chiede la spec; i numeri della RAM nel punto 6.
+
+## Punto 1 — `list` senza tetti nascosti (P0)
+
+**Il bug provato:** 1200 note col tag `bot/a1`,
+`list({ tags: ['bot/a1'], limit: 100000 })` → **1000**: il
+`clamp(1, 1000)` di `ListTask` tagliava in silenzio. In Homun è l'oblio
+di un bot eliminato: con 5000 messaggi di storia ne restavano 4000 e il
+log diceva «dimenticato».
+
+**La regola adottata** (scritta in `docs/node.md`): un `limit` esplicito
+si rispetta **così com'è** — è un processo locale, gli id stanno già in
+memoria, nessun tetto. `limit` assente vale 100 come prima. Zero è
+`INVALID_ARGUMENT`: una pagina di zero è un bug del chiamante, non una
+risposta. Stessa regola per `k` di search e per il `limit` di
+`embedPending`.
+
+**Tutti i tetti muti del collegamento, trovati e tolti** (cercati in
+`lib.rs`: `clamp`, `min(` su valori del chiamante):
+
+| dove | prima | ora |
+|---|---|---|
+| `ListTask.limit` | `clamp(1, 1000)` | rispettato; `0` = `INVALID_ARGUMENT` |
+| `build_query` k (Cell.search) | `clamp(1, 100)` | rispettato; `0` = `INVALID_ARGUMENT` |
+| `EngineSearchTask` k | `clamp(1, 100)` (una seconda volta) | unificato in `parse_k`, rispettato |
+| `EmbedPendingTask.limit` | `clamp(1, 8192)` | rispettato; `0` = `INVALID_ARGUMENT` |
+| `build_query` graphHops | `min(2)` | 0–2 valido, oltre è `INVALID_ARGUMENT` |
+| `NeighborsTask.depth` | `min(4)` | 1–4 valido, fuori è `INVALID_ARGUMENT` |
+
+E **il tetto un piano sotto**: la finestra dei candidati BM25 del core
+era un fisso `50` in ENTRAMBI i percorsi (testo e ibrido) — provato:
+120 note con lo stesso termine, `k(150)` → **50**. Ora la finestra è
+`max(50, k)`: per `k ≤ 50` (il profilo di sempre, Homun usa k 10) costa
+come prima, sopra non taglia più in silenzio. Test nel core:
+`k_beyond_the_candidate_window_is_respected` (120 note, k 150 → 120).
+
+**Il test JS, prima e dopo** (1500 note, `limit: 100_000`):
+
+```console
+✖ list: no hidden ceilings, explicit limit respected (P0.1)
+    actual: 1000,    expected: 1500,      # prima
+✔ list: no hidden ceilings, explicit limit respected (P0.1)   # dopo
+```
+
+e la paginazione: pagine da 137 con `offset` crescente → 1500 id, zero
+doppi, l'ordine di concatenazione è quello della cella; `limit: 0` →
+`INVALID_ARGUMENT`. Il tetto dei 100 su `k`: `k: 200` su 150 note →
+prima **50** (finestra BM25), ora **150**.
+
+## Punto 2 — le lapidi in `list` e gli stati sconosciuti (P0)
+
+**Il bug provato:** `list({ status: ['deleted'] })` → `[]` **senza
+errore**: il `filter_map` scartava gli stati sconosciuti e il filtro
+vuoto non lasciava passare nulla. Una nota eliminata teneva il testo
+nello storico per sempre e Homun non aveva modo di trovarla per offrire
+«Dimentica per sempre» (la `purge` sull'id di una lapide funziona già:
+`forgottenPayloads: 2, scrubbed: true`, riletto nella prova).
+
+**Ora:** `deleted` è uno status di prima classe in `list` — una lapide
+si elenca come la sua ultima versione con `status: 'deleted'` (la riga
+mantieni­ il contenuto finché una purge non lo dimentica). Il core
+guadagna `Cell::note_ids_all` (tutti gli id, lapidi comprese);
+`note_ids` resta la vista dei soli vivi che sync e lista di default
+usano: senza `status` la lista resta delle note vive, `get` resta
+l'oracolo chiuso (`null` per quarantena e lapide). Ammessi: `active`,
+`quarantined`, `superseded`, `deleted`; uno sconosciuto è
+`INVALID_ARGUMENT`, mai un filtro vuoto.
+
+**`INVALID_ARGUMENT`** (codice nuovo, documentato): gli argomenti della
+chiamata — status sconosciuto, `limit`/`k` zero, `graphHops` oltre 2,
+`depth` fuori 1–4, `mode` inesistente, `asOf` malformata, query senza
+testo, `search` senza celle. `INVALID_NOTE` resta delle note (source,
+confidence, noteType, date). Il confine è dichiarato: il chiamante
+distingue un bug suo da una nota che non può scrivere.
+
+**Il test JS, prima e dopo:**
+
+```console
+✖ tombstones list; unknown statuses are INVALID_ARGUMENT (P0.2)
+    actual: 0,    expected: 1,            # prima: la lapide non si elencava
+✔ tombstones list; unknown statuses are INVALID_ARGUMENT (P0.2)  # dopo
+```
+
+e a mano, dentro il test: la lapide elencata ha corpo e status
+`deleted`; `purge` sul suo id → `scrubbed: true` e **nessuna radice del
+testo** in nessun file sotto la root (il metodo di `forgetting.rs`
+portato in JS: parole intere minuscole e le loro troncate); dopo la
+purge la lista non la porta più; `list({ status: ['foo'] })` e
+`list({ status: ['active', 'bar'] })` → `INVALID_ARGUMENT`.
+
+## Punto 3 — `Engine.dropCell(name, reason)`: l'oblio di una cella intera (P0)
+
+Homun cancella un bot e con lui le sue celle: prima una `purge` per nota
+(~30 ms l'una, minuti di coda con migliaia di note) e in modo fragile
+(punto 1). `dropCell` dimentica tutta la cella: le note (lapidi
+comprese), i file della cella (**WAL e istantanee `-snap-*.sqlite`
+comprese**), e i file delle note nelle viste legate, come
+`purge_everywhere`. `DropView = { notes, scrubbed, pending, views }`
+come `PurgeView`: una vista non raggiungibile è `pending: ['vault']`,
+`scrubbed: false` e il problema elencato (root e motivo, mai
+contenuti) — mai un'eccezione. Il registro dei motivi non c'è: della
+cella non resta nulla in cui scriverlo; `reason` è obbligatoria e resta
+la traccia del chiamante.
+
+**La concorrenza, il punto delicato.** Il `Gate` del v0.4.1 ora porta un
+verdetto (codice+messaggio): quello del motore dice `CLOSED`, quello di
+una GENERAZIONE di cella dice `NOT_FOUND`. `dropCell` tiene il lock
+delle generazioni per tutto l'oblio: le operazioni in volo su quella
+cella finiscono prima (il seal aspetta i permessi in volo), le `Cell`
+già aperte rispondono `NOT_FOUND`, e un `cell(name)` arrivato a metà
+aspetta lo stesso lock e poi crea una cella **vuota** con una generazione
+fresca — mai un fantasma su un file cancellato. `close` e `dropCell` si
+coordinano col gate del motore, come prima.
+
+**I test JS** (tutti e tre rossi prima, verdi dopo):
+
+- 1500 note + 20 lapidi → `{ notes: 1520, scrubbed: true, pending: [],
+  views: [] }`; `cells()` non la elenca più; **nessun file sotto la
+  root contiene una radice del testo**; un nuovo `cell(name)` nasce
+  vuoto (lista 0);
+- con una `Cell` aperta prima: l'operazione in volo (chiamata prima
+  della drop) **finisce senza errore**, poi put/get/list/search/delete/
+  purge su quella `Cell` → `NOT_FOUND`; il `cell(name)` nuovo è un'altra
+  cella (scrive e rilegge);
+- le viste: raggiungibile → i file delle note spariscono subito
+  (`vista/note` vuota); irraggiungibile (rinominata via) → `pending:
+  ['vault']`, `scrubbed: false`, `views[0]` con root e motivo e **zero
+  contenuti**.
+
+**Scoperta documentata nei test:** una nota ha **un** file, ovunque sia
+— un secondo `vault init` RIBINDA ogni nota alla vista nuova e la prima
+resta con copie orfane (semantica v0.3.1 P0.6, preesistente). Per questo
+«una vista raggiungibile e una no» sono due scenari separati: non
+possono tenere legami entrambe allo stesso tempo.
+
+**Prove a mano trascritte** (probe Node + CLI):
+
+```console
+cells: [ 'solo-cli' ]
+drop (never opened): {"notes":1,"scrubbed":true,"pending":[],"views":[]}
+cells after: []
+second drop: NOT_FOUND - cella solo-cli inesistente
+unknown cell: NOT_FOUND
+empty reason: INVALID_ARGUMENT
+after close: CLOSED
+```
+
+```console
+$ engramma … cell create bot-v3; … vault init $T/vista-qui
+dimenticata: bot-v3 — bot eliminato (5 note, 5 file di viste)
+$ ls …/vista-qui/fact     → (vuota: i file sono andati con la cella)
+$ engramma … cell drop bot-x --reason prova --json
+{ "dropped": "bot-x", "reason": "prova", "notes": 1, "files": 0,
+  "scrubbed": true, "pending": [] }
+```
+
+La CLI `cell drop` prende `--reason` (obbligatoria) e usa la stessa
+`drop_cell_everywhere`: prima cancellava solo il file `.sqlite` — le
+viste legate tenevano le copie per sempre, e nemmeno i `-snap-*` venivano
+toccati.
+
+## Punto 4 — `pullModel` collega l'embedder al motore aperto (P1)
+
+Richiesta 2 del REPORT di Homun: dopo un `pullModel` il motore APERTO
+restava senza embedder (`MODEL_MISSING` su `embedPending`) finché
+qualcuno non chiudeva e riapriva — e Homun lo faceva in produzione.
+
+**Ora** l'embedder vive in uno slot condiviso del motore: il pull finito
+(con i file verificati) lo carica, e ogni task lo legge quando gira.
+Test JS col modello vero di `ENGRAMMA_MODEL_DIR` rispecchiato come
+**symlink** in una modelDir temporanea (il pull verifica gli sha
+agganciati e salta: niente rete, niente copie):
+
+```console
+✖ pullModel attaches the embedder to the OPEN engine (P1.4)   # prima
+  [Error: embedPending senza modello: `pullModel` prima] { code: 'MODEL_MISSING' }
+✔ … (P1.4)                                                     # dopo
+   modelStatus.present: false → true · embedPending() = 2 sulla Cell
+   aperta PRIMA del pull · ibrida con explain.semanticRank · scrittura
+   e embed successivi · mai un close/open in tutto il test
+```
+
+Le ricerche già in volo durante il collegamento finiscono col ramo che
+avevano (lo slot si legge una volta a inizio compute). Se il caricamento
+fallisce la `pullModel` rifiuta `IO` e lo slot resta vuoto (motore in
+testo+grafo, funzionante): il ramo è irraggiungibile nei test senza un
+modello sha-corretto ma rotto — la verifica sha avviene PRIMA del
+carico, ed è la garanzia stessa del pull. `embedder: 'none'` all'apertura
+scarica ma non collega mai (scelta esplicita).
+
+## Punto 5 — `ENGRAMMA_PULL_BASE` (P1)
+
+Richiesta 1 del REPORT di Homun. La variabile d'ambiente, quando c'è e
+non è vuota, sostituisce la base di download di `pullModel`
+(predefinita `https://huggingface.co`): installazioni offline e mirror
+negli ambienti chiusi. **La revisione agganciata e lo sha256 per file
+restano agganciati**: una base diversa può solo consegnare gli STESSI
+byte o fallire, mai cambiare il contenuto (scritto in `docs/node.md`).
+
+Test JS con un server su 127.0.0.1 che serve i percorsi agganciati
+(`{repo}/resolve/{revisione}/{file}`) dalla cartella del modello vero,
+col `tokenizer.json` alterato di un byte:
+
+```console
+✖ ENGRAMMA_PULL_BASE: … (P1.5)   # prima: la pull ignorava la base e
+  #  andava alla rete vera (14,8 s, risolta invece di rifiutare)
+✔ … (P1.5)                        # dopo
+  err.code = IO, /sha256/ nel messaggio
+  requests[0] = /ibm-granite/granite-embedding-97m-multilingual-r2/
+                resolve/835ad14087e140460703cf0fae09f97d469d65c2/tokenizer.json
+  modelStatus.present = false, nessun .part né tokenizer.json landed
+```
+
+(la base è la NOSTRA: la richiesta è arrivata al server locale, sul
+percorso agganciato, ed è stata la prima e unica).
+
+## Punto 6 — Quanta RAM costa il modello (P1)
+
+Misurato dal processo Node (`process.memoryUsage().rss`, con
+`/usr/bin/time -l` intorno: picco **1431 MB**), modello Granite 97M
+(~390 MB di pesi f32), 1000 note da 80–120 caratteri:
+
+| stadio | RSS |
+|---|---|
+| processo Node, prima di tutto | 51 MB |
+| `Engine` senza modello | 52 MB |
+| dopo 1000 put | 61 MB |
+| **modello collegato** (`pullModel` a caldo, 793 ms) | **1152 MB** |
+| dopo 1000 `embedPending(1000)` (1147 ms) | 1174 MB |
+| dopo 1000 ricerche ibride (536 ms) | 1178 MB |
+| dopo altre 1000 ricerche | 1169 MB |
+| dopo `close` + Engine e Cell fuori scope + gc | 1169 MB |
+
+**La crescita oltre i pesi è del carico, non delle operazioni**:
++1091 MB al collegamento e poi PIATTA (2000 ricerche e 1000 embed non
+spostano nulla: nessuna sessione per thread, nessuna copia accumulata
+per query). La causa: il piano di tract (pesi + grafo ottimizzato,
+~470 MB vivi, vedi sotto) più i transitori di `into_typed`/
+`into_optimized`, pagine che il malloc di macOS **non restituisce** al
+sistema — ma riusa: tre giri di carico/scarico con gc in mezzo danno
+1156 → 1627 → 1654 MB (il secondo piano non raddoppia, il terzo quasi
+non cresce: l'arena viene riusata, non è una perdita di oggetti vivi).
+Nessuna correzione piccola era disponibile: caricare senza
+`into_optimized` dimezzerebbe la RAM ma rallenterebbe ogni embedding —
+una scelta di motore diversa, non un ritocco. Homun misura 251→896 MB
+nel suo demone (+645): la stessa forma, tra il costo vivo (~470) e il
+picco di carico (~1100), coerente con la misura presa dopo l'assestamento.
+
+**Non serve rifare il banco della ricerca** (spec): il percorso di
+ricerca non è cambiato; le prove di velocità sono nei tempi qui sopra
+(1000 ibride in 536 ms, k 5, una cella).
+
+## Chiusura
+
+- `cargo fmt --check`, `cargo clippy --all-targets --offline -- -D
+  warnings` verdi; `cargo test --offline --workspace` in debug **25
+  suite ok** e in `--release` **25 suite ok**; `cargo deny check
+  licenses bans` ok;
+- `node --test` (Node 24.22.1) **25/25**; `npm run test:electron`
+  (l'Electron di Homun in modo Node) **25/25**; `npm run
+  test:electron-main` ok (il modulo nel processo principale vero);
+- i test JS trovano la CLI anche con `CARGO_TARGET_DIR` impostato
+  (riserva della v0.4.1, sistemata: `engrammaBin()` legge la variabile
+  e poi `target/`; provato con e senza);
+- `npm run build` rifatto: `engramma.darwin-arm64.node`, `index.js` e
+  `index.d.ts` corrispondono al tag;
+- temporanei solo in `/var/folders/nb/r6fbsdsn3z58bkbb9w55nn780000gn/T/`
+  e cancellati a fine fase (sonde, prove RAM, cartelle dei test);
+- tag `fase-v0.4.2`. Nessun push.
+
+## Scelte e dichiarazioni di questa fase
+
+1. **Nessun tetto, né in alto né in silenzio**: la decisione è non avere
+   massimi su `limit`/`k` (processo locale, id in memoria) e trasformare
+   i massimi del MOTORE (`graphHops` 0–2, `depth` 1–4) in errori. Lo
+   zero è `INVALID_ARGUMENT` ovunque: una richiesta di nulla è un bug.
+2. **La lista di default resta dei vivi**: aggiungere le lapidi a chi
+   non chiede `status` avrebbe cambiato un contratto che Homun usa (i
+   conteggi della sua interfaccia); chi vuole le lapidi le chiede.
+3. **`dropCell` non tiene un registro dei motivi**: della cella non
+   resta nulla in cui scriverlo — il contrario dell'oblio sarebbe
+   scrivere «abbiamo dimenticato cosa e perché». `reason` valida e
+   resta al chiamante.
+4. **Una vista raggiungibile e una no, in due scenari**: una nota ha UN
+   file legato (vincolo strutturale, il secondo `vault init` ribinda);
+   il test onesto è due celle con una vista ciascuna. La scoprivo
+   scrivendo il test sbagliato: la prima vista restava con copie orfane
+   e zero righe. Semantica preesistente, fuori dagli scopi di questa
+   fase, documentata qui e nel test.
+5. **La finestra BM25 segue `k`, pavimento 50**: toccava il core, ma un
+   `k` che il motore taglia a 50 senza dirlo è lo stesso contratto che
+   mente — solo un piano più sotto. Per `k ≤ 50` (tutti i chiamanti di
+   sempre) il profilo è identico.
+
+## Cosa non ho potuto provare
+
+- **Windows e Linux**: solo macOS arm64, come nelle fasi precedenti.
+- **cargo deny advisories**: richiedono rete; eseguito `licenses bans`.
+- **Il ramo «modello verificato ma non caricabile»** del punto 4: la
+  verifica sha256 precede il carico, quindi serve un modello con l'hash
+  giusto e i byte rotti — irraggiungibile senza una collisione. Il
+  codice c'è (rifiuta `IO`, slot vuoto, motore in testo+grafo), il test
+  no.
+- **L'effettivo rilascio della RAM di tract alla distanza**: misurato
+  che l'arena viene riusata (tre giri) e che gli oggetti vivi non
+  crescono; il comportamento page-per-page del malloc di macOS non è
+  osservabile da qui.
