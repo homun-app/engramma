@@ -1,6 +1,6 @@
 # engramma-node — il motore dentro Node.js ed Electron
 
-v0.4.1. Il collegamento in-process per Homun: un modulo **N-API**
+v0.4.2. Il collegamento in-process per Homun: un modulo **N-API**
 (napi-rs 3) che carica il motore una volta per processo. L'N-API è
 stabile tra versioni di Node ed Electron: il `.node` non va ricompilato a
 ogni aggiornamento di Electron (Homun oggi non ha moduli nativi; questo
@@ -44,6 +44,7 @@ export class Engine {
   static open(opts: EngineOptions): Promise<Engine>
   cell(name: string, opts?: { create?: boolean; actor?: string }): Promise<Cell>
   cells(): Promise<string[]>
+  dropCell(name: string, reason: string): Promise<DropView>   // v0.4.2: oblio di una cella intera
   modelStatus(): Promise<{ present: boolean; id?: string; bytes?: number }>
   pullModel(onProgress?: (done: number, total: number) => void): Promise<void>
   search(cells: string[], q: SearchInput): Promise<SearchHit[]>   // RRF k=60, approssimata
@@ -103,6 +104,11 @@ export interface SearchHit {
 }
 export interface PurgeView {
   forgottenPayloads: number; scrubbed: boolean; pending: string[]
+  views: Array<{ viewId: string | null; root: string; reason: string }>
+}
+export interface DropView {                     // v0.4.2
+  notes: number                                 // le note dimenticate, lapidi comprese
+  scrubbed: boolean; pending: string[]
   views: Array<{ viewId: string | null; root: string; reason: string }>
 }
 ```
@@ -172,13 +178,66 @@ Notevoli:
   fissata verificando lo sha256 a chunk (già presente: verifica e
   salta);
 - gli **errori** sono `Error` con `code` stabile: `NOT_FOUND`,
-  `QUARANTINED`, `INVALID_NOTE`, `CONFLICT`, `CLOSED`, `IO`,
-  `MODEL_MISSING`, `COMPACTED`. I messaggi non rivelano contenuti di
-  note;
+  `QUARANTINED`, `INVALID_NOTE`, **`INVALID_ARGUMENT`** (v0.4.2),
+  `CONFLICT`, `CLOSED`, `IO`, `MODEL_MISSING`, `COMPACTED`. I messaggi
+  non rivelano contenuti di note. `INVALID_ARGUMENT` è per gli
+  **argomenti della chiamata** (uno `status` sconosciuto in `list`, un
+  `limit` di zero, `graphHops` oltre 2, `depth` oltre 4, una `mode` che
+  non esiste), `INVALID_NOTE` resta delle **note** (source, confidence,
+  noteType, date): il chiamante distingue un bug suo da una nota che non
+  può scrivere;
 - **concorrenza**: `Engine` e `Cell` si usano da molte promesse in
   parallelo; le scritture sulla stessa cella si serializzano nel motore.
   Due processi sulla stessa cella restano possibili (WAL), ma Homun ne
-  userà uno.
+  userà uno;
+- **nessun tetto muto** (v0.4.2): un `limit` esplicito di `list` o di
+  `embedPending` si rispetta **così com'è** — è un processo locale, gli
+  id stanno già in memoria; `limit` assente vale 100 (list) o 512
+  (embedPending), `k` assente 10. Il tetto di 1000 del v0.4.1 tagliava
+  in silenzio: 1200 note ne arrivavano 1000 e il chiamante credeva di
+  avere tutto. `limit: 0` e `k: 0` sono `INVALID_ARGUMENT` (una pagina
+  di zero è un bug del chiamante). I massimi **del motore** sono errori,
+  mai tagli silenziosi: `graphHops` 0–2, `neighbors` depth 1–4. Anche
+  la finestra dei candidati BM25 nel core segue `k` (pavimento 50: per
+  `k ≤ 50` costa come sempre);
+- **le lapidi si elencano** (v0.4.2): `list({ status: ['deleted'] })`
+  mostra una nota eliminata come la sua ultima versione, con
+  `status: 'deleted'` — quella che l'utente vede per decidere se
+  ripristinarla (`history` + `restore` nella CLI) o dimenticarla per
+  sempre (`purge` sull'id funziona anche sulla lapide). Ammessi:
+  `active`, `quarantined`, `superseded`, `deleted`; uno stato
+  sconosciuto è `INVALID_ARGUMENT`, mai un filtro vuoto che risponde
+  `[]` senza dire perché. La lista senza `status` resta delle note vive
+  e `get` resta l'oracolo chiuso (`null` per quarantena e lapide);
+- **`dropCell(name, reason)`** (v0.4.2): l'oblio di una **cella intera**
+  — le note (lapidi comprese), i file della cella (WAL e istantanee di
+  compattazione compresi) e i file delle note nelle viste legate, come
+  `purge` fa per una nota. La `DropView` dice `notes`, `scrubbed`,
+  `pending` e quali viste non ha potuto raggiungere (`views`, senza
+  contenuti): una vista irraggiungibile è `pending: ['vault']` e
+  `scrubbed: false`, mai un'eccezione. Dopo: `cells()` non la elenca, le
+  `Cell` già aperte rispondono `NOT_FOUND`, un nuovo `cell(name)` ne
+  crea una **vuota**. Le operazioni in volo su quella cella finiscono
+  prima, come per `close`. Il registro dei motivi non esiste: della
+  cella non resta nulla in cui scriverlo — `reason` è obbligatoria e
+  resta la traccia del chiamante (nessun contenuto). Nella CLI:
+  `engramma cell drop <nome> --reason …`;
+- **`pullModel` collega l'embedder al motore APERTO** (v0.4.2): finito
+  il download (o trovati i file già presenti e verificati), il motore
+  aperto carica il modello e da lì in poi `modelStatus().present` vale
+  `true`, la ibrida usa i vettori, `embedPending` lavora — **senza**
+  `close`/`open`. Le ricerche già in volo durante il collegamento
+  finiscono col ramo che avevano. Se il caricamento fallisce la
+  `pullModel` rifiuta (`IO`) e il motore resta in testo+grafo,
+  funzionante. `embedder: 'none'` all'apertura è una scelta esplicita:
+  la `pullModel` scarica ma non collega mai;
+- **`ENGRAMMA_PULL_BASE`** (v0.4.2): la variabile d'ambiente, quando c'è
+  e non è vuota, sostituisce la base di download di `pullModel`
+  (predefinita `https://huggingface.co`) — installazioni offline e
+  mirror negli ambienti chiusi, come i test della CLI con un server
+  locale. La **revisione agganciata e lo sha256 per file restano**: una
+  base diversa può solo consegnare gli **stessi** byte o fallire, mai
+  cambiare il contenuto.
 
 ## Un assistente che ricorda
 
@@ -255,5 +314,9 @@ libreria nativa va firmata, e il `.node` **non può stare dentro
    comunque nel pipeline (`codesign --verify --deep --strict` sull'app).
 
 Il demone di Homun gira senza finestre: il modulo va caricato LÌ, una
-volta sola — il modello occupa ~400 MB di RAM — e l'interfaccia chiede
-tutto al demone via RPC.
+volta sola — con il Granite 97M collegato il processo tiene circa
+1,1 GB di RSS (pesi f32 ~390 MB, il resto è il carico di tract: il
+picco di `into_typed`/`into_optimized` che il malloc di macOS non
+restituisce al sistema, ma riusa — 1000 `embedPending` e 2000 ricerche
+ibride sopra non spostano la misura, REPORT §v0.4.2) — e l'interfaccia
+chiede tutto al demone via RPC.
