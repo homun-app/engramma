@@ -930,6 +930,19 @@ pub struct EngineOptions {
     pub actor: String,
 }
 
+/// The engine's embedder slot (v0.4.2, P1.4): `None` until the model is
+/// there (at open or after a pull), the loaded builtin from then on.
+type EmbedderSlot = Arc<std::sync::RwLock<Option<Arc<dyn Embedder>>>>;
+
+/// v0.4.2 (P1.4): what the slot holds RIGHT NOW. Read once per task, at
+/// compute time — a search that started before an attach keeps its branch.
+fn embedder_now(slot: &EmbedderSlot) -> Result<Option<Arc<dyn Embedder>>> {
+    Ok(slot
+        .read()
+        .map_err(|_| transport_err("IO", "lock dell'embedder avvelenato"))?
+        .clone())
+}
+
 /// Everything an open engine shares: the cell cache, the optional builtin
 /// embedder, the actor every write is stamped with.
 #[derive(Clone)]
@@ -937,7 +950,17 @@ pub struct EngineHandle {
     root: PathBuf,
     model_dir: Option<PathBuf>,
     actor: Arc<String>,
-    embedder: Option<Arc<dyn Embedder>>,
+    /// v0.4.2 (P1.4): the SHARED embedder slot. Until v0.4.1 the embedder
+    /// bound at open: after a `pullModel` the OPEN engine kept answering
+    /// text+graph and `embedPending` said MODEL_MISSING until close/open —
+    /// Homun restarted its daemon's engine to work around it. Now the pull
+    /// fills this slot while the engine stays open, and every task reads it
+    /// WHEN IT RUNS: a search already in flight during the attach finishes
+    /// with the branch it had, the next one runs on the vectors.
+    embedder: EmbedderSlot,
+    /// Whether this engine wants the builtin embedder at all (`embedder:
+    /// 'none'` is an explicit choice: the pull downloads, never attaches).
+    want_builtin: bool,
     cells: Arc<Mutex<HashMap<String, CoreCell>>>,
     /// v0.4.2 (P0.3): one gate per cell GENERATION. `dropCell` removes the
     /// entry holding this map's lock for the whole drop, so the in-flight
@@ -1107,7 +1130,8 @@ impl Task for OpenTask {
             root,
             model_dir,
             actor: Arc::new(self.opts.actor.clone()),
-            embedder,
+            embedder: Arc::new(std::sync::RwLock::new(embedder)),
+            want_builtin,
             cells: Arc::new(Mutex::new(HashMap::new())),
             trackers: Arc::new(Mutex::new(HashMap::new())),
             gate: Gate::default(),
@@ -1130,14 +1154,7 @@ pub struct CellOpenTask {
 }
 
 impl Task for CellOpenTask {
-    type Output = (
-        CoreCell,
-        String,
-        Option<Arc<dyn Embedder>>,
-        String,
-        Gate,
-        Arc<Gate>,
-    );
+    type Output = (CoreCell, String, EmbedderSlot, String, Gate, Arc<Gate>);
     type JsValue = Cell;
 
     fn compute(&mut self) -> Result<Self::Output> {
@@ -1156,7 +1173,7 @@ impl Task for CellOpenTask {
         Ok((
             cell,
             self.name.clone(),
-            self.handle.embedder.clone(),
+            Arc::clone(&self.handle.embedder),
             actor,
             self.handle.gate.clone(),
             tracker,
@@ -1224,6 +1241,10 @@ impl Task for ModelStatusTask {
 
 pub struct PullModelTask {
     model_dir: Option<PathBuf>,
+    /// v0.4.2 (P1.4): the slot to fill when the pull succeeds and this
+    /// engine wants the builtin embedder.
+    embedder: EmbedderSlot,
+    want_builtin: bool,
     _open: GateGuard,
     #[allow(clippy::type_complexity)]
     progress: Option<Box<dyn FnMut(u64, u64) + Send>>,
@@ -1252,6 +1273,25 @@ impl Task for PullModelTask {
             &mut cb,
         )
         .map_err(|e| transport_err("IO", format!("pull: {e}")))?;
+        // v0.4.2 (P1.4): the pull ends with the model VERIFIED — the open
+        // engine loads the embedder now, no close/open. Homun used to
+        // restart its daemon's engine for this. When the load fails the
+        // pull REJECTS (IO) and the slot stays empty: the engine keeps
+        // answering text+graph, working, and the next pull retries.
+        // `embedder: 'none'` is an explicit choice: the pull downloads, it
+        // never attaches.
+        if self.want_builtin {
+            let loaded =
+                engramma_embed::Builtin::load_named(&dir, "granite-embedding-97m-multilingual-r2")
+                    .map_err(|e| {
+                        transport_err("IO", format!("il modello scaricato non si carica: {e}"))
+                    })?;
+            *self
+                .embedder
+                .write()
+                .map_err(|_| transport_err("IO", "lock dell'embedder avvelenato"))? =
+                Some(Arc::new(loaded) as Arc<dyn Embedder>);
+        }
         Ok(())
     }
 
@@ -1278,10 +1318,13 @@ impl Task for EngineSearchTask {
             return Err(invalid_argument("serve almeno una cella"));
         }
         let k = parse_k(self.q.k)?;
+        // v0.4.2 (P1.4): read ONCE — the slot can fill mid-flight (a pull
+        // that lands), and this search runs with the branch it started with
+        let embedder = embedder_now(&self.handle.embedder)?;
         let mut fused: HashMap<String, (f64, SearchHit)> = HashMap::new();
         for name in &self.cells {
             let cell = self.handle.open_cell(name, false)?;
-            let hits = search_cell(&cell, name, &self.q, self.handle.embedder.as_ref())?;
+            let hits = search_cell(&cell, name, &self.q, embedder.as_ref())?;
             for (rank, hit) in hits.into_iter().take(k).enumerate() {
                 // RRF, k = 60: the scores of different cells do not compare
                 // (documented as approximate)
@@ -1486,6 +1529,12 @@ impl Engine {
 
     /// Download the builtin model (pinned revision, sha256 verified per
     /// chunk). Already-present files verify and skip: offline it is a no-op.
+    /// v0.4.2 (P1.4): when the model is verified, the OPEN engine loads the
+    /// embedder and uses it from then on — `modelStatus().present`, hybrid
+    /// search on the vectors, `embedPending` working — without any
+    /// close/open. A load failure rejects with `IO` and the engine keeps
+    /// answering text+graph. An engine opened with `embedder: 'none'`
+    /// downloads but never attaches (the explicit choice stands).
     #[napi(ts_return_type = "Promise<void>")]
     pub fn pull_model(
         &self,
@@ -1512,6 +1561,8 @@ impl Engine {
         };
         Ok(AsyncTask::new(PullModelTask {
             model_dir: self.handle.model_dir.clone(),
+            embedder: Arc::clone(&self.handle.embedder),
+            want_builtin: self.handle.want_builtin,
             _open: self.handle.gate.enter_now().map_err(|e| recode(env, e))?,
             progress,
         }))
@@ -1578,7 +1629,10 @@ impl Engine {
 pub struct Cell {
     cell: CoreCell,
     name: String,
-    embedder: Option<Arc<dyn Embedder>>,
+    /// v0.4.2 (P1.4): the ENGINE's embedder slot, read when a task runs —
+    /// a cell opened before a `pullModel` embeds and searches on the
+    /// vectors from the moment the model lands.
+    embedder: EmbedderSlot,
     actor: String,
     gate: Gate,
     /// v0.4.2 (P0.3): this cell's GENERATION gate — sealed (NOT_FOUND) by
@@ -1601,7 +1655,7 @@ impl Cell {
     fn from_parts(
         cell: CoreCell,
         name: String,
-        embedder: Option<Arc<dyn Embedder>>,
+        embedder: EmbedderSlot,
         actor: String,
         gate: Gate,
         tracker: Arc<Gate>,
@@ -1905,7 +1959,7 @@ impl Task for ListTask {
 pub struct SearchTask {
     cell: CoreCell,
     name: String,
-    embedder: Option<Arc<dyn Embedder>>,
+    embedder: EmbedderSlot,
     q: SearchInput,
     _open: CellPermits,
 }
@@ -1915,7 +1969,10 @@ impl Task for SearchTask {
     type JsValue = Vec<SearchHit>;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        search_cell(&self.cell, &self.name, &self.q, self.embedder.as_ref())
+        // v0.4.2 (P1.4): read ONCE, at compute time — the cell may have been
+        // opened before the pull that fills the slot
+        let embedder = embedder_now(&self.embedder)?;
+        search_cell(&self.cell, &self.name, &self.q, embedder.as_ref())
     }
 
     fn resolve(&mut self, _env: Env, hits: Vec<SearchHit>) -> Result<Vec<SearchHit>> {
@@ -2138,7 +2195,7 @@ impl Task for PurgeTask {
 
 pub struct EmbedPendingTask {
     cell: CoreCell,
-    embedder: Option<Arc<dyn Embedder>>,
+    embedder: EmbedderSlot,
     limit: Option<u32>,
     _open: CellPermits,
 }
@@ -2148,7 +2205,9 @@ impl Task for EmbedPendingTask {
     type JsValue = f64;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let Some(embedder) = self.embedder.as_ref() else {
+        // v0.4.2 (P1.4): the slot, read when this runs — the pull may have
+        // landed after the cell was opened (or after this was called)
+        let Some(embedder) = embedder_now(&self.embedder)? else {
             return Err(transport_err(
                 "MODEL_MISSING",
                 "embedPending senza modello: `pullModel` prima",
@@ -2402,7 +2461,7 @@ impl Cell {
         Ok(AsyncTask::new(SearchTask {
             cell: self.cell.clone(),
             name: self.name.clone(),
-            embedder: self.embedder.clone(),
+            embedder: Arc::clone(&self.embedder),
             q,
             _open: self.enter(env)?,
         }))
@@ -2498,7 +2557,7 @@ impl Cell {
     ) -> Result<AsyncTask<EmbedPendingTask>> {
         Ok(AsyncTask::new(EmbedPendingTask {
             cell: self.cell.clone(),
-            embedder: self.embedder.clone(),
+            embedder: Arc::clone(&self.embedder),
             limit,
             _open: self.enter(env)?,
         }))

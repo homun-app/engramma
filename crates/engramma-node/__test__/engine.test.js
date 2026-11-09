@@ -894,6 +894,80 @@ test('dropCell reaches the views, and says the unreachable one (P0.3)', async ()
   await e.close();
 });
 
+// v0.4.2 (P1.4): pullModel attaches the embedder to the OPEN engine. Until
+// v0.4.1 the embedder bound at open: after a pull the engine kept answering
+// text+graph and embedPending said MODEL_MISSING until close/open — Homun
+// restarted the engine in production to work around it. Now the pull ends
+// with the model verified AND loaded: modelStatus().present, hybrid search
+// on the vectors, embedPending working, no close/open. The model files come
+// from the real ENGRAMMA_MODEL_DIR, MIRRORED AS SYMLINKS into a temp
+// modelDir: the pull finds them present, verifies the pinned sha256 and
+// skips — no network, no copy (the disk is tight). Cells opened BEFORE the
+// pull pick the embedder up: they read the engine's slot when they run.
+test('pullModel attaches the embedder to the OPEN engine (P1.4)', async (t) => {
+  const modelRoot = process.env.ENGRAMMA_MODEL_DIR
+    ? path.resolve(process.env.ENGRAMMA_MODEL_DIR)
+    : path.join(require('node:os').homedir(), '.cache', 'engramma', 'models');
+  const real = path.join(modelRoot, 'granite-embedding-97m-multilingual-r2');
+  const hasModel = fs.existsSync(real)
+    && fs.readdirSync(real).length > 0
+    && fs.readdirSync(path.join(real, fs.readdirSync(real)[0])).length > 0;
+  if (!hasModel) {
+    return t.skip(`the builtin model is not in ${modelRoot}: pull it first`);
+  }
+  const mirrorModel = (src, dst) => {
+    fs.mkdirSync(dst, { recursive: true });
+    for (const ent of fs.readdirSync(src, { withFileTypes: true })) {
+      const s = path.join(src, ent.name);
+      const d = path.join(dst, ent.name);
+      if (ent.isDirectory()) mirrorModel(s, d);
+      else if (!fs.existsSync(d)) fs.symlinkSync(s, d);
+    }
+  };
+
+  const rootDir = root();
+  const modelDir = path.join(path.dirname(rootDir), 'modelli-a-caldo');
+  const e = await Engine.open({
+    root: rootDir,
+    modelDir,
+    embedder: 'builtin',
+    actor: 'homun',
+  });
+  // the model is NOT there: text+graph, and the honest errors
+  assert.equal((await e.modelStatus()).present, false);
+  const cell = await e.cell('caldo'); // opened BEFORE the pull, like Homun's
+  const n1 = await cell.put({ body: 'il trasloco di fabio a milano', source: 's', confidence: 'stated' });
+  const n2 = await cell.put({ body: 'fabio lavora allo studio aurora', source: 's', confidence: 'stated' });
+  await assert.rejects(cell.embedPending(), (err) => err.code === 'MODEL_MISSING');
+  await assert.rejects(
+    cell.search({ text: 'trasloco', mode: 'vector' }),
+    (err) => err.code === 'MODEL_MISSING',
+  );
+  // the pull: the mirrored files verify and skip, and the engine (OPEN)
+  // loads the embedder
+  mirrorModel(real, path.join(modelDir, 'granite-embedding-97m-multilingual-r2'));
+  let progressCalls = 0;
+  await e.pullModel(() => { progressCalls += 1; });
+  assert.ok(progressCalls > 0, 'the progress callback ran');
+  const status = await e.modelStatus();
+  assert.equal(status.present, true, JSON.stringify(status));
+  assert.ok(status.bytes > 0);
+  // embedPending works NOW, on the cell opened before the pull
+  const done = await cell.embedPending();
+  assert.equal(done, 2, `${done}`);
+  // the hybrid search runs on the vectors: the explain says so
+  const hits = await cell.search({ text: 'dove vive fabio', k: 2, explain: true });
+  assert.ok(hits.length >= 1);
+  assert.ok(hits.some((h) => h.explain && typeof h.explain.semanticRank === 'number'),
+    'no hit carries a semantic rank');
+  assert.equal(hits[0].id, n1.id);
+  // and the engine keeps working after (no close/open anywhere above)
+  await cell.put({ body: 'una nota dopo il collegamento', source: 's', confidence: 'stated' });
+  assert.equal(await cell.embedPending(), 1);
+  const _ = n2;
+  await e.close();
+});
+
 // the test root goes away with the last engine: no temp left behind
 process.on('exit', () => {
   if (!process.env.ENGRAMMA_TEST_TMP) {
