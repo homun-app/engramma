@@ -1497,6 +1497,26 @@ impl Cell {
         Ok(out)
     }
 
+    /// Every note id, tombstones included (v0.4.2, P0.2): a deleted note
+    /// keeps its row — restorable — until a purge forgets it, and `list`
+    /// with `status: ['deleted']` must be able to find it (the Node binding
+    /// offers the tombstones so the caller can offer «Dimentica per
+    /// sempre»). [`Cell::note_ids`] stays the living-only view the sync and
+    /// the default list use.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn note_ids_all(&self) -> Result<Vec<Ulid>, CellError> {
+        let inner = self.lock()?;
+        let mut stmt = inner.conn.prepare("SELECT id FROM notes ORDER BY id")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(Ulid::from_string(&row?).map_err(|_| CellError::Db("bad note id".into()))?);
+        }
+        Ok(out)
+    }
+
     /// The `version` column of a note (how many writes it took).
     ///
     /// # Errors

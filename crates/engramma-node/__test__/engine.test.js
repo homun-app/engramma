@@ -650,6 +650,72 @@ test('search k respected; hops/depth beyond the range are errors (P0.1)', async 
   await e.close();
 });
 
+// v0.4.2 (P0.2): the tombstones list. `list({ status: ['deleted'] })` shows
+// a deleted note as its last version with status 'deleted' — what the user
+// sees to decide restore or forget; before, the unknown status was dropped
+// by a filter_map and the answer was an EMPTY list, no error, so a deleted
+// note kept its text in the history forever with no way to find it. An
+// unknown status is INVALID_ARGUMENT now. `get` stays a closed oracle:
+// null for quarantined and tombstoned, as ever.
+test('tombstones list; unknown statuses are INVALID_ARGUMENT (P0.2)', async () => {
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  const cell = await e.cell('lapidi');
+  const BODY = 'segreto quokkaviolaceo zibellinotremante';
+  const n = await cell.put({ body: BODY, title: 'Segreto', source: 's', confidence: 'stated' });
+  await cell.delete(n.id);
+  // the closed oracle stays closed
+  assert.equal(await cell.get(n.id), null);
+  // but the tombstone LISTS, as its last version
+  const tombs = await cell.list({ status: ['deleted'] });
+  assert.equal(tombs.length, 1, `${JSON.stringify(tombs)}`);
+  assert.equal(tombs[0].id, n.id);
+  assert.equal(tombs[0].status, 'deleted');
+  assert.equal(tombs[0].body, BODY);
+  // and it does not pollute the default list (as ever: living notes only)
+  assert.equal((await cell.list()).length, 0);
+  // purge on the tombstone's id forgets it for good, and afterwards the
+  // list does not carry it anymore
+  const p = await cell.purge(n.id, 'dimentica per sempre');
+  assert.equal(p.scrubbed, true, `${JSON.stringify(p)}`);
+  assert.equal((await cell.list({ status: ['deleted'] })).length, 0);
+  // an unknown status is an ERROR, never a silent empty filter
+  await assert.rejects(
+    cell.list({ status: ['foo'] }),
+    (err) => err.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    cell.list({ status: ['active', 'bar'] }),
+    (err) => err.code === 'INVALID_ARGUMENT',
+  );
+  await e.close();
+  // no root of the text survives anywhere under the root (forgetting.rs's
+  // lesson, from JS: the whole lowered words of an invented vocabulary)
+  const needles = [];
+  for (const tok of BODY.toLowerCase().split(/[^a-zà-ÿ]+/)) {
+    for (const len of [tok.length, tok.length - 1, tok.length - 2]) {
+      const stem = tok.slice(0, len);
+      if (stem.length >= 5 && !needles.includes(stem)) needles.push(stem);
+    }
+  }
+  const stack = [rootDir];
+  while (stack.length) {
+    const d = stack.pop();
+    if (!fs.existsSync(d)) continue;
+    for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+      const pp = path.join(d, ent.name);
+      if (ent.isDirectory()) {
+        stack.push(pp);
+        continue;
+      }
+      const raw = fs.readFileSync(pp);
+      for (const needle of needles) {
+        assert.ok(!raw.includes(needle), `«${needle}» sopravvive in ${pp}`);
+      }
+    }
+  }
+});
+
 // the test root goes away with the last engine: no temp left behind
 process.on('exit', () => {
   if (!process.env.ENGRAMMA_TEST_TMP) {

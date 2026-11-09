@@ -1570,16 +1570,32 @@ impl Task for ListTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         let want_type = self.note_type.as_deref().map(parse_note_type).transpose()?;
-        let wanted: Option<Vec<NoteStatus>> = self.statuses.as_ref().map(|ss| {
-            ss.iter()
-                .filter_map(|s| match s.as_str() {
-                    "active" => Some(NoteStatus::Active),
-                    "quarantined" => Some(NoteStatus::Quarantined),
-                    "superseded" => Some(NoteStatus::Superseded),
-                    _ => None,
-                })
-                .collect()
-        });
+        // v0.4.2 (P0.2): a status the engine does not know is the caller's
+        // mistake to hear about — the old filter_map dropped it and the
+        // empty filter let NOTHING through: `list({ status: ['deleted'] })`
+        // answered [] with no error, and a deleted note kept its text in
+        // the history forever with no way to find it. `deleted` is a first
+        // class status here: a tombstone lists as its last version (the row
+        // keeps the content until a purge forgets it), which is what the
+        // user sees to decide restore or forget. `get` stays a closed
+        // oracle: null for quarantined and tombstoned, as ever.
+        let wanted: Option<Vec<NoteStatus>> = match self.statuses.as_ref() {
+            None => None,
+            Some(ss) => Some(
+                ss.iter()
+                    .map(|s| match s.as_str() {
+                        "active" => Ok(NoteStatus::Active),
+                        "quarantined" => Ok(NoteStatus::Quarantined),
+                        "superseded" => Ok(NoteStatus::Superseded),
+                        "deleted" => Ok(NoteStatus::Deleted),
+                        other => Err(invalid_argument(format!(
+                            "status non valida: {other:?} \
+                             (active|quarantined|superseded|deleted)"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+        };
         let offset = self.offset.unwrap_or(0) as usize;
         // v0.4.2 (P0.1): an explicit limit is respected AS GIVEN — the old
         // silent `clamp(1, 1000)` answered Homun's `limit: 100_000` with a
@@ -1591,7 +1607,14 @@ impl Task for ListTask {
             Some(n) => n as usize,
             None => 100,
         };
-        let ids = self.cell.note_ids().map_err(cell_error)?;
+        // the tombstones sit below note_ids' living-only view: ask for every
+        // row when the caller asked for a status at all (the filter above
+        // keeps the living-only answer when `deleted` is not among them)
+        let ids = if self.statuses.is_some() {
+            self.cell.note_ids_all().map_err(cell_error)?
+        } else {
+            self.cell.note_ids().map_err(cell_error)?
+        };
         let mut out: Vec<Note> = Vec::new();
         for id in ids {
             if out.len() >= offset + limit {
@@ -1750,8 +1773,10 @@ impl Task for SetStatusTask {
             "active" => NoteStatus::Active,
             "quarantined" => NoteStatus::Quarantined,
             "superseded" => NoteStatus::Superseded,
+            // v0.4.2 (P0.2): a wrong ARGUMENT of the call, not a note
+            // problem — deleting is `delete`
             other => {
-                return Err(invalid(format!(
+                return Err(invalid_argument(format!(
                     "status non valida: {other:?} (active|quarantined|superseded)"
                 )));
             }
