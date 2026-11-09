@@ -966,8 +966,10 @@ pub struct EngineHandle {
     /// entry holding this map's lock for the whole drop, so the in-flight
     /// operations of that generation finish first and every Cell object of
     /// it answers `NOT_FOUND` from the seal on; a `cell(name)` that arrives
-    /// mid-drop waits on the same lock and then mints a FRESH gate over a
-    /// fresh empty cell — there is no third state.
+    /// mid-drop waits on this same lock and then mints a FRESH gate over a
+    /// fresh empty cell — there is no third state. v0.4.3 (P2.3): the open
+    /// takes gate and cell under this same lock, so no Cell is ever born
+    /// with a gate a completed drop had already sealed (born dead).
     trackers: Arc<Mutex<HashMap<String, Arc<Gate>>>>,
     gate: Gate,
 }
@@ -1026,19 +1028,31 @@ impl EngineHandle {
         Ok(cell)
     }
 
-    /// The generation gate of a cell name (v0.4.2, P0.3): the one the map
-    /// holds, or a fresh one installed now. CellOpenTask takes it BEFORE
-    /// opening the cell file, so a drop in flight serializes against every
-    /// open of that name.
-    fn tracker_for(&self, name: &str) -> Result<Arc<Gate>> {
+    /// The generation gate AND the cell, under the SAME generations lock
+    /// (v0.4.2 P0.3 took the gate first and opened the cell after, lock
+    /// released in between — v0.4.3 P2.3 closes that window). A dropCell
+    /// entering it sealed the very gate the open was about to hand out, and
+    /// the returning Cell answered `NOT_FOUND` forever: born dead, a fresh
+    /// Cell over a fresh file. Worse, the open could CREATE the file while
+    /// a drop was unlinking it, and the drop died on the half-written
+    /// database. With the lock held across both, a drop of that name either
+    /// finishes BEFORE the open (which then mints a fresh gate over a fresh
+    /// cell) or waits for it and takes the generation THIS open created: a
+    /// Cell can only die of an oblivion that started after it existed. The
+    /// lock is per engine, not per name — a drop of one name briefly waits
+    /// an unrelated open; both are rare events in Homun's daemon.
+    fn open_tracked_cell(&self, name: &str, create: bool) -> Result<(CoreCell, Arc<Gate>)> {
         let mut map = self
             .trackers
             .lock()
             .map_err(|_| transport_err("IO", "lock delle generazioni avvelenato"))?;
-        Ok(map
+        let tracker = map
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(Gate::dropped_cell(name)))
-            .clone())
+            .clone();
+        let cell = self.open_cell(name, create)?;
+        drop(map);
+        Ok((cell, tracker))
     }
 }
 
@@ -1171,12 +1185,12 @@ impl Task for CellOpenTask {
     type JsValue = Cell;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        // v0.4.2 (P0.3): the generation gate comes FIRST — a dropCell in
-        // flight holds the trackers lock until the cell's files are gone,
-        // so this open waits and then creates a FRESH cell, never a ghost
-        // over a deleted file
-        let tracker = self.handle.tracker_for(&self.name)?;
-        let cell = self.handle.open_cell(&self.name, self.create)?;
+        // v0.4.2 (P0.3): the generation gate comes first, so a dropCell in
+        // flight serializes against every open of that name. v0.4.3 (P2.3):
+        // gate AND open under the SAME lock — see open_tracked_cell
+        let (cell, tracker) = self
+            .handle
+            .open_tracked_cell(&self.name, self.create)?;
         let actor = match &self.actor {
             // v0.4.1 (P1.6): an empty actor is the same as none — the
             // engine's own stamps the writes

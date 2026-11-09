@@ -999,6 +999,66 @@ test('dropCell closes the connection a live Cell still shares (P1.2)', async (t)
   await e.close();
 });
 
+// v0.4.3 (P2.3): no Cell is born dead. The open took the generation gate
+// first and opened the cell file after, with the lock released in between:
+// a dropCell entering that window sealed the very gate the open was about
+// to hand out, and the returning `cell(name)` answered NOT_FOUND forever —
+// a fresh Cell over a fresh file, dead on arrival (its `cell(name)` had
+// been called before the drop, but the Cell object did not exist yet).
+// 200 cell()/dropCell() pairs race on one name: every Cell that comes
+// back must answer list(), unless a drop completed AFTER the Cell was
+// created (the legitimate death: an oblivion that took the generation the
+// Cell belongs to, started after it existed).
+test('no Cell is born dead: 200 cell()/dropCell() pairs (P2.3)', async () => {
+  const e = await engine();
+  const seed = await e.cell('stress');
+  await seed.put({ body: 'una nota perché ogni drop abbia qualcosa da dimenticare', source: 's', confidence: 'stated' });
+
+  // one monotonic clock for both resolutions, written as they happen: the
+  // tick lands in the CALLER's slot (openAt[i] belongs to cells[i]), not in
+  // resolution order
+  let tick = 0;
+  const openAt = new Array(200);
+  const dropAt = [];
+  const opens = [];
+  const drops = [];
+  for (let i = 0; i < 200; i++) {
+    drops.push(
+      e.dropCell('stress', `stress ${i}`).catch((err) => {
+        // a drop that arrives when the file is not there lost the race:
+        // NOT_FOUND is the honest answer of THAT call
+        if (err.code !== 'NOT_FOUND') throw err;
+      }).then(() => { dropAt.push(tick++); }),
+    );
+    opens.push(
+      e.cell('stress').then((c) => { openAt[i] = tick++; return c; }),
+    );
+  }
+  const cells = await Promise.all(opens);
+  await Promise.all(drops);
+
+  let dead = 0;
+  // every Cell answers, in order of creation; a NOT_FOUND is acceptable
+  // only when some drop completed AFTER that Cell was created
+  for (let i = 0; i < cells.length; i++) {
+    try {
+      await cells[i].list();
+    } catch (err) {
+      assert.equal(err.code, 'NOT_FOUND', `unexpected: ${err.message}`);
+      const aDropCameLater = dropAt.some((d) => d > openAt[i]);
+      assert.ok(
+        aDropCameLater,
+        `la Cell #${i} è nata morta: nessun drop completato dopo la sua creazione`,
+      );
+      dead += 1;
+    }
+  }
+  // with the race over, a fresh cell(name) must be alive
+  const after = await e.cell('stress');
+  assert.equal((await after.list()).length, 0);
+  await e.close();
+});
+
 // v0.4.2 (P1.4): pullModel attaches the embedder to the OPEN engine. Until
 // v0.4.1 the embedder bound at open: after a pull the engine kept answering
 // text+graph and embedPending said MODEL_MISSING until close/open — Homun
