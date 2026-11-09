@@ -54,6 +54,10 @@ fn split_transport(err: &Error) -> (&'static str, String) {
                 "NOT_FOUND",
                 "QUARANTINED",
                 "INVALID_NOTE",
+                // v0.4.2 (P0.2): a wrong ARGUMENT of the call (an unknown
+                // status in `list`, a `limit` of zero) — INVALID_NOTE is
+                // about the notes, and never fit these
+                "INVALID_ARGUMENT",
                 "CONFLICT",
                 "IO",
                 "MODEL_MISSING",
@@ -100,6 +104,14 @@ fn not_found(message: impl std::fmt::Display) -> Error {
 
 fn invalid(message: impl std::fmt::Display) -> Error {
     transport_err("INVALID_NOTE", message)
+}
+
+/// v0.4.2 (P0.2): a wrong ARGUMENT of the call — an unknown `status` in
+/// `list`, a `limit` of zero. `INVALID_NOTE` is about the notes and never
+/// fit these; the caller can tell a bug of its own from a note it cannot
+/// write.
+fn invalid_argument(message: impl std::fmt::Display) -> Error {
+    transport_err("INVALID_ARGUMENT", message)
 }
 
 fn cell_error(e: CellError) -> Error {
@@ -661,16 +673,37 @@ fn json_to_yaml(v: &serde_json::Value) -> Result<engramma_core::format::yaml::Ya
 // search plumbing (shared by Cell and Engine)
 // ---------------------------------------------------------------------------
 
+/// v0.4.2 (P0.1): an explicit `k` is respected AS GIVEN — the old silent
+/// `clamp(1, 100)` cut Homun's pages without a word. Zero is a caller's
+/// bug, not an empty answer: INVALID_ARGUMENT.
+fn parse_k(k: Option<u32>) -> Result<usize> {
+    match k {
+        None => Ok(10),
+        Some(0) => Err(invalid_argument("k deve essere almeno 1")),
+        Some(n) => Ok(n as usize),
+    }
+}
+
 fn build_query(q: &SearchInput) -> Result<Query> {
     if q.text.trim().is_empty() {
-        return Err(invalid("query senza testo"));
+        return Err(invalid_argument("query senza testo"));
     }
-    let mut query = Query::text(&q.text).k(q.k.unwrap_or(10).clamp(1, 100) as usize);
-    query.graph_hops = q.graph_hops.unwrap_or(1).min(2);
+    let mut query = Query::text(&q.text).k(parse_k(q.k)?);
+    // the engine's own range is 0–2: beyond it is the caller's mistake to
+    // hear about, never a silent `min(2)`
+    let hops = q.graph_hops.unwrap_or(1);
+    if hops > 2 {
+        return Err(invalid_argument(format!(
+            "graphHops {hops} fuori range (0–2)"
+        )));
+    }
+    query.graph_hops = hops;
     if let Some(as_of) = q.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
         let t = OffsetDateTime::parse(as_of, &time::format_description::well_known::Rfc3339)
             .or_else(|_| Validity::parse(as_of).map(|v| v.start()))
-            .map_err(|e| invalid(format!("asOf non valida (RFC 3339 o YYYY-MM-DD): {e}")))?;
+            .map_err(|e| {
+                invalid_argument(format!("asOf non valida (RFC 3339 o YYYY-MM-DD): {e}"))
+            })?;
         query.filters.as_of = Some(t);
     }
     if q.include_quarantined.unwrap_or(false) {
@@ -733,7 +766,7 @@ fn search_cell(
         "vector" | "embedding" => Mode::Vector,
         "hybrid" => Mode::Hybrid,
         other => {
-            return Err(invalid(format!(
+            return Err(invalid_argument(format!(
                 "mode non valida: {other:?} (text|vector|hybrid)"
             )));
         }
@@ -1140,9 +1173,9 @@ impl Task for EngineSearchTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         if self.cells.is_empty() {
-            return Err(invalid("serve almeno una cella"));
+            return Err(invalid_argument("serve almeno una cella"));
         }
-        let k = self.q.k.unwrap_or(10).clamp(1, 100) as usize;
+        let k = parse_k(self.q.k)?;
         let mut fused: HashMap<String, (f64, SearchHit)> = HashMap::new();
         for name in &self.cells {
             let cell = self.handle.open_cell(name, false)?;
@@ -1548,7 +1581,16 @@ impl Task for ListTask {
                 .collect()
         });
         let offset = self.offset.unwrap_or(0) as usize;
-        let limit = self.limit.unwrap_or(100).clamp(1, 1000) as usize;
+        // v0.4.2 (P0.1): an explicit limit is respected AS GIVEN — the old
+        // silent `clamp(1, 1000)` answered Homun's `limit: 100_000` with a
+        // thousand notes and the log said «dimenticato». This is a local
+        // process, the ids are already in memory: no ceiling at all. Zero is
+        // a caller's bug: INVALID_ARGUMENT, not an empty page.
+        let limit = match self.limit {
+            Some(0) => return Err(invalid_argument("limit deve essere almeno 1")),
+            Some(n) => n as usize,
+            None => 100,
+        };
         let ids = self.cell.note_ids().map_err(cell_error)?;
         let mut out: Vec<Note> = Vec::new();
         for id in ids {
@@ -1657,9 +1699,17 @@ impl Task for NeighborsTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         let id = resolve_id(&self.cell, &self.id)?;
+        // v0.4.2 (P0.1): the engine's range is 1–4 — beyond it (or zero) is
+        // the caller's mistake, never a silent `min(4)`
+        if self.depth == 0 || self.depth > 4 {
+            return Err(invalid_argument(format!(
+                "depth {} fuori range (1–4)",
+                self.depth
+            )));
+        }
         let ns = self
             .cell
-            .neighbors(&format!("note:{id}"), self.depth.min(4), &[], false)
+            .neighbors(&format!("note:{id}"), self.depth, &[], false)
             .map_err(search_error)?;
         Ok(ns
             .into_iter()
@@ -1843,7 +1893,13 @@ impl Task for EmbedPendingTask {
                 .add_model(&model, embedder.dim())
                 .map_err(cell_error)?;
         }
-        let limit = self.limit.unwrap_or(512).clamp(1, 8192) as usize;
+        // v0.4.2 (P0.1): an explicit limit is respected AS GIVEN, no silent
+        // `clamp(1, 8192)`; zero is a caller's bug
+        let limit = match self.limit {
+            Some(0) => return Err(invalid_argument("limit deve essere almeno 1")),
+            Some(n) => n as usize,
+            None => 512,
+        };
         let report = self
             .cell
             .embed_pending(embedder.as_ref(), limit)

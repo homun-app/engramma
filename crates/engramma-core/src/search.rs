@@ -685,6 +685,13 @@ fn match_expr_with(terms: &[String], df: &HashMap<String, i64>, total: i64) -> S
     or_match_expr(&kept)
 }
 
+/// The BM25 candidate window for a query (v0.4.2, P0.1): at least 50 (the
+/// historical window, so the default `k ≤ 50` profile costs the same as
+/// ever), never below the asked `k` — a silent cut is a lying answer.
+fn candidate_window(k: usize) -> u64 {
+    u64::try_from(k.max(50)).unwrap_or(50)
+}
+
 /// The BM25 candidate list for a MATCH expression: `(id, -bm25)` (FTS5's
 /// bm25() is negative, more negative = better), at most `limit`.
 fn bm25_candidates(
@@ -846,14 +853,17 @@ impl Cell {
         }
         let conn = &inner.conn;
 
-        // 1. BM25 candidates (up to 50), with the ubiquitous terms out of
-        // the MATCH (they still count for coverage below).
+        // 1. BM25 candidates, with the ubiquitous terms out of the MATCH
+        // (they still count for coverage below). v0.4.2 (P0.1): the window is
+        // `max(50, k)` — a fixed 50 silently cut every explicit `k` above it,
+        // and the caller never knew. The default profile (k ≤ 50) is the same
+        // as ever.
         let terms = text::query_terms(&q.text, q.lang);
         if terms.is_empty() {
             return Err(SearchError::Invalid("query has no usable terms".into()));
         }
         let match_expr = match_expr_for(conn, &terms)?;
-        let text_hits = bm25_candidates(conn, &match_expr, 50)?;
+        let text_hits = bm25_candidates(conn, &match_expr, candidate_window(q.k))?;
 
         // 2. Filters come BEFORE the graph expansion: only candidates that
         // pass them (status, quarantine, superseded, `as_of`) can seed the
@@ -2125,7 +2135,9 @@ fn semantic_pipeline(
     let df = doc_frequencies(conn, &terms)?;
     if !terms.is_empty() {
         let match_expr = match_expr_with(&terms, &df, total_notes);
-        text_hits = bm25_candidates(conn, &match_expr, 50)?;
+        // v0.4.2 (P0.1): the window follows the asked `k`, floor 50 — no
+        // silent cut above it (same rule as the text path above)
+        text_hits = bm25_candidates(conn, &match_expr, candidate_window(q.k))?;
     }
     // one batched read for the candidates (P0.3): note + coverage columns
     let cand_rows = read_candidates(
@@ -2746,6 +2758,39 @@ mod tests {
         // Ranks are positions in the BM25 candidate list *before* filters:
         // the quarantined web note can rank first and then be filtered out.
         assert_eq!(hits[0].explain.bm25_rank, Some(2));
+    }
+
+    /// v0.4.2 (P0.1): an explicit `k` is respected AS GIVEN. The BM25
+    /// candidate window was a fixed 50: a caller asking `k(150)` on a corpus
+    /// where the term matches more notes got a silent cut. The window is now
+    /// `max(50, k)` — the default profile (k ≤ 50) is unchanged.
+    #[test]
+    fn k_beyond_the_candidate_window_is_respected() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let cell = Cell::create(&dir.path().join("k.sqlite"), "k", "tester")
+            .unwrap(/* test-only */);
+        const TOTAL: u16 = 120;
+        for i in 0..TOTAL {
+            let n = note(
+                i,
+                &format!("nota {i}"),
+                &format!("la quokkanota numero {i} di centoventi"),
+                NoteType::Fact,
+            );
+            cell.put_note(&n, "t").unwrap(/* test-only */);
+        }
+        let small = cell
+            .search_with_now(&Query::text("quokkanota").k(10), now())
+            .unwrap(/* test-only */);
+        assert_eq!(small.len(), 10, "the default window answers 10");
+        let big = cell
+            .search_with_now(&Query::text("quokkanota").k(150), now())
+            .unwrap(/* test-only */);
+        assert_eq!(big.len(), usize::from(TOTAL), "no silent cut at 50");
+        // still ranked, still deduplicated
+        let ids: Vec<String> = big.iter().map(|h| h.note.id.to_string()).collect();
+        let uniq: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(uniq.len(), usize::from(TOTAL));
     }
 
     #[test]

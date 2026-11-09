@@ -179,12 +179,20 @@ test('errors carry a stable code', async () => {
   await expectCode('INVALID_NOTE', cell.put({ body: 'x', source: 's', confidence: 'boh' }));
   await expectCode('INVALID_NOTE', cell.put({ body: 'x', source: '', confidence: 'stated' }));
   await expectCode('INVALID_NOTE', cell.put({ body: 'x', source: 's', confidence: 'stated', noteType: 'nonexistent' }));
-  await expectCode('INVALID_NOTE', cell.search({ text: '   ' }));
+  // v0.4.2: the ARGUMENTS of a call are INVALID_ARGUMENT (the notes stay
+  // INVALID_NOTE) — an empty query text is an argument, not a note
+  await expectCode('INVALID_ARGUMENT', cell.search({ text: '   ' }));
+  await expectCode('INVALID_ARGUMENT', cell.search({ text: 'x', mode: 'boh' }));
   await expectCode('NOT_FOUND', e.cell('inesistente', { create: false }));
   // confirm of a NON-quarantined note is QUARANTINED
   const active = await cell.put({ body: 'y', source: 's', confidence: 'stated' });
   await expectCode('QUARANTINED', cell.confirm(active.id));
-  assert.deepEqual(Object.keys(codes).sort(), ['INVALID_NOTE', 'NOT_FOUND', 'QUARANTINED']);
+  assert.deepEqual(Object.keys(codes).sort(), [
+    'INVALID_ARGUMENT',
+    'INVALID_NOTE',
+    'NOT_FOUND',
+    'QUARANTINED',
+  ]);
   await e.close();
 });
 
@@ -572,6 +580,73 @@ test('purge reaches a bound view (P0.2)', async () => {
   assert.ok(p2.views[0].reason.length > 0);
   // no note content rides in the problem
   assert.ok(!JSON.stringify(p2.views).includes('zibellinotrem'));
+  await e.close();
+});
+
+// v0.4.2 (P0.1): `list` has no hidden ceilings. An explicit `limit` is
+// respected AS GIVEN (a local process, the ids are already in memory) —
+// Homun asks `limit: 100_000` on a bot's cell and must not be answered by a
+// silent cut at 1000; absent still means 100, as ever. `offset` pages
+// without holes or duplicates. `limit: 0` and `k: 0` are INVALID_ARGUMENT:
+// a page of zero is a caller's bug, not a result.
+test('list: no hidden ceilings, explicit limit respected (P0.1)', async () => {
+  const e = await engine();
+  const cell = await e.cell('tetti');
+  const TOTAL = 1500;
+  for (let i = 0; i < TOTAL; i++) {
+    await cell.put({
+      body: `nota numero ${i} su argomento-${i % 7}`,
+      source: 'homun:bot-a1',
+      confidence: 'stated',
+    });
+  }
+  // absent limit = 100, as ever
+  assert.equal((await cell.list()).length, 100);
+  // an explicit limit is respected AS GIVEN: no silent cut at 1000
+  assert.equal((await cell.list({ limit: 100_000 })).length, TOTAL);
+  assert.equal((await cell.list({ limit: TOTAL })).length, TOTAL);
+  // offset+limit page without holes or duplicates
+  const seen = [];
+  const PAGE = 137;
+  for (let off = 0; off < TOTAL; off += PAGE) {
+    seen.push(...(await cell.list({ offset: off, limit: PAGE })).map((n) => n.id));
+  }
+  assert.equal(seen.length, TOTAL, `${TOTAL} notes paged`);
+  assert.equal(new Set(seen).size, TOTAL, 'no duplicates across the pages');
+  assert.deepEqual(seen, (await cell.list({ limit: TOTAL })).map((n) => n.id));
+  // zero is a bug, not an empty page
+  await assert.rejects(
+    cell.list({ limit: 0 }),
+    (err) => err.code === 'INVALID_ARGUMENT',
+  );
+  await e.close();
+});
+
+// v0.4.2 (P0.1): the OTHER silent ceilings of the binding are gone too.
+// Search `k` is respected as given (absent = 10); the engine's own maxima
+// (graphHops 0–2, neighbors depth 1–4) are ERRORS now, never silent clamps.
+test('search k respected; hops/depth beyond the range are errors (P0.1)', async () => {
+  const e = await engine();
+  const cell = await e.cell('soffitti');
+  for (let i = 0; i < 150; i++) {
+    await cell.put({ body: `argomento-${i % 5} nota numero ${i}`, source: 's', confidence: 'stated' });
+  }
+  assert.equal((await cell.search({ text: 'argomento', k: 10 })).length, 10);
+  const big = await cell.search({ text: 'argomento', k: 200 });
+  assert.equal(big.length, 150, 'k beyond the old ceiling of 100 is respected');
+  await assert.rejects(
+    cell.search({ text: 'argomento', k: 0 }),
+    (err) => err.code === 'INVALID_ARGUMENT',
+  );
+  await assert.rejects(
+    cell.search({ text: 'argomento', graphHops: 3 }),
+    (err) => err.code === 'INVALID_ARGUMENT',
+  );
+  const n = await cell.put({ body: 'una nota che cita [[Roma]]', source: 's', confidence: 'stated' });
+  await assert.rejects(cell.neighbors(n.id, 5), (err) => err.code === 'INVALID_ARGUMENT');
+  // within the range they work as ever
+  assert.ok(Array.isArray(await cell.neighbors(n.id, 4)));
+  assert.ok((await cell.search({ text: 'Roma', graphHops: 2 })).length >= 1);
   await e.close();
 });
 
