@@ -12,6 +12,17 @@ const path = require('node:path');
 
 const { Engine, version } = require('..');
 
+// v0.4.2: the CLI binary the view tests spawn. ENGRAMMA_BIN wins; then
+// $CARGO_TARGET_DIR (a v0.4.1 leftover: with it set, the old lookup only
+// tried <repo>/target and found nothing), then the repo's own target.
+const engrammaBin = () =>
+  process.env.ENGRAMMA_BIN ||
+  [process.env.CARGO_TARGET_DIR, '../../../target']
+    .filter(Boolean)
+    .flatMap((t) => [`${t}/release/engramma`, `${t}/debug/engramma`])
+    .map((p) => path.resolve(__dirname, p))
+    .find((p) => fs.existsSync(p));
+
 const TMP = process.env.ENGRAMMA_TEST_TMP
   ? process.env.ENGRAMMA_TEST_TMP
   : fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'engramma-node-'));
@@ -288,11 +299,7 @@ test('modelStatus reports the builtin model (when present)', async () => {
 // everywhere — messages, unbind, vaultUnbind — like the notes' (the first 8
 // of a ULID are the timestamp: two views minted minutes apart share them).
 test('vaultUnbind takes the last 8 of the view id (P2.9)', async () => {
-  const cli =
-    process.env.ENGRAMMA_BIN ||
-    ['../../../target/release/engramma', '../../../target/debug/engramma']
-      .map((p) => path.resolve(__dirname, p))
-      .find((p) => fs.existsSync(p));
+  const cli = engrammaBin();
   assert.ok(cli, 'engramma binary not found: build it or set ENGRAMMA_BIN');
   const run = (args) => {
     const r = require('node:child_process').spawnSync(cli, args, { encoding: 'utf8' });
@@ -519,11 +526,7 @@ test('extensions round-trip, also through a patch (P1.3)', async () => {
 // honestly (`pending: ['vault']`, `scrubbed: false`, the problems listed).
 // The view is bound with the CLI, like the spec's hand proof.
 test('purge reaches a bound view (P0.2)', async () => {
-  const cli =
-    process.env.ENGRAMMA_BIN ||
-    ['../../../target/release/engramma', '../../../target/debug/engramma']
-      .map((p) => path.resolve(__dirname, p))
-      .find((p) => fs.existsSync(p));
+  const cli = engrammaBin();
   assert.ok(cli, 'engramma binary not found: build it or set ENGRAMMA_BIN');
   const run = (args) => {
     const r = require('node:child_process').spawnSync(cli, args, { encoding: 'utf8' });
@@ -831,13 +834,7 @@ test('dropCell with an open Cell: NOT_FOUND, in-flight ops finish (P0.3)', async
 // a second `vault init` REBINDS every note to the new view) — a reachable
 // view and an unreachable one cannot both hold bindings at once.
 test('dropCell reaches the views, and says the unreachable one (P0.3)', async () => {
-  const cli =
-    process.env.ENGRAMMA_BIN ||
-    [process.env.CARGO_TARGET_DIR, '../../../target']
-      .filter(Boolean)
-      .flatMap((t) => [`${t}/release/engramma`, `${t}/debug/engramma`])
-      .map((p) => path.resolve(__dirname, p))
-      .find((p) => fs.existsSync(p));
+  const cli = engrammaBin();
   assert.ok(cli, 'engramma binary not found: build it or set ENGRAMMA_BIN');
   const run = (args) => {
     const r = require('node:child_process').spawnSync(cli, args, { encoding: 'utf8' });
