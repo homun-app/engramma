@@ -1188,9 +1188,7 @@ impl Task for CellOpenTask {
         // v0.4.2 (P0.3): the generation gate comes first, so a dropCell in
         // flight serializes against every open of that name. v0.4.3 (P2.3):
         // gate AND open under the SAME lock — see open_tracked_cell
-        let (cell, tracker) = self
-            .handle
-            .open_tracked_cell(&self.name, self.create)?;
+        let (cell, tracker) = self.handle.open_tracked_cell(&self.name, self.create)?;
         let actor = match &self.actor {
             // v0.4.1 (P1.6): an empty actor is the same as none — the
             // engine's own stamps the writes

@@ -10,8 +10,8 @@
 
 use std::process::Command;
 
-use engramma_core::format::{At, Lang, Note, NoteType};
 use engramma_core::cell::CompactOptions;
+use engramma_core::format::{At, Lang, Note, NoteType};
 use engramma_core::{Cell, Confidence, Status};
 
 fn note(n: u16, body: &str) -> Note {
@@ -37,7 +37,8 @@ fn note(n: u16, body: &str) -> Note {
 }
 
 struct Fixture {
-    dir: tempfile::TempDir,
+    /// Keeps the temp folder alive for the Fixture's life (never read).
+    _dir: tempfile::TempDir,
     root: std::path::PathBuf,
 }
 
@@ -46,7 +47,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap(/* test-only */);
         let root = dir.path().join("root");
         std::fs::create_dir_all(root.join("cells")).unwrap(/* test-only */);
-        Fixture { dir, root }
+        Fixture { _dir: dir, root }
     }
 
     fn cell(&self, name: &str, bodies: &[&str]) -> std::path::PathBuf {
@@ -132,14 +133,25 @@ fn cell_list_skips_the_real_snapshots_and_they_go_with_their_cell() {
 
     // `cell list` says storia, not storia-snap-<head>
     let out = fx.run(&["cell", "list", "--json"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(stdout.contains("\"storia\""), "{stdout}");
-    assert!(!stdout.contains("storia-snap-"), "the snapshot is listed: {stdout}");
+    assert!(
+        !stdout.contains("storia-snap-"),
+        "the snapshot is listed: {stdout}"
+    );
 
     // and the drop takes the snapshot with its cell
     let out = fx.run(&["cell", "drop", "storia", "--reason", "prova"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!snap.exists(), "the snapshot survived its cell's drop");
     assert!(
         !fx.root.join("cells").join("storia.sqlite").exists(),
