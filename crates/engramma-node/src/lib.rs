@@ -982,6 +982,16 @@ impl EngineHandle {
                 "nome cella non valido: {name:?} (a-z 0-9 - _)"
             )));
         }
+        // v0.4.3 (P0.1): the snapshot-shaped name is reserved. A cell called
+        // `x-snap-7` would be indistinguishable from a snapshot of `x`: its
+        // file would ride with x's dropCell and `cells()` could never list
+        // it. `storia-snap-archivio` stays valid (the suffix is not digits)
+        if engramma_core::snapshot_of(&format!("{name}.sqlite")).is_some() {
+            return Err(invalid_argument(format!(
+                "nome cella riservato: {name:?} (il formato `-snap-<cifre>` \
+                 è delle istantanee di compattazione)"
+            )));
+        }
         Ok(self.root.join("cells").join(format!("{name}.sqlite")))
     }
 
@@ -1035,6 +1045,9 @@ impl EngineHandle {
 /// Every file a cell owns on disk (v0.4.2, P0.3): the database, its WAL and
 /// shm, and the compaction snapshots (`<name>-snap-<seq>.sqlite`, written
 /// next to the cell by `compact`). A whole-cell forgetting deletes them all.
+/// v0.4.3 (P0.1): the snapshots are the EXACT compact format — one
+/// predicate in the core — so a neighboring cell called
+/// `storia-snap-archivio` never rides with storia's drop.
 fn cell_files(path: &std::path::Path) -> Vec<PathBuf> {
     let mut out = vec![path.to_path_buf()];
     for suffix in ["-wal", "-shm"] {
@@ -1054,7 +1067,7 @@ fn cell_files(path: &std::path::Path) -> Vec<PathBuf> {
             .map(|e| e.path())
             .filter(|p| {
                 p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n.starts_with(&format!("{stem}-snap-")) && n.ends_with(".sqlite")
+                    engramma_core::snapshot_of(n).is_some_and(|(cell, _)| cell == stem)
                 })
             })
             .collect();
@@ -1202,6 +1215,15 @@ impl Task for CellsTask {
             std::fs::read_dir(self.root.join("cells")).map_err(|e| transport_err("IO", e))?;
         for entry in entries.flatten() {
             let p = entry.path();
+            // v0.4.3 (P0.1): a compaction snapshot is not a cell. A cell can
+            // no longer have that name (reserved in cell_path), so a file in
+            // that shape is ALWAYS a snapshot — it does not list
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| engramma_core::snapshot_of(n).is_some())
+            {
+                continue;
+            }
             if p.extension().is_some_and(|e| e == "sqlite")
                 && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
             {

@@ -1472,6 +1472,16 @@ fn run_cell(cli: &Cli, action: &CellAction) -> Result<(), CliError> {
                 for entry in std::fs::read_dir(&dir)? {
                     let entry = entry?;
                     let p = entry.path();
+                    // v0.4.3 (P0.1): a compaction snapshot is not a cell. A
+                    // cell can no longer have that name (refused at
+                    // creation), so a file in that shape is ALWAYS a
+                    // snapshot — it does not list
+                    if p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| engramma_core::snapshot_of(n).is_some())
+                    {
+                        continue;
+                    }
                     if p.extension().is_some_and(|e| e == "sqlite")
                         && let Some(stem) = p.file_stem().and_then(|s| s.to_str())
                     {
@@ -1490,6 +1500,17 @@ fn run_cell(cli: &Cli, action: &CellAction) -> Result<(), CliError> {
             Ok(())
         }
         CellAction::Create { name } => {
+            // v0.4.3 (P0.1): the snapshot-shaped name is reserved — a cell
+            // called `x-snap-7` would be indistinguishable from a snapshot
+            // of `x` (its file would ride with x's drop, `cell list` could
+            // never show it). Opening an existing cell by name stays
+            // possible: the CLI is the way out for legacy cells
+            if engramma_core::snapshot_of(&format!("{name}.sqlite")).is_some() {
+                return Err(CliError::usage(format!(
+                    "cell name `{name}` is reserved (the `-snap-<digits>` shape \
+                     belongs to compact's snapshots)"
+                )));
+            }
             let path = cell_path(cli, name)?;
             Cell::create(&path, name, "cli")?;
             report_ok(cli, "creata", name);
@@ -1525,12 +1546,15 @@ fn run_cell(cli: &Cli, action: &CellAction) -> Result<(), CliError> {
                 std::fs::remove_file(&p).ok();
             }
             if let Some(dir) = path.parent() {
-                let prefix = format!("{name}-snap-");
+                // v0.4.3 (P0.1): only THIS cell's own snapshots — the exact
+                // compact format, one predicate in the core. The old prefix
+                // match took a neighboring cell called `storia-snap-archivio`
+                // with it
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let file_name = entry.file_name();
                         let n = file_name.to_string_lossy();
-                        if n.starts_with(&prefix) && n.ends_with(".sqlite") {
+                        if engramma_core::snapshot_of(&n).is_some_and(|(cell, _)| cell == name) {
                             std::fs::remove_file(entry.path()).ok();
                         }
                     }

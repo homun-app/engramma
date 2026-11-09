@@ -16,7 +16,7 @@ pub mod search;
 pub mod text;
 pub mod vector;
 
-pub use cell::{Cell, NotePatch, PurgeReport, VaultFile, VaultView, VerifyReport};
+pub use cell::{snapshot_of, Cell, NotePatch, PurgeReport, VaultFile, VaultView, VerifyReport};
 pub use cell::{EmbedPendingReport, ModelCoverage, ModelRow, ModelState};
 pub use consolidation::{Candidate, CandidateKind, Consolidation};
 pub use embed::{Embedder, TextKind};

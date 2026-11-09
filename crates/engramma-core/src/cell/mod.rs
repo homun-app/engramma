@@ -506,6 +506,26 @@ impl Drop for Inner {
     }
 }
 
+/// v0.4.3 (P0.1): the ONE recognizer of a compaction snapshot file. Only
+/// the exact format `compact` writes — `<cell>-snap-<digits>.sqlite`
+/// (`{}-snap-{head_seq}.sqlite`) — is a snapshot **of `<cell>`**: a
+/// neighboring CELL called `storia-snap-archivio` is not (the suffix is
+/// not all digits), and neither is a `-snap-` in the middle of a longer
+/// name. The three places that used to agree on a loose prefix match (the
+/// engine binding's `dropCell`, the CLI's `cell drop` and this module's
+/// [`Cell`] footprint) all ask this predicate now, so a whole-cell
+/// forgetting can only ever take the files of THAT cell.
+pub fn snapshot_of(file_name: &str) -> Option<(&str, u64)> {
+    let stem = file_name.strip_suffix(".sqlite")?;
+    let split = stem.rfind("-snap-")?;
+    let (cell, rest) = stem.split_at(split);
+    let seq = rest.strip_prefix("-snap-")?;
+    if cell.is_empty() || seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((cell, seq.parse().ok()?))
+}
+
 /// An open cell. Cheap to clone; one process-wide write lock per file.
 #[derive(Clone)]
 pub struct Cell {
@@ -1869,7 +1889,10 @@ impl Cell {
         {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(&format!("{stem}-snap-")) && name.ends_with(".sqlite") {
+                // v0.4.3 (P0.1): only THIS cell's own snapshots belong in
+                // its bill — a neighboring cell named `storia-snap-archivio`
+                // used to be counted into storia's footprint
+                if snapshot_of(&name).is_some_and(|(cell, _)| cell == stem) {
                     total += entry.metadata().map(|m| m.len()).unwrap_or(0);
                 }
             }
@@ -2775,6 +2798,25 @@ fn compare_states(a: &Connection, b: &Connection) -> Result<Option<String>, Cell
 mod tests {
     use super::*;
     use crate::format::NoteType;
+
+    /// v0.4.3 (P0.1): the one snapshot recognizer — only the exact compact
+    /// format, never a neighboring cell whose name merely looks like one.
+    #[test]
+    fn snapshot_of_recognizes_only_the_compact_format() {
+        assert_eq!(snapshot_of("storia-snap-2.sqlite"), Some(("storia", 2)));
+        // the LAST `-snap-` splits: a cell may be called `a-snap-b`
+        assert_eq!(snapshot_of("a-snap-b-snap-3.sqlite"), Some(("a-snap-b", 3)));
+        // a neighboring CELL, not a snapshot (the suffix is not all digits)
+        assert_eq!(snapshot_of("storia-snap-archivio.sqlite"), None);
+        assert_eq!(snapshot_of("storia-snap-x7.sqlite"), None);
+        // not the sidecars, not the plain cell, not an empty cell name
+        assert_eq!(snapshot_of("storia-snap-2.sqlite-wal"), None);
+        assert_eq!(snapshot_of("storia-snap-2.sqlite-shm"), None);
+        assert_eq!(snapshot_of("storia.sqlite"), None);
+        assert_eq!(snapshot_of("-snap-7.sqlite"), None);
+        assert_eq!(snapshot_of("storia-snap-.sqlite"), None);
+        assert_eq!(snapshot_of("storia-snap-99999999999999999999.sqlite"), None);
+    }
 
     fn at(day: u8) -> At {
         At(

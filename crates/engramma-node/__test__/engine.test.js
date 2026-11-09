@@ -891,6 +891,73 @@ test('dropCell reaches the views, and says the unreachable one (P0.3)', async ()
   await e.close();
 });
 
+// v0.4.3 (P0.1): snapshots and cells share the folder, and only the EXACT
+// compact format `<cell>-snap-<digits>.sqlite` is a snapshot. `storia-snap-2`
+// is storia's snapshot; `storia-snap-archivio` is a CELL whose name merely
+// looks like one — dropCell('storia') must forget storia (its file, WAL and
+// snapshot) and leave the neighbor whole on disk, readable from a FRESH
+// engine. And `cells()` never lists a snapshot: a cell cannot have that
+// name anymore, so a file in that shape is always a snapshot.
+test('dropCell spares the neighbors; a snapshot is not a cell (P0.1)', async () => {
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  const storia = await e.cell('storia');
+  await storia.put({ body: 'la nota di storia', source: 's', confidence: 'stated' });
+  // a REAL snapshot, the format compact writes: storia-snap-<head>.sqlite
+  await storia.compact(1, { keepSnapshot: true });
+  const cellsDir = path.join(rootDir, 'cells');
+  const snap = fs.readdirSync(cellsDir).find((n) => /^storia-snap-\d+\.sqlite$/.test(n));
+  assert.ok(snap, `compact wrote a snapshot: ${fs.readdirSync(cellsDir)}`);
+
+  // the neighbor whose name merely LOOKS like a snapshot, and one more cell
+  const archivio = await e.cell('storia-snap-archivio');
+  await archivio.put({ body: "la nota dell'archivio", source: 's', confidence: 'stated' });
+  const storia2 = await e.cell('storia2');
+  await storia2.put({ body: 'la nota di storia2', source: 's', confidence: 'stated' });
+
+  // cells() lists the cells, NEVER the snapshot
+  const listed = await e.cells();
+  assert.ok(listed.includes('storia'), `${listed}`);
+  assert.ok(listed.includes('storia-snap-archivio'), `${listed}`);
+  assert.ok(!listed.some((n) => /^storia-snap-\d+$/.test(n)), `the snapshot is listed: ${listed}`);
+
+  await e.dropCell('storia', 'prova del punto 1');
+  // storia went: the db, its WAL/shm and ITS snapshot
+  const left = fs.readdirSync(cellsDir).sort();
+  assert.ok(!left.includes('storia.sqlite'), `${left}`);
+  assert.ok(
+    !left.some((n) => /^storia-snap-\d+\.sqlite(-wal|-shm)?$/.test(n)),
+    `storia's snapshot survived: ${left}`,
+  );
+  // the neighbors are whole on disk, no orphan wal/shm of the dropped cell
+  assert.ok(left.includes('storia-snap-archivio.sqlite'), `${left}`);
+  assert.ok(left.includes('storia2.sqlite'), `${left}`);
+  // and they re-read WHOLE from a fresh engine (the data, not a RAM ghost)
+  await e.close();
+  const e2 = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  const arch2 = await e2.cell('storia-snap-archivio', { create: false });
+  const archNotes = await arch2.list();
+  assert.equal(archNotes.length, 1, `${JSON.stringify(archNotes)}`);
+  assert.match(archNotes[0].body, /archivio/);
+  const due = await e2.cell('storia2', { create: false });
+  assert.equal((await due.list()).length, 1);
+  await e2.close();
+});
+
+// v0.4.3 (P0.1): the snapshot-SHAPED name is reserved. A cell called
+// `x-snap-7` would be indistinguishable from a snapshot of `x`: its file
+// would ride with x's drop and never be listed. INVALID_ARGUMENT, like
+// every other bad argument of the call. `storia-snap-archivio` stays valid:
+// it does not end with digits.
+test('a cell name that looks like a snapshot is reserved (P0.1)', async () => {
+  const e = await engine();
+  await assert.rejects(e.cell('x-snap-7'), (err) => err.code === 'INVALID_ARGUMENT');
+  await assert.rejects(e.dropCell('x-snap-7', 'prova'), (err) => err.code === 'INVALID_ARGUMENT');
+  const ok = await e.cell('storia-snap-archivio');
+  assert.equal((await ok.list()).length, 0);
+  await e.close();
+});
+
 // v0.4.2 (P1.4): pullModel attaches the embedder to the OPEN engine. Until
 // v0.4.1 the embedder bound at open: after a pull the engine kept answering
 // text+graph and embedPending said MODEL_MISSING until close/open — Homun
