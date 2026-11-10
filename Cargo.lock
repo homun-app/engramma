@@ -654,6 +654,7 @@ dependencies = [
  "engramma-core",
  "engramma-embed",
  "ring",
+ "serde",
  "serde_json",
  "tempfile",
  "time",

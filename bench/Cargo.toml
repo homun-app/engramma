@@ -20,6 +20,7 @@ serde_json.workspace = true
 # digest crate already in the tree (rustls, via ureq) and indexes the
 # vector cache by sha256 of the round text.
 ring.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 # the longmemeval example builds its one-cell-per-question tree in a

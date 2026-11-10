@@ -27,7 +27,7 @@
 //!
 //! ```text
 //! cargo run -p engramma-bench --release --example longmemeval -- \
-//!          [--mode text|hybrid|both] [--subset N] [--data PATH] [--out PATH.md]
+//!          [--mode text|hybrid|both|vector] [--subset N] [--data PATH] [--out PATH.md]
 //! ```
 //!
 //! `--subset N` (seed 42, proportional per `question_type`, ids printed)
@@ -42,15 +42,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use engramma_core::format::{At, Lang, Note, NoteType, YamlValue};
-use engramma_core::search::{Hit, Query, Semantic};
+use engramma_core::format::yaml::YamlValue;
+use engramma_core::format::{At, Lang, Note, NoteType};
+use engramma_core::search::{Hit, Mode, Query, Semantic};
 use engramma_core::{Cell, Confidence, EmbedError, Embedder, Status, TextKind};
 use serde::Deserialize;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use ulid::Ulid;
 
-const EXPECTED_SHA256: &str =
-    "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442";
+const EXPECTED_SHA256: &str = "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442";
 /// Ranked rounds per question: session-distinct @10 needs more than 10
 /// raw hits (the original walks its retrieved list the same way).
 const TOP_K: usize = 50;
@@ -195,9 +195,11 @@ impl VectorCache {
                 index.insert(key, (i * record) as u64);
             }
         }
+        // read+append: `get` reads the record at its offset, `put` appends
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .open(path)
             .unwrap_or_else(|e| die(format!("cannot open {}: {e}", path.display())));
         Self {
@@ -250,13 +252,15 @@ impl VectorCache {
         for v in vector {
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        use std::io::Write as _;
+        use std::io::{Seek as _, SeekFrom, Write as _};
         let mut slot = match self.file.lock() {
             Ok(f) => f,
             Err(_) => return,
         };
         let Some(file) = slot.as_mut() else { return };
-        let Ok(offset) = file.stream_position() else {
+        // the read cursor may sit anywhere after a `get`: the record offset
+        // is the END of the file, where the append-mode write will land
+        let Ok(offset) = file.seek(SeekFrom::End(0)) else {
             return;
         };
         if file.write_all(&buf).and_then(|_| file.flush()).is_ok() {
@@ -265,10 +269,6 @@ impl VectorCache {
             }
             self.embedded_chars.fetch_add(chars, Ordering::Relaxed);
         }
-    }
-
-    fn records(&self) -> usize {
-        self.index.lock().map_or(0, |i| i.len())
     }
 }
 
@@ -383,7 +383,11 @@ impl Metrics {
                 self.recall_all[ki] += 1.0;
             }
             let ideal = dcg(&vec![true; relevant_total], *k);
-            self.ndcg[ki] += if ideal > 0.0 { dcg(top, *k) / ideal } else { 1.0 };
+            self.ndcg[ki] += if ideal > 0.0 {
+                dcg(top, *k) / ideal
+            } else {
+                1.0
+            };
         }
         if relevant_total > 0 {
             self.n_rel += 1;
@@ -476,7 +480,8 @@ fn run_question(
         .unwrap_or_else(|e| die(format!("{}: cell create: {e}", q.question_id)));
     let mut by_id: HashMap<Ulid, usize> = HashMap::with_capacity(rounds.len());
     for (i, round) in rounds.iter().enumerate() {
-        let id = Ulid::new();
+        let id = engramma_core::id::new_ulid()
+            .unwrap_or_else(|e| die(format!("{}: ulid: {e}", q.question_id)));
         let note = Note {
             id,
             note_type: NoteType::Note,
@@ -494,7 +499,10 @@ fn run_question(
             created_at: At(round.at),
             updated_at: At(round.at),
             extensions: vec![
-                ("x-lme-session".into(), YamlValue::Str(round.session.clone())),
+                (
+                    "x-lme-session".into(),
+                    YamlValue::Str(round.session.clone()),
+                ),
                 ("x-lme-round".into(), YamlValue::Int(i as i64)),
             ],
         };
@@ -523,7 +531,7 @@ fn run_question(
             .unwrap_or_else(|e| die(format!("{}: search: {e}", q.question_id)));
         absorb("text", eval_question(q, &hits, &by_id, &rounds));
     }
-    if mode == "hybrid" || mode == "both" {
+    if mode == "hybrid" || mode == "both" || mode == "vector" {
         let Some(embedder) = embedder else {
             die("hybrid needs the builtin model");
         };
@@ -538,14 +546,23 @@ fn run_question(
                 q.question_id, report.remaining
             ));
         }
-        let sem = Semantic::new(Arc::clone(embedder) as Arc<dyn Embedder>);
+        // `vector` is the diagnostic of the phase: the cosine branch alone,
+        // to tell a fusion problem from an embedding problem
+        let sem = match mode {
+            "vector" => Semantic::new(embedder.clone()).with_mode(Mode::Vector),
+            _ => Semantic::new(embedder.clone()),
+        };
         let mut query = Query::text(&q.question);
         query.k = TOP_K;
         query.lang = Some(Lang::En);
-        let hits = cell
+        let outcome = cell
             .search_semantic_with_now(&query, now, &sem)
             .unwrap_or_else(|e| die(format!("{}: hybrid search: {e}", q.question_id)));
-        absorb("hybrid", eval_question(q, &hits, &by_id, &rounds));
+        let hits = outcome.hits;
+        match mode {
+            "vector" => absorb("vector", eval_question(q, &hits, &by_id, &rounds)),
+            _ => absorb("hybrid", eval_question(q, &hits, &by_id, &rounds)),
+        }
     }
 
     drop(cell);
@@ -573,13 +590,13 @@ fn parse_args() -> Args {
         data: None,
         out: None,
     };
-    let mut it = std::env::args().skip(2);
+    let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--mode" => {
                 args.mode = it
                     .next()
-                    .unwrap_or_else(|| die("--mode wants text|hybrid|both"));
+                    .unwrap_or_else(|| die("--mode wants text|hybrid|both|vector"));
             }
             "--subset" => {
                 args.subset = it
@@ -601,8 +618,8 @@ fn parse_args() -> Args {
             other => die(format!("unknown argument `{other}`")),
         }
     }
-    if !matches!(args.mode.as_str(), "text" | "hybrid" | "both") {
-        die("--mode wants text|hybrid|both");
+    if !matches!(args.mode.as_str(), "text" | "hybrid" | "both" | "vector") {
+        die("--mode wants text|hybrid|both|vector");
     }
     args
 }
@@ -641,8 +658,9 @@ fn pick_subset(questions: &[Question], n: usize) -> Vec<usize> {
     exact.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     let mut left = n - assigned;
     let mut ti = 0;
+    let n_types = exact.len();
     while left > 0 {
-        if let Some(slot) = exact.get_mut(ti % exact.len()) {
+        if let Some(slot) = exact.get_mut(ti % n_types) {
             slot.0 += 1;
         }
         left -= 1;
@@ -651,7 +669,9 @@ fn pick_subset(questions: &[Question], n: usize) -> Vec<usize> {
     let mut picked = Vec::with_capacity(n);
     for (take, t, _) in &exact {
         let mut ids = by_type[*t].clone();
-        let mut rng = Rng(SUBSET_SEED ^ u64::from(t.len() << 8) ^ t.bytes().map(u64::from).sum::<u64>());
+        // the seed differs per type so the picks are independent
+        let seed = SUBSET_SEED ^ ((t.len() as u64) << 8) ^ t.bytes().map(u64::from).sum::<u64>();
+        let mut rng = Rng(seed);
         for i in (1..ids.len()).rev() {
             let j = rng.below(i + 1);
             ids.swap(i, j);
@@ -667,12 +687,11 @@ fn rss_mib() -> u64 {
     {
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("VmRSS:") {
-                if let Some(kb) = rest.split_whitespace().next() {
-                    if let Ok(kb) = kb.parse::<u64>() {
-                        return kb / 1024;
-                    }
-                }
+            if let Some(rest) = line.strip_prefix("VmRSS:")
+                && let Some(kb) = rest.split_whitespace().next()
+                && let Ok(kb) = kb.parse::<u64>()
+            {
+                return kb / 1024;
             }
         }
         0
@@ -713,19 +732,15 @@ fn main() {
     }
     let bytes = std::fs::read(&data).unwrap_or_else(|e| die(format!("{}: {e}", data.display())));
     let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
-    let hex: String = digest
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
     if hex != EXPECTED_SHA256 {
         die(format!(
             "sha256 mismatch on {}: expected {EXPECTED_SHA256}, found {hex}",
             data.display()
         ));
     }
-    let questions: Vec<Question> = serde_json::from_slice(&bytes)
-        .unwrap_or_else(|e| die(format!("{}: {e}", data.display())));
+    let questions: Vec<Question> =
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| die(format!("{}: {e}", data.display())));
     drop(bytes);
     let total = questions.len();
     let questions: Vec<Question> = questions
@@ -774,7 +789,10 @@ fn main() {
             &cache_dir.join(format!("vec-cache-{safe}.bin")),
             builtin.dim(),
         ));
-        Some(Arc::new(CachedBuiltin { inner: builtin, cache }))
+        Some(Arc::new(CachedBuiltin {
+            inner: builtin,
+            cache,
+        }))
     } else {
         None
     };
@@ -830,12 +848,23 @@ fn main() {
     }
     report.push_str("\n| modalità | livello | tipo | any@5 | all@5 | ndcg@5 | any@10 | all@10 | ndcg@10 | n |\n");
     report.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
-    let mut modes: Vec<&str> = table.keys().map(|(m, _, _)| *m).collect();
-    modes.dedup();
+    // the report's mode order is fixed; only the modes that ran appear
+    let modes: Vec<&str> = ["text", "hybrid", "vector"]
+        .into_iter()
+        .filter(|m| table.keys().any(|(mm, _, _)| mm == m))
+        .collect();
     let mut rows: Vec<String> = Vec::new();
     for mode in &modes {
         for level in ["sessione", "turno"] {
-            for qtype in ["TOTALE", "knowledge-update", "multi-session", "single-session-assistant", "single-session-preference", "single-session-user", "temporal-reasoning"] {
+            for qtype in [
+                "TOTALE",
+                "knowledge-update",
+                "multi-session",
+                "single-session-assistant",
+                "single-session-preference",
+                "single-session-user",
+                "temporal-reasoning",
+            ] {
                 if let Some(m) = table.get(&(mode, level, qtype)) {
                     rows.push(format!("| {mode} | {level} | {qtype} {}", m.cells()));
                 }
