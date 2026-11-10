@@ -147,7 +147,7 @@ claude mcp add engramma -- /path/to/engramma mcp --root ~/.engramma --cells fami
 - `crates/engramma-vault` — the bidirectional Markdown view (`engramma vault`)
 - `crates/engramma-node` — the Node.js (N-API) binding, for Homun and any
   Node/Electron host (`docs/node.md`); its Rust allocations go through
-  mimalloc (v0.4.4)
+  mimalloc on macOS (v0.4.4; per-platform since v0.4.5)
 - `crates/engramma-cli` — the `engramma` binary
 - `crates/engramma-mcp` — the MCP server (stdio, read-only)
 - `spec/` — the note format specification, with valid/invalid examples used
