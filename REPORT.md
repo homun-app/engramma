@@ -3773,3 +3773,490 @@ index.d.ts                  bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a648
   le celle di LongMemEval vivevano in un `tempfile::TempDir` e sono
   andate via da sole; la **cache dei vettori resta** in
   `~/.cache/engramma/bench/` (`vec-cache-granite-embedding-97m-multilingual-r2-835ad140.bin`, 73,8 MB, 47 060 round distinti (deduplicato dopo il bug sottostante)).
+
+# REPORT — Engramma v0.4.5 (il peso della fusione e il picco della RAM)
+
+Data: 2026-11-10. Base: `main` @ `186e347` (dopo il tag `fase-v0.4.4`).
+Un commit per punto, con dentro solo i file di quel punto; la misura o
+il test che mostra il problema prima della correzione. Tutto costruito
+con `cargo --offline`, Rust 1.95.0, macOS arm64 (darwin 27, 10 core,
+24 GB). **Nessuna crate nuova**: `tract-nnef` è stata aggiunta come
+dipendenza diretta per la prova della cache NNEF (stessa versione
+0.23.10 già nel lock, senza feature) e poi **rimossa** quando la prova
+è fallita — il `Cargo.lock` finale è identico a quello della v0.4.4.
+Nessun `unsafe` nuovo, nessun `unwrap`/`expect` fuori dai test, clippy
+`-D warnings` verde su macOS e su Linux. Il repo di Homun non è stato
+toccato.
+
+Disco: `du -sh target` — inizio fase **6,4 GB**, dopo P0 6,5, a metà
+fase 7,3–7,6 (build di rilascio dei banchi e della baseline), fine
+**8,2 GB**. Spazio libero mai sotto 130 GB. `~/.cache/cargo-target`
+mai toccata.
+
+La macchina ha condiviso la CPU per circa metà giornata (l'embedding
+delle 320 domande di test e la taratura italiana sono corsi in
+parallelo per ore, load medio 15–30): dove pesa è detto; tutte le
+coppie prima/dopo sensibili al tempo sono corse a macchina ferma.
+
+## P0 — le metriche di LongMemEval, esattamente quelle ufficiali
+
+La verifica v0.4.4 aveva trovato `recall_any`/`recall_all` già identici
+all'ufficiale e l'**ndcg di sessione no**: l'esempio deduplicava le
+sessioni e calcolava l'ndcg sulla lista delle distinte. L'ufficiale
+(`evaluate_retrieval_turn2session` → `evaluate_retrieval` → `ndcg`):
+
+1. gli id di round diventano id di sessione togliendo l'ultimo
+   segmento; le sessioni giuste sono un insieme;
+2. `k_eff` parte da k e cresce finché i primi `k_eff` risultati
+   contengono k sessioni **distinte** (o la classifica finisce);
+3. la lista **non si deduplica**: i primi `k_eff` risultati restano
+   tutti, ognuno con la rilevanza della propria sessione;
+   - `recall_any`/`recall_all` sull'**insieme** delle sessioni del
+     prefisso (≡ le prime min(k, distinte) distinte: per questo i
+     recall erano già giusti);
+   - `dcg(r, k_eff) = r[0] + Σ_{i≥1} r[i]/log2(i+1)`;
+   - l'**ideale** conta i round del **corpus** nelle sessioni giuste:
+     `min(k_eff, R_a)` uni, con `R_a` = round del corpus nelle sessioni
+     di risposta — non le sole con `has_answer`;
+   - ndcg = 0 se l'ideale è 0.
+
+**La correzione** (`bench/examples/longmemeval.rs`, commit `a680122`):
+`Metrics::add_session_ranking` implementa il taglio `k_eff`, i recall
+sull'insieme e l'ndcg non deduplicato; `add_ranking` resta quello di
+turno. Test unitari nell'esempio stesso
+(`cargo test -p engramma-bench --example longmemeval`):
+
+- `session_ndcg_is_the_official_turn2session_one` — classifica a mano
+  `A A B x1 x2 x3 A` con due round della stessa sessione giusta in
+  testa, risposte {A, B}, `R_a` = 5:
+  k=5 → k_eff = 6, rels `1 1 1 0 0 0`, dcg = 2,6309297536, ideale =
+  3,5616063117 → **ndcg@5 = 0,7386919**; k=10 → k_eff = 7, rels
+  `1 1 1 0 0 0 1`, dcg = 2,9871369407 → **ndcg@10 = 0,8387050**. La
+  versione deduplicata della v0.4.4 dava 1,0/1,0: il test distingue le
+  due;
+- `session_recalls_when_one_answer_session_is_missing` — any 1, all 0,
+  ndcg = 1/3,1309297536 = **0,3193939**;
+- `turn_level_metrics_are_unchanged` — fissa il turno (any 1, all 0,
+  ndcg = 1,6309297536/2,6309297536 = **0,6199062**): P0 tocca solo la
+  sessione.
+
+**Le corse rifatte** (release, cache dei vettori calda; il testo non
+usa vettori). I numeri nuovi accanto ai vecchi — cambiano SOLO le due
+colonne ndcg di sessione; le righe `turno` sono byte-identiche,
+verificato con `diff` sulle righe estratte:
+
+| corsa | metrica | v0.4.4 (deduplicato) | v0.4.5 (ufficiale) |
+|---|---|---|---|
+| testo, 470 | sessione any@5 / all@5 | 0,9702 / 0,8447 | identici |
+| testo, 470 | sessione ndcg@5 / @10 | 0,8828 / 0,8968 | **0,6607 / 0,6504** |
+| testo, 150 | sessione ndcg@5 / @10 | 0,9042 / 0,9158 | **0,6830 / 0,6714** |
+| ibrida, 150 | sessione ndcg@5 / @10 | 0,9324 / 0,9426 | **0,7719 / 0,7896** |
+| ibrida, 150 | sessione any@5 / all@5 | 0,9733 / 0,9000 | identici |
+| tutte le corse | righe turno | — | byte-identiche |
+
+Lettura: con l'ideale che conta i round del corpus, l'ndcg di sessione
+scende ovunque e la relazione si inverte in profondità — **l'ibrida
+batte il testo sull'ndcg di sessione** (0,7719 contro 0,6830 @5 sulle
+150) mentre il turno resta del testo (0,7276 contro 0,6765). Il riquadro
+LongMemEval del DESIGN diceva «la fusione vince in profondità» citando
+proprio l'ndcg deduplicato: letto sul numero sbagliato, riscritto in P3.
+
+## P1 — α: tarato su due banchi, confermato su domande tenute da parte
+
+### La divisione delle domande (fissata prima di guardare i numeri)
+
+- **dev** = le 150 della v0.4.4 (seme 42, proporzionali per tipo, gli
+  stessi id elencati nel REPORT v0.4.4);
+- **test** = le altre **320** non `_abs`: le 470 meno le dev, ordine
+  del dataset. Costruita con uno script python a parte (dataset +
+  lista dev del REPORT v0.4.4) e riprodotta **identica** dall'esempio
+  (`--questions test`, confronto con `diff`). SHA256 della lista (id
+  separati da «a capo», ordine del dataset, UTF-8):
+  **`c44755696a7ebcebe4d99748877b9ddca717e5bec4b3830f878abf6f8b8c0414`**.
+- Le manopole nell'esempio: `--fusion convex:<α>|rrf:<k>` (predefinito
+  il `Fusion::default()` del motore), `--hops 0|1|2`, `--questions
+  dev|test|all`; il nome della configurazione va nell'intestazione del
+  rapporto.
+
+### La regola di scelta (scritta PRIMA delle tabelle, con data)
+
+1. **Ammissibile**: MRR pesato ≥ 0,8529 − 0,010 = **0,8429** sul banco
+   italiano E minimo fra i vicini ±0,1 di α ≥ 0,8483 − 0,010 = **0,8383**.
+2. Fra gli ammissibili vince il **turno ndcg@5** più alto su dev;
+   parità entro 0,005 → sessione `all@5`; ancora parità → il più vicino
+   a 0,7.
+3. Se nessun α < 0,7 fosse ammissibile: niente cambio, tabella e
+   distanza fra i due ottimi nel REPORT, decisione all'utente.
+4. Conferma su test, UNA corsa: ibrida > solo testo su sessione
+   any@5, sessione all@5 e turno ndcg@5, altrimenti niente cambio. Non
+   si ritarra guardando test.
+
+### L'embedding delle 320 di test
+
+Stima prima di partire: 66 174 testi di round distinti nelle domande
+di test, 60 010 assenti dalla cache, 120,9 M caratteri → ~2,1 h a
+16 k caratteri/s. Corsa reale in background (`nohup`, log, cache
+incrementale: ogni round scritto appena incorporato), con lo stdout —
+la tabella dei numeri di test — in `/dev/null`: **nessun numero di test
+è stato guardato prima della scelta di α**. Esito: 320/320 in 8 400 s
+(≈ 2 h 20; la macchina condivideva la CPU con la taratura: load 15–30),
+RSS massima del processo 2 181 MB, zero round non incorporati (meta:
+l'esempio esce di errore se `remaining ≠ 0`). Nota a posteriori: la
+cache cresce oltre la previsione perché il motore incorpora i **pezzi**
+in cui spezza i round lunghi, non solo i round interi (124 763 chiavi
+distinte a fine corsa; 61 doppioni benigni, testi ripetuti nello stesso
+lotto); la conferma con cache calda ha riusato 108 883 record senza
+incorporarne nessuno di nuovo: copertura completa.
+
+### (a) Il banco italiano — la griglia v0.3.2 rifatta
+
+`engramma-bench --calibrate --notes 100000 --runs 3` (release). La
+griglia è tornata alla forma v0.3.2 (convex, peso del grafo 0,35 fisso,
+semina fusa), α da 0,2 a 0,8 così che ogni candidato abbia i vicini
+±0,1 in griglia, più `rrf:60` e il riferimento 0,6/0,40 della v0.3.1.
+MRR pesato per numero di domande, mediana dei giri, e la colonna del
+minimo fra i vicini ±0,1 di α. La fase «vincitore» della v0.4.1 non
+esiste più: la scelta sta qui, non nel banco.
+
+| configurazione | pesato@100k | min vicini ±0,1 α | fattuali | parafrasi | multi-salto | inglese |
+|---|---|---|---|---|---|---|
+| convex α0,2 g0,35 | 0,6874 | 0,6874 | 0,8001 | 0,6469 | 0,6937 | 0,5324 |
+| convex α0,3 g0,35 | 0,7902 | 0,6874 | 0,8688 | 0,7760 | 0,7482 | 0,6717 |
+| convex α0,4 g0,35 | 0,8397 | 0,7902 | 0,8946 | 0,8374 | 0,7950 | 0,7490 |
+| convex α0,5 g0,35 | 0,8577 | 0,8397 | 0,9066 | 0,8588 | 0,7504 | 0,7881 |
+| convex α0,6 g0,35 | 0,8527 | 0,8527 | 0,9104 | 0,8705 | 0,4568 | 0,8090 |
+| convex α0,7 g0,35 | 0,8529 | 0,8485 | 0,9118 | 0,8730 | 0,3556 | 0,8274 |
+| convex α0,8 g0,35 | 0,8485 | 0,8485 | 0,9044 | 0,8710 | 0,2887 | 0,8397 |
+| rrf:60 g0,35 | 0,6536 | — | 0,7762 | 0,6328 | 0,2870 | 0,5381 |
+| rif α0,6 g0,40 (v0.3.1) | 0,8656 | — | 0,9099 | 0,8624 | 0,7952 | 0,8023 |
+
+Le celle α0,4–α0,7 a peso 0,35 riproducono la v0.3.2 al quarta cifra
+(0,8397 / 0,8577 / 0,8527 / 0,8529): stessa misura, stesso banco. Il
+minimo dei vicini di α=0,7 qui è 0,8485 e non 0,8483 perché la finestra
+della v0.3.2 comprendeva anche i vicini del peso del grafo.
+
+### (b) LongMemEval dev — la griglia
+
+Le stesse 150 domande, cache calda (51 268 riusi, 0 nuovi per ogni
+configurazione). Il turno ndcg@5 — la metrica della regola — in grassetto:
+
+| fusione | ses. any@5 | ses. all@5 | ses. ndcg@5 | **turno ndcg@5** | turno any@5 | turno all@5 |
+|---|---|---|---|---|---|---|
+| solo testo | 0,9867 | 0,8667 | 0,6830 | **0,7276** | 0,9000 | 0,7133 |
+| convex 0,3 | 0,9933 | 0,8933 | 0,7556 | **0,7529** | 0,9200 | 0,7267 |
+| convex 0,4 | 0,9867 | 0,9133 | 0,7705 | **0,7475** | 0,9200 | 0,7200 |
+| convex 0,5 | 0,9933 | 0,9200 | 0,7815 | **0,7303** | 0,9133 | 0,7067 |
+| convex 0,6 | 0,9800 | 0,9067 | 0,7789 | **0,7049** | 0,8933 | 0,6867 |
+| convex 0,7 (vecchio) | 0,9733 | 0,9000 | 0,7719 | **0,6765** | 0,8800 | 0,6600 |
+| rrf:60 | 0,9800 | 0,9000 | 0,7625 | **0,7045** | 0,8867 | 0,6933 |
+
+Due sanità: la corsa `--fusion convex:0.7` riproduce riga per riga
+l'ibrida predefinita del P0 (le manopole non perturbano il
+predefinito), e la tabella delle 150 rifatta col codice P2
+(ordinamento per lunghezza, budget, pool fisso) è **byte-identica**
+alla corsa P0 col codice v0.4.4.
+
+### La decisione
+
+Ammissibili: **α0,5** (0,8577 / 0,8397), **α0,6** (0,8527 / 0,8527),
+**α0,7** (0,8529 / 0,8485). Fuori: α0,3 (MRR 0,7902), α0,4 (0,8397,
+sotto soglia di 0,0032), rrf:60 (0,6536). Fra gli ammissibili vince il
+turno ndcg@5 su dev: **α = 0,5** (0,7303 contro 0,7049 e 0,6765, senza
+parità). Il punto 3 della regola (fermarsi) non scatta: α < 0,7
+ammissibile esiste.
+
+### La conferma su test (una corsa, dopo la scelta)
+
+320 domande, cache calda (108 883 riusi, 0 nuovi), ibrida α=0,5 contro
+solo testo, con α=0,7 come riferimento:
+
+| | ses. any@5 | ses. all@5 | ses. ndcg@5 | turno ndcg@5 |
+|---|---|---|---|---|
+| solo testo | 0,9625 | 0,8344 | 0,6502 | 0,6620 |
+| **ibrida α=0,5** | **0,9750** ✓ | **0,8500** ✓ | 0,7406 | **0,6813** ✓ |
+| ibrida α=0,7 (rif.) | 0,9750 | 0,8656 | 0,7325 | 0,6272 |
+
+Le tre condizioni sono tutte superate: **il predefinito passa a
+α = 0,5**. Su test α=0,5 batte α=0,7 anche sul turno (0,6813 contro
+0,6272); α=0,7 resta davanti solo sulla sessione all@5 (0,8656 contro
+0,8500).
+
+### Il nuovo predefinito e i test
+
+`Fusion::default()` → `Convex { alpha: 0.5, cos_norm: Candidates }`; il
+commento in `search.rs` racconta la storia (0,6 → 0,7 → 0,5) con regola
+e numeri dei due banchi. I test che passano α esplicitamente non
+cambiano; i golden del nucleo sono testo+grafo e non vedono α.
+**Nessun test ha dovuto essere ritoccato**: `golden_semantic`, i due
+test manuali del semantico e i 29 test Node (29/29 in Node 24 e in
+Electron) passano con α=0,5 senza toccare le attese — il cambiamento
+non sposta le classifiche dorate. È l'informazione, ed è positiva: non
+ci sono golden da aggiornare.
+
+### La corsa piena su tutte le 470 (il nuovo numero di partenza)
+
+| | ses. any@5 | ses. all@5 | ses. ndcg@5 | ses. ndcg@10 | turno any@5 | turno ndcg@5 | turno ndcg@10 |
+|---|---|---|---|---|---|---|---|
+| solo testo | 0,9702 | 0,8447 | 0,6607 | 0,6504 | 0,8766 | 0,6829 | 0,7181 |
+| ibrida α=0,5 | **0,9745** | **0,8766** | **0,7451** | **0,7588** | 0,8660 | 0,6429 | 0,6889 |
+
+Per tipo, sessione ndcg@5 (il resto nelle tabelle complete delle
+corse, riprodotte dallo stesso comando): testo — knowledge-update
+0,7132, multi-session 0,6867, single-assistant 0,8231,
+single-preference 0,3125, single-user 0,6313, temporal 0,6316; ibrida —
+1,0/0,9722→0,7689, multi-session 0,7689, single-assistant 0,9757,
+single-preference 0,5214, single-user 0,6689, temporal 0,6985.
+
+### Il banco a 100k non è peggiorato
+
+Binario v0.4.4 ricostruito dalla base (stash → build → copia → pop)
+contro il binario finale, stesso comando
+`engramma-bench --notes 100000 --runs 1`, macchina ferma, addossati:
+
+| metrica | prima (v0.4.4, α0,7) | dopo (v0.4.5, α0,5) | Δ |
+|---|---|---|---|
+| ibrido caldo p50 | 11,5 ms | 11,8 ms | **+2,6%** ✓ |
+| ibrido caldo p95 | 14,6 ms | 15,0 ms | **+2,7%** ✓ |
+| vettori p50 / p95 | 4,5 / 5,1 ms | 4,5 / 5,2 ms | ~0 |
+| ibrido con embedding p50 | 20,1 ms | 20,5 ms | +2,0% |
+| embedding (note/s) | 201 | 74 | −63% (vedi P2) |
+
+La soglia del +10% è rispettata con margine: α non tocca le latenze, il
+piccolo Δ è rumore di giro singolo.
+
+## P2 — RAM: abbassare il picco
+
+### Lo strumento di misura
+
+`--matrix N` negli esempi `ram`/`ram_mimalloc` (`crates/engramma-embed/
+examples/`): N figli in processi separati dello stesso binario
+(l'allocatore viaggia col binario), ognuno stampa una riga CSV —
+carico (s), RSS dopo il carico / dopo il lavoro / dopo 10 s, **picco**
+(macOS: «Physical footprint (peak)» di `vmmap --summary` sul processo
+vivo — su darwin 27 è una riga propria, il formato «(peak: …)» inline
+non esiste più; Linux: `VmHWM`), tempo di embed. Il padre stampa
+mediana/min/max. Stessa cosa in Node: `node __test__/rss.js --matrix 5`
+(figli Node, picco da `process.resourceUsage().maxRSS`). Una corsa sola
+non dice più nulla: la stima da 540 MB della verifica era una corsa
+fortunata.
+
+### Il carico da solo (prima la misura)
+
+`ram --csv --load-only`, 5 corse: **0,6–2,4 s** (dipende dalla cache
+delle pagine del file) e **picco ~1,11 GB** (1 105–1 132 MB di RSS a
+carico fatto). La verifica dei passaggi (a): `into_typed(self)` e
+`into_optimized(self)` consumano il grafo precedente — al più due copie
+dei pesi vive in un istante, e nessuna nostra variabile allunga la vita
+di uno stadio. I byte del file dopo la decodifica sono affare di tract.
+
+### La cache NNEF (b): provata, impossibile, scartata
+
+Provata come da piano: `<sha256 dell'onnx>.nnef.tar` nella cartella del
+modello, sidecar JSON con hash del tar + mappa degli input + versione,
+scrittura atomica (tmp + rename), ricostituzione silenziosa a qualunque
+difetto. **Il grafo ottimizzato non è serializzabile** in NNEF con
+tract 0.23: `write_to_tar` muore su `OptMulUnicast` («No serializer
+found», nodo `/embeddings/norm/LayerNormalization.normalized_scaled`).
+Nemmeno il grafo tipizzato (pre-ottimizzazione) passa: muore su
+`StridedSlice` (`/layers.0/attn/Slice_1`). Servirebbero serializzatori
+custom: un progetto a sé. Numeri per non riprovarlo: carico a freddo
+0,6–2,4 s, picco ~1,11 GB — la cache avrebbe dovuto abbassare il picco
+di ≥ 200 MB o dimezzare il tempo; non esiste, e il costo della prova è
+zero tentativi riusciti. Codice rimosso, `tract-nnef` tolto dalle
+dipendenze, lock invariato.
+
+### Il budget di token, l'ordinamento, il pool
+
+In `Builtin::embed` (v0.4.5): i testi sono **ordinati per lunghezza in
+token** (la riempitura collassa al divario tra vicini), i lotti tagliati
+sotto il tetto `righe × seq ≤ ENGRAMMA_EMBED_TOKEN_BUDGET` (un testo più
+lungo del tetto va da solo: seq è già capped da max_tokens), un **pool
+fisso di lavoratori** — predefinito `min(4, available_parallelism)`,
+`ENGRAMMA_EMBED_THREADS` resta — pesca i lotti da una coda; i buffer
+ids/mask sono stesi nell'ordine ordinato e i lavoratori prendono
+**fette**, non le copie doppie della v0.4.4. L'ordine originale è
+ricomposto all'uscita.
+
+**Bug trovato e corretto in corsa dal mio primo taglio**: dopo lo
+`scope` i messaggi stavano tutti nel canale ma il `tx` originale restava
+vivo nel chiamante, quindi il drenaggio `for … in rx` aspettava una
+chiusura che non arrivava mai — deadlock alla prima query (individuato
+con `sample`: il main in `mpmc::recv`). Fix: `drop(tx)` prima del
+drenaggio. Tutte le misure che seguono sono col codice corretto.
+
+**Fedeltà**: `cargo test -p engramma-embed --test fidelity` verde senza
+toccare le soglie; test nuovo `order_and_budget_do_not_change_the_vectors`
+— stessi 12 testi in ordine inverso e con budget 1 e 8192: vettori
+**identici bit per bit** (non coseni: uguaglianza). E2E: la tabella
+LongMemEval delle 150 rifatta col codice nuovo è byte-identica alla
+precedente (51 268 vettori riusati). `ENGRAMMA_EMBED_TOKEN_BUDGET`
+non valido (0, non numerico) ricade sul predefinito (test
+`budget_override_needs_a_whole_number_at_least_one`).
+
+### La griglia budget × thread (8 punti × 5 corse, sistema)
+
+| budget | lavoratori | dopo carico | +10 s (med/min/max) | **picco (footprint)** | embed 64 note |
+|---|---|---|---|---|---|
+| 2048 | 2 | 1100 | 1450 / 1442 / 1499 | **1331** | 8,3 s |
+| 2048 | 4 | 1101 | 1396 / 1391 / 1472 | 1536 | 5,3 s |
+| 4096 | 1 | 1100 | 1376 / 1370 / 1383 | 1229 | 12,2 s |
+| 4096 | 2 | 1101 | 1692 / 1655 / 1700 | 1536 | 8,6 s |
+| 4096 | 4 | 1100 | 1949 / 1941 / 2072 | 2048 | 5,5 s |
+| 8192 | 2 | 1101 | 2257 / 2255 / 2344 | 2150 | 9,4 s |
+| 8192 | 4 | 1100 | 3248 / 3171 / 3406 | 3174 | 6,1 s |
+| 8192 | 6 | 1100 | 3277 / 2531 / 3488 | 3277 | 5,9 s |
+
+Riferimento del tempo (v0.4.4, stesso carico): 8,6 s mediana. Il punto
+col picco più basso nel budget di tempo è **(2048, 2)**: picco
+1331 MB, embed 8,3 s (−3%). (4096, 1) ha picco 1229 ma tempo +42%:
+fuori. **Il predefinito del budget è 2048**; il pool predefinito resta
+min(4, available_parallelism) come da fase — a 4 lavoratori il picco
+del predefinito è 1536 MB a processo nudo.
+
+### Gli allocatori, rimisurati (macOS, processo nudo, 5 corse)
+
+| punto | allocatore | dopo carico | +10 s | picco (footprint) | embed |
+|---|---|---|---|---|---|
+| 2048/2 | sistema | 1100 | 1450 | 1331 | 8,3 s |
+| 2048/2 | **mimalloc** | **846** | **1149** (1142–1153) | **1126** | 8,4 s |
+| 2048/4 | **mimalloc** | **846** | 1390 (1350–1399) | 1331 | 5,4 s |
+| 4096/1 | **mimalloc** | **846** | 1112 | 1126 | 12,8 s |
+
+Su macOS **mimalloc vince su tutto** (carico −254 MB, riposo −300 MB,
+picco −205 MB al punto scelto) e la varianza della v0.4.4 (971–2293 MB)
+è scomparsa: 1142–1153 MB. Su Linux il contrario (stesso comando nel
+contenitore `engramma-linux:1.95.0`, budget 2048, 4 lavoratori, 5 corse):
+
+| Linux | glibc | mimalloc |
+|---|---|---|
+| dopo carico | 561 MB | 785 MB |
+| **+10 s (mediana)** | **637** (574–639) | 1166 (851–1183) |
+| **picco (VmHWM)** | **1021** | 1410 |
+| embed 64 note | 13,6 s | 10,8 s |
+
+Come da regola della fase, **mimalloc resta solo dove vince**:
+`#[cfg(target_os = "macos")]` sul `#[global_allocator]` del `.node` e
+del binario CLI, e `[target.'cfg(target_os = "macos")'.dependencies]`
+per la dipendenza. Nota a margine: su Linux il picco del predefinito è
+1021 MB — glibc restituisce davvero.
+
+### L'artefatto vero: Node (`rss.js --matrix 5`, .node con mimalloc)
+
+| stadio | mediana | min | max |
+|---|---|---|---|
+| modello caricato | 894 MB | 894 | 894 |
+| dopo embedPending (64 note, metà lunghe) | 1429 MB | 1407 | 1455 |
+| **+10 s** | **1446 MB** | 1436 | 1469 |
+| **picco (maxRSS)** | **1446 MB** | 1436 | 1469 |
+| embedPending (2ª cella) | 9 059 ms | 8 779 | 9 190 |
+
+### Le soglie, onestamente
+
+- **picco ≤ 1,2 GB**: a processo nudo **sì** col punto (2048, 2) sotto
+  mimalloc (1126 MB); **no** nel predefinito a 4 lavoratori (1331 nudo,
+  1446 in Node, che conta anche l'heap di Node). Il picco scende da
+  ~2,3–2,4 GB della v0.4.4 a ~1,45 GB nell'artefatto: **−40%**.
+- **RSS +10 s ≤ 700 MB (mediana) e ≤ 900 MB (massimo)**: **NO** —
+  1446 MB (1436–1469). La causa è misurata, non ipotizzata: la memoria
+  in uso è ~485 MB, il resto sono pagine liberate e trattenute.
+  `vmmap --summary` a fine corsa: footprint 1,4 GB (picco 1,4),
+  «Writable regions: Total=2.5G … resident=1.4G (55%)», le zone Malloc
+  di sistema quasi vuote (Malloc Small 7 MB: **mimalloc tiene la sua
+  memoria in segmenti mmap propri**, fuori dalle zone), il 90% delle
+  librerie non residente. `malloc_zone_pressure_relief` su darwin 27
+  restituisce 0 MB (già provato in verifica: da non riprovare).
+
+Dove sta la memoria che resta, in una riga: ~490 MB di pesi/grafo
+vivi + ~950 MB di pagine liberate che né mimalloc né l'allocatore di
+sistema restituiscono a macOS dopo il lavoro, con qualunque budget o
+numero di lavoratori. **Ci si ferma qui come da fase**: l'embedding
+fuori processo è un'opzione architettonica della v0.5 (DESIGN § 12).
+
+### Il banco a 100k, riga per riga
+
+Vedi la tabella in fondo a P1 (prima/dopo addossati). Il throughput di
+embedding scende da 201 a 74 note/s: **per lavoratore è identico**
+(18,5 contro 20 note/s/lavoratore) — è il pool a 4 lavoratori contro i
+10–12 fili della v0.4.4, per costruzione. Il patto è dichiarato:
+`ENGRAMMA_EMBED_THREADS=8..10` riporta il throughput (e con lui il
+picco: è la manopola del compromesso, documentata in `docs/node.md`).
+Il carico di lavoro da 64 note — la metrica d'accettazione della fase —
+è **migliorato** (5,3 s contro 8,6 con 4 lavoratori, budget 2048).
+
+## P3 — il DESIGN e il README
+
+- **§ 11, il riquadro LongMemEval**: riscritto con le metriche
+  ufficiali (P0), la divisione dev/test, lo studio di α e il nuovo
+  numero di partenza sulle 470;
+- **§ 6.3 (punto 5)**: α = 0,5 con la storia 0,6 → 0,7 → 0,5, la regola
+  e i numeri dei due banchi;
+- **§ 7**: il lotto di incorporazione (ordinamento per lunghezza,
+  tetto di token, pool fisso, le due variabili d'ambiente), la RAM
+  misurata a matrice (mediana/min/max, non una corsa), l'allocatore per
+  piattaforma, la cache NNEF provata e scartata coi numeri,
+  `malloc_zone_pressure_relief` inutile su darwin 27;
+- **§ 12**: la riga v0.4.5 e l'embedding fuori processo fra le opzioni
+  della v0.5;
+- **§ 14**: chiuse α (n. 7) e allocatore per piattaforma (n. 6);
+- **`docs/node.md`**: `ENGRAMMA_EMBED_THREADS` e
+  `ENGRAMMA_EMBED_TOKEN_BUDGET` con i loro effetti misurati, e la RAM
+  che aspettarsi; la nota mimalloc per piattaforma;
+- **`README.md`**: la riga dell'allocatore per piattaforma (l'unica
+  cosa non più vera).
+
+## Per Homun
+
+- **α passa da 0,7 a 0,5** (la fusione predefinita di `recall_memory` e
+  `search_history` in modo ibrido): cambiano le classifiche — su
+  LongMemEval l'ibrida guadagna su tutte le profondità di sessione e
+  sul turno; sul banco italiano l'MRR pesato sale da 0,8529 a 0,8577.
+  I contratti JS non cambiano, né i risultati dei test (29/29 verdi
+  senza ritoccare le attese).
+- **RAM**: il picco dell'embedding scende da ~2,3–2,4 GB a ~1,45 GB nel
+  `.node`; a riposo dopo `embedPending` aspettarsi ~1,4–1,5 GB
+  (prima: 1,0–2,3 GB a seconda della corsa — ora è stabile: la
+  mediana delle 5 corse è 1446 MB, ventaglio 33 MB).
+- **Variabili d'ambiente nuove**: `ENGRAMMA_EMBED_TOKEN_BUDGET`
+  (predefinito 2048; 0/non numerico → predefinito) e
+  `ENGRAMMA_EMBED_THREADS` (ora è il pool: predefinito
+  min(4, available_parallelism)). Per l'importazione iniziale di
+  grandi storie, `ENGRAMMA_EMBED_THREADS=8` quadruplica il ritmo
+  riportando il picco ai valori vecchi.
+- **Nessuna cache NNEF**: la prova è fallita e il codice è stato
+  rimosso; il disco del modello non cambia.
+- Embedding bulk più lento a parità di RAM: 74 note/s predefinite
+  contro 201 (per lavoratore invariato) — vedere la variabile qui sopra.
+
+## Chiusura
+
+- macOS: `cargo fmt --check` ✓, `cargo clippy --all-targets --offline
+  -- -D warnings` ✓, `cargo test --offline --workspace` ✓ (26 suite;
+  più i 3 test dell'esempio longmemeval con `cargo test -p
+  engramma-bench --example longmemeval`), `cargo deny check licenses
+  bans` ✓ (bans ok, licenses ok).
+- Linux: `scripts/linux.sh` verde — fmt, clippy `-D warnings` e 26
+  suite nel contenitore `engramma-linux:1.95.0` (due passaggi: il
+  primo ha pescato un lint solo-Linux, `size_to_mib` morta fuori da
+  macOS, corretta con `#[cfg]` come già in v0.4.4); poi
+  `docker volume rm engramma-linux-target`.
+- JS: Node 24 `npm test` 29/29, `test:electron` 29/29,
+  `test:electron-main` ok — col `.node` della fase.
+- `npm run build` rifatto; SHA256 dei tre file per Homun:
+
+  ```
+  engramma.darwin-arm64.node  6fffb45888cf02178461e67a3984857a0ed475a8542ab08992c8edb8abee0ec6  (33,5 MB)
+  index.js                    25fd9cc1d50a1ec3f2d74bc004d904663ff07360102d27b938870329d9c832d4
+  index.d.ts                  bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a6488005bf69d9f8
+
+  `index.js` e `index.d.ts` hanno gli stessi SHA256 della v0.4.4: il
+  contratto JS non è cambiato, come promesso dalla fase.
+  ```
+
+- `du -sh target`: 6,4 GB all'inizio, **8,2 GB** alla fine.
+- Temporanei in `/var/folders/nb/r6fbsdsn3z58bkbb9w55nn780000gn/T/engramma-v045/`
+  cancellati a fine fase (script, log, tabelle md, binario baseline,
+  campioni di stack). Restano, come da fase: la cache dei vettori in
+  `~/.cache/engramma/bench/` (ora 195,7 MB, 124 824 record: le 470
+  domande intere) e **nessuna** cache NNEF (scartata). Le celle di
+  LongMemEval vivevano in `tempfile::TempDir` e sono andate via da sé.
+  Nessun push.
