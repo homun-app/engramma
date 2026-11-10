@@ -32,10 +32,18 @@
 //! ```text
 //! cargo run -p engramma-bench --release --example longmemeval -- \
 //!          [--mode text|hybrid|both|vector] [--subset N] [--data PATH] [--out PATH.md]
+//!          [--fusion convex:<α>|rrf:<k>] [--hops 0|1|2] [--questions dev|test|all]
 //! ```
 //!
 //! `--subset N` (seed 42, proportional per `question_type`, ids printed)
 //! runs BOTH modes on the same questions, for a like-for-like comparison.
+//! The v0.4.5 (P1) knobs change nothing unless given: `--fusion` starts
+//! from the ENGINE default (`Fusion::default()`), `--hops` from the
+//! query default (1 hop; the text mode stays at 0, BM25 has no graph),
+//! and `--questions` picks the FIXED split of the α study — `dev` is
+//! the v0.4.4 subset of 150 (seed 42, same ids), `test` the other 320
+//! non-`_abs` questions (the 470 minus the dev ones, dataset order).
+//! The configuration lands in the report header.
 //! No thresholds here: this run fixes the starting number. The data never
 //! enters the repo; the sha256 of the file is checked first.
 
@@ -48,7 +56,7 @@ use std::time::Instant;
 
 use engramma_core::format::yaml::YamlValue;
 use engramma_core::format::{At, Lang, Note, NoteType};
-use engramma_core::search::{Hit, Mode, Query, Semantic};
+use engramma_core::search::{CosNorm, Fusion, Hit, Mode, Query, Semantic};
 use engramma_core::{Cell, Confidence, EmbedError, Embedder, Status, TextKind};
 use serde::Deserialize;
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
@@ -60,6 +68,9 @@ const EXPECTED_SHA256: &str = "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821e
 const TOP_K: usize = 50;
 const KS: [usize; 2] = [5, 10];
 const SUBSET_SEED: u64 = 42;
+/// The v0.4.5 (P1) `dev` split: the fixed subset of 150 of v0.4.4 —
+/// `pick_subset(questions, 150)` with the seed above, same ids.
+const DEV_N: usize = 150;
 
 fn die(what: impl std::fmt::Display) -> ! {
     eprintln!("longmemeval: {what}");
@@ -520,11 +531,46 @@ fn eval_question(
     out
 }
 
+/// Which questions a run sees (v0.4.5 P1): `Dev` is the v0.4.4 subset of
+/// 150, `Test` the complement — chosen BEFORE looking at any number.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Split {
+    All,
+    Dev,
+    Test,
+}
+
+/// The knobs of a run: every `None` means "the engine default stands".
+#[derive(Debug, Clone, Copy)]
+struct Knobs {
+    fusion: Option<Fusion>,
+    hops: Option<u8>,
+}
+
+impl Knobs {
+    fn none() -> Self {
+        Self {
+            fusion: None,
+            hops: None,
+        }
+    }
+}
+
+/// The human name of a fusion, echoed in the report header.
+fn fusion_desc(f: &Fusion) -> String {
+    match f {
+        Fusion::Convex { alpha, .. } => format!("convex:{alpha}"),
+        Fusion::Rrf { k } => format!("rrf:{k}"),
+        Fusion::Adaptive { alpha, w_max, .. } => format!("adaptive:{alpha}/w_max:{w_max}"),
+    }
+}
+
 fn run_question(
     q: &Question,
     root: &Path,
     mode: &str,
     embedder: &Option<Arc<CachedBuiltin>>,
+    knobs: &Knobs,
 ) -> QuestionOutcome {
     let rounds = rounds_of(q);
     let name = format!("lme-{}", q.question_id);
@@ -605,13 +651,19 @@ fn run_question(
         }
         // `vector` is the diagnostic of the phase: the cosine branch alone,
         // to tell a fusion problem from an embedding problem
-        let sem = match mode {
+        let mut sem = match mode {
             "vector" => Semantic::new(embedder.clone()).with_mode(Mode::Vector),
             _ => Semantic::new(embedder.clone()),
         };
+        if let Some(f) = knobs.fusion {
+            sem = sem.with_fusion(f);
+        }
         let mut query = Query::text(&q.question);
         query.k = TOP_K;
         query.lang = Some(Lang::En);
+        if let Some(h) = knobs.hops {
+            query.graph_hops = h.min(2);
+        }
         let outcome = cell
             .search_semantic_with_now(&query, now, &sem)
             .unwrap_or_else(|e| die(format!("{}: hybrid search: {e}", q.question_id)));
@@ -638,6 +690,35 @@ struct Args {
     subset: usize,
     data: Option<PathBuf>,
     out: Option<PathBuf>,
+    split: Split,
+    knobs: Knobs,
+}
+
+/// `convex:<α>` (CosNorm::Candidates, the engine's normalisation) or
+/// `rrf:<k>` — anything else dies.
+fn parse_fusion(spec: &str) -> Fusion {
+    if let Some(a) = spec.strip_prefix("convex:") {
+        let alpha: f64 = a
+            .parse()
+            .unwrap_or_else(|e| die(format!("--fusion convex: α must be a number ({e})")));
+        if !(0.0..=1.0).contains(&alpha) {
+            die("--fusion convex: α must be within 0–1");
+        }
+        Fusion::Convex {
+            alpha,
+            cos_norm: CosNorm::Candidates,
+        }
+    } else if let Some(k) = spec.strip_prefix("rrf:") {
+        let kk: u64 = k
+            .parse()
+            .unwrap_or_else(|e| die(format!("--fusion rrf: k must be an integer ({e})")));
+        if kk == 0 {
+            die("--fusion rrf: k must be ≥ 1");
+        }
+        Fusion::Rrf { k: kk }
+    } else {
+        die("--fusion wants convex:<α>|rrf:<k>")
+    }
 }
 
 fn parse_args() -> Args {
@@ -646,6 +727,8 @@ fn parse_args() -> Args {
         subset: 0,
         data: None,
         out: None,
+        split: Split::All,
+        knobs: Knobs::none(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -662,6 +745,35 @@ fn parse_args() -> Args {
                     .parse()
                     .unwrap_or_else(|e| die(format!("--subset: {e}")));
             }
+            "--fusion" => {
+                let spec = it
+                    .next()
+                    .unwrap_or_else(|| die("--fusion wants convex:<α>|rrf:<k>"));
+                args.knobs.fusion = Some(parse_fusion(&spec));
+            }
+            "--hops" => {
+                let h: u8 = it
+                    .next()
+                    .unwrap_or_else(|| die("--hops wants 0|1|2"))
+                    .parse()
+                    .unwrap_or_else(|e| die(format!("--hops: {e}")));
+                if h > 2 {
+                    die("--hops wants 0|1|2 (the graph walks at most 2 hops)");
+                }
+                args.knobs.hops = Some(h);
+            }
+            "--questions" => {
+                args.split = match it
+                    .next()
+                    .unwrap_or_else(|| die("--questions wants dev|test|all"))
+                    .as_str()
+                {
+                    "dev" => Split::Dev,
+                    "test" => Split::Test,
+                    "all" => Split::All,
+                    _ => die("--questions wants dev|test|all"),
+                };
+            }
             "--data" => {
                 args.data = Some(PathBuf::from(
                     it.next().unwrap_or_else(|| die("--data wants a path")),
@@ -677,6 +789,9 @@ fn parse_args() -> Args {
     }
     if !matches!(args.mode.as_str(), "text" | "hybrid" | "both" | "vector") {
         die("--mode wants text|hybrid|both|vector");
+    }
+    if args.split != Split::All && args.subset > 0 {
+        die("--questions and --subset are exclusive (dev IS the subset of 150)");
     }
     args
 }
@@ -810,16 +925,41 @@ fn main() {
         questions.len()
     );
 
-    let chosen: Vec<usize> = if args.subset > 0 && args.subset < questions.len() {
-        let picked = pick_subset(&questions, args.subset);
-        let ids: Vec<&str> = picked
-            .iter()
-            .map(|&i| questions[i].question_id.as_str())
-            .collect();
-        eprintln!("subset of {}: {}", args.subset, ids.join(" "));
-        picked
-    } else {
-        (0..questions.len()).collect()
+    let chosen: Vec<usize> = match args.split {
+        Split::Dev => {
+            let picked = pick_subset(&questions, DEV_N);
+            let ids: Vec<&str> = picked
+                .iter()
+                .map(|&i| questions[i].question_id.as_str())
+                .collect();
+            eprintln!("dev: the fixed subset of {DEV_N}: {}", ids.join(" "));
+            picked
+        }
+        Split::Test => {
+            // the 470 non-_abs questions minus the dev ones, dataset order
+            let dev: HashSet<usize> = pick_subset(&questions, DEV_N).into_iter().collect();
+            let rest: Vec<usize> = (0..questions.len()).filter(|i| !dev.contains(i)).collect();
+            let ids: Vec<&str> = rest
+                .iter()
+                .map(|&i| questions[i].question_id.as_str())
+                .collect();
+            eprintln!(
+                "test: the {} non-_abs questions minus the dev ones: {}",
+                rest.len(),
+                ids.join(" ")
+            );
+            rest
+        }
+        Split::All if args.subset > 0 && args.subset < questions.len() => {
+            let picked = pick_subset(&questions, args.subset);
+            let ids: Vec<&str> = picked
+                .iter()
+                .map(|&i| questions[i].question_id.as_str())
+                .collect();
+            eprintln!("subset of {}: {}", args.subset, ids.join(" "));
+            picked
+        }
+        Split::All => (0..questions.len()).collect(),
     };
 
     // The cells live in a temp directory, gone at the end of the process.
@@ -859,7 +999,7 @@ fn main() {
     let mut max_rss = 0_u64;
     for (n, &qi) in chosen.iter().enumerate() {
         let q = &questions[qi];
-        let outcome = run_question(q, root.path(), &args.mode, &embedder);
+        let outcome = run_question(q, root.path(), &args.mode, &embedder, &args.knobs);
         for ((mode, level), m) in outcome.metrics {
             let slot = table.entry((mode, level, &q.question_type)).or_default();
             merge(slot, &m);
@@ -888,6 +1028,21 @@ fn main() {
         chosen.len(),
         if args.subset > 0 { format!(", sottoinsieme fisso di {}", args.subset) } else { ", tutte".into() },
         TOP_K
+    ));
+    report.push_str(&format!(
+        "- configurazione: fusione {}, hops {}, domande {} (il testo corre sempre a hops 0)\n",
+        args.knobs
+            .fusion
+            .as_ref()
+            .map_or_else(|| fusion_desc(&Fusion::default()), fusion_desc),
+        args.knobs
+            .hops
+            .map_or_else(|| "predefiniti (1)".to_string(), |h| h.to_string()),
+        match args.split {
+            Split::All => "tutte",
+            Split::Dev => "dev (le 150 di v0.4.4)",
+            Split::Test => "test (le 320 altre)",
+        }
     ));
     report.push_str(&format!(
         "- durata: {:.0} s; RSS massima: {} MB\n",

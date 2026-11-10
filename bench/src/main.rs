@@ -2115,116 +2115,74 @@ fn measure_config(
     per_cat
 }
 
-/// Warm hybrid latencies (ms) over the whole question set: (p50, p95).
-fn warm_latencies(
-    cell: &Cell,
-    corpus: &Corpus,
-    now: OffsetDateTime,
-    sem: &Semantic,
-    seeding: engramma_core::GraphSeeding,
-    graph_weight: f64,
-) -> (f64, f64) {
-    let mut ts: Vec<f64> = Vec::with_capacity(corpus.questions.len());
-    for q in &corpus.questions {
-        if q.expect_ids.is_empty() {
-            continue;
-        }
-        let mut query = Query::text(&q.text).k(5).graph_hops(2);
-        query.lang = Some(Lang::It);
-        if let Some(a) = q.as_of {
-            query.filters.as_of = Some(a);
-        }
-        query.weights.graph_seeding = seeding;
-        query.weights.graph_weight = graph_weight;
-        let t = Instant::now();
-        let _ = cell.search_semantic_with_now(&query, now, sem);
-        ts.push(t.elapsed().as_secs_f64() * 1000.0);
-    }
-    (percentile(ts.clone(), 0.5), percentile(ts, 0.95))
-}
-
-/// v0.4 (P1.6): the ADAPTIVE calibration. The grid is the new graph's
-/// knobs — `w_max` × `u_min` × `seed_passage_weight` × α (24 points) —
-/// measured at 10k (median of `runs10k` rounds) and at 100k (one round on
-/// the grid, the machine's honest budget), on the 97M. The criterion is
-/// the declared one: the **mean of the per-category MRRs** (every category
-/// counts the same), in the WORST of the measured sizes; within 0.002 the
-/// configuration that keeps the paraphrases wins. The two fixed references
-/// ride along (the v0.3.2 and v0.3.1 defaults, with the v0.3.2 seeding:
-/// the like-for-like baseline). The winner and the references then get
-/// `runs100k` rounds at the largest size, with warm hybrid latencies, and
-/// the phase's thresholds are checked. Prints everything; deletes its
-/// cells.
+/// v0.4.5 (P1): the α study grid, the v0.3.2 SHAPE again — convex α at
+/// the FIXED graph weight 0.35 with the fused seeding (the exact
+/// behavior the 0.7 default was born from), α from 0.2 to 0.8 in 0.1
+/// steps so every candidate of {0.3…0.7} has its ±0.1 α neighbours in
+/// the grid, `rrf:60` as the no-calibration reference and the v0.3.1
+/// 0.6/0.40 for context. The criterion is the v0.3.2 one: the MRR
+/// **weighted by question count** over the four categories, median of
+/// the rounds (`--runs` at 10k, `runs100k` = 3 at 100k). The table
+/// also prints the neighbourhood minimum over ±0.1 of α — the
+/// robustness signal of the v0.3.2 rule. The CHOICE is not made here:
+/// it is written in the REPORT before the tables are read.
 #[allow(clippy::too_many_lines)]
 fn calibrate(sizes: &[usize], runs10k: usize, runs100k: usize, dir: &std::path::Path) {
     use std::sync::Arc;
     let categories = ["fattuali", "parafrasi", "multi-salto", "inglese"];
-    let alphas = [0.6_f64, 0.7];
-    let w_maxes = [0.40_f64, 0.45, 0.50, 0.60];
-    let u_mins = [0.05_f64, 0.15];
-    let spws = [0.05_f64, 0.15];
-    #[derive(Clone, Copy)]
-    struct P {
-        alpha: f64,
-        w_max: f64,
-        u_min: f64,
-        spw: f64,
+    const GW: f64 = 0.35;
+    /// One measured configuration; `alpha` is `Some` for the convex rows
+    /// the ±0.1 neighbourhood is computed over.
+    struct C {
+        label: String,
+        alpha: Option<f64>,
+        fusion: Fusion,
+        seeding: engramma_core::GraphSeeding,
+        gw: f64,
     }
-    let mut grid: Vec<P> = Vec::new();
-    for &a in &alphas {
-        for &w in &w_maxes {
-            for &u in &u_mins {
-                for &sp in &spws {
-                    grid.push(P {
-                        alpha: a,
-                        w_max: w,
-                        u_min: u,
-                        spw: sp,
-                    });
-                }
-            }
-        }
-    }
-    // the fixed references: the old defaults, with the exact behavior of
-    // their phase (fused seeding, fixed weight)
-    let refs: [(String, Fusion, engramma_core::GraphSeeding, f64); 2] = [
-        (
-            "rif-α0.7-g0.35 (v0.3.2)".into(),
-            Fusion::Convex {
-                alpha: 0.7,
+    let mut configs: Vec<C> = [0.2_f64, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+        .iter()
+        .map(|&a| C {
+            label: format!("convex α{a:.1} g{GW:.2}"),
+            alpha: Some(a),
+            fusion: Fusion::Convex {
+                alpha: a,
                 cos_norm: engramma_core::CosNorm::Candidates,
             },
-            engramma_core::GraphSeeding::Fused,
-            0.35,
-        ),
-        (
-            "rif-α0.6-g0.40 (v0.3.1)".into(),
-            Fusion::Convex {
-                alpha: 0.6,
-                cos_norm: engramma_core::CosNorm::Candidates,
-            },
-            engramma_core::GraphSeeding::Fused,
-            0.40,
-        ),
-    ];
-    let config_of = |p: &P| -> (Fusion, engramma_core::GraphSeeding, f64) {
-        (
-            Fusion::Adaptive {
-                alpha: p.alpha,
-                cos_norm: engramma_core::CosNorm::Candidates,
-                w_max: p.w_max,
-                u_min: p.u_min,
-            },
-            engramma_core::GraphSeeding::Question {
-                seed_passage_weight: p.spw,
-            },
-            p.w_max, // the Fixed-path weight; unused under Adaptive
-        )
-    };
+            seeding: engramma_core::GraphSeeding::Fused,
+            gw: GW,
+        })
+        .collect();
+    configs.push(C {
+        label: "rrf:60 g0.35".into(),
+        alpha: None,
+        fusion: Fusion::Rrf { k: 60 },
+        seeding: engramma_core::GraphSeeding::Fused,
+        gw: GW,
+    });
+    configs.push(C {
+        label: "rif α0.6 g0.40 (v0.3.1)".into(),
+        alpha: None,
+        fusion: Fusion::Convex {
+            alpha: 0.6,
+            cos_norm: engramma_core::CosNorm::Candidates,
+        },
+        seeding: engramma_core::GraphSeeding::Fused,
+        gw: 0.40,
+    });
 
-    // per size: build once, measure the grid (+refs) `rounds` times, keep
-    // the medians. The LARGEST size keeps its cell alive for the winner
-    // phase.
+    /// The MRR weighted by question count over the categories (the
+    /// v0.3.2 criterion).
+    fn weighted_mrr(cats: &[(f64, f64, usize)]) -> f64 {
+        let n: usize = cats.iter().map(|(_, _, n)| n).sum();
+        if n == 0 {
+            return 0.0;
+        }
+        cats.iter().map(|(_, m, c)| m * *c as f64).sum::<f64>() / n as f64
+    }
+
+    // per size: build once, measure every config `rounds` times, keep
+    // the medians
     struct SizeResult {
         target: usize,
         per_config: Vec<Vec<(f64, f64, usize)>>,
@@ -2232,18 +2190,8 @@ fn calibrate(sizes: &[usize], runs10k: usize, runs100k: usize, dir: &std::path::
     let mut size_results: Vec<SizeResult> = Vec::new();
     let mut sizes_sorted = sizes.to_vec();
     sizes_sorted.sort_unstable();
-    let largest = sizes_sorted.last().copied().unwrap_or(100_000);
-    // the winner-phase world (filled at the largest size)
-    /// The largest size's world, kept alive for the winner phase.
-    struct Kept {
-        cell: Cell,
-        corpus: Corpus,
-        sem: Semantic,
-        now: OffsetDateTime,
-    }
-    let mut keep: Option<Kept> = None;
     for &target in &sizes_sorted {
-        let rounds = if target <= 10_000 { runs10k } else { 1 };
+        let rounds = if target <= 10_000 { runs10k } else { runs100k };
         let corpus = build_corpus(target, false);
         let db = dir.join(format!("cal-{target}.sqlite"));
         for suffix in ["", "-wal", "-shm"] {
@@ -2269,39 +2217,27 @@ fn calibrate(sizes: &[usize], runs10k: usize, runs100k: usize, dir: &std::path::
         }
         let now = OffsetDateTime::from_unix_timestamp(1_810_000_000).expect(/* fixed */ "ts");
         let sem = Semantic::new(Arc::clone(&embedder));
-        let n_configs = grid.len() + refs.len();
         let mut all_rounds: Vec<Vec<Vec<(f64, f64, usize)>>> = Vec::new();
         for round in 1..=rounds {
             eprintln!("taratura {target} note, giro {round}/{rounds}…");
-            let mut one = Vec::with_capacity(n_configs);
-            for p in &grid {
-                let (fusion, seeding, gw) = config_of(p);
-                one.push(measure_config(
-                    &cell,
-                    &corpus,
-                    now,
-                    &sem,
-                    &categories,
-                    fusion,
-                    seeding,
-                    gw,
-                ));
-            }
-            for (_, fusion, seeding, gw) in &refs {
-                one.push(measure_config(
-                    &cell,
-                    &corpus,
-                    now,
-                    &sem,
-                    &categories,
-                    *fusion,
-                    *seeding,
-                    *gw,
-                ));
-            }
+            let one: Vec<Vec<(f64, f64, usize)>> = configs
+                .iter()
+                .map(|c| {
+                    measure_config(
+                        &cell,
+                        &corpus,
+                        now,
+                        &sem,
+                        &categories,
+                        c.fusion,
+                        c.seeding,
+                        c.gw,
+                    )
+                })
+                .collect();
             all_rounds.push(one);
         }
-        let medians: Vec<Vec<(f64, f64, usize)>> = (0..n_configs)
+        let medians: Vec<Vec<(f64, f64, usize)>> = (0..configs.len())
             .map(|ci| {
                 (0..categories.len())
                     .map(|cat| {
@@ -2317,211 +2253,61 @@ fn calibrate(sizes: &[usize], runs10k: usize, runs100k: usize, dir: &std::path::
             target,
             per_config: medians,
         });
-        if target == largest {
-            keep = Some(Kept {
-                cell,
-                corpus,
-                sem,
-                now,
-            });
-        } else {
-            drop(cell);
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(dir.join(format!("cal-{target}.sqlite{suffix}")));
-            }
+        drop(cell);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(dir.join(format!("cal-{target}.sqlite{suffix}")));
         }
     }
 
-    // the criterion: mean per category, worst over the measured sizes
-    let mean_of = |cats: &[(f64, f64, usize)]| -> f64 {
-        category_mean(&cats.iter().map(|(_, m, _)| *m).collect::<Vec<_>>())
-    };
-    let mut rows: Vec<(usize, f64, Vec<f64>)> = Vec::new();
-    for ci in 0..(grid.len() + refs.len()) {
-        let means: Vec<f64> = size_results
-            .iter()
-            .map(|sr| mean_of(&sr.per_config[ci]))
-            .collect();
-        let worst = means.iter().copied().fold(f64::INFINITY, f64::min);
-        rows.push((ci, worst, means.clone()));
-    }
-    let label = |ci: usize| -> String {
-        if ci < grid.len() {
-            let p = grid[ci];
-            format!(
-                "ad α{:.1} w{:.2} u{:.2} spw{:.2}",
-                p.alpha, p.w_max, p.u_min, p.spw
-            )
-        } else {
-            refs[ci - grid.len()].0.clone()
-        }
-    };
-    println!("# Taratura adattiva (griglia w_max × u_min × spw × α, 97M, mediana dei giri)");
+    // the table: weighted MRR per size, the ±0.1 α neighbourhood minimum
+    // and the per-category MRR at the LARGEST size
+    let main_si = size_results
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, sr)| sr.target)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
     println!(
-        "criterio (v0.4 P1.6): MEDIA per categoria dell'MRR, nel caso peggiore tra le          dimensioni misurate; i due riferimenti in fondo sono i predefiniti vecchi          (seme fuso della v0.3.2)"
+        "# Taratura α (forma v0.3.2: convex, peso grafo 0,35, semina fusa; MRR pesato per domande, mediana dei giri)"
     );
     let sizes_hdr: Vec<String> = size_results
         .iter()
-        .map(|sr| format!("media@{}k", sr.target / 1_000))
+        .map(|sr| format!("pesato@{}k", sr.target / 1_000))
         .collect();
     println!(
-        "| configurazione | {} | peggiore | fattuali | parafrasi | multi-salto | inglese |",
+        "| configurazione | {} | min vicini ±0,1 α | fattuali | parafrasi | multi-salto | inglese |",
         sizes_hdr.join(" | ")
     );
     println!(
         "|---|{}|---|---|---|---|---|",
         "|---|".repeat(size_results.len())
     );
-    for (ci, worst, means) in &rows {
-        // per-category MRR at the WORST size (the one the criterion saw)
-        let worst_si = means
+    for (ci, c) in configs.iter().enumerate() {
+        let pesato: Vec<String> = size_results
             .iter()
-            .enumerate()
-            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let cats = &size_results[worst_si].per_config[*ci];
-        let mean_str: Vec<String> = means.iter().map(|m| format!("{m:.4}")).collect();
+            .map(|sr| format!("{:.4}", weighted_mrr(&sr.per_config[ci])))
+            .collect();
+        // the ±0.1 α neighbourhood minimum, over the grid points that
+        // exist (v0.3.2's robustness signal, α only: the weight is fixed)
+        let neigh = c.alpha.map(|a| {
+            configs
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.alpha.is_some_and(|oa| (oa - a).abs() <= 0.1 + 1e-9))
+                .map(|(oi, _)| weighted_mrr(&size_results[main_si].per_config[oi]))
+                .fold(f64::INFINITY, f64::min)
+        });
+        let cats = &size_results[main_si].per_config[ci];
         println!(
-            "| {} | {} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} |",
-            label(*ci),
-            mean_str.join(" | "),
-            worst,
+            "| {} | {} | {} | {:.4} | {:.4} | {:.4} | {:.4} |",
+            c.label,
+            pesato.join(" | "),
+            neigh.map_or_else(|| "—".to_string(), |m| format!("{m:.4}")),
             cats[0].1,
             cats[1].1,
             cats[2].1,
             cats[3].1
         );
-    }
-    // the winner among the ADAPTIVE points: best worst-mean, within 0.002
-    // the one that keeps the paraphrases (at its worst size)
-    let para_at_worst = |ci: usize| -> f64 {
-        let means = rows
-            .iter()
-            .find(|(c, _, _)| *c == ci)
-            .map(|(_, _, m)| m.clone())
-            .unwrap_or_default();
-        let worst_si = means
-            .iter()
-            .enumerate()
-            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        size_results[worst_si].per_config[ci][1].1
-    };
-    let mut best_ci = 0_usize;
-    let mut best_worst = f64::NEG_INFINITY;
-    for (ci, worst, _) in &rows[..grid.len()] {
-        let better = *worst > best_worst + 0.002
-            || ((*worst - best_worst).abs() <= 0.002
-                && para_at_worst(*ci) > para_at_worst(best_ci));
-        if better {
-            best_worst = *worst;
-            best_ci = *ci;
-        }
-    }
-    let p = grid[best_ci];
-    println!(
-        "\nvincitore della griglia: α = {}, w_max = {}, u_min = {}, spw = {} (media peggiore {best_worst:.4})",
-        p.alpha, p.w_max, p.u_min, p.spw
-    );
-
-    // --- the winner phase at the largest size: median of `runs100k`
-    // rounds for the winner and the references, plus warm hybrid latencies
-    if let Some(Kept {
-        cell,
-        corpus,
-        sem,
-        now,
-    }) = keep
-    {
-        eprintln!("fase del vincitore a {largest} note: {runs100k} giri + latenze…");
-        let (w_fusion, w_seeding, w_gw) = config_of(&p);
-        let finalists: [(String, Fusion, engramma_core::GraphSeeding, f64); 3] = [
-            ("vincitore".into(), w_fusion, w_seeding, w_gw),
-            refs[0].clone(),
-            refs[1].clone(),
-        ];
-        let mut finals: Vec<Vec<Vec<(f64, f64, usize)>>> = Vec::new();
-        for round in 1..=runs100k {
-            eprintln!("giro {round}/{runs100k}…");
-            let one: Vec<Vec<(f64, f64, usize)>> = finalists
-                .iter()
-                .map(|(_, f, s, g)| {
-                    measure_config(&cell, &corpus, now, &sem, &categories, *f, *s, *g)
-                })
-                .collect();
-            finals.push(one);
-        }
-        let medians: Vec<Vec<(f64, f64, usize)>> = (0..finalists.len())
-            .map(|fi| {
-                (0..categories.len())
-                    .map(|cat| {
-                        let mrrs: Vec<f64> = finals.iter().map(|r| r[fi][cat].1).collect();
-                        let recalls: Vec<f64> = finals.iter().map(|r| r[fi][cat].0).collect();
-                        (median(recalls), median(mrrs), finals[0][fi][cat].2)
-                    })
-                    .collect()
-            })
-            .collect();
-        let lat: Vec<(f64, f64)> = finalists
-            .iter()
-            .map(|(_, _f, s, g)| warm_latencies(&cell, &corpus, now, &sem, *s, *g))
-            .collect();
-        println!("\n## Il vincitore e i riferimenti a {largest} note (mediana di {runs100k} giri)");
-        println!(
-            "| configurazione | fattuali | parafrasi | multi-salto | inglese | media | ibrido caldo p50/p95 (ms) |"
-        );
-        println!("|---|---|---|---|---|---|---|");
-        for (fi, (name, _, _, _)) in finalists.iter().enumerate() {
-            let mrrs: Vec<f64> = medians[fi].iter().map(|(_, m, _)| *m).collect();
-            println!(
-                "| {} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.1} / {:.1} |",
-                name,
-                mrrs[0],
-                mrrs[1],
-                mrrs[2],
-                mrrs[3],
-                category_mean(&mrrs),
-                lat[fi].0,
-                lat[fi].1
-            );
-        }
-        // the thresholds (spec P1.6), against the v0.3.2 reference
-        let mrrs_of = |fi: usize| -> Vec<f64> { medians[fi].iter().map(|(_, m, _)| *m).collect() };
-        let w = mrrs_of(0);
-        let rif = mrrs_of(1);
-        println!("\nSoglie della fase (a {largest}):");
-        // categories in table order: fattuali(0) parafrasi(1) multi-salto(2) inglese(3)
-        for (idx, name) in [(0_usize, "fattuali"), (1, "parafrasi"), (3, "inglese")] {
-            println!(
-                "- {name}: {:.4} contro {:.4} del riferimento (Δ {:+.4}, soglia −0,02: {})",
-                w[idx],
-                rif[idx],
-                w[idx] - rif[idx],
-                if w[idx] - rif[idx] >= -0.02 {
-                    "OK"
-                } else {
-                    "NO"
-                }
-            );
-        }
-        println!(
-            "- multi-salto: {:.4} (soglia ≥ 0,75: {})",
-            w[2],
-            if w[2] >= 0.75 { "OK" } else { "NO" }
-        );
-        let p95_delta = (lat[0].1 - lat[1].1) / lat[1].1.max(1e-9) * 100.0;
-        println!(
-            "- ibrido p95: {:.1} ms contro {:.1} ms del riferimento ({p95_delta:+.1}%, soglia +10%: {})",
-            lat[0].1,
-            lat[1].1,
-            if p95_delta <= 10.0 { "OK" } else { "NO" }
-        );
-        drop(cell);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(dir.join(format!("cal-{largest}.sqlite{suffix}")));
-        }
     }
 }
 
@@ -2652,7 +2438,9 @@ fn main() {
 
 /// The mean of the per-category MRRs (v0.4, P0.3/P1.6): every category
 /// counts the same — the question-weighted MRR hid multi-salto, which is a
-/// twentieth of the questions.
+/// twentieth of the questions. The v0.4.5 (P1) calibration went back to
+/// the v0.3.2 question-weighted MRR, so this lives on for its test.
+#[cfg(test)]
 fn category_mean(mrrs: &[f64]) -> f64 {
     if mrrs.is_empty() {
         return 0.0;

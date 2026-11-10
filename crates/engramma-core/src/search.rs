@@ -439,14 +439,19 @@ impl Default for Fusion {
         // §v0.2.1): the convex combination with the cosine min-max'd over the
         // candidates — the cosine rides on BM25's [0, 1] scale, so α means
         // what it says. Retuned JOINTLY with the graph weight in v0.3.1
-        // (0.6/0.40, best absolute weighted MRR 0.8656) and again in v0.3.2
+        // (0.6/0.40, best absolute weighted MRR 0.8656), again in v0.3.2
         // with the ROBUST rule — best weighted MRR in the worst case among
         // the ±1-step neighbours of the grid: 0.7/0.35 (0.8529, neighbourhood
-        // minimum 0.8483 against 0.8410 for 0.6/0.40, which sits on the edge
-        // of the 0.45 cliff). A corpus that shifts a little must not fall
-        // into the collapse.
+        // minimum 0.8483) — and finally in v0.4.5 with TWO benches: on the
+        // Italian 100k grid the admissible set (weighted MRR ≥ 0.8429,
+        // α-neighbourhood minimum ≥ 0.8383) is {0.5, 0.6, 0.7} (0.5: 0.8577 /
+        // 0.8397; 0.6: 0.8527 / 0.8527; 0.7: 0.8529 / 0.8485), and among
+        // them LongMemEval dev's turn ndcg@5 picks 0.5 (0.7303 vs 0.7049 and
+        // 0.6765) — confirmed on 320 held-out questions (session any@5
+        // 0.9750 vs text 0.9625, all@5 0.8500 vs 0.8344, turn ndcg@5 0.6813
+        // vs 0.6620). REPORT v0.4.5.
         Fusion::Convex {
-            alpha: 0.7,
+            alpha: 0.5,
             cos_norm: CosNorm::Candidates,
         }
     }
