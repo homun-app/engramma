@@ -25,8 +25,11 @@ search** (text + graph + time) that **explains** every result.
 - **MCP**: read-only access for Claude and other MCP clients, scoped to the
   cells you choose.
 
-**Status: v0.2 — the format is unstable.** The bidirectional Markdown view
-arrives in v0.3. See `docs/DESIGN.md` for the full roadmap.
+**Status: v0.4 — the format is unstable.** The bidirectional Markdown view
+(`engramma vault`), the right to be forgotten (`purge`) and the Node.js
+binding for in-process hosts (Homun) are in; encrypted peer sync is next
+(v0.5). Tested on macOS arm64 and Linux arm64 (Docker); x86_64 and Windows
+are not tested yet. See `docs/DESIGN.md` for the full roadmap.
 
 ## Install from source
 
@@ -141,12 +144,20 @@ claude mcp add engramma -- /path/to/engramma mcp --root ~/.engramma --cells fami
   (no network I/O)
 - `crates/engramma-embed` — the embedders: builtin ONNX via tract (pure
   Rust), Ollama, OpenAI-compatible HTTP
+- `crates/engramma-vault` — the bidirectional Markdown view (`engramma vault`)
+- `crates/engramma-node` — the Node.js (N-API) binding, for Homun and any
+  Node/Electron host (`docs/node.md`); its Rust allocations go through
+  mimalloc (v0.4.4)
 - `crates/engramma-cli` — the `engramma` binary
 - `crates/engramma-mcp` — the MCP server (stdio, read-only)
 - `spec/` — the note format specification, with valid/invalid examples used
   as tests
-- `bench/` — the benchmark (`engramma-bench`, deterministic corpus)
-- `docs/` — `DESIGN.md` (the project document), `cli.md`, `architecture.md`
+- `bench/` — the benchmark (`engramma-bench`, deterministic corpus) and the
+  LongMemEval example (`bench/examples/longmemeval.rs`)
+- `scripts/linux.sh` — the workspace checks inside the Linux arm64 Docker
+  image, offline
+- `docs/` — `DESIGN.md` (the project document), `cli.md`, `architecture.md`,
+  `node.md`
 
 ## Model licences
 

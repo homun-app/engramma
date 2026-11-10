@@ -1,6 +1,6 @@
-# Motore di memoria — documento di progetto (bozza 1)
+# Motore di memoria — documento di progetto
 
-> **Nome: Engramma** (scelto dall'utente il 2026-11-05: l'engramma è la traccia fisica di un ricordo; libero su crates.io, 14 progetti omonimi su GitHub). Bozza del 2026-11-05.
+> **Nome: Engramma** (scelto dall'utente il 2026-11-05: l'engramma è la traccia fisica di un ricordo; libero su crates.io, 14 progetti omonimi su GitHub). **Stato al tag `fase-v0.4.4`** (bozza 1 del 2026-11-05, aggiornata alle fasi successive senza riscrittura).
 
 ## 1. Visione
 
@@ -229,12 +229,11 @@ query {
   - **incorporato**, quello predefinito: ONNX via **tract**, in puro Rust. *Deciso il 2026-11-05:* dà gli stessi vettori di ONNX Runtime (cos 1,000000 su Granite R2), senza librerie native da distribuire, quindi anche su mobile e WASM. `ort` è più veloce (~2×), ma è ancora in rc e scarica binari: in futuro sarà al più un backend facoltativo. candle è scartato, perché il suo ModernBERT ha l'attivazione fissa (gelu) e Granite R2 usa `silu`;
   - **Ollama** (`/api/embed`);
   - **HTTP compatibile OpenAI** (`/v1/embeddings`), per il server.
-- **Il modello predefinito si decide misurando, in v0.2**, sul benchmark italiano (§ 11). Candidati verificati il 2026-11-05:
-  - **IBM Granite Embedding Multilingual R2**, Apache 2.0, ModernBERT, italiano tra le lingue di addestramento, nessun prefisso:
-    - 97M: 384 dimensioni, MTEB Multilingual Retrieval 60,3;
-    - 311M: 768 dimensioni con Matryoshka, 65,2.
-  - **EmbeddingGemma 308M** (62,5), con **licenza Gemma, non open source**: supportato come cartella fornita dall'utente, non incluso né scaricato di serie.
+- **Il modello predefinito** — *deciso in v0.2 misurando sul benchmark italiano (§ 11), confermato in v0.4* — è **IBM Granite Embedding Multilingual R2 97M**: Apache 2.0, ModernBERT, 384 dimensioni, italiano tra le lingue di addestramento, nessun prefisso (MTEB Multilingual Retrieval 60,3). Il 311M (768 dimensioni con Matryoshka, 65,2) resta un'opzione per chi dà più RAM. **EmbeddingGemma 308M** (62,5) ha **licenza Gemma, non open source**: supportato come cartella fornita dall'utente, non incluso né scaricato di serie.
   - I modelli si scaricano con `engramma model pull`, con revisione e sha256 fissati.
+- **La RAM del modello, misurata (v0.4.4, macOS arm64, Node 24, Granite 97M f32 da 390 MB):** motore aperto senza modello ~50 MB; modello caricato ~870–935 MB; dopo `embedPending` di 64 note (metà di ~600 token) la residente **resta alta**: 1857 MB con l'allocatore di sistema, 971–2437 MB (varianza alta tra corse) con **mimalloc** come allocatore del `.node` e del binario CLI; la memoria in uso è ~485 MB, il resto sono pagine liberate che l'allocatore tiene residenti (i segmenti da 128 MB di mimalloc su questo macOS, le zone «empty» del sistema). Il picco è ~2,3–2,4 GB in entrambi i casi. Numeri e diagnosi nel REPORT v0.4.4.
+- **mimalloc** è l'allocatore dei due artefatti finali (il `.node` di Homun e il binario `engramma`), *non* delle librerie: l'allocatore lo sceglie chi produce l'eseguibile, e chi incorpora il core deve poter scegliere il suo. Abbassa la residente a modello caricato (846 vs 981 MB a processo nudo) e in Node la mediana a riposo (~1,4 GB vs 1857 MB), ma **su macOS la memoria liberata non torna tutta al sistema** con nessuno dei due allocatori: la soglia di 700 MB dopo 10 s della v0.4.4 non è raggiunta e resta un problema aperto. `ENGRAMMA_EMBED_THREADS` limita i filoni di embedding (heap per thread) se un ospite ha bisogno di stringere.
+- **I pesi in f16 sono stati provati e scartati** (v0.4.4): `FloatPrecisionTranslator` su Granite 97M non abbassa la memoria dopo il carico (803 vs 822 MB a processo nudo, 983 vs 1192 MB dopo il lavoro) e peggiora la fedeltà — coseno contro f32: medio 0,99948, peggiore 0,99438. Da non riprovare.
 - **Cambio di modello «blu/verde».** Ogni vettore porta il modello e l'hash del testo. Il modello nuovo si costruisce (`building`) mentre il vecchio (`ready`) continua a servire la ricerca; lo scambio è atomico a copertura completa. La ricerca per significato non si spegne mai. *Rivisto il 2026-11-05:* prima si spegneva durante il ricalcolo.
 - **Le scritture non calcolano embedding:** le note nuove restano in attesa, e `embed_pending` le elabora a lotti. L'inserimento resta veloce.
 
@@ -278,14 +277,16 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 - **Ambiti:** il server si avvia con l'elenco delle celle esposte (`engramma mcp --cells famiglia,preferenze`). In HTTP si usano token per ambito. Ogni lettura finisce nel registro di audit della cella.
 
 ### 8.4 Homun (v0.4)
-- **Collegamento in-process:** il daemon carica il modulo `napi-rs` — `crates/engramma-node`, **N-API** (stabile tra versioni di Node ed Electron: il `.node` non si ricompila a ogni aggiornamento). Il contratto JS (`Engine`, `Cell`) è in `docs/node.md`: ogni metodo che tocca disco o modello è asincrono sul pool di libuv, gli errori sono `Error` con `code` stabile e senza contenuti di note (l'oracolo chiuso vale anche per `get`: una nota in quarantena risponde `null`). Il modello sta nel demone, una volta (~400 MB); la ricerca su più celle fonde le classifiche con RRF k=60, dichiarata approssimata.
+- **Collegamento in-process:** il daemon carica il modulo `napi-rs` — `crates/engramma-node`, **N-API** (stabile tra versioni di Node ed Electron: il `.node` non si ricompila a ogni aggiornamento). Il contratto JS (`Engine`, `Cell`) è in `docs/node.md`: ogni metodo che tocca disco o modello è asincrono sul pool di libuv, gli errori sono `Error` con `code` stabile e senza contenuti di note (l'oracolo chiuso vale anche per `get`: una nota in quarantena risponde `null`). Il modello sta nel demone, una volta (la RAM misurata sta nel § 7); la ricerca su più celle fonde le classifiche con RRF k=60, dichiarata approssimata. Dal v0.4.4 le allocazioni Rust del modulo passano per **mimalloc** (§ 7): Node ed Electron restano col loro allocatore.
 - **Firma su macOS:** il `.node` va **fuori dall'asar** e firmato con l'identità dell'app prima della notarizzazione (`codesign --options runtime`; `docs/node.md`).
 - **Migrazione:** le note di oggi (`agents/<id>/memory`, `user/memory`) diventano celle:
   - `bot-<id>` per le note di un bot;
   - `utente` per quelle condivise;
   - `core` diventa un tag;
   - `source` vale `migrated:homun`.
-- **Strumenti del bot:** `recall_memory` e `update_memory` restano nell'interfaccia, ma usano il motore. Nascono `search_history` e `read_history`, che usano un indice delle conversazioni in una cella `storia` dedicata.
+- **Strumenti del bot:** `recall_memory` e `update_memory` restano nell'interfaccia, ma usano il motore. Nascono `search_history` e `read_history`, con l'indice delle conversazioni in **una cella `storia-<id>` per bot** (v0.4.4: non una cella `storia` unica — la cronologia di un bot è sua, cancellabile in blocco con la sua cella, e il nome `storia` non riserva niente a nessuno).
+- **Il contratto di `dropCell`** (v0.4.3, con Homun): i nomi a forma di istantanea (`<qualcosa>-snap-<cifre>`) sono **riservati** alle istantanee di compattazione — una cella così chiamata verrebbe cancellata insieme alla cella di cui porta il nome, e la creazione la rifiuta; la connessione condivisa si chiude **subito**, anche se un oggetto `Cell` resta vivo in JS (il GC non decide lui quando l'oblio è fatto); nessuna `Cell` nasce morta (gate di generazione e apertura sotto lo stesso lock).
+- **Stato dell'integrazione:** Homun usa la versione con il lock degli hash del registro (v0.4.2); le correzioni v0.4.3 (dropCell) e v0.4.4 (allocatore) sono pronte per il passo successivo, la sincronizzazione della v0.5.
 - **Quarantena:** ciò che il bot ricava in un turno contaminato si scrive come `external` — nasce in quarantena e la ricerca non la vede finché qualcuno non la conferma.
 - **Oblio:** `purge` non mente — se il WAL o una vista markdown trattengono ancora byte, la risposta lo dice (`pending`) e il chiamante finisce il lavoro.
 - **La sezione Memoria di Homun** è un'interfaccia sul motore: elenco, ricerca, grafo, «perché lo so?» (l'explain, peso del grafo compreso), conferma della quarantena, storico.
@@ -327,30 +328,33 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
   - di astensione (la risposta non c'è).
 
   Si misurano il richiamo@k e il MRR sulla parte del motore: **non** serve un giudice LLM, perché si giudica se la nota giusta è tra le prime k.
-- **Confronto esterno:** un sottoinsieme di LongMemEval (aggiornamenti e astensione). LoCoMo solo con cautela: il suo giudice e le sue risposte di riferimento sono stati contestati nel 2026.
-- **Prestazioni**, su un Mac M-series, cella da 100 000 note:
-  - inserimento ≥ 2 000 note/s senza embedding;
-  - ricerca testo + grafo con p95 ≤ 30 ms;
-  - ricerca mista con embedding della domanda già calcolato, p95 ≤ 50 ms;
-  - apertura di una cella ≤ 50 ms.
+- **Confronto esterno — LongMemEval** (v0.4.4, `bench/examples/longmemeval.rs`): LongMemEval-S *cleaned*, 470 domande (le 30 di astensione escluse), una cella per domanda, nota = round, metriche ufficiali (`recall_any/all@k`, `ndcg@k`, livello sessione e turno, k = 5 e 10), modalità testo (BM25), ibrida predefinita e la diagnostica solo-vettori, `question_date` come «adesso» per la recenza. **Il numero di partenza** (dettagli e tabelle nel REPORT v0.4.4): testo su tutte le 470 → `recall_any@5` sessione **0,9702** (ndcg@5 0,8828); ibrida e testo sullo stesso sottoinsieme fisso di 150 → sessione any@5 0,9733 (ibrida) contro 0,9867 (testo), ma `all@5` **0,900** contro 0,867 e `ndcg@5` **0,932** contro 0,904: su questo dataset ripulito BM25 è quasi saturo e la fusione (α=0,7) vince in profondità, non sulla prima sessione. I lavori pubblicati (dataset originale, indici diversi) riportano 0,8–0,97: il confronto resta un ordine di grandezza. LoCoMo solo con cautela: il suo giudice e le sue risposte di riferimento sono stati contestati nel 2026.
+- **Prestazioni**, su un Mac M-series, cella da 100 000 note — **misurate** (v0.4.3, verifiche; confermate dal banco in v0.4.4 entro il rumore):
+  - inserimento ~1 900–2 500 note/s senza embedding;
+  - ricerca testo + grafo p95 **12,3 ms**;
+  - ricerca mista calda (embedding della domanda già calcolato) p50 **10,5 ms**, p95 **13,9 ms**;
+  - ricerca ibrida con embedding della domanda p95 ~24 ms;
+  - apertura di una cella ~1 ms;
+  - embedding ~135–148 note/s (Granite 97M, 10 filoni).
 
-  Da confermare con le prime misure.
+  Gli obiettivi della bozza (≥ 2 000/s, p95 ≤ 30 e ≤ 50 ms) sono dunque raggiunti con margine.
 - **Correttezza:**
   - test di proprietà (giro del formato senza perdite; registro rigiocato = stesso stato; esportazione → importazione = stesso stato);
   - `engramma verify`: ricostruisce gli indici e li confronta.
 
 ## 12. Tabella di marcia
 
-| Versione | Contenuto | Dipende da |
-|---|---|---|
-| **v0.1** | Formato e parser; cella SQLite; registro con HLC e hash; versioni e lapidi; FTS con radici italiano/inglese; entità, relazioni e tag; validità e quarantena; ricerca testo + grafo + tempo con spiegazioni; import/export della cartella; CLI; MCP stdio in sola lettura; benchmark e test di proprietà | — |
-| v0.2 | Embedder (ONNX incorporato via tract, Ollama, HTTP); vettori derivati con indice `FlatI8`; ricerca mista (RRF o convessa, scelta misurando); scelta misurata del modello; cambio di modello blu/verde | v0.1 |
-| v0.3 | Grafo in memoria con PPR come terza lista (costo e multi-salto); registro v2 con payload dimenticabili; `purge`; compattazione con istantanee; vista markdown bidirezionale (riconciliazione per scansione, `notify` come innesco); candidati al consolidamento | v0.2 |
-| v0.4 | Collegamento Node (napi-rs); **integrazione in Homun**: migrazione, strumenti, `search_history`, sezione Memoria, quarantena dai turni contaminati, audit MCP con ambiti | v0.3 |
-| v0.5 | Identità, abbinamento, sincronizzazione cifrata del registro tra pari, permessi per cella, conflitti | v0.4 |
-| v0.6 | `engramma serve`: API, autenticazione, molte celle | v0.5 |
-| v0.7 | Cluster: posizionamento Raft, router, replica multi-Raft, spostamento celle, backup su storage a oggetti | v0.6 |
-| poi | Python, Swift, Kotlin, WASM; MLS per i gruppi; messaggi A2A sul canale | — |
+| Versione | Contenuto | Dipende da | Stato |
+|---|---|---|---|
+| **v0.1** | Formato e parser; cella SQLite; registro con HLC e hash; versioni e lapidi; FTS con radici italiano/inglese; entità, relazioni e tag; validità e quarantena; ricerca testo + grafo + tempo con spiegazioni; import/export della cartella; CLI; MCP stdio in sola lettura; benchmark e test di proprietà | — | **fatta** (`fase-v0.1`, `fase-v0.1.1`) |
+| v0.2 | Embedder (ONNX incorporato via tract, Ollama, HTTP); vettori derivati con indice `FlatI8`; ricerca mista (RRF o convessa, scelta misurando); scelta misurata del modello; cambio di modello blu/verde | v0.1 | **fatta** (`fase-v0.2`, `fase-v0.2.1`) |
+| v0.3 | Grafo in memoria con PPR come terza lista (costo e multi-salto); registro v2 con payload dimenticabili; `purge`; compattazione con istantanee; vista markdown bidirezionale (riconciliazione per scansione, `notify` come innesco); candidati al consolidamento | v0.2 | **fatta** (`fase-v0.3`, `fase-v0.3.1`, `fase-v0.3.2`) |
+| v0.4 | Collegamento Node (napi-rs); **integrazione in Homun**: migrazione, strumenti, `search_history`, sezione Memoria, quarantena dai turni contaminati, audit MCP con ambiti | v0.3 | **fatta** (`fase-v0.4` … `fase-v0.4.4`). **Slittati fuori dalla v0.4:** il **grafo adattivo** (non ha raggiunto le soglie: multi-salto 0,458 a 100k col predefinito, contro il testo+grafo che già lo serve) e l'**audit MCP con ambiti** (MCP resta stdio in sola lettura con `--cells`); la chiusura v0.4.3–v0.4.4 ha consolidato disco, RAM, Linux e LongMemEval (§ 7 e § 11) |
+| v0.4.4 | Consolidamento: profili di build (`line-tables-only`), mimalloc nei due artefatti (§ 7), Linux arm64 provato in Docker (`scripts/linux.sh`), LongMemEval come numero esterno (§ 11), DESIGN alla verità | v0.4.3 | **fatta** (`fase-v0.4.4`) |
+| v0.5 | Identità, abbinamento, sincronizzazione cifrata del registro tra pari, permessi per cella, conflitti | v0.4 | da fare |
+| v0.6 | `engramma serve`: API, autenticazione, molte celle | v0.5 | da fare |
+| v0.7 | Cluster: posizionamento Raft, router, replica multi-Raft, spostamento celle, backup su storage a oggetti | v0.6 | da fare |
+| poi | Python, Swift, Kotlin, WASM; MLS per i gruppi; messaggi A2A sul canale | — | — |
 
 ## 13. v0.1 nel dettaglio (sarà il primo prompt per GLM)
 
@@ -398,12 +402,21 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 
 ## 14. Decisioni aperte
 
+Chiuse lungo la strada:
+
 1. ~~Il nome~~ → **Engramma** (deciso 2026-11-05; il pacchetto npm sarà `@engramma/core`).
-2. **Campi in inglese** nel formato: adottati per la v0.1 (raccomandazione; l'utente può rivederla).
-3. **Dove vive:** repository privato finché non c'è la v0.1, poi pubblico su GitHub?
-4. **Il modello di embedding predefinito:** si decide in v0.2 misurando Granite R2 97M contro 311M. Runtime (tract) e indice (`FlatI8`, niente sqlite-vec per ora) sono decisi il 2026-11-05.
-5. **SQLCipher sì o no** per la cifratura della cella (v0.5).
-6. **Il rapporto con Homun:** il motore resta un progetto separato, con le sue versioni. Homun fissa una versione precisa.
+2. ~~**Campi in inglese** nel formato~~ → adottati dalla v0.1, confermati.
+3. ~~**Il modello di embedding predefinito**~~ → **Granite R2 97M** (v0.2, misurato; § 7). Il 311M resta un'opzione. Runtime (tract) deciso 2026-11-05.
+4. ~~**Indice vettoriale**~~ → `FlatI8` in Rust: **sqlite-vec scartato** (un'estensione caricata a runtime, da tenere in passo con SQLite e da firmare diversamente in Electron; la scansione int8 nostra basta fino a ~1M vettori, § 11).
+5. ~~**L'istantanea di compattazione**~~ → facoltativa (`--keep-snapshot`): la compattazione base è un punto di controllo senza seconda copia; l'istantanea serve a chi vuole un file coerente da portare via (v0.3.2).
+6. ~~**L'allocatore degli artefatti finali**~~ → mimalloc nel `.node` e nel binario CLI, librerie neutre (v0.4.4, § 7).
+
+Ancora aperte:
+
+7. **Dove vive:** repository privato o pubblico su GitHub?
+8. **SQLCipher sì o no** per la cifratura della cella (v0.5).
+9. **Windows:** non provato (v0.4.4: macOS arm64 provato, Linux arm64 provato in Docker, x86_64 e Windows no; i punti sensibili — file aperti, nomi riservati, separatori — sono nel REPORT v0.4.4).
+10. **Il rapporto con Homun:** il motore resta un progetto separato, con le sue versioni. Homun fissa una versione precisa (oggi quella col lock degli hash del registro).
 
 ## Fonti (verificate il 2026-11-05)
 - Licenza SurrealDB: https://surrealdb.com/license

@@ -23,7 +23,12 @@ use engramma_embed::Builtin;
 fn rss_mib() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    line.split_whitespace().nth(1)?.parse().ok()
+    // /proc reports VmRSS in kB
+    line.split_whitespace()
+        .nth(1)?
+        .parse::<u64>()
+        .ok()
+        .map(|kb| kb / 1024)
 }
 
 #[cfg(not(target_os = "linux"))]

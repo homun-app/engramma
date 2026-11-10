@@ -1,10 +1,13 @@
 # engramma-node — il motore dentro Node.js ed Electron
 
-v0.4.3. Il collegamento in-process per Homun: un modulo **N-API**
+v0.4.4. Il collegamento in-process per Homun: un modulo **N-API**
 (napi-rs 3) che carica il motore una volta per processo. L'N-API è
 stabile tra versioni di Node ed Electron: il `.node` non va ricompilato a
 ogni aggiornamento di Electron (Homun oggi non ha moduli nativi; questo
-è il primo, ed è il motivo della scelta).
+è il primo, ed è il motivo della scelta). Da v0.4.4 le allocazioni Rust
+del modulo (motore e tract) passano per **mimalloc**: in un `cdylib` il
+`#[global_allocator]` vale per il modulo, non per Node o Electron, che
+restano col loro allocatore (le misure stanno nel REPORT v0.4.4).
 
 ## Costruzione
 

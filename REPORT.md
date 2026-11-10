@@ -3454,3 +3454,322 @@ stress: 40 coppie, Cell morte (di drop successivi): 36 — l'ultima cell(name) �
   `NOT_FOUND` per la Cell morta, qualunque altro errore fa fallire).
 - **Windows e Linux**: solo macOS arm64, come nelle fasi precedenti.
 - **cargo deny advisories**: richiedono rete; eseguito `licenses bans`.
+
+# REPORT — Engramma v0.4.4 (consolidamento: disco, RAM, Linux, LongMemEval, DESIGN)
+
+Data: 2026-11-10. Base: `main` @ `50489a9` (tag `fase-v0.4.3`). Un commit
+per punto, la misura prima della correzione. Tutto costruito con
+`cargo --offline`, Rust 1.95.0, macOS arm64 (darwin 27.0.1, 10 core).
+Unica crate nuova: `mimalloc 0.1.39` (con `libmimalloc-sys 0.1.35`, MIT,
+già nel registro locale). Nessun `unsafe` fuori da napi-derive, nessun
+`unwrap`/`expect` fuori dai test, clippy `-D warnings` verde su macOS **e
+su Linux**. Il repo di Homun NON è stato toccato. La macchina ha
+condiviso la CPU con un'altra sessione di lavoro (carico medio 4–12 nel
+giorno): dove pesa, è detto; le coppie prima/dopo sono state corsa il più
+possibile addossate.
+
+Disco: partiti con 25 GB liberi; mai scesi sotto 30; `du -sh target`
+all'inizio **11 GB** (residuo di fasi passate: build di rilascio comprese),
+alla fine **6,4 GB**.
+
+## P0 — il disco di una build: `line-tables-only`
+
+`[profile.dev] debug = "line-tables-only"` e
+`[profile.dev.package."*"] debug = false` nel `Cargo.toml` del workspace:
+i nostri crate tengono file e riga nei backtrace, le dipendenze perdono
+il debug completo che nessuno usa (la rlib di tract da sola pesava
+~170 MB; i binari di test 105–130 MB l'uno).
+
+Misura su `cargo clean` + `cargo test --offline --workspace` (26 suite
+verdi entrambe le volte):
+
+| | prima | dopo |
+|---|---|---|
+| `du -sh target` | **3,2 GB** | **2,1 GB** |
+| build pulita | **4:18** | **2:38** |
+
+I 12,3 GiB che `cargo clean` ha tolto all'inizio includevano i prodotti
+di rilascio delle fasi passate; il confronto pulito è quello della
+tabella. Sul volume Docker di Linux lo stesso profilo porta il target da
+7,2 GB (misurati in verifica) a **3,9 GB**.
+
+## P1 — RAM: mimalloc nei due artefatti finali
+
+**La misura che mostra il problema** (`crates/engramma-node/__test__/rss.js`,
+Node 24, Granite 97M f32 da 390 MB, 64 note di cui metà ~600 token,
+`embedPending` una volta): con l'allocatore di sistema, RSS a fine lavoro
+**1857 MB e lì resta** (vmmap: in uso 485 MB, `Malloc Large (empty)`
+731 MB, `Malloc Small (empty)` 545 MB, frammentazione 58%), picco 2,3 GB.
+
+**La correzione**: `#[global_allocator]` con `mimalloc::MiMalloc` nei due
+artefatti finali — `crates/engramma-node` (il `.node` di Homun) e
+`crates/engramma-cli` — e **solo lì**: le librerie restano neutre, chi
+produce l'eseguibile sceglie il proprio allocatore. In un `cdylib`
+N-API l'allocatore copre le allocazioni Rust del modulo (motore e tract),
+non Node o Electron.
+
+RSS con mimalloc (stesso script). Due tracce complete, com'erano stampate:
+
+| | modello caricato | dopo embed | +2 s | +10 s |
+|---|---|---|---|---|
+| corsa A | 886 | 1544 | 1552 | **971** |
+| corsa B | 869 | 2103 | 1696 | **1413** |
+
+RSS a +10 s in tutte le corse con mimalloc (filoni di default, misura
+singola per corsa): **971, 993, 1309, 1413, 1768, 2008, 2159, 2293 MB** —
+varianza alta, mai sotto 971. Motore aperto senza modello: 50 MB (51 con
+mimalloc). Picco 2,4 GB.
+`embedPending` delle 64 note: 8,6 s prima, 7,4–13,7 s dopo (rumore della
+macchina condivisa; mediana invariata).
+
+**La soglia di 700 MB non è raggiunta** e la causa è capita e misurata:
+con mimalloc la memoria liberata resta in segmenti da **128 MB** parzialmente
+residenti che nessuna pressione esterna (6 GB allocati accanto) restituisce
+— `vmmap` li mostra sporchi, gli stats di mimalloc dicono 38,7 GiB purgati.
+Le prove fatte: `ENGRAMMA_EMBED_THREADS` a 1/2/4/10 (a 1 filone il tempo
+raddoppia, 21,5 s, e la RSS dopo 10 s resta 1052–1489 MB: gli heap per
+thread non sono il grosso), `MIMALLOC_PURGE_DELAY` 0/10/100 e
+`MIMALLOC_RESET_DELAY` 0/10 (0 *disattiva* il purge in mimalloc; i valori
+piccoli non cambiano nulla), `MIMALLOC_ABANDONED_PAGE_RESET=1` (993 MB,
+gli heap abbandonati dei filoni non sono il grosso). A processo nudo
+(`crates/engramma-embed/examples/ram*.rs`): allocatore di sistema
+981 → 2123 → 1833 MB a +10 s; mimalloc 846 → 2437 → **2437** MB: su
+darwin 27 il prototipo della verifica (540 MB) non si riproduce, né
+dentro Node né fuori. **In cambio** mimalloc abassa la residente a modello
+caricato (846 vs 981 MB nudo; 886–894 vs 935 in Node) e in Node la mediana
+a riposo (~1,4 GB vs 1857 MB stabili). Su Linux la storia è diversa e
+migliore (vedi P2). La soglia resta un problema aperto, scritto nel
+DESIGN § 7 con i numeri.
+
+**Nessuna regressione di velocità** (banco 100k, `--runs 1`, macchina
+condivisa: le coppie sono state corse addossate; le punte p95 fuori nome
+— 28–69 ms — sono picchi dell'altra sessione, presenti in entrambe):
+
+| metrica | prima | dopo |
+|---|---|---|
+| embedding (note/s) | 135 | 148 |
+| vettori p50 / p95 (ms) | 4,5 / 5,1 | 4,5 / 5,1 |
+| ibrido caldo p50 (ms) | 11,7 | 12,0 |
+| ibrido caldo p95 (ms) | 14,9 | 15,5 |
+| ibrido con embedding p50 (ms) | 20,6 | 21,1 |
+
+Riferimento non condiviso (v0.4.3, `bench/RESULTS.md`): embedding 148/s,
+ibrido caldo 11,6/14,7 — il banco con mimalloc nei sorgenti torna sugli
+stessi numeri. **Fedeltà**: `cargo test -p engramma-embed --test fidelity`
+verde senza toccare le soglie (5 test; un allocatore non cambia i
+vettori). **test:electron-main** verde: il demone Electron di Homun
+carica il `.node` con mimalloc e fa il giro completo.
+
+## P2 — Linux, davvero
+
+`scripts/linux.sh` (uso in testa al file): `engramma-linux:1.95.0`
+(Debian bookworm, Rust 1.95.0 aarch64, gcc 12, clippy e rustfmt),
+sorgente montato **in sola lettura**, `--network none`, **utente normale**
+(non root), target nel volume `engramma-linux-target`.
+
+**Nota d'ambiente**: Docker Desktop ha perso tutte le immagini a metà
+giorno (reset del daemon; `docker images` vuoto, i volumi sono sopravvissuti).
+L'immagine è stata ricostruita come in verifica da
+`rust:1.95.0-slim-bookworm` (gcc + clippy + rustfmt); serve rete solo
+per quello, il lavoro dentro il container resta `--offline`.
+
+- **fmt, clippy `-D warnings` e test verdi su Linux**: 26 suite, come
+  utente normale. Due lints esistevano solo nei rami
+  `#[cfg(target_os = "linux")]` degli esempi nuovi (`needless_question_mark`
+  in `ram`, `collapsible_if` in `longmemeval`): macOS non li compilava
+  mai, Linux sì — corretti.
+- **Il test dei permessi** (`compact_fails_cleanly_when_the_old_file_cannot_go`,
+  `forgetting.rs` ~733): dopo il `chmod 0o555` il test ora prova a creare
+  un file nella cartella; se ci riesce, i permessi non legano (root li
+  ignora) e il test **salta con un messaggio** invece di fallire. Niente
+  `geteuid`, niente `unsafe`. Su Linux da utente normale il test **corre**
+  (i permessi legano): la via giusta è provata davvero. Era l'unico test
+  che usa `set_permissions`/`from_mode` (cercati).
+- **Il test `lsof` della v0.4.3** (`dropCell closes the connection…`):
+  su Linux ora legge `/proc/self/fd` (lsof non c'è nell'immagine), su
+  macOS resta `lsof`: su entrambi il test prova qualcosa di vero.
+- **`cargo build -p engramma-node --release` riesce nel container**
+  (scripts/linux.sh build-node): il `.node` per Linux si costruisce, con
+  mimalloc. Il collegamento Node non si prova (nell'immagine non c'è
+  Node), come da fase.
+- **La RAM su Linux** (`crates/engramma-embed/examples/ram*.rs` nel
+  container, `/proc/self/status`; l'output dell'esempio stampava kB
+  come «MB», corretto dopo la corsa — i valori qui sono ricalcolati):
+  - allocatore di glibc: 562 MB a modello caricato, 604 dopo il lavoro,
+    **604 a +10 s** (stabili), picco `VmHWM` 2158 MB;
+  - mimalloc: 718, 779, **779** a +10 s, picco 2419 MB.
+  Su Linux **entrambi** gli allocatori restituiscono: la retention di
+  macOS è un comportamento del sistema, non del motore. mimalloc tiene
+  ~175 MB in più di glibc a riposo.
+- **Il volume del target Linux** (con P0): **3,9 GB**
+  (`docker system df -v`), contro i 7,2 GB misurati in verifica senza.
+- **Windows, rilettura** (non provato; nessuna correzione oltre quella
+  ovvia):
+  1. *cancellare un file aperto*: già gestito per progetto — `retire()`
+     della v0.4.3 chiude la connessione **prima** della `remove_file`;
+  2. *nomi riservati*: `CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`
+     come nomi di cella sono ora rifiutati su Windows (`#[cfg(windows)]`
+     nei due punti di validazione: Node `cell_path` e `cell create`
+     della CLI; su macOS/Linux cambia nulla);
+  3. *separatori dei percorsi nella vista markdown*: già normalizzati a
+     `/` in `port.rs` e in `engramma-vault` (tre punti);
+  4. *aperto*: MCP apre celle esistenti per nome (se l'OS rifiuta il
+     file, l'errore IO è chiaro); i nomi delle note esportate finiscono
+     con l'id ULID, quindi niente punti/spazi finali. Da provare quando
+     ci sarà una macchina Windows.
+
+## P3 — LongMemEval: il numero di partenza
+
+`bench/examples/longmemeval.rs`: legge
+`~/.cache/engramma/bench/longmemeval_s_cleaned.json` (sha256 verificato
+prima di tutto; errore chiaro se manca), **una cella per domanda** in
+una cartella temporanea cancellata alla fine, **nota = round** (turno
+`user` + il `assistant` che segue; `createdAt` = data della sessione,
+`source: longmemeval`, `session_id` e indice round in `x-lme-*`),
+rilevanza a livello di turno quando un turno del round ha `has_answer`.
+La domanda: `search({text: question, k=50})` con `question_date` come
+«adesso» — l'API Rust espone `search_with_now`, quindi la recenza vede
+le date 2023; senza tempo di riferimento le stesse date avrebbero
+sballato il peso di recenza contro un «adesso» 2026. Metriche ufficiali
+di `eval_utils.py` (recall_any/all@k, ndcg binaria con
+`dcg = r[0] + Σ r[i]/log2(i+1)`), livello **sessione** (round → sessioni
+distinte in ordine, fino a k) e **turno**, k = 5 e 10, saltando le 30
+`_abs`.
+
+**Cache dei vettori** (`~/.cache/engramma/bench/vec-cache-<modello>.bin`,
+record `sha256(testo) ‖ vettore`): ogni round distinto si incorpora una
+volta per tutte le domande; i round condivisi tra domande non si rifanno.
+*Bug trovato e corretto in corsa*: la prima versione apriva il file
+`append` senza `read`, così ogni lettura falliva e la cache non serviva
+mai (la prima corsa ha incorporato anche i round condivisi, 75,7 M
+caratteri; la corsa diagnostica ne stava riappendendo duplicati quando
+l'ho fermata). Corretto, file deduplicato (47 060 round distinti), e da
+lì ogni corsa sul sottoinsieme costa ~100 s. I numeri non cambiano: i
+vettori sono gli stessi, cambia solo il tempo.
+
+- **Ritmo misurato**: sonda di 5 domande, 1738 round, 2,56 M caratteri in
+  161 s ≈ 16 k caratteri/s → la corsa piena sarebbe ~3,3 h > 3 h.
+- **Testo (BM25) su tutte le 470**: durata 82 s, RSS massima 575 MB.
+- **Ibrida e testo sullo stesso sottoinsieme fisso di 150** (seme 42,
+  proporzionale per tipo; id in fondo): durata 6530 s (1 h 49); seconda corsa con la cache calda 83 s, RSS
+  massima 2303 MB (seconda corsa 1081), 51 268 record riusati, 0 nuovi — la corsa fredda aveva incorporato 75,7 M caratteri.
+- **Ripetibilità**: seconda corsa dell'ibrida con la cache calda,
+  fatta, `--mode both` di nuovo: **tabelle identiche** (diff vuoto); 83 s, 51 268 riusi.
+
+Le tabelle (le righe `text`·470 e `text`/`hybrid`·150 vengono da corse separate;
+la `vector` è la diagnostica):
+
+| modalità | livello | tipo | any@5 | all@5 | ndcg@5 | any@10 | all@10 | ndcg@10 | n |
+|---|---|---|---|---|---|---|---|---|---|
+| text | sessione | TOTALE | 0.9702 | 0.8447 | 0.8828 | 0.9872 | 0.9149 | 0.8968 | 470
+| text | sessione | knowledge-update | 1.0000 | 0.9583 | 0.9543 | 1.0000 | 0.9861 | 0.9592 | 72
+| text | sessione | multi-session | 0.9669 | 0.6942 | 0.8344 | 0.9917 | 0.8347 | 0.8614 | 121
+| text | sessione | single-session-assistant | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 56
+| text | sessione | single-session-preference | 0.8667 | 0.8667 | 0.6582 | 0.9000 | 0.9000 | 0.6682 | 30
+| text | sessione | single-session-user | 0.9844 | 0.9844 | 0.9786 | 1.0000 | 1.0000 | 0.9835 | 64
+| text | sessione | temporal-reasoning | 0.9606 | 0.7795 | 0.8413 | 0.9843 | 0.8740 | 0.8600 | 127
+| text | turno | TOTALE | 0.8766 | 0.6617 | 0.6829 | 0.9404 | 0.7702 | 0.7181 | 470
+| text | turno | knowledge-update | 0.9583 | 0.7917 | 0.7446 | 1.0000 | 0.8750 | 0.7675 | 72
+| text | turno | multi-session | 0.8926 | 0.3719 | 0.5298 | 0.9587 | 0.5537 | 0.5833 | 121
+| text | turno | single-session-assistant | 0.8750 | 0.8750 | 0.8486 | 0.9286 | 0.9286 | 0.8694 | 56
+| text | turno | single-session-preference | 0.6000 | 0.4333 | 0.4267 | 0.8000 | 0.6667 | 0.5022 | 30
+| text | turno | single-session-user | 0.9688 | 0.9688 | 0.9416 | 1.0000 | 1.0000 | 0.9523 | 64
+| text | turno | temporal-reasoning | 0.8346 | 0.6693 | 0.6510 | 0.8976 | 0.7559 | 0.6846 | 127
+| text | sessione | TOTALE | 0.9867 | 0.8667 | 0.9042 | 0.9933 | 0.9267 | 0.9158 | 150
+| text | sessione | knowledge-update | 1.0000 | 1.0000 | 0.9840 | 1.0000 | 1.0000 | 0.9840 | 23
+| text | sessione | multi-session | 1.0000 | 0.7436 | 0.8771 | 1.0000 | 0.8974 | 0.9024 | 39
+| text | sessione | single-session-assistant | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 18
+| text | sessione | single-session-preference | 1.0000 | 1.0000 | 0.7693 | 1.0000 | 1.0000 | 0.7693 | 10
+| text | sessione | single-session-user | 1.0000 | 1.0000 | 0.9815 | 1.0000 | 1.0000 | 0.9815 | 20
+| text | sessione | temporal-reasoning | 0.9500 | 0.7500 | 0.8367 | 0.9750 | 0.8250 | 0.8554 | 40
+| text | turno | TOTALE | 0.9000 | 0.7133 | 0.7276 | 0.9467 | 0.8200 | 0.7576 | 150
+| text | turno | knowledge-update | 1.0000 | 0.8696 | 0.7927 | 1.0000 | 0.9565 | 0.8089 | 23
+| text | turno | multi-session | 0.9231 | 0.4103 | 0.5849 | 0.9744 | 0.6154 | 0.6376 | 39
+| text | turno | single-session-assistant | 0.8889 | 0.8889 | 0.8684 | 0.9444 | 0.9444 | 0.8899 | 18
+| text | turno | single-session-preference | 0.7000 | 0.6000 | 0.5501 | 1.0000 | 1.0000 | 0.6670 | 10
+| text | turno | single-session-user | 1.0000 | 1.0000 | 0.9565 | 1.0000 | 1.0000 | 0.9565 | 20
+| text | turno | temporal-reasoning | 0.8250 | 0.7250 | 0.6959 | 0.8500 | 0.7500 | 0.7088 | 40
+| hybrid | sessione | TOTALE | 0.9733 | 0.9000 | 0.9324 | 0.9867 | 0.9467 | 0.9426 | 150
+| hybrid | sessione | knowledge-update | 1.0000 | 1.0000 | 0.9920 | 1.0000 | 1.0000 | 0.9920 | 23
+| hybrid | sessione | multi-session | 1.0000 | 0.8974 | 0.9170 | 1.0000 | 0.9487 | 0.9229 | 39
+| hybrid | sessione | single-session-assistant | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 18
+| hybrid | sessione | single-session-preference | 0.9000 | 0.9000 | 0.9000 | 1.0000 | 1.0000 | 0.9387 | 10
+| hybrid | sessione | single-session-user | 0.9000 | 0.9000 | 0.9000 | 0.9500 | 0.9500 | 0.9178 | 20
+| hybrid | sessione | temporal-reasoning | 0.9750 | 0.8000 | 0.9071 | 0.9750 | 0.8750 | 0.9211 | 40
+| hybrid | turno | TOTALE | 0.8800 | 0.6600 | 0.6765 | 0.9333 | 0.8200 | 0.7160 | 150
+| hybrid | turno | knowledge-update | 0.9565 | 0.8261 | 0.7607 | 1.0000 | 0.9565 | 0.7874 | 23
+| hybrid | turno | multi-session | 0.9231 | 0.4359 | 0.5573 | 0.9744 | 0.6923 | 0.6169 | 39
+| hybrid | turno | single-session-assistant | 0.8889 | 0.8889 | 0.8406 | 0.9444 | 0.9444 | 0.8604 | 18
+| hybrid | turno | single-session-preference | 0.8000 | 0.8000 | 0.6577 | 0.9000 | 0.9000 | 0.6878 | 10
+| hybrid | turno | single-session-user | 0.9000 | 0.9000 | 0.8815 | 0.9000 | 0.9000 | 0.8815 | 20
+| hybrid | turno | temporal-reasoning | 0.8000 | 0.5250 | 0.5725 | 0.8750 | 0.7500 | 0.6309 | 40
+| vector | sessione | TOTALE | 0.9733 | 0.8867 | 0.9056 | 0.9800 | 0.9267 | 0.9147 | 150
+| vector | sessione | knowledge-update | 1.0000 | 0.9565 | 0.9462 | 1.0000 | 1.0000 | 0.9539 | 23
+| vector | sessione | multi-session | 1.0000 | 0.8718 | 0.8961 | 1.0000 | 0.9231 | 0.9068 | 39
+| vector | sessione | single-session-assistant | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 18
+| vector | sessione | single-session-preference | 0.9000 | 0.9000 | 0.8631 | 0.9000 | 0.9000 | 0.8631 | 10
+| vector | sessione | single-session-user | 0.9000 | 0.9000 | 0.8815 | 0.9500 | 0.9500 | 0.8994 | 20
+| vector | sessione | temporal-reasoning | 0.9750 | 0.8000 | 0.8717 | 0.9750 | 0.8500 | 0.8822 | 40
+| vector | turno | TOTALE | 0.8200 | 0.5533 | 0.5847 | 0.9000 | 0.7400 | 0.6352 | 150
+| vector | turno | knowledge-update | 0.8696 | 0.6522 | 0.5946 | 1.0000 | 0.9130 | 0.6597 | 23
+| vector | turno | multi-session | 0.8205 | 0.3333 | 0.4657 | 0.9231 | 0.6154 | 0.5451 | 39
+| vector | turno | single-session-assistant | 0.8889 | 0.8889 | 0.8406 | 0.9444 | 0.9444 | 0.8591 | 18
+| vector | turno | single-session-preference | 0.7000 | 0.7000 | 0.5706 | 0.8000 | 0.8000 | 0.6062 | 10
+| vector | turno | single-session-user | 0.8500 | 0.8500 | 0.7762 | 0.9000 | 0.9000 | 0.7955 | 20
+| vector | turno | temporal-reasoning | 0.7750 | 0.3750 | 0.4876 | 0.8250 | 0.5750 | 0.5355 | 40
+
+La condizione della fase — l'ibrida batte il solo testo su
+`recall_any@5` a livello di sessione, sul totale — **non è soddisfatta, ed è capita**: il testo (BM25) è già a 148/150 su `any@5` sessione (0,9867) e l'ibrida segue il ramo denso (0,9733). La corsa diagnostica `--mode vector` sullo stesso sottoinsieme dà 0,9733: sono le 2 domande in cui il coseno mette la sessione giusta oltre il 5° posto e la fusione (α=0,7, tunata sul banco italiano) non le solleva. Non è troncamento (il ramo vettoriale vince l'`all@5` sessione: 0,8867 contro 0,8667 del testo — i round lunghi si trovano) né la data (stessa per tutte le modalità). La fusione somma davvero: `all@5` 0,900 e `ndcg@5` 0,932 contro 0,867/0,904 del testo. BM25 così alto dipende dal dataset *cleaned* (domande ambigue tolte) e dai round corti da due turni: il confronto coi lavori pubblicati (0,8–0,97, dataset originale) resta un ordine di grandezza.
+Riferimenti esterni (solo ordine di grandezza, configurazioni diverse):
+i lavori su LongMemEval riportano `recall@5` a livello di sessione tra
+~0,8 e ~0,97 secondo retriever e indice.
+
+Id del sottoinsieme di 150 (seme 42, proporzionali per tipo):
+
+```
+1e043500 c5e8278d 5d3d2817 7527f7e2 94f70d80 c8c3f81d 6b168ec8 75499fd8 21436231 95bcc1c8 853b0a1d b86304ba d52b4f67 ec81a493 e01b8e2f 4fd1909e 76d63226 86f00804 4100d0a0 29f2956b 0a995998 b5ef892d 3a704032 dd2973ad c4a1ceb8 36b9f61e 2e6d26dc 80ec1f4f d682f1a2 gpt4_5501fe77 gpt4_31ff4165 a9f6b44c gpt4_e05b82a6 e3038f8c c2ac3c61 32260d93 afdc33df 6b7dfb22 1a1907b4 38146c39 75f70248 b6025781 b0479f84 1d4e3b97 1c0ddc50 cc06de0d 4f54b7c9 1f2b8d4f e6041065 d905b33f 7405e8b1 a4996e51 60036106 4adc0475 5025383b a1cc6108 8979f9ec 3fe836c9 1c549ce4 1192316e 0ea62687 67e0d0f2 60159905 d6062bb9 157a136e a08a253f f0e564bc a346bb18 efc3f7c2 71017276 gpt4_4929293a gpt4_1d4ab0c9 gpt4_e072b769 gpt4_7f6b06db gpt4_8279ba02 gpt4_a1b77f9c gpt4_7a0daae1 gpt4_1e4a8aeb gpt4_4fc4f797 4dfccbf7 gpt4_61e13b3c 2ebe6c90 gpt4_e061b84f gpt4_4ef30696 gpt4_f420262c gpt4_98f46fc6 gpt4_a2d1d1f6 gpt4_85da3956 gpt4_e061b84g gpt4_d6585ce9 gpt4_4929293b 6e984302 gpt4_2655b836 0bb5a684 gpt4_385a5000 bbf86515 gpt4_5dcc0aab gpt4_2d58bcd6 gpt4_4edbafa2 c8090214 e4e14d04 gpt4_2c50253f cc6d1ec1 gpt4_4cd9eba1 b29f3365 gpt4_2f56ae70 gpt4_0a05b494 gpt4_213fd887 gpt4_fe651585 6a1eabeb 08e075c7 f9e8c073 41698283 45dc21b6 618f13b2 72e3ee87 01493427 6a27ffc2 7a87bd0c 8fb83627 4b24c848 59524333 5831f84d eace081b dfde3500 69fee5aa 7401057b 06db6396 dad224aa ba61f0b9 89941a94 07741c45 c4f10528 6ae235be f523d9fe 0e5e2d1a dc439ea3 8464fc84 8aef76bc 2bf43736 70b3e69b 6222b6eb e8a79c70 e982271f 7a8d0b71 a40e080f 41275add 4baee567 c8f1aeed 1de5cff2
+```
+
+## P4 — il DESIGN dice la verità
+
+- in testa: «stato al tag `fase-v0.4.4`»;
+- § 7: modello predefinito Granite 97M deciso; RAM misurata prima/dopo
+  al posto dei «~400 MB»; mimalloc e perché; f16 provato e scartato con
+  i numeri (cosino medio 0,99948, peggiore 0,99438, nessun risparmio);
+- § 8.4: celle `storia-<id>` per bot; il contratto di `dropCell` (nomi
+  `-snap-<cifre>` riservati, connessione chiusa subito, nessuna Cell
+  nata morta); integrazione Homun ferma alla versione col lock degli hash;
+- § 11: le latenze vere delle verifiche (ibrida calda p50 10,5 / p95
+  13,9 ms; testo+grafo p95 12,3 ms) e il riquadro LongMemEval;
+- § 12: colonna **stato** — v0.1–v0.4.4 fatte coi tag, il grafo adattivo
+  slittato (multi-salto 0,458 a 100k col predefinito) e l'audit MCP con
+  ambiti slittato (MCP resta stdio in sola lettura con `--cells`);
+- § 14: chiuse modello, indice (sqlite-vec scartato), istantanea
+  facoltativa, allocatore; aperte repo pubblico, SQLCipher, Windows;
+- piattaforme: macOS arm64 provato; Linux arm64 provato in Docker;
+  x86_64 e Windows non provati. Anche il `README.md` (status v0.4,
+  layout con vault e node, scripts/linux.sh).
+
+## Chiusura
+
+- macOS: `cargo fmt --check`, `cargo clippy --all-targets --offline
+  -- -D warnings`, `cargo test --offline --workspace` (26 suite),
+  `cargo deny check licenses bans`: tutto verde.
+- `scripts/linux.sh` verde; poi `docker volume rm engramma-linux-target`.
+- JS: Node 24 `npm test` 29/29, `test:electron` 29/29,
+  `test:electron-main` ok — col `.node` mimalloc.
+- `npm run build` rifatto; SHA256 dei tre file per Homun:
+
+  ```
+  engramma.darwin-arm64.node  8a1c67735372adcbdbf23b1424c05951c27e6171d048e834460aeedf6fc75982  (33,5 MB)
+index.js                    25fd9cc1d50a1ec3f2d74bc004d904663ff07360102d27b938870329d9c832d4
+index.d.ts                  bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a6488005bf69d9f8
+  ```
+
+- `du -sh target`: 11 GB all'inizio, 6,4 GB alla fine.
+- `docs/node.md`: una riga sull'allocatore del modulo (v0.4.4).
+- Temporanei in `/var/folders/nb/r6fbsdsn3z58bkbb9w55nn780000gn/T/`
+  cancellati a fine fase (log, md delle corse, script di pressione);
+  le celle di LongMemEval vivevano in un `tempfile::TempDir` e sono
+  andate via da sole; la **cache dei vettori resta** in
+  `~/.cache/engramma/bench/` (`vec-cache-granite-embedding-97m-multilingual-r2-835ad140.bin`, 73,8 MB, 47 060 round distinti (deduplicato dopo il bug sottostante)).
