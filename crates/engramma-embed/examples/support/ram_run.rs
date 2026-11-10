@@ -23,7 +23,7 @@ use engramma_embed::Builtin;
 fn rss_mib() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    Some(line.split_whitespace().nth(1)?.parse().ok()?)
+    line.split_whitespace().nth(1)?.parse().ok()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -45,10 +45,31 @@ fn show(label: &str) {
 }
 
 const WORDS: [&str; 25] = [
-    "ricorda", "milano", "trasloco", "lavoro", "giulia", "marco", "progetto",
-    "condominio", "bici", "treno", "ricerca", "memoria", "quarantena",
-    "istruzioni", "riunione", "martedì", "novembre", "preventivo", "cucina",
-    "affitto", "lavori", "cantina", "soppalco", "libreria", "tramonto",
+    "ricorda",
+    "milano",
+    "trasloco",
+    "lavoro",
+    "giulia",
+    "marco",
+    "progetto",
+    "condominio",
+    "bici",
+    "treno",
+    "ricerca",
+    "memoria",
+    "quarantena",
+    "istruzioni",
+    "riunione",
+    "martedì",
+    "novembre",
+    "preventivo",
+    "cucina",
+    "affitto",
+    "lavori",
+    "cantina",
+    "soppalco",
+    "libreria",
+    "tramonto",
 ];
 
 /// ~600 tokens of distinct-enough memory text (the rss.js script's shape).
