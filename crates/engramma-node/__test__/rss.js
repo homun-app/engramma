@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// v0.4.4 (P1): the RSS profile of the builtin embedder inside the real
-// addon — the measurement of the spec, redone as a script (it is NOT a
-// node:test file: `node __test__/rss.js`). Stages: engine open without the
-// model, model loaded, after embedPending of 64 notes (half ~600 tokens),
-// after 2 s and after 10 s; then vmmap (macOS) / /proc/self/status (Linux)
-// for allocated-vs-resident at the end.
+// v0.4.4 (P1) → v0.4.5 (P2): the RSS profile of the builtin embedder
+// inside the real addon. Stages: engine open without the model, model
+// loaded, after embedPending of 64 notes (half ~600 tokens), after 2 s
+// and after 10 s; then vmmap (macOS) / /proc/self/status (Linux) for
+// allocated-vs-resident at the end. It is NOT a node:test file:
+// `node __test__/rss.js [cellsRoot]` (a fresh temp dir by default).
 //
-// Usage: node __test__/rss.js [cellsRoot]   (a fresh temp dir by default)
+// v0.4.5 (P2): a single run no longer says anything — the RSS after 10 s
+// swings by more than 1 GB from run to run on darwin 27. `--matrix N`
+// spawns N SINGLE-RUN child Node processes (sequentially: parallel runs
+// would read each other's memory pressure) and prints median/min/max of
+// every stage plus the PEAK (`process.resourceUsage().maxRSS`).
+//
+// Usage: node __test__/rss.js [--matrix N] [cellsRoot]
 
 'use strict';
 
@@ -26,8 +32,7 @@ const rss = () => {
   }
   return process.memoryUsage().rss;
 };
-const line = (label) =>
-  console.log(`${label.padEnd(34)} ${(rss() / MB).toFixed(0).padStart(6)} MB`);
+const rssMib = () => Math.round(rss() / MB);
 
 // ~600 tokens of plausible memory text (≈ 0.75 words/token): distinct per
 // note so the tokenizer cache never serves the same text twice.
@@ -47,51 +52,66 @@ const longBody = (i) => {
   return `nota lunga ${i}: ${out.join(' ')}.`;
 };
 
-const root = process.argv[2] || fs.mkdtempSync(path.join(os.tmpdir(), 'engramma-rss-'));
-fs.rmSync(root, { recursive: true, force: true });
-fs.mkdirSync(root, { recursive: true });
+// ---- the single run ------------------------------------------------------
 
-const main = async () => {
-  // 1. engine open, no model
+// Returns the measurement; `quiet` (the --matrix child) prints only the
+// JSON line on stdout and the human lines on stderr.
+const singleRun = async (quiet, root) => {
+  fs.rmSync(root, { recursive: true, force: true });
+  fs.mkdirSync(root, { recursive: true });
+  const say = quiet ? (...a) => console.error(...a) : (...a) => console.log(...a);
+
   const bare = await Engine.open({ root, embedder: 'none', actor: 'rss' });
-  line('motore aperto senza modello');
+  const bareMb = rssMib();
+  say(`motore aperto senza modello ${String(bareMb).padStart(12)} MB`);
   await bare.close();
 
-  // 2. model loaded (Granite 97M via tract)
   const e = await Engine.open({ root, embedder: 'builtin', actor: 'rss' });
-  line('modello caricato');
+  const loadMb = rssMib();
+  say(`modello caricato ${String(loadMb).padStart(21)} MB`);
 
-  // 3. 64 notes, half long, then one embedPending
-  const cell = await e.cell('rss');
-  for (let i = 0; i < 64; i++) {
-    await cell.put({
-      body: i % 2 === 0 ? longBody(i) : `nota corta ${i}: una cosa da ricordare.`,
-      source: 'rss',
-      confidence: 'stated',
-    });
-  }
-  await cell.embedPending(64);
-  line('dopo embedPending di 64 note');
-  const more = await e.cell('rss2');
-  for (let i = 0; i < 64; i++) {
-    await more.put({
-      body: i % 2 === 0 ? longBody(10_000 + i) : `nota corta b${i}: un'altra cosa da ricordare.`,
-      source: 'rss',
-      confidence: 'stated',
-    });
-  }
+  const fill = async (name, base) => {
+    const cell = await e.cell(name);
+    for (let i = 0; i < 64; i++) {
+      await cell.put({
+        body: i % 2 === 0 ? longBody(base + i) : `nota corta ${name}-${i}: una cosa da ricordare.`,
+        source: 'rss',
+        confidence: 'stated',
+      });
+    }
+    return cell;
+  };
+
+  await fill('rss', 0);
+  await (await e.cell('rss')).embedPending(64);
+  const workMb = rssMib();
+  say(`dopo embedPending di 64 note ${String(workMb).padStart(11)} MB`);
+
+  const second = await fill('rss2', 10_000);
   const t0 = process.hrtime.bigint();
-  await more.embedPending(64);
-  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
-  console.log(`embedPending di 64 note (2ª cella) ${ms.toFixed(0).padStart(10)} ms`);
+  await second.embedPending(64);
+  const embedMs = Number(process.hrtime.bigint() - t0) / 1e6;
+  say(`embedPending di 64 note (2ª cella) ${embedMs.toFixed(0).padStart(10)} ms`);
 
-  // 4./5. what stays resident when the work is done
   await new Promise((r) => setTimeout(r, 2000));
-  line('dopo 2 s');
+  const twoMb = rssMib();
+  say(`dopo 2 s ${String(twoMb).padStart(30)} MB`);
   await new Promise((r) => setTimeout(r, 8000));
-  line('dopo 10 s');
+  const tenMb = rssMib();
+  say(`dopo 10 s ${String(tenMb).padStart(29)} MB`);
 
-  // 6. allocated vs resident, from the OS
+  const peakMb = Math.round(process.resourceUsage().maxRSS / 1024);
+  await e.close();
+  if (quiet) {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+  return { bareMb, loadMb, workMb, twoMb, tenMb, peakMb, embedMs };
+};
+
+// ---- the human single run (the v0.4.4 behaviour, vmmap included) --------
+
+const human = async (root) => {
+  const m = await singleRun(false, root);
   if (process.platform === 'darwin') {
     const vm = spawnSync('vmmap', ['--summary', String(process.pid)], { encoding: 'utf8' });
     if (!vm.error) {
@@ -107,10 +127,81 @@ const main = async () => {
       if (/^(VmPeak|VmSize|VmRSS|VmHWM|VmData)/.test(l)) console.log(l);
     }
   }
-  await e.close();
+  console.log(`picco (maxRSS) ${String(m.peakMb).padStart(29)} MB`);
 };
 
-main().catch((err) => {
-  console.error(err);
-  process.exitCode = 1;
-});
+// ---- the --matrix N parent: N children in separate processes ------------
+
+const median = (xs) => {
+  const v = [...xs].sort((a, b) => a - b);
+  const n = v.length;
+  return n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
+};
+
+const matrix = (runs) => {
+  const rows = [];
+  for (let i = 1; i <= runs; i++) {
+    const child = spawnSync(process.execPath, [__filename, '--child'], { encoding: 'utf8' });
+    if (child.status !== 0) {
+      console.error(`figlio ${i} fallito:\n${child.stderr}`);
+      process.exit(1);
+    }
+    const jsonLine = child.stdout.split('\n').find((l) => l.trim().startsWith('{'));
+    if (!jsonLine) {
+      console.error(`figlio ${i}: nessuna riga JSON:\n${child.stdout}`);
+      process.exit(1);
+    }
+    const m = JSON.parse(jsonLine);
+    console.log(
+      `corsa ${i}/${runs}: carico ${m.loadMb} MB | lavoro ${m.workMb} MB | +10 s ${m.tenMb} MB | picco ${m.peakMb} MB | embed ${m.embedMs.toFixed(0)} ms`
+    );
+    rows.push(m);
+  }
+  const cols = [
+    ['carico (MB)', 'loadMb'],
+    ['dopo lavoro (MB)', 'workMb'],
+    ['+10 s (MB)', 'tenMb'],
+    ['picco (MB)', 'peakMb'],
+    ['embed (ms)', 'embedMs'],
+  ];
+  console.log(`# ${runs} corse in processi Node separati — mediana / min / max`);
+  for (const [name, key] of cols) {
+    const xs = rows.map((r) => r[key]);
+    const min = Math.min(...xs);
+    const max = Math.max(...xs);
+    console.log(
+      `${name.padEnd(20)} ${String(median(xs)).padStart(8)} / ${min.toFixed(1)} / ${max.toFixed(1)}`
+    );
+  }
+};
+
+// ---- entry ---------------------------------------------------------------
+
+const argv = process.argv.slice(2);
+const isChild = argv.includes('--child');
+let runs = 5;
+let rootArg;
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--matrix') {
+    runs = Number(argv[i + 1]) || 5;
+    i++;
+  } else if (argv[i] !== '--child') {
+    rootArg = argv[i];
+  }
+}
+
+if (argv.includes('--matrix')) {
+  matrix(runs);
+} else {
+  const root = rootArg || fs.mkdtempSync(path.join(os.tmpdir(), 'engramma-rss-'));
+  const main = isChild
+    ? async () => {
+        const m = await singleRun(true, root);
+        console.log(JSON.stringify(m));
+      }
+    : () => human(root);
+  main().catch((err) => {
+    console.error(err);
+    process.exitCode = 1;
+  });
+}

@@ -18,11 +18,14 @@
 //! object verbatim (its own async-work code says so), so what reaches
 //! `catch (e)` has `e.code` and `e.message` as documented.
 
-// v0.4.4 (P1): this cdylib's Rust allocations (engine + tract) go through
-// mimalloc: macOS's allocator keeps the freed intermediate copies of the
-// model load resident (~1.3 GB); mimalloc returns them (REPORT v0.4.4).
-// In a cdylib the `#[global_allocator]` covers this module only — Node
-// and Electron keep their own.
+// v0.4.4 (P1) → v0.4.5 (P2): this cdylib's Rust allocations (engine +
+// tract) go through mimalloc ON MACOS ONLY: macOS's allocator keeps the
+// freed pages of the work resident; mimalloc holds far less (1149 vs
+// 1450 MB at rest, REPORT v0.4.5). On Linux the opposite holds — glibc
+// returns them (637 vs 1166 MB at rest) — so there the system allocator
+// stays. In a cdylib the `#[global_allocator]` covers this module only:
+// Node and Electron keep their own.
+#[cfg(target_os = "macos")]
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

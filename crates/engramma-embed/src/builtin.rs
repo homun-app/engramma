@@ -19,6 +19,29 @@ use crate::spec::{self, ModelSpec, Pooling};
 
 type Plan = Arc<RunnableModel<TypedFact, Box<dyn tract_onnx::prelude::TypedOp>>>;
 
+/// v0.4.5 (P2): the token budget of one forward pass —
+/// `rows × batch_seq ≤ ENGRAMMA_EMBED_TOKEN_BUDGET`. The measured choice
+/// of the {2048, 4096, 8192} × threads grid (REPORT v0.4.5): 2048 gives
+/// the lowest peak within the time budget — the activation memory of the
+/// pass stops following the batch the caller happens to send.
+const DEFAULT_TOKEN_BUDGET: usize = 2048;
+
+/// v0.4.5 (P2): `ENGRAMMA_EMBED_TOKEN_BUDGET` — a whole number ≥ 1;
+/// anything else (0, non-numeric, unset) falls back to the default.
+fn parse_budget(v: &str) -> Option<usize> {
+    v.trim().parse::<usize>().ok().filter(|&n| n >= 1)
+}
+
+// v0.4.5 (P2.3b, ATTEMPTED AND DROPPED): an NNEF cache of the graph —
+// warm opens would skip the ONNX decode. It cannot work on this model
+// with tract 0.23: the OPTIMIZED graph is not serializable (`OptMul`
+// and friends have no NNEF serializer) and the TYPED graph is not
+// either (`StridedSlice`); custom serializers are a project of their
+// own. Measured: the cold load peaks at ~1,11 GB and takes 0,6–2,4 s
+// (file cache aside) — the numbers are in the REPORT v0.4.5 so nobody
+// retries this. The load path keeps only (a): conversions that consume
+// the previous graph, ours never holding a stage alive.
+
 /// An error from tract, in our typed wrapper.
 fn tract_err(e: impl std::fmt::Display) -> EmbedError {
     EmbedError::BadModel(format!("tract: {e}"))
@@ -33,7 +56,10 @@ pub struct Builtin {
     /// For each input slot of the graph: `true` = attention_mask, `false` =
     /// input_ids. Inputs are fed in slot order, whatever the export order.
     mask_slots: Vec<bool>,
+    /// The fixed worker pool (v0.4.5 P2).
     threads: usize,
+    /// The forward-pass token budget (v0.4.5 P2).
+    token_budget: usize,
 }
 
 impl Builtin {
@@ -65,9 +91,30 @@ impl Builtin {
         let tokenizer = hf::Tokenizer::from_file(&tok_path)
             .map_err(|e| EmbedError::BadModel(format!("{}: {e}", tok_path.display())))?;
 
-        // Load the ONNX graph and give both inputs symbolic batch and
-        // sequence dims. The symbols must come from `model.symbols` — a
-        // fresh SymbolScope makes tract fail on dim unification.
+        // v0.4.5 (P2): a FIXED pool of embed workers — min(4, available_
+        // parallelism) by default. The v0.4.4 pool sized itself on
+        // available_parallelism() (10–12 here): the activation peak and the
+        // per-thread allocator heaps followed it. `ENGRAMMA_EMBED_THREADS`
+        // (a whole number ≥ 1) still overrides.
+        let threads = std::env::var("ENGRAMMA_EMBED_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(1, |n| n.get())
+                    .min(4)
+            });
+        let token_budget = std::env::var("ENGRAMMA_EMBED_TOKEN_BUDGET")
+            .ok()
+            .as_deref()
+            .and_then(parse_budget)
+            .unwrap_or(DEFAULT_TOKEN_BUDGET);
+
+        // The load path (v0.4.5 P2.3a): decode the ONNX, give both inputs
+        // symbolic batch and sequence dims. The symbols must come from
+        // `model.symbols` — a fresh SymbolScope makes tract fail on dim
+        // unification.
         let mut model = tract_onnx::onnx()
             .model_for_path(&onnx_path)
             .map_err(tract_err)?;
@@ -92,6 +139,9 @@ impl Builtin {
                 .set_input_fact(slot, fact.clone())
                 .map_err(tract_err)?;
         }
+        // v0.4.5 (P2.3a): each conversion consumes the previous graph —
+        // `into_typed(self)`, `into_optimized(self)` — so at most two
+        // weight copies are alive at any instant, ours never longer.
         let typed = model.into_typed().map_err(tract_err)?;
         let typed = typed.into_optimized().map_err(tract_err)?;
         // Sanity: one output, the hidden states, shaped [batch, seq, dim].
@@ -103,16 +153,6 @@ impl Builtin {
         }
         let plan = typed.into_runnable().map_err(tract_err)?;
 
-        // v0.4.4 (P1): the parallel embed threads. `ENGRAMMA_EMBED_THREADS`
-        // (a whole number ≥ 1) overrides `available_parallelism()`: every
-        // spawned thread leaves behind a per-thread allocator heap, and on
-        // short-lived batches nobody reclaims them — fewer threads, less
-        // resident memory after the work (REPORT v0.4.4).
-        let threads = std::env::var("ENGRAMMA_EMBED_THREADS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
         Ok(Self {
             model_id: spec.model_id(),
             spec: spec.clone(),
@@ -120,6 +160,7 @@ impl Builtin {
             plan,
             mask_slots,
             threads: threads.max(1),
+            token_budget,
         })
     }
 
@@ -127,6 +168,17 @@ impl Builtin {
     #[must_use]
     pub fn spec(&self) -> &ModelSpec {
         &self.spec
+    }
+
+    /// Override this instance's forward-pass token budget (v0.4.5 P2;
+    /// otherwise `ENGRAMMA_EMBED_TOKEN_BUDGET` or the default stands).
+    /// Values < 1 keep the current budget. The vectors are bit-identical
+    /// across budgets — proven by the fidelity tests — this only shapes
+    /// the batches.
+    pub fn set_token_budget(&mut self, budget: usize) {
+        if budget >= 1 {
+            self.token_budget = budget;
+        }
     }
 
     /// Embed a slice of the batch: token tensors in graph-slot order, one
@@ -233,87 +285,161 @@ impl Embedder for Builtin {
             .tokenizer
             .encode_batch(refs, true)
             .map_err(|e| EmbedError::BadModel(format!("tokenize: {e}")))?;
-        // Truncate to max_tokens first, then pad the batch to its longest
-        // sequence (right padding; CLS pooling and the attention mask make
-        // the result padding-invariant — proven by the fidelity tests).
+        // Truncate to max_tokens first (right padding; CLS pooling and the
+        // attention mask make the result padding-invariant — proven by the
+        // fidelity tests).
         let max = self.spec.max_tokens;
-        let seq = encodings
+        let lens: Vec<usize> = encodings
             .iter()
             .map(|e| e.get_ids().len().min(max))
-            .max()
-            .unwrap_or(0);
-        if seq == 0 {
+            .collect();
+        if lens.iter().all(|&l| l == 0) {
             return Err(EmbedError::BadModel("empty token sequence".into()));
         }
+
+        // v0.4.5 (P2): sort by token length first — the padding of a batch
+        // collapses to the gap between neighbours — then cut the sorted
+        // order into batches under a token budget: `rows × batch_seq ≤
+        // ENGRAMMA_EMBED_TOKEN_BUDGET` (a text longer than the budget runs
+        // alone, seq is capped by max_tokens anyway). The activation
+        // memory of a forward pass stops following the caller's batch.
+        let mut order: Vec<usize> = (0..lens.len()).collect();
+        order.sort_by_key(|&i| lens[i]);
+        let budget = self.token_budget.max(1);
+        // batches of the sorted order: (row start, rows, batch seq)
+        let mut batches: Vec<(usize, usize, usize)> = Vec::new();
+        let mut start = 0_usize;
+        while start < order.len() {
+            let mut rows = 1_usize;
+            while start + rows < order.len() {
+                // sorted ascending: the next text is the new longest
+                let seq_try = lens[order[start + rows]];
+                if rows.saturating_add(1).saturating_mul(seq_try) > budget {
+                    break;
+                }
+                rows += 1;
+            }
+            let seq_b = lens[order[start + rows - 1]];
+            batches.push((start, rows, seq_b));
+            start += rows;
+        }
+
+        // ids/mask laid out batch by batch in SORTED order: every batch is
+        // one contiguous slice of these two buffers, so the workers take
+        // slices — not the Vec-copied-twice chunks of v0.4.4.
         let pad_id = encodings
             .first()
             .map(|e| e.get_ids().last().copied().unwrap_or(0))
             .unwrap_or(0);
-        let mut ids: Vec<i64> = Vec::with_capacity(encodings.len() * seq);
-        let mut mask: Vec<i64> = Vec::with_capacity(encodings.len() * seq);
-        for e in &encodings {
-            let n = e.get_ids().len().min(max);
-            ids.extend(e.get_ids()[..n].iter().map(|&t| i64::from(t)));
-            mask.extend(e.get_attention_mask()[..n].iter().map(|&m| i64::from(m)));
-            for _ in n..seq {
-                ids.push(i64::from(pad_id));
-                mask.push(0);
+        let total: usize = batches.iter().map(|&(_, rows, seq)| rows * seq).sum();
+        let mut ids: Vec<i64> = Vec::with_capacity(total);
+        let mut mask: Vec<i64> = Vec::with_capacity(total);
+        for &(bstart, brows, seq_b) in &batches {
+            for row in bstart..bstart + brows {
+                let e = &encodings[order[row]];
+                let n = lens[order[row]];
+                ids.extend(e.get_ids()[..n].iter().map(|&t| i64::from(t)));
+                mask.extend(e.get_attention_mask()[..n].iter().map(|&m| i64::from(m)));
+                for _ in n..seq_b {
+                    ids.push(i64::from(pad_id));
+                    mask.push(0);
+                }
             }
         }
 
-        // Independent sub-batches run in parallel (std::thread::scope), up to
-        // available_parallelism(); the shared plan only takes &self in run().
-        let batch_len = encodings.len().div_ceil(self.threads).max(1);
-        let mut chunks: Vec<(Vec<i64>, Vec<i64>)> = Vec::new();
-        let mut rest_ids = ids.as_slice();
-        let mut rest_mask = mask.as_slice();
-        while !rest_ids.is_empty() {
-            let take = batch_len.min(rest_ids.len() / seq);
-            chunks.push((
-                rest_ids[..take * seq].to_vec(),
-                rest_mask[..take * seq].to_vec(),
-            ));
-            rest_ids = &rest_ids[take * seq..];
-            rest_mask = &rest_mask[take * seq..];
-        }
+        // v0.4.5 (P2): a fixed pool of workers (min(threads, batches))
+        // pulls the batches off a queue; the shared plan only takes &self
+        // in run(), the buffers are borrowed, nothing is cloned on the way
+        // in. Results land per batch, the original order is restored at
+        // the end.
+        let workers = self.threads.min(batches.len()).max(1);
         let plan = Arc::clone(&self.plan);
         let mask_slots = &self.mask_slots;
         let dim = self.spec.dim;
         let pooling = self.spec.pooling;
-        let results: Vec<Result<Vec<Vec<f32>>, EmbedError>> =
-            std::thread::scope(|scope| -> Vec<Result<Vec<Vec<f32>>, EmbedError>> {
-                let mut handles = Vec::with_capacity(chunks.len());
-                for (cids, cmask) in &chunks {
-                    // Each thread gets its own Arc clone of the plan.
-                    let plan = Arc::clone(&plan);
-                    let cids = cids.clone();
-                    let cmask = cmask.clone();
-                    handles.push(scope.spawn(move || {
-                        Self::embed_chunk(&plan, mask_slots, dim, pooling, &cids, &cmask, seq)
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .map_err(|_| {
-                                EmbedError::BadModel("an embedding worker thread panicked".into())
-                            })
-                            .and_then(|r| r)
-                    })
-                    .collect()
-            });
-        let mut all: Vec<Vec<f32>> = Vec::with_capacity(encodings.len());
-        for r in results {
-            all.extend(r?);
+        let queue: std::sync::Mutex<std::collections::VecDeque<usize>> =
+            std::sync::Mutex::new((0..batches.len()).collect());
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<Vec<Vec<f32>>, EmbedError>)>();
+        std::thread::scope(|scope| {
+            let batches = batches.as_slice();
+            let ids = ids.as_slice();
+            let mask = mask.as_slice();
+            let mask_slots = mask_slots.as_slice();
+            for _ in 0..workers {
+                // each worker owns its Arc clone; the buffers travel as
+                // shared slices
+                let plan = Arc::clone(&plan);
+                let tx = tx.clone();
+                let queue = &queue;
+                scope.spawn(move || {
+                    loop {
+                        let next = queue.lock().map_or(None, |mut q| q.pop_front());
+                        let Some(b) = next else {
+                            break;
+                        };
+                        let (bstart, brows, seq_b) = batches[b];
+                        let from = bstart * seq_b;
+                        let to = (bstart + brows) * seq_b;
+                        let r = Self::embed_chunk(
+                            &plan,
+                            mask_slots,
+                            dim,
+                            pooling,
+                            &ids[from..to],
+                            &mask[from..to],
+                            seq_b,
+                        );
+                        if tx.send((b, r)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        // the scope joined: the worker senders are gone; drop the LAST
+        // one too, or the drain below would wait for a close that never
+        // comes (the bug of the first cut — a deadlock on the very
+        // first query)
+        drop(tx);
+        let mut per_batch: Vec<Option<Result<Vec<Vec<f32>>, EmbedError>>> =
+            (0..batches.len()).map(|_| None).collect();
+        for (b, r) in rx {
+            per_batch[b] = Some(r);
         }
-        if all.len() != texts.len() {
-            return Err(EmbedError::BadModel(format!(
-                "embedded {} texts out of {}",
-                all.len(),
-                texts.len()
-            )));
+        let mut out: Vec<Option<Vec<f32>>> = (0..texts.len()).map(|_| None).collect();
+        for (b, slot) in per_batch.into_iter().enumerate() {
+            let vecs = slot.unwrap_or_else(|| {
+                Err(EmbedError::BadModel("a batch produced no result".into()))
+            })?;
+            let (bstart, _rows, _seq_b) = batches[b];
+            for (j, v) in vecs.into_iter().enumerate() {
+                out[order[bstart + j]] = Some(v);
+            }
+        }
+        let mut all: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        for (i, slot) in out.into_iter().enumerate() {
+            match slot {
+                Some(v) => all.push(v),
+                None => return Err(EmbedError::BadModel(format!("text {i} produced no vector"))),
+            }
         }
         Ok(all)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_budget;
+
+    #[test]
+    fn budget_override_needs_a_whole_number_at_least_one() {
+        assert_eq!(parse_budget("1"), Some(1));
+        assert_eq!(parse_budget(" 4096 "), Some(4096));
+        // 0 and junk both mean "the default" (v0.4.5 P2)
+        assert_eq!(parse_budget("0"), None);
+        assert_eq!(parse_budget(""), None);
+        assert_eq!(parse_budget("non-numeric"), None);
+        assert_eq!(parse_budget("-8"), None);
+        assert_eq!(parse_budget("1.5"), None);
     }
 }

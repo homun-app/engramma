@@ -176,3 +176,50 @@ fn empty_batch_is_empty() {
             .is_empty()
     );
 }
+
+/// v0.4.5 (P2): the sorted, budgeted batching must be invisible in the
+/// output — the SAME texts in a different order, and under very
+/// different token budgets (one text per forward pass at 1, the default,
+/// a wide 8192), give BIT-IDENTICAL vectors (not cosines: equality).
+#[test]
+fn order_and_budget_do_not_change_the_vectors() {
+    let Some(mut b) = load_or_skip(&ModelSpec::granite_97m()) else {
+        return;
+    };
+    let sentence = "Fabio ha traslocato a Milano con Giulia dopo il matrimonio di Sara. ";
+    let texts: Vec<String> = (0..12)
+        .map(|i| match i % 3 {
+            0 => format!("nota {i}: {}", sentence.repeat(i + 1)),
+            1 => format!("nota {i}: {}", sentence.repeat(20 + i)),
+            _ => format!("nota corta {i}: una cosa da ricordare."),
+        })
+        .collect();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let base = b
+        .embed(&refs, TextKind::Document)
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    // reversed order: vector i must equal base[i], bit for bit
+    let mut rev = texts.clone();
+    rev.reverse();
+    let rrefs: Vec<&str> = rev.iter().map(String::as_str).collect();
+    let got = b
+        .embed(&rrefs, TextKind::Document)
+        .unwrap_or_else(|e| panic!("{e}"));
+    for (i, v) in got.iter().enumerate() {
+        let want = &base[refs.len() - 1 - i];
+        assert_eq!(v, want, "reversed order changed vector {i}");
+    }
+
+    // budgets: 1 = one text per forward pass, then a wide 8192 — the
+    // batches fall apart completely, the vectors must not
+    for budget in [1_usize, 8192] {
+        b.set_token_budget(budget);
+        let got = b
+            .embed(&refs, TextKind::Document)
+            .unwrap_or_else(|e| panic!("budget {budget}: {e}"));
+        for (i, v) in got.iter().enumerate() {
+            assert_eq!(v, &base[i], "budget {budget} changed vector {i}");
+        }
+    }
+}

@@ -5,9 +5,13 @@
 
 mod output;
 
-// v0.4.4 (P1): the executable picks the allocator. macOS's keeps ~1.3 GB
-// of freed load-time copies resident (see REPORT v0.4.4); mimalloc returns
-// them. The libraries stay allocator-neutral — whoever links them chooses.
+// v0.4.4 (P1) → v0.4.5 (P2): the executable picks the allocator, and it
+// picks it PER PLATFORM: mimalloc on macOS (the system allocator keeps
+// the freed pages of the work resident; mimalloc holds far less), the
+// system allocator on Linux (glibc returns them: 637 vs 1166 MB at
+// rest, REPORT v0.4.5). The libraries stay allocator-neutral — whoever
+// links them chooses.
+#[cfg(target_os = "macos")]
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

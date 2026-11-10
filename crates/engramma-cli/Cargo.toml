@@ -20,8 +20,11 @@ serde_json.workspace = true
 time.workspace = true
 ulid.workspace = true
 tokio.workspace = true
-# v0.4.4 (P1): the executable chooses the allocator (see the workspace
-# entry); the libraries stay allocator-neutral.
+
+# v0.4.4 (P1) → v0.4.5 (P2): the executable chooses the allocator, per
+# platform (see the workspace entry): mimalloc on macOS only — on Linux
+# glibc returns the freed pages and mimalloc does not (REPORT v0.4.5).
+[target.'cfg(target_os = "macos")'.dependencies]
 mimalloc.workspace = true
 
 [dev-dependencies]
