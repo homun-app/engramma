@@ -1,3 +1,12 @@
+# v0.4.4 (P0): the debug info of the dependencies was the bulk of a build
+# (tract's rlib alone ~170 MB). Our crates keep file:line backtraces
+# (`line-tables-only`); dependencies get none — nobody steps into them.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [workspace]
 resolver = "2"
 members = ["crates/engramma-core", "crates/engramma-embed", "crates/engramma-vault", "crates/engramma-cli", "crates/engramma-mcp", "crates/engramma-node", "bench"]
