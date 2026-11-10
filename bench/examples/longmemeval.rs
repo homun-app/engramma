@@ -11,10 +11,14 @@
 //! The official metrics of `src/retrieval/eval_utils.py` (LongMemEval),
 //! skipping the 30 `_abs` questions: `recall_any@k`, `recall_all@k` and
 //! binary `ndcg@k` (dcg = r[0] + Σ r[i]/log2(i+1), ideal = the relevances
-//! sorted descending, 0 when the ideal is 0), at SESSION level
-//! (`evaluate_retrieval_turn2session`: the ranked rounds reduce to distinct
-//! sessions in order, until k of them or the list ends) and at TURN level,
-//! k = 5 and 10, averaged over the questions and per `question_type`. The
+//! sorted descending, 0 when the ideal is 0), at TURN level and at
+//! SESSION level (`evaluate_retrieval_turn2session`, made EXACTLY the
+//! official one in v0.4.5 P0: the ranked rounds keep their session id,
+//! the list is NOT deduplicated — the cutoff k_eff is the first prefix
+//! holding k distinct sessions, recalls read the session SET of that
+//! prefix, and the ideal counts the corpus ROUNDS of the answer
+//! sessions), k = 5 and 10, averaged over the questions and per
+//! `question_type`. The
 //! question text is searched with the `question_date` as `now`, so the
 //! recency weight sees 2023 dates; the ranked list holds the top 50 rounds
 //! (session-distinct @10 needs more than 10 raw hits).
@@ -368,6 +372,9 @@ struct Metrics {
 }
 
 impl Metrics {
+    /// Turn level (unchanged since v0.4.4): the ranked rounds as they
+    /// come back, relevance from `has_answer`, ideal =
+    /// `dcg([1; min(k, relevant_total)])`.
     fn add_ranking(&mut self, ranked: &[bool], relevant_total: usize) {
         self.n += 1;
         for (ki, k) in KS.iter().enumerate() {
@@ -391,6 +398,56 @@ impl Metrics {
         }
         if relevant_total > 0 {
             self.n_rel += 1;
+        }
+    }
+
+    /// Session level, EXACTLY `evaluate_retrieval_turn2session` (v0.4.5
+    /// P0). The ranked list keeps every round — no dedup. For each k,
+    /// `k_eff` is the length of the shortest prefix holding k DISTINCT
+    /// sessions (the whole list when it never gets there);
+    /// `recall_any`/`recall_all` read the SET of sessions of that
+    /// prefix, `ndcg` reads its per-hit relevances (a hit is relevant
+    /// when its session is an answer session) against the ideal
+    /// `dcg([1; min(k_eff, answer_rounds)])`, where `answer_rounds`
+    /// counts the corpus rounds of the answer sessions; ndcg adds 0
+    /// when the ideal is 0.
+    fn add_session_ranking(
+        &mut self,
+        ranked: &[&str],
+        answer: &HashSet<&str>,
+        answer_rounds: usize,
+    ) {
+        self.n += 1;
+        if !answer.is_empty() {
+            self.n_rel += 1;
+        }
+        for (ki, &k) in KS.iter().enumerate() {
+            let mut distinct: HashSet<&str> = HashSet::new();
+            let mut k_eff = ranked.len();
+            for (i, s) in ranked.iter().enumerate() {
+                distinct.insert(s);
+                if distinct.len() >= k {
+                    k_eff = i + 1;
+                    break;
+                }
+            }
+            let prefix = &ranked[..k_eff];
+            let rels: Vec<bool> = prefix.iter().map(|s| answer.contains(*s)).collect();
+            if rels.iter().any(|&r| r) {
+                self.recall_any[ki] += 1.0;
+            }
+            let found: HashSet<&str> = prefix
+                .iter()
+                .copied()
+                .filter(|s| answer.contains(s))
+                .collect();
+            if !answer.is_empty() && found.len() == answer.len() {
+                self.recall_all[ki] += 1.0;
+            }
+            let ideal = dcg(&vec![true; answer_rounds], k_eff);
+            if ideal > 0.0 {
+                self.ndcg[ki] += dcg(&rels, k_eff) / ideal;
+            }
         }
     }
 
@@ -444,19 +501,19 @@ fn eval_question(
         .collect();
     turn.add_ranking(&ranked_turns, relevant_rounds);
 
-    // session level: distinct sessions in rank order, until k of them
-    let mut order: Vec<&str> = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    for h in hits {
-        if let Some(&i) = by_id.get(&h.note.id) {
-            let s = rounds[i].session.as_str();
-            if seen.insert(s) {
-                order.push(s);
-            }
-        }
-    }
-    let ranked_sessions: Vec<bool> = order.iter().map(|s| answer_sessions.contains(s)).collect();
-    session.add_ranking(&ranked_sessions, answer_sessions.len());
+    // session level, the official turn2session way (see
+    // `Metrics::add_session_ranking`): every ranked round keeps its
+    // session id, the list is not deduplicated, and the ideal counts
+    // the corpus rounds of the answer sessions
+    let hit_sessions: Vec<&str> = hits
+        .iter()
+        .filter_map(|h| by_id.get(&h.note.id).map(|&i| rounds[i].session.as_str()))
+        .collect();
+    let answer_rounds = rounds
+        .iter()
+        .filter(|r| answer_sessions.contains(r.session.as_str()))
+        .count();
+    session.add_session_ranking(&hit_sessions, &answer_sessions, answer_rounds);
 
     out.insert(("turno", "x"), turn);
     out.insert(("sessione", "x"), session);
@@ -822,7 +879,9 @@ fn main() {
     }
 
     let mut report = String::new();
-    report.push_str("# LongMemEval-S (cleaned) — engramma v0.4.4 (P3)\n\n");
+    report.push_str(
+        "# LongMemEval-S (cleaned) — engramma v0.4.5 (P0: ndcg di sessione ufficiale)\n\n",
+    );
     report.push_str(&format!(
         "- dati: `{}` (sha256 verificato)\n- domande: {} (saltate le `_abs`){}\n- top {} round per domanda, livelli sessione e turno, k = 5 e 10\n",
         data.display(),
@@ -889,4 +948,108 @@ fn merge(dst: &mut Metrics, src: &Metrics) {
     }
     dst.n += src.n;
     dst.n_rel += src.n_rel;
+}
+
+// ---------------------------------------------------------------------------
+// v0.4.5 (P0): the metrics, pinned by hand
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The official session-level ndcg, on a hand-written ranking with
+    /// two rounds of the SAME answer session at the head (v0.4.5 P0).
+    ///
+    /// Corpus: 3 rounds of A, 2 of B (answer sessions {A, B},
+    /// `answer_rounds = 5`), one round each for the fillers.
+    /// Ranking (round → session): `A A B x1 x2 x3 A`.
+    ///
+    /// k = 5: the first 5 DISTINCT sessions sit at indices 0, 2, 3, 4, 5
+    /// → `k_eff = 6`, prefix `A A B x1 x2 x3`, rels `1 1 1 0 0 0`:
+    ///   dcg   = 1 + 1/log2(2) + 1/log2(3)            = 2.6309297536
+    ///   ideal = 1 + 1 + 1/log2(3) + 1/log2(4) + 1/log2(5) = 3.5616063117
+    ///   ndcg@5 = 2.6309297536 / 3.5616063117         = 0.7386919
+    /// k = 10 > 7 hits → `k_eff = 7`, rels `1 1 1 0 0 0 1`:
+    ///   dcg   = 2.6309297536 + 1/log2(7)             = 2.9871369407
+    ///   ideal = min(7, 5) ones                        = 3.5616063117
+    ///   ndcg@10 = 2.9871369407 / 3.5616063117        = 0.8387050
+    ///
+    /// The DEDUPLICATED version of v0.4.4 would reduce the ranking to
+    /// `A B x1 x2 x3` and score ndcg@5 = ndcg@10 = 1.0 (2 hits over a
+    /// 2-session ideal): this test tells the two apart. Recall_any and
+    /// recall_all agree with it — by design, the session SET of the
+    /// k_eff prefix is the first min(k, distinct) distinct sessions.
+    #[test]
+    fn session_ndcg_is_the_official_turn2session_one() {
+        let ranked = ["A", "A", "B", "x1", "x2", "x3", "A"];
+        let answer: HashSet<&str> = ["A", "B"].into_iter().collect();
+        let mut m = Metrics::default();
+        m.add_session_ranking(&ranked, &answer, 5);
+        assert_eq!(m.n, 1);
+        for ki in 0..KS.len() {
+            assert!((m.recall_any[ki] - 1.0).abs() < 1e-9, "any[{ki}]");
+            assert!((m.recall_all[ki] - 1.0).abs() < 1e-9, "all[{ki}]");
+        }
+        assert!(
+            (m.ndcg[0] - 0.738_691_9).abs() < 1e-6,
+            "ndcg@5 = {}",
+            m.ndcg[0]
+        );
+        assert!(
+            (m.ndcg[1] - 0.838_705_0).abs() < 1e-6,
+            "ndcg@10 = {}",
+            m.ndcg[1]
+        );
+    }
+
+    /// The official recalls when the second answer session never shows
+    /// up (answer {A, C}, 4 answer rounds in the corpus). The ranking
+    /// `A B x1 x2 x3` already holds 5 distinct sessions → k_eff = 5 for
+    /// both k; C is nowhere: any = 1, all = 0, rels `1 0 0 0 0`,
+    /// dcg = 1, ideal = dcg([1; min(5, 4)]) =
+    /// 1 + 1 + 1/log2(3) + 1/log2(4) = 3.1309297536 → ndcg = 0.3193939.
+    #[test]
+    fn session_recalls_when_one_answer_session_is_missing() {
+        let ranked = ["A", "B", "x1", "x2", "x3"];
+        let answer: HashSet<&str> = ["A", "C"].into_iter().collect();
+        let mut m = Metrics::default();
+        m.add_session_ranking(&ranked, &answer, 4);
+        for ki in 0..KS.len() {
+            assert!((m.recall_any[ki] - 1.0).abs() < 1e-9, "any[{ki}]");
+            assert!((m.recall_all[ki] - 0.0).abs() < 1e-9, "all[{ki}]");
+            assert!(
+                (m.ndcg[ki] - 0.319_393_9).abs() < 1e-6,
+                "ndcg[{ki}] = {}",
+                m.ndcg[ki]
+            );
+        }
+    }
+
+    /// The turn-level metrics stay the v0.4.4 ones (v0.4.5 P0 fixes the
+    /// session ndcg only): ranked turns `1 0 1 0 0…`, 3 relevant rounds
+    /// in the corpus. k = 5 and 10 see the same top hits:
+    ///   dcg   = 1 + 1/log2(3)        = 1.6309297536
+    ///   ideal = dcg([1; 3])          = 2.6309297536
+    ///   ndcg  = 0.6199062
+    /// recall_any = 1 (a hit is there), recall_all = 0 (2 of 3 found).
+    #[test]
+    fn turn_level_metrics_are_unchanged() {
+        let ranked = [
+            true, false, true, false, false, false, false, false, false, false, false,
+        ];
+        let mut m = Metrics::default();
+        m.add_ranking(&ranked, 3);
+        assert_eq!(m.n, 1);
+        assert_eq!(m.n_rel, 1);
+        for ki in 0..KS.len() {
+            assert!((m.recall_any[ki] - 1.0).abs() < 1e-9, "any[{ki}]");
+            assert!((m.recall_all[ki] - 0.0).abs() < 1e-9, "all[{ki}]");
+            assert!(
+                (m.ndcg[ki] - 0.619_906_2).abs() < 1e-6,
+                "ndcg[{ki}] = {}",
+                m.ndcg[ki]
+            );
+        }
+    }
 }
