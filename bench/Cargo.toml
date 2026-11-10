@@ -16,6 +16,12 @@ engramma-core.workspace = true
 ulid.workspace = true
 time.workspace = true
 serde_json.workspace = true
+# v0.4.4 (P3): the longmemeval example checks the dataset sha256 with the
+# digest crate already in the tree (rustls, via ureq) and indexes the
+# vector cache by sha256 of the round text.
+ring.workspace = true
 
 [dev-dependencies]
+# the longmemeval example builds its one-cell-per-question tree in a
+# tempdir, gone at the end of the run
 tempfile.workspace = true

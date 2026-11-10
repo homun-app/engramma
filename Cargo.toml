@@ -62,3 +62,9 @@ notify-debouncer-full = "0.7.0"
 # sha256 of model files: ring is already in the tree (rustls, via ureq), so
 # declaring it here adds no new crate to Cargo.lock.
 ring = "0.17"
+# v0.4.4 (P1): the allocator of the two final artifacts (the `.node` and
+# the CLI binary). The system allocator of macOS keeps the freed
+# intermediate copies of the model load resident (~1.3 GB); mimalloc
+# returns them. NOT for the libraries: whoever produces the executable
+# chooses its allocator.
+mimalloc = "0.1.39"

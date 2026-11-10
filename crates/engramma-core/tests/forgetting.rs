@@ -726,6 +726,26 @@ fn compact_fails_cleanly_when_the_old_file_cannot_go() {
     let mode = meta.permissions().mode();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
         .unwrap(/* test-only */);
+    // v0.4.4 (P2): root ignores the 0o555 — probe it. If a file can still
+    // be created inside, the permissions do not bind and the removal below
+    // would succeed: the test would assert a failure that never happens.
+    // Skip explicitly instead (no `geteuid`: no unsafe, and capability
+    // sets can lie the same way root does).
+    let probe = dir.path().join("perm-probe");
+    let perms_bind = std::fs::write(&probe, b"probe").is_err();
+    if !perms_bind {
+        std::fs::remove_file(&probe).ok();
+        // restore before anything else can run in this test
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode))
+            .unwrap(/* test-only */);
+        drop(cell);
+        eprintln!(
+            "SKIP: {} does not honor directory permissions (root or equivalent); \
+             the compaction failure cannot be forced here",
+            std::env::consts::OS
+        );
+        return;
+    }
     let failed = cell.compact(head2, &CompactOptions::default());
     // restore before any early return below can skip the cleanup
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode))

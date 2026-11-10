@@ -5,6 +5,12 @@
 
 mod output;
 
+// v0.4.4 (P1): the executable picks the allocator. macOS's keeps ~1.3 GB
+// of freed load-time copies resident (see REPORT v0.4.4); mimalloc returns
+// them. The libraries stay allocator-neutral — whoever links them chooses.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1509,6 +1515,19 @@ fn run_cell(cli: &Cli, action: &CellAction) -> Result<(), CliError> {
                 return Err(CliError::usage(format!(
                     "cell name `{name}` is reserved (the `-snap-<digits>` shape \
                      belongs to compact's snapshots)"
+                )));
+            }
+            // v0.4.4 (P2): on Windows `con.sqlite` still resolves to the
+            // device; gated so macOS and Linux keep accepting the names.
+            #[cfg(windows)]
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "con" | "prn" | "aux" | "nul"
+                    | "com1" | "com2" | "com3" | "com4" | "com5" | "com6" | "com7" | "com8" | "com9"
+                    | "lpt1" | "lpt2" | "lpt3" | "lpt4" | "lpt5" | "lpt6" | "lpt7" | "lpt8" | "lpt9"
+            ) {
+                return Err(CliError::usage(format!(
+                    "cell name `{name}` is reserved on Windows"
                 )));
             }
             let path = cell_path(cli, name)?;

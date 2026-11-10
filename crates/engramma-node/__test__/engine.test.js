@@ -972,20 +972,36 @@ test('dropCell closes the connection a live Cell still shares (P1.2)', async (t)
   }
   await e.dropCell('tenuta', 'il GC non decide lui quando chiudere');
   // the Cell object is STILL alive in JS — and yet no descriptor on the
-  // cell's files may survive the drop
-  const lsof = require('node:child_process').spawnSync(
-    'lsof',
-    ['-p', String(process.pid)],
-    { encoding: 'utf8' },
-  );
-  if (lsof.error) {
-    await e.close();
-    return t.skip(`lsof non disponibile: ${lsof.error.message}`);
+  // cell's files may survive the drop. v0.4.4 (P2): on Linux the right
+  // window is /proc/self/fd (lsof is not in the Docker image); on macOS
+  // it stays lsof.
+  let openOn;
+  if (fs.existsSync('/proc/self/fd')) {
+    const cellsDir = path.join(rootDir, 'cells');
+    openOn = fs.readdirSync('/proc/self/fd')
+      .flatMap((fd) => {
+        try {
+          const target = fs.readlinkSync(path.join('/proc/self/fd', fd));
+          return target.startsWith(cellsDir) ? [`fd ${fd} -> ${target}`] : [];
+        } catch {
+          return [];
+        }
+      });
+  } else {
+    const lsof = require('node:child_process').spawnSync(
+      'lsof',
+      ['-p', String(process.pid)],
+      { encoding: 'utf8' },
+    );
+    if (lsof.error) {
+      await e.close();
+      return t.skip(`lsof non disponibile: ${lsof.error.message}`);
+    }
+    assert.equal(lsof.status, 0, lsof.stderr);
+    openOn = lsof.stdout
+      .split('\n')
+      .filter((l) => l.includes(path.join(rootDir, 'cells')));
   }
-  assert.equal(lsof.status, 0, lsof.stderr);
-  const openOn = lsof.stdout
-    .split('\n')
-    .filter((l) => l.includes(path.join(rootDir, 'cells')));
   assert.equal(openOn.length, 0, `descrittori ancora aperti: ${openOn.join(' | ')}`);
   // and the live Cell object answers NOT_FOUND from the seal, as ever (the
   // gate refuses at CALL time — a sync throw, which the async wrapper turns

@@ -103,7 +103,16 @@ impl Builtin {
         }
         let plan = typed.into_runnable().map_err(tract_err)?;
 
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        // v0.4.4 (P1): the parallel embed threads. `ENGRAMMA_EMBED_THREADS`
+        // (a whole number ≥ 1) overrides `available_parallelism()`: every
+        // spawned thread leaves behind a per-thread allocator heap, and on
+        // short-lived batches nobody reclaims them — fewer threads, less
+        // resident memory after the work (REPORT v0.4.4).
+        let threads = std::env::var("ENGRAMMA_EMBED_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
         Ok(Self {
             model_id: spec.model_id(),
             spec: spec.clone(),

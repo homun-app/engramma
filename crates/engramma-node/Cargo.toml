@@ -20,6 +20,9 @@ time.workspace = true
 ulid.workspace = true
 napi.workspace = true
 napi-derive.workspace = true
+# v0.4.4 (P1): in a cdylib the #[global_allocator] covers THIS module's
+# Rust allocations (engine + tract); Node/Electron keep their own.
+mimalloc.workspace = true
 
 [build-dependencies]
 napi-build.workspace = true

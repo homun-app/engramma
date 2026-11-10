@@ -18,6 +18,14 @@
 //! object verbatim (its own async-work code says so), so what reaches
 //! `catch (e)` has `e.code` and `e.message` as documented.
 
+// v0.4.4 (P1): this cdylib's Rust allocations (engine + tract) go through
+// mimalloc: macOS's allocator keeps the freed intermediate copies of the
+// model load resident (~1.3 GB); mimalloc returns them (REPORT v0.4.4).
+// In a cdylib the `#[global_allocator]` covers this module only — Node
+// and Electron keep their own.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -992,6 +1000,20 @@ impl EngineHandle {
             return Err(invalid_argument(format!(
                 "nome cella riservato: {name:?} (il formato `-snap-<cifre>` \
                  è delle istantanee di compattazione)"
+            )));
+        }
+        // v0.4.4 (P2): on Windows `con.sqlite` still resolves to the device:
+        // the classic reserved names cannot be cell file names there. The
+        // check is gated so macOS and Linux keep accepting them.
+        #[cfg(windows)]
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "con" | "prn" | "aux" | "nul"
+                | "com1" | "com2" | "com3" | "com4" | "com5" | "com6" | "com7" | "com8" | "com9"
+                | "lpt1" | "lpt2" | "lpt3" | "lpt4" | "lpt5" | "lpt6" | "lpt7" | "lpt8" | "lpt9"
+        ) {
+            return Err(invalid_argument(format!(
+                "nome cella riservato su Windows: {name:?}"
             )));
         }
         Ok(self.root.join("cells").join(format!("{name}.sqlite")))
