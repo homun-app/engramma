@@ -60,6 +60,10 @@ pub struct Builtin {
     threads: usize,
     /// The forward-pass token budget (v0.4.5 P2).
     token_budget: usize,
+    /// The pad_id of the tokenizer's own padding config, when it ships
+    /// one (both Granite R2 do) — used as OUR batch pad_id after the
+    /// config is stripped (v0.4.6 P0).
+    pad_id: Option<u32>,
 }
 
 impl Builtin {
@@ -85,11 +89,19 @@ impl Builtin {
         let onnx_path = dir.join("onnx").join("model.onnx");
         let tok_path = dir.join("tokenizer.json");
 
-        // The tokenizer itself stays unconfigured: truncation and padding are
-        // ours (see `embed`). A truncating tokenizer would also cap
-        // `approx_tokens`, which must see the true length to chunk notes.
-        let tokenizer = hf::Tokenizer::from_file(&tok_path)
+        // The tokenizer of both Granite R2 models ships with BatchLongest
+        // PADDING in tokenizer.json (v0.4.6 P0): a bare `from_file` makes
+        // `encode_batch` pad every text to the longest of the call — the
+        // v0.4.5 length sort sorted nothing (all lens equal) and a short
+        // note paid the longest's compute. Padding is OURS (see `embed`);
+        // the config's pad_id, when there is one, is kept for it. The
+        // tokenizer's own TRUNCATION stays (max_length 32768, far above
+        // our max_tokens cut): `approx_tokens` must see the true length
+        // to chunk notes.
+        let mut tokenizer = hf::Tokenizer::from_file(&tok_path)
             .map_err(|e| EmbedError::BadModel(format!("{}: {e}", tok_path.display())))?;
+        let pad_id = tokenizer.get_padding().map(|p| p.pad_id);
+        tokenizer.with_padding(None);
 
         // v0.4.5 (P2): a FIXED pool of embed workers — min(4, available_
         // parallelism) by default. The v0.4.4 pool sized itself on
@@ -161,6 +173,7 @@ impl Builtin {
             mask_slots,
             threads: threads.max(1),
             token_budget,
+            pad_id,
         })
     }
 
@@ -173,8 +186,9 @@ impl Builtin {
     /// Override this instance's forward-pass token budget (v0.4.5 P2;
     /// otherwise `ENGRAMMA_EMBED_TOKEN_BUDGET` or the default stands).
     /// Values < 1 keep the current budget. The vectors are bit-identical
-    /// across budgets — proven by the fidelity tests — this only shapes
-    /// the batches.
+    /// at the SAME configuration; across budgets the batch shape changes
+    /// the summation order inside tract and the last digits move — the
+    /// fidelity tests bound it at cos ≥ 0,999999, |Δ| ≤ 1e-5 (v0.4.6 P0).
     pub fn set_token_budget(&mut self, budget: usize) {
         if budget >= 1 {
             self.token_budget = budget;
@@ -303,12 +317,20 @@ impl Embedder for Builtin {
         // ENGRAMMA_EMBED_TOKEN_BUDGET` (a text longer than the budget runs
         // alone, seq is capped by max_tokens anyway). The activation
         // memory of a forward pass stops following the caller's batch.
+        // v0.4.6 (P0): now that the tokenizer no longer pads, the lens
+        // are the TRUE lengths — this sort finally has something to sort.
         let mut order: Vec<usize> = (0..lens.len()).collect();
         order.sort_by_key(|&i| lens[i]);
         let budget = self.token_budget.max(1);
-        // batches of the sorted order: (row start, rows, batch seq)
-        let mut batches: Vec<(usize, usize, usize)> = Vec::new();
+        // batches of the sorted order: (row start, rows, batch seq,
+        // buffer offset). The offset is the PREFIX SUM of `rows × seq` —
+        // `start × seq_b` was right only while every batch shared the
+        // same seq, which the v0.4.5 tokenizer-padding accident made true
+        // and a no-padding tokenizer breaks (a worker would slice out of
+        // bounds).
+        let mut batches: Vec<(usize, usize, usize, usize)> = Vec::new();
         let mut start = 0_usize;
+        let mut offset = 0_usize;
         while start < order.len() {
             let mut rows = 1_usize;
             while start + rows < order.len() {
@@ -320,21 +342,28 @@ impl Embedder for Builtin {
                 rows += 1;
             }
             let seq_b = lens[order[start + rows - 1]];
-            batches.push((start, rows, seq_b));
+            batches.push((start, rows, seq_b, offset));
+            offset += rows * seq_b;
             start += rows;
         }
 
         // ids/mask laid out batch by batch in SORTED order: every batch is
         // one contiguous slice of these two buffers, so the workers take
-        // slices — not the Vec-copied-twice chunks of v0.4.4.
-        let pad_id = encodings
-            .first()
-            .map(|e| e.get_ids().last().copied().unwrap_or(0))
-            .unwrap_or(0);
-        let total: usize = batches.iter().map(|&(_, rows, seq)| rows * seq).sum();
+        // slices — not the Vec-copied-twice chunks of v0.4.4. The pad id
+        // is the one of the tokenizer's padding config when it ships one
+        // (v0.4.6 P0), else the last id of the first text — the attention
+        // mask zeroes the pad positions, so the choice cannot change the
+        // vectors (the padding tests prove it).
+        let pad_id = self.pad_id.unwrap_or_else(|| {
+            encodings
+                .first()
+                .map(|e| e.get_ids().last().copied().unwrap_or(0))
+                .unwrap_or(0)
+        });
+        let total: usize = batches.iter().map(|&(_, rows, seq, _)| rows * seq).sum();
         let mut ids: Vec<i64> = Vec::with_capacity(total);
         let mut mask: Vec<i64> = Vec::with_capacity(total);
-        for &(bstart, brows, seq_b) in &batches {
+        for &(bstart, brows, seq_b, _) in &batches {
             for row in bstart..bstart + brows {
                 let e = &encodings[order[row]];
                 let n = lens[order[row]];
@@ -377,9 +406,9 @@ impl Embedder for Builtin {
                         let Some(b) = next else {
                             break;
                         };
-                        let (bstart, brows, seq_b) = batches[b];
-                        let from = bstart * seq_b;
-                        let to = (bstart + brows) * seq_b;
+                        let (_bstart, brows, seq_b, boff) = batches[b];
+                        let from = boff;
+                        let to = boff + brows * seq_b;
                         let r = Self::embed_chunk(
                             &plan,
                             mask_slots,
@@ -411,7 +440,7 @@ impl Embedder for Builtin {
             let vecs = slot.unwrap_or_else(|| {
                 Err(EmbedError::BadModel("a batch produced no result".into()))
             })?;
-            let (bstart, _rows, _seq_b) = batches[b];
+            let (bstart, _rows, _seq_b, _off) = batches[b];
             for (j, v) in vecs.into_iter().enumerate() {
                 out[order[bstart + j]] = Some(v);
             }
