@@ -19,12 +19,15 @@ use crate::spec::{self, ModelSpec, Pooling};
 
 type Plan = Arc<RunnableModel<TypedFact, Box<dyn tract_onnx::prelude::TypedOp>>>;
 
-/// v0.4.5 (P2): the token budget of one forward pass —
-/// `rows × batch_seq ≤ ENGRAMMA_EMBED_TOKEN_BUDGET`. The measured choice
-/// of the {2048, 4096, 8192} × threads grid (REPORT v0.4.5): 2048 gives
-/// the lowest peak within the time budget — the activation memory of the
-/// pass stops following the batch the caller happens to send.
-const DEFAULT_TOKEN_BUDGET: usize = 2048;
+/// v0.4.6 (P1): the token budget of one forward pass —
+/// `rows × batch_seq ≤ ENGRAMMA_EMBED_TOKEN_BUDGET`. The v0.4.5 rule
+/// (lowest peak whose 64-note time stays within +15% of the v0.4.4 8,6 s)
+/// now admits (4096, 1) — without the tokenizer padding one worker does
+/// the workload in 6,4 s, −26% vs v0.4.4 — and the default FOLLOWS the
+/// rule: peak 1229 MB (system allocator), 1126 under mimalloc (the
+/// grid of REPORT v0.4.6). The activation memory of a pass stops
+/// following the batch the caller happens to send.
+const DEFAULT_TOKEN_BUDGET: usize = 4096;
 
 /// v0.4.5 (P2): `ENGRAMMA_EMBED_TOKEN_BUDGET` — a whole number ≥ 1;
 /// anything else (0, non-numeric, unset) falls back to the default.
@@ -103,20 +106,21 @@ impl Builtin {
         let pad_id = tokenizer.get_padding().map(|p| p.pad_id);
         tokenizer.with_padding(None);
 
-        // v0.4.5 (P2): a FIXED pool of embed workers — min(4, available_
-        // parallelism) by default. The v0.4.4 pool sized itself on
-        // available_parallelism() (10–12 here): the activation peak and the
-        // per-thread allocator heaps followed it. `ENGRAMMA_EMBED_THREADS`
-        // (a whole number ≥ 1) still overrides.
+        // v0.4.6 (P1): ONE worker by default. The v0.4.5 rule (lowest
+        // peak within +15% of the v0.4.4 64-note time) had already picked
+        // (4096, 1) by peak and rejected it only on time (+42%); with the
+        // tokenizer padding gone the time is 6,4 s (−26%) and the default
+        // FOLLOWS the rule — the v0.4.5 phase chose (2048, 2) and then
+        // kept min(4, available_parallelism), an inconsistency this
+        // closes. Peak 1229 MB at one worker vs 1331–2355 everywhere else
+        // on the grid (REPORT v0.4.6). `ENGRAMMA_EMBED_THREADS` (a whole
+        // number ≥ 1) still overrides — the bulk-import knob: each worker
+        // adds rate and peak in equal measure.
         let threads = std::env::var("ENGRAMMA_EMBED_THREADS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map_or(1, |n| n.get())
-                    .min(4)
-            });
+            .unwrap_or(1);
         let token_budget = std::env::var("ENGRAMMA_EMBED_TOKEN_BUDGET")
             .ok()
             .as_deref()
