@@ -3998,14 +3998,25 @@ ci sono golden da aggiornare.
 | | ses. any@5 | ses. all@5 | ses. ndcg@5 | ses. ndcg@10 | turno any@5 | turno ndcg@5 | turno ndcg@10 |
 |---|---|---|---|---|---|---|---|
 | solo testo | 0,9702 | 0,8447 | 0,6607 | 0,6504 | 0,8766 | 0,6829 | 0,7181 |
-| ibrida α=0,5 | **0,9745** | **0,8766** | **0,7451** | **0,7588** | 0,8660 | 0,6429 | 0,6889 |
+| ibrida α=0,5 | **0,9809** | **0,8723** | **0,7536** | **0,7638** | **0,9106** | **0,6970** | **0,7342** |
 
-Per tipo, sessione ndcg@5 (il resto nelle tabelle complete delle
-corse, riprodotte dallo stesso comando): testo — knowledge-update
-0,7132, multi-session 0,6867, single-assistant 0,8231,
-single-preference 0,3125, single-user 0,6313, temporal 0,6316; ibrida —
-1,0/0,9722→0,7689, multi-session 0,7689, single-assistant 0,9757,
-single-preference 0,5214, single-user 0,6689, temporal 0,6985.
+> **Correzione della verifica (2026-11-11).** La riga ibrida scritta
+> qui in origine (0,9745 / 0,8766 / 0,7451 / 0,7588 / 0,8660 / 0,6429 /
+> 0,6889) era una corsa con **α=0,7**, non 0,5: coincide con la media
+> pesata di dev e test ad α=0,7 (per esempio il turno ndcg@5
+> (150·0,6765 + 320·0,6272)/470 = 0,6429). Rifatta dalla verifica col
+> binario del tag (`--mode hybrid --questions all`, intestazione
+> «fusione convex:0.5», cache calda, 4:35): la riga sopra, che coincide
+> con la media pesata di dev e test ad α=0,5 (turno ndcg@5 0,6969).
+> Con α=0,5 l'ibrida batte il solo testo su **tutte** le metriche
+> delle 470, anche al turno.
+
+Per tipo, sessione ndcg@5: testo — knowledge-update 0,7132,
+multi-session 0,6867, single-assistant 0,8231, single-preference
+0,3125, single-user 0,6313, temporal 0,6316; ibrida α=0,5 (corsa della
+verifica) — knowledge-update 0,7790, multi-session 0,7801,
+single-assistant 0,9687, single-preference 0,4816, single-user 0,6992,
+temporal 0,7109.
 
 ### Il banco a 100k non è peggiorato
 
