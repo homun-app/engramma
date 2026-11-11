@@ -4271,3 +4271,243 @@ Il carico di lavoro da 64 note — la metrica d'accettazione della fase —
   domande intere) e **nessuna** cache NNEF (scartata). Le celle di
   LongMemEval vivevano in `tempfile::TempDir` e sono andate via da sé.
   Nessun push.
+
+# REPORT — Engramma v0.4.6 (i lotti di embedding, davvero)
+
+Data: 2026-11-11. Base: `main` @ `cc2018f` (tag `fase-v0.4.5` più un
+commit di sola documentazione della verifica). Un commit per punto, con
+dentro solo i file di quel punto; il test rosso prima della correzione.
+Tutto costruito con `cargo --offline`, Rust 1.95.0, macOS arm64 (darwin
+27, 10 core, 24 GB). **Nessuna crate nuova** (il `Cargo.lock` è identico
+a quello della v0.4.5), nessun `unsafe` nuovo, nessun `unwrap`/`expect`
+fuori dai test, clippy `-D warnings` verde su macOS e su Linux. Il
+contratto JS non cambia: `index.js` e `index.d.ts` hanno gli stessi
+SHA256 della v0.4.4 e v0.4.5. Il repo di Homun non è stato toccato.
+
+Disco: `du -sh target` — inizio fase **8,2 GB**, fine **8,2 GB**
+(ricompilazioni al posto). `~/.cache/cargo-target` mai toccata. Le
+coppie sensibili al tempo (griglia, banco 100k) sono corse a macchina
+ferma, una dietro l'altra.
+
+## P0 — il tokenizer riempiva già i testi, e gli offset erano sbagliati
+
+### Cosa non funzionava (trovato dalla verifica della v0.4.5)
+
+Il `tokenizer.json` di **entrambi** i Granite R2 contiene
+`"padding": {"strategy": "BatchLongest", "direction": "Right", …}`
+(97M: pad_id 179935, `<|endoftext|>`; 311M: pad_id 0, `<pad>`):
+`Tokenizer::from_file` carica quella configurazione, quindi
+`encode_batch` in `Builtin::embed` restituiva **tutti i testi riempiti
+al più lungo della chiamata**. Il commento «the tokenizer itself stays
+unconfigured» era falso dalla v0.2. Conseguenze:
+
+1. **l'ordinamento per lunghezza non ordinava niente** — `lens` era
+   uguale per tutti, cioè `min(il più lungo, 512)`, e una nota corta in
+   una chiamata con una lunga pagava 512 token di calcolo. È la vera
+   causa del calo del banco a 100k da 201 a 74 note/s (non solo il pool
+   a 4 della v0.4.5);
+2. **gli offset dei lotti erano sbagliati ma il difetto era nascosto**:
+   i buffer ids/mask sono stesi lotto per lotto, ognuno col suo `seq`,
+   ma il lavoratore leggeva `from = inizio_riga × seq_lotto` — giusto
+   solo se tutti i lotti hanno lo stesso `seq`, che il riempimento
+   garantiva per caso. **Riprodotto in questa fase**: padding tolto e
+   offset vecchi → panic in un lavoratore (`builtin.rs:422`, fetta
+   fuori dai limiti) al primo test con lotti di seq diversi;
+3. **il test «bit-identici a ogni budget» passava solo perché tutte le
+   forme erano uguali**: non è una proprietà del motore, lo è solo a
+   parità di `seq`.
+
+### Il test rosso (commit `cce543e`)
+
+- `the_loaded_tokenizer_does_not_pad` (unitario, in `builtin.rs`): due
+  testi di lunghezza diversa in un `encode_batch` col tokenizer di
+  `Builtin::load` devono dare lunghezze diverse. **Prima della
+  correzione fallisce**: «the tokenizer pads the batch: both texts came
+  out 24 tokens»;
+- `order_and_budget_do_not_change_the_vectors` (fidelity) riscritto
+  onesto: alla stessa configurazione un **ordine diverso** dà vettori
+  **identici bit per bit** (l'ordinamento ricostruisce gli stessi
+  lotti); **budget diversi** (1, 2048, 8192) danno coseno ≥ 0,999999 e
+  |Δ| ≤ 1e-5 per componente, e il commento dice perché non
+  l'uguaglianza (la forma del lotto cambia l'ordine delle somme dentro
+  tract). I testi coprono tre lunghezze distinte **sotto** i 512 token
+  (verificato nel test con `approx_tokens`): il caso che fa lavorare
+  gli offset, prima nascosto dal riempimento che livellava tutto.
+
+### La correzione (commit `b41078a`)
+
+- `Builtin::load` legge il `pad_id` della configurazione di riempimento
+  (se c'è) e **toglie il riempimento** (`with_padding(None)`): il
+  ripiego senza configurazione resta l'ultimo id del primo testo, e la
+  maschera rende la scelta irrilevante (i test di riempimento lo
+  provano). La troncatura resta del tokenizer (32768, sopra il nostro
+  taglio a `max_tokens`): `approx_tokens` continua a vedere la
+  lunghezza vera;
+- **offset per lotto a somma prefissa** di `righe × seq`, calcolati
+  quando si tagliano i lotti e passati ai lavoratori;
+- i commenti che dicevano il falso, corretti («stays unconfigured»,
+  «bit-identical across budgets»).
+
+**Fedeltà contro ONNX Runtime**: `granite_97m_matches_onnxruntime` e
+`granite_311m_matches_onnxruntime` verdi **senza toccare le soglie**
+(cos ≥ 0,9999), insieme a `padding_does_not_change_the_vector`,
+`truncation_keeps_the_first_tokens_and_the_batch_shape` e il test
+riscritto.
+
+## P1 — rimisurare, e scegliere con la regola scritta
+
+### La griglia budget × thread rifatta (stessi 8 punti, 5 corse, entrambi gli allocatori)
+
+`ram`/`ram_mimalloc --matrix 5`, 64 note (metà di ~600 token), processi
+separati, macchina ferma:
+
+| budget | lav. | dopo carico | +10 s (med/min/max) | **picco** | embed 64 | picco mimalloc | +10 s mimalloc |
+|---|---|---|---|---|---|---|---|
+| 2048 | 2 | 1100 | 1434 / 1421 / 1475 | 1331 | 4,4 s | 1126 | 1142 (1130–1152) |
+| 2048 | 4 | 1101 | 1390 / 1364 / 1431 | 1536 | 2,8 s | 1331 | 1340 (1327–1370) |
+| **4096** | **1** | 1100 | 1374 / 1354 / 1380 | **1229** | 6,4 s | **1126** | **1110** (908–1110) |
+| 4096 | 2 | 1101 | 1696 / 1676 / 1806 | 1536 | 4,5 s | 1434 | 1426 (1345–1436) |
+| 4096 | 4 | 1100 | 1877 / 1792 / 1982 | 2048 | 2,9 s | 1741 | 1721 (1653–1827) |
+| 8192 | 2 | 1101 | 2261 / 2207 / 2392 | 2150 | 4,7 s | 1843 | 1850 (1831–1965) |
+| 8192 | 4 | 1100 | 2390 / 2056 / 2520 | 2253 | 4,7 s | 1946 | 1953 (1828–2034) |
+| 8192 | 6 | 1100 | 2405 / 2229 / 2424 | 2355 | 4,7 s | 1946 | 1932 (1862–2030) |
+
+(dopo carico mimalloc: 846 MB su tutti i punti; embed mimalloc: 4,5 /
+2,9 / 6,8 / 4,6 / 3,0 / 5,0 / 4,8 / 4,8 s negli stessi punti. Per
+confronto, la griglia v0.4.5 sugli stessi punti: 8,3 / 5,3 / 12,2 /
+8,6 / 5,5 / 9,4 / 6,1 / 5,9 s.)
+
+**La regola, la stessa della v0.4.5** — il picco più basso il cui tempo
+non peggiori oltre il 15% rispetto alla v0.4.4 (8,6 s, cioè ≤ 9,89 s):
+con il riempimento tolto il tempo delle 64 note sta tutto fra 2,8 e
+6,8 s, **tutti i punti sono ammissibili** e vince **(4096, 1)**: picco
+1229 MB a sistema, 1126 MB con mimalloc e il miglior riposo della
+griglia (+10 s 1110 MB). È il punto che la regola della v0.4.5 sceglieva
+già per il picco e scartava solo per il tempo (12,2 s, +42%); ora fa
+6,4 s (−26%). **Questa volta i predefiniti seguono la regola** (commit
+`3acbf5b`): `ENGRAMMA_EMBED_TOKEN_BUDGET=4096`, pool a **1 lavoratore**
+— nella v0.4.5 la regola sceglieva (2048, 2) e poi il predefinito
+restava `min(4, ·)`.
+
+### Il banco a 100k (prima/dopo addossati, macchina ferma)
+
+`engramma-bench --notes 100000 --runs 1`: binario v0.4.5 ricostruito
+dalla base (74 note/s, il numero del REPORT v0.4.5 riprodotto) contro
+il binario finale coi predefiniti nuovi (4096 × 1):
+
+| metrica | v0.4.4 | v0.4.5 | v0.4.6 | Δ 4.5→4.6 |
+|---|---|---|---|---|
+| **embedding (note/s)** | 201 | 74 | **68** | −8% |
+| **per lavoratore (note/s)** | ~18,5 (10–12 lav.) | 18,5 (4 lav.) | **68 (1 lav.)** | **3,7×** |
+| ibrido caldo p50 / p95 | 11,5 / 14,6 ms | 11,9 / 15,2 ms | 12,4 / 16,1 ms | ~+4% |
+| vettori p50 / p95 | 4,5 / 5,1 ms | 4,6 / 5,6 ms | 4,7 / 6,2 ms | ~0 |
+| ibrido con embedding p50 / p95 | 20,1 / — | 20,8 / 25,1 ms | 20,8 / 24,4 ms | ~0 |
+| inserimento (note/s, viva) | — | 2592 | 2561 | −1% |
+| richiamo@5 / MRR (tutte le righe) | — | 0,940 / 0,683 | identici | 0 |
+
+Lettura onesta: **il ritmo per lavoratore è salito da 18,5 a 68 note/s
+(3,7×)** — era tutto lì il costo del riempimento, e la v0.4.4 faceva
+201 note/s proprio perché spendeva 10–12 lavoratori da 18,5. Il totale
+al predefinito scende da 74 a 68 perché il pool passa da 4 a 1: è il
+prezzo della regola del picco, dichiarato. Con la scalabilità lineare
+misurata nella v0.4.5 (18,5 × 4 = 74, verificata), 4 lavoratori oggi
+sarebbero ≈ 270 note/s — sopra i 201 della v0.4.4 — ma non è una corsa
+di questa fase: la manopola è `ENGRAMMA_EMBED_THREADS`, e chi importa
+un archivio intero la alza sapendo che ogni lavoratore porta con sé
+picco e ritmo in uguale misura (la griglia qui sopra).
+
+### Node (`rss.js --matrix 5`, .node nuovo, predefiniti nuovi)
+
+| stadio | mediana | min | max |
+|---|---|---|---|
+| modello caricato | 894 MB | 894 | 894 |
+| dopo embedPending (64 note, metà lunghe) | 1214 MB | 1214 | 1215 |
+| **+10 s** | **1224 MB** | 1224 | 1224 |
+| **picco (maxRSS)** | **1224 MB** | 1224 | 1224 |
+| embedPending (2ª cella) | 12 963 ms | 12 882 | 13 354 |
+
+Il picco scende da 1446 MB (v0.4.5) a **1224**: **la soglia di 1,2 GB è
+rispettata nell'artefatto** (1224 < 1228,8), e le cinque corse sono
+uguali al megabyte. `embedPending` passa da 9,1 a 13,0 s: è il pool a 1
+lavoratore. **La soglia di 700 MB a +10 s resta fuori** (1224 MB):
+pagine liberate ma residenti su macOS, con qualunque allocatore — la
+causa è misurata nella v0.4.5 e non è cambiata. L'embedding fuori
+processo resta l'opzione della v0.5.
+
+### Linux (contenitore `engramma-linux:1.95.0`, glibc, 5 corse, predefiniti nuovi)
+
+**Picco (VmHWM) 1008 MB, +10 s 596 MB** (596–597; dopo carico 561; embed
+18,2 s). Nella v0.4.5, a 2048×4: picco 1021, +10 s 637. Su Linux la
+soglia dei 700 MB a +10 s **è rispettata** — glibc restituisce, e il
+predefinito a 1 lavoratore la sfrutta.
+
+### LongMemEval (una corsa ibrida sulle 150 dev, cache calda)
+
+`--mode hybrid --questions dev`, 76 s, **0 incorporazioni nuove, 51 268
+riusi**: sessione any@5 / all@5 / ndcg@5 / ndcg@10 = 0,9933 / 0,9200 /
+0,7815 / 0,7933, turno ndcg@5 0,7303 — **gli stessi numeri della
+v0.4.5, riga per riga**. **I vettori in cache sono quelli vecchi**,
+calcolati col riempimento: differiscono dai nuovi solo nell'ultima cifra
+(coseno ≥ 0,999999, la proprietà del test riscritto) e nessuna cache va
+buttata; la corsa prova che l'esempio funziona col codice nuovo.
+
+## P2 — la documentazione
+
+- **DESIGN § 7**: il lotto di incorporazione com'è dopo P0 (niente
+  riempimento dal tokenizer, offset a somma prefissa, predefiniti
+  4096 × 1), una riga su cosa non funzionava nella v0.4.5, la proprietà
+  vera dei vettori (bit-identici a parità di configurazione, coseno
+  ≥ 0,999999 fra budget), i numeri nuovi della RAM e dell'allocatore;
+  § 12: la riga v0.4.6;
+- **`docs/node.md`**: le due variabili d'ambiente con i predefiniti e
+  gli effetti misurati nuovi; la RAM che aspettarsi (1,2 GB);
+- **REPORT**: questo testo.
+
+## Per Homun
+
+- **L'embedding per lavoratore è 3,7× più veloce** (68 note/s contro
+  18,5): il riempimento del tokenizer costava quello, non il pool. Al
+  predefinito (1 lavoratore, il picco più basso della regola) il ritmo
+  di massa è 68 note/s; per l'importazione iniziale di grandi storie
+  `ENGRAMMA_EMBED_THREADS=4` (o più) accelera in proporzione — linearità
+  misurata — riportando su il picco: la manopola del compromesso.
+- **RAM**: picco dell'embedding **1224 MB** nel `.node` (prima 1446;
+  ~2,3 GB nella v0.4.4), identico su tutte le corse; a riposo dopo
+  `embedPending` aspettarsi ~1,2 GB. `embedPending` di 64 note: ~13 s
+  (9,1 s nella v0.4.5 a 4 lavoratori) — in background, non cambia i
+  risultati.
+- **Predefiniti nuovi**: `ENGRAMMA_EMBED_TOKEN_BUDGET=4096`,
+  `ENGRAMMA_EMBED_THREADS=1` (0/non numerico → predefinito, come prima).
+- **Le cache dei vettori restano valide**: i vettori nuovi differiscono
+  dai vecchi solo nell'ultima cifra; ricalcoli non necessari.
+- I contratti JS non cambiano: `index.js` e `index.d.ts` immutati
+  (SHA256 sotto).
+
+## Chiusura
+
+- macOS: `cargo fmt --check` ✓, `cargo clippy --all-targets --offline
+  -- -D warnings` ✓, `cargo test --offline --workspace` ✓ (26 suite,
+  0 falliti), `cargo test -p engramma-bench --example longmemeval` ✓
+  (3 test), `cargo deny check licenses bans` ✓.
+- Linux: `scripts/linux.sh` verde (fmt, clippy `-D warnings`, 26 suite
+  nel contenitore `engramma-linux:1.95.0`, rete chiusa, sorgente in
+  sola lettura); poi `docker volume rm engramma-linux-target`.
+- JS: Node 24 `npm test` 29/29, `test:electron` 29/29,
+  `test:electron-main` ok — col `.node` della fase.
+- `npm run build` rifatto; SHA256 dei tre file per Homun:
+
+  ```
+  engramma.darwin-arm64.node  4a6e24af94f3efeba1d935048e29e9d2e1a92cf89620f8e6d6b6b72cddab898f  (33,6 MB)
+  index.js                    25fd9cc1d50a1ec3f2d74bc004d904663ff07360102d27b938870329d9c832d4
+  index.d.ts                  bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a6488005bf69d9f8
+
+  `index.js` e `index.d.ts` hanno gli stessi SHA256 della v0.4.4 e
+  v0.4.5: il contratto JS non è cambiato, come promesso dalla fase.
+  ```
+
+- `du -sh target`: 8,2 GB all'inizio, **8,2 GB** alla fine.
+- Temporanei in `/var/folders/nb/r6fbsdsn3z58bkbb9w55nn780000gn/T/engramma-v046/`
+  cancellati a fine fase (script, log, tabelle, binari baseline).
+  Resta, come dalle fasi precedenti: la cache dei vettori in
+  `~/.cache/engramma/bench/` (i vettori vecchi, validi — vedi
+  LongMemEval). Nessun push.

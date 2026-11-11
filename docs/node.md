@@ -1,6 +1,6 @@
 # engramma-node — il motore dentro Node.js ed Electron
 
-v0.4.5. Il collegamento in-process per Homun: un modulo **N-API**
+v0.4.6. Il collegamento in-process per Homun: un modulo **N-API**
 (napi-rs 3) che carica il motore una volta per processo. L'N-API è
 stabile tra versioni di Node ed Electron: il `.node` non va ricompilato a
 ogni aggiornamento di Electron (Homun oggi non ha moduli nativi; questo
@@ -10,23 +10,29 @@ del modulo (motore e tract) passano per **mimalloc**: in un `cdylib` il
 restano col loro allocatore (le misure stanno nel REPORT v0.4.4; dalla
 v0.4.5 su macOS, su Linux resta quello di sistema — § 7 del DESIGN).
 
-**Le due variabili d'ambiente dell'embedding** (v0.4.5):
+**Le due variabili d'ambiente dell'embedding** (v0.4.6):
 
 - `ENGRAMMA_EMBED_THREADS` — quanti lavoratori incorporano in parallelo.
-  Predefinito `min(4, available_parallelism)`. Ogni lavoratore ha il suo
-  forward pass: ridurlo (per esempio a 2) abbassa il picco di RAM di
-  ~200 MB al costo di ~3 s su 64 note (numeri nel REPORT v0.4.5).
+  Predefinito **1** (la regola della v0.4.5 sul picco, seguita davvero:
+  v0.4.6, REPORT). Ogni lavoratore è un forward pass in più: a processo
+  nudo passare da 1 a 2 lavoratori porta le 64 note da 6,4 a 4,5 s ma il
+  picco da 1126 a 1434 MB (mimalloc); nell'artefatto il predefinito tiene
+  il picco a **1224 MB** con `embedPending` di 64 note a ~13 s. Per
+  l'importazione iniziale di grandi storie è la manopola del compromesso:
+  ogni lavoratore aggiunge ritmo e picco in uguale misura.
 - `ENGRAMMA_EMBED_TOKEN_BUDGET` — il tetto di token di un forward pass
-  (`righe × seq_lotto ≤ budget`). Predefinito **2048**; un valore non
-  valido (0, non numerico) ricade sul predefinito. I vettori non cambiano
-  a nessun budget: cambia solo la memoria.
+  (`righe × seq_lotto ≤ budget`). Predefinito **4096**; un valore non
+  valido (0, non numerico) ricade sul predefinito. A parità di
+  configurazione i vettori sono identici bit per bit; fra budget diversi
+  la forma del lotto sposta l'ultima cifra dentro tract (coseno
+  ≥ 0,999999, |Δ| ≤ 1e-5): cambia la memoria, non il significato.
 
 **La RAM che aspettarsi** (macOS, Node 24, Granite 97M, 5 corse):
-modello caricato ~894 MB; dopo `embedPending` di 64 note ~1,45 GB e lì
+modello caricato ~894 MB; dopo `embedPending` di 64 note ~1,2 GB e lì
 resta — pagine liberate ma residenti, con qualunque allocatore su macOS
-(ventaglio 1436–1469 MB; il picco scende da ~2,3 GB della v0.4.4 a
-~1,45 GB). Le soglie di riposo più basse richiedono l'embedding fuori
-processo: opzione della v0.5.
+(1224/1224/1224 MB nelle cinque corse; il picco scende da ~2,3 GB della
+v0.4.4 a 1,45 GB nella v0.4.5 a 1,2 GB ora). Le soglie di riposo più
+basse richiedono l'embedding fuori processo: opzione della v0.5.
 
 ## Costruzione
 
