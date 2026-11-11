@@ -4511,3 +4511,75 @@ buttata; la corsa prova che l'esempio funziona col codice nuovo.
   Resta, come dalle fasi precedenti: la cache dei vettori in
   `~/.cache/engramma/bench/` (i vettori vecchi, validi — vedi
   LongMemEval). Nessun push.
+
+## v0.4.6.1 — correzione di verifica: il budget predefinito a 512
+
+Data: 2026-11-11. Base `fase-v0.4.6` (`a52445e`). Fatta nella verifica
+della v0.4.6: un commit, tag annotato `fase-v0.4.6.1`.
+
+**Cosa ha trovato la verifica.** La griglia della v0.4.6 ripeteva gli 8
+punti della v0.4.5 e a 1 lavoratore aveva solo il budget 4096; la regola
+(«il picco più basso entro il +15% di tempo») sceglie il migliore fra i
+punti misurati, non oltre. Il difetto è della spec, non della fase. Gli
+stessi strumenti (`ram`/`ram_mimalloc --matrix 5`, 64 note di cui metà
+lunghe, 1 lavoratore):
+
+| budget | picco mimalloc | +10 s mimalloc | 64 note | picco sistema | +10 s sistema |
+|---|---|---|---|---|---|
+| **512** | **878** | **888** | **5,8 s** | 1024 | 1132 |
+| 1024 | 912 | 922 | 6,7 s | 1024 | 1142 |
+| 2048 | 993 | 1003 | 6,2 s | 1126 | 1255 |
+| 4096 (v0.4.6) | 1126 | 1110 | 6,4 s | 1229 | 1350 |
+
+(a 1024 × 2, mimalloc: picco 986 MB, 64 note 3,9 s.)
+
+Il banco a 10k, 1 lavoratore (`engramma-bench --notes 10000 --runs 1`):
+
+| budget | 97M (note/s) | 311M (note/s) |
+|---|---|---|
+| **512** | **100** | **37** |
+| 4096 | 75 | 26 |
+
+Latenze di ricerca identiche (ibrido caldo p50 2,1 ms, con embedding
+10,6 ms). **Perché:** senza il riempimento del tokenizer, su CPU un lotto
+grande non fa risparmiare calcolo (tract fa una passata per lavoratore),
+mentre le attivazioni intermedie crescono con il lotto ed escono dalla
+cache. 512 è `max_tokens`: un testo lungo passa da solo, i corti si
+impacchettano fino allo stesso tetto.
+
+**Correzione:** `DEFAULT_TOKEN_BUDGET = 512` (`builtin.rs`) con i
+commenti; DESIGN § 7 e § 12, `docs/node.md`. Il pool resta a 1
+lavoratore.
+
+**Node** (`rss.js --matrix 5`, .node nuovo, Node 24.22.1):
+
+| stadio | mediana | min | max |
+|---|---|---|---|
+| modello caricato | 894 MB | 894 | 894 |
+| dopo embedPending (64 note) | 953 MB | 953 | 953 |
+| **+10 s** | **959 MB** | 959 | 959 |
+| picco (maxRSS) | 1222 MB | 1222 | 1222 |
+| embedPending | 11 450 ms | 11 409 | 11 456 |
+
+Il riposo a +10 s scende da 1224 a **959 MB**. Il picco resta 1222 MB
+perché **ora lo fa il caricamento del modello**: 1220 MB di `maxRSS` già
+subito dopo `Engine.open` con l'embedder builtin (l'ottimizzazione del
+grafo in tract), prima di qualsiasi embedding. Per abbassare il picco
+ancora bisogna intervenire sul carico, non sui lotti. La soglia di 700 MB
+a +10 s resta fuori su macOS.
+
+**Chiusura:** `cargo fmt --check`, `cargo clippy --all-targets --offline
+-- -D warnings`, `cargo test --offline --workspace` (26 suite),
+l'esempio `longmemeval` (3 test), `cargo deny check licenses bans`: tutti
+verdi. Node 24 `npm test` 29/29, `test:electron` 29/29,
+`test:electron-main` ok. **Non rifatti:** `scripts/linux.sh` (una
+costante cambiata, nessun codice di piattaforma) e il banco a 100k (il
+banco a 10k qui sopra è la misura del ritmo). I vettori cambiano solo
+nell'ultima cifra (la proprietà del test di fedeltà, coseno ≥ 0,999999):
+le cache dei vettori restano valide.
+
+```
+engramma.darwin-arm64.node  c64010d381df14cd6ad48be20db7e112b9d4331d823f1deb5e017da707c3bd31  (33,6 MB)
+index.js                    25fd9cc1d50a1ec3f2d74bc004d904663ff07360102d27b938870329d9c832d4
+index.d.ts                  bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a6488005bf69d9f8
+```

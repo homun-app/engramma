@@ -19,15 +19,17 @@ use crate::spec::{self, ModelSpec, Pooling};
 
 type Plan = Arc<RunnableModel<TypedFact, Box<dyn tract_onnx::prelude::TypedOp>>>;
 
-/// v0.4.6 (P1): the token budget of one forward pass —
-/// `rows × batch_seq ≤ ENGRAMMA_EMBED_TOKEN_BUDGET`. The v0.4.5 rule
-/// (lowest peak whose 64-note time stays within +15% of the v0.4.4 8,6 s)
-/// now admits (4096, 1) — without the tokenizer padding one worker does
-/// the workload in 6,4 s, −26% vs v0.4.4 — and the default FOLLOWS the
-/// rule: peak 1229 MB (system allocator), 1126 under mimalloc (the
-/// grid of REPORT v0.4.6). The activation memory of a pass stops
-/// following the batch the caller happens to send.
-const DEFAULT_TOKEN_BUDGET: usize = 4096;
+/// v0.4.6.1: the token budget of one forward pass —
+/// `rows × batch_seq ≤ ENGRAMMA_EMBED_TOKEN_BUDGET`. The v0.4.6 grid had
+/// no small-budget points at one worker; measured at (·, 1) under
+/// mimalloc, 5 runs: 512 → peak 878 MB, 64 notes 5,8 s; 1024 → 912 MB;
+/// 2048 → 993 MB; 4096 → 1126 MB, 6,4 s. Without the tokenizer padding
+/// big batches buy NO time on CPU (tract runs one pass per worker; the
+/// larger intermediates only fall out of cache): at 512 the 10k bench
+/// embeds 100 notes/s against 75 at 4096. 512 = max_tokens, so a long
+/// text still runs alone and short ones pack up to the same budget.
+/// The activation memory of a pass stops following the caller's batch.
+const DEFAULT_TOKEN_BUDGET: usize = 512;
 
 /// v0.4.5 (P2): `ENGRAMMA_EMBED_TOKEN_BUDGET` — a whole number ≥ 1;
 /// anything else (0, non-numeric, unset) falls back to the default.
@@ -112,8 +114,9 @@ impl Builtin {
         // tokenizer padding gone the time is 6,4 s (−26%) and the default
         // FOLLOWS the rule — the v0.4.5 phase chose (2048, 2) and then
         // kept min(4, available_parallelism), an inconsistency this
-        // closes. Peak 1229 MB at one worker vs 1331–2355 everywhere else
-        // on the grid (REPORT v0.4.6). `ENGRAMMA_EMBED_THREADS` (a whole
+        // closes. One worker gives the lowest peak at every budget; with
+        // the 512 budget (v0.4.6.1) it is 878 MB under mimalloc
+        // (REPORT v0.4.6, verification). `ENGRAMMA_EMBED_THREADS` (a whole
         // number ≥ 1) still overrides — the bulk-import knob: each worker
         // adds rate and peak in equal measure.
         let threads = std::env::var("ENGRAMMA_EMBED_THREADS")
