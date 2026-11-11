@@ -429,7 +429,7 @@ impl Embedder for Builtin {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_budget;
+    use super::{Builtin, parse_budget};
 
     #[test]
     fn budget_override_needs_a_whole_number_at_least_one() {
@@ -441,5 +441,43 @@ mod tests {
         assert_eq!(parse_budget("non-numeric"), None);
         assert_eq!(parse_budget("-8"), None);
         assert_eq!(parse_budget("1.5"), None);
+    }
+
+    /// v0.4.6 (P0): the tokenizer of `Builtin::load` must NOT pad. Both
+    /// Granite R2 `tokenizer.json` ship with BatchLongest padding, so a
+    /// bare `from_file` makes `encode_batch` pad every text to the longest
+    /// of the call — the v0.4.5 length sort sorted nothing and a short
+    /// note paid the longest's compute (the 100k bulk rate fell 201 → 74
+    /// notes/s). This test is the red one of the phase: it fails until
+    /// the padding config is stripped in `load`.
+    #[test]
+    fn the_loaded_tokenizer_does_not_pad() {
+        if std::env::var("ENGRAMMA_SKIP_MODEL_TESTS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            eprintln!("ENGRAMMA_SKIP_MODEL_TESTS=1: skipping the tokenizer test");
+            return;
+        }
+        let root = crate::spec::model_root();
+        let b = Builtin::load_named(&root, "granite-embedding-97m-multilingual-r2")
+            .unwrap_or_else(|e| panic!("model load: {e}"));
+        let encodings = b
+            .tokenizer
+            .encode_batch(
+                vec![
+                    "corto",
+                    "un testo molto più lungo, con molte parole diverse dentro, abbastanza da \
+                     contare davvero qualche decina di token",
+                ],
+                true,
+            )
+            .unwrap_or_else(|e| panic!("encode_batch: {e}"));
+        assert_eq!(encodings.len(), 2);
+        let (l0, l1) = (encodings[0].get_ids().len(), encodings[1].get_ids().len());
+        assert_ne!(
+            l0, l1,
+            "the tokenizer pads the batch: both texts came out {l0} tokens"
+        );
     }
 }

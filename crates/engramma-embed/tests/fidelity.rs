@@ -177,10 +177,19 @@ fn empty_batch_is_empty() {
     );
 }
 
-/// v0.4.5 (P2): the sorted, budgeted batching must be invisible in the
-/// output — the SAME texts in a different order, and under very
-/// different token budgets (one text per forward pass at 1, the default,
-/// a wide 8192), give BIT-IDENTICAL vectors (not cosines: equality).
+/// v0.4.5 (P2) → v0.4.6 (P0): the sorted, budgeted batching must be
+/// invisible in the output — but honestly. At the SAME configuration the
+/// sort makes the batches the same whatever the input order, so a
+/// reversed input gives BIT-IDENTICAL vectors (not cosines: equality).
+/// Across BUDGETS bit-equality is not a property of the engine: the
+/// batch shape (`rows × seq`) changes the order of the sums inside
+/// tract, and the last digits move (~1e-7) — the honest promise is
+/// cos ≥ 0,999999 and |Δ| ≤ 1e-5 per component (the ONNX Runtime
+/// fidelity threshold below is 0,9999). The texts span three different
+/// token lengths, ALL below max_tokens, and the budgets are 1 (one text
+/// per forward pass), 2048 and 8192: with a per-batch sequence the
+/// worker buffer offsets are exercised for real — the v0.4.5 tokenizer
+/// padding hid them by making every batch the same length.
 #[test]
 fn order_and_budget_do_not_change_the_vectors() {
     let Some(mut b) = load_or_skip(&ModelSpec::granite_97m()) else {
@@ -190,16 +199,28 @@ fn order_and_budget_do_not_change_the_vectors() {
     let texts: Vec<String> = (0..12)
         .map(|i| match i % 3 {
             0 => format!("nota {i}: {}", sentence.repeat(i + 1)),
-            1 => format!("nota {i}: {}", sentence.repeat(20 + i)),
+            1 => format!("nota {i}: {}", sentence.repeat(8 + i)),
             _ => format!("nota corta {i}: una cosa da ricordare."),
         })
         .collect();
+    // all lengths below 512 and at least three DISTINCT ones — the case
+    // the v0.4.5 tests never hit (their long texts were all cut to 512)
+    let lens: Vec<usize> = texts.iter().map(|t| b.approx_tokens(t)).collect();
+    assert!(
+        lens.iter().all(|&l| l < 512),
+        "the texts must stay under max_tokens: {lens:?}"
+    );
+    let distinct = std::collections::HashSet::<usize>::from_iter(lens.iter().copied());
+    assert!(distinct.len() >= 3, "want ≥ 3 distinct lengths: {lens:?}");
+
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    b.set_token_budget(2048);
     let base = b
         .embed(&refs, TextKind::Document)
         .unwrap_or_else(|e| panic!("{e}"));
 
-    // reversed order: vector i must equal base[i], bit for bit
+    // reversed order: same batches (the sort), so vector i must equal
+    // base[i] bit for bit
     let mut rev = texts.clone();
     rev.reverse();
     let rrefs: Vec<&str> = rev.iter().map(String::as_str).collect();
@@ -212,14 +233,27 @@ fn order_and_budget_do_not_change_the_vectors() {
     }
 
     // budgets: 1 = one text per forward pass, then a wide 8192 — the
-    // batches fall apart completely, the vectors must not
+    // batches fall apart completely, and only cos/max-|Δ| can hold
     for budget in [1_usize, 8192] {
         b.set_token_budget(budget);
         let got = b
             .embed(&refs, TextKind::Document)
             .unwrap_or_else(|e| panic!("budget {budget}: {e}"));
         for (i, v) in got.iter().enumerate() {
-            assert_eq!(v, &base[i], "budget {budget} changed vector {i}");
+            let cos = cosine(v, &base[i]);
+            assert!(
+                cos >= 0.999_999,
+                "budget {budget} moved vector {i} (cos {cos:.8})"
+            );
+            let max_abs = v
+                .iter()
+                .zip(&base[i])
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs <= 1e-5,
+                "budget {budget} moved vector {i} by {max_abs:e}"
+            );
         }
     }
 }
