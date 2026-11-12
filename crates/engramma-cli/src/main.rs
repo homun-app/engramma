@@ -321,7 +321,7 @@ enum Command {
         #[command(subcommand)]
         action: OauthAction,
     },
-    /// Start the MCP server (stdio)
+    /// Start the MCP server (stdio, or HTTP with --http)
     Mcp {
         /// Exposed cells (comma-separated; without this flag no cell is exposed)
         #[arg(long, value_delimiter = ',')]
@@ -331,8 +331,24 @@ enum Command {
         #[arg(long, value_delimiter = ',')]
         write: Vec<String>,
         /// Who signs the proposals (`mcp:<actor>`); required with --write
+        /// (stdio only: over HTTP the actor is the grant's label)
         #[arg(long)]
         actor: Option<String>,
+        /// Serve over HTTP on this loopback address instead of stdio
+        /// (v0.5.2): `--http 127.0.0.1:8787`
+        #[arg(long)]
+        http: Option<String>,
+        /// The https URL the tunnel publishes for this server (required
+        /// with --http)
+        #[arg(long)]
+        public_url: Option<String>,
+        /// Accept RFC 7591 dynamic client registration (off by default)
+        #[arg(long)]
+        allow_dcr: bool,
+        /// Client compatibility shims: `chatgpt` adds the fixed-schema
+        /// `search`/`fetch` tools its connectors want
+        #[arg(long)]
+        compat: Option<String>,
     },
 }
 
@@ -1448,13 +1464,17 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             cells,
             write,
             actor,
+            http,
+            public_url,
+            allow_dcr,
+            compat,
         } => {
             if cells.is_empty() {
                 return Err(CliError::usage(
                     "`engramma mcp` needs --cells <a,b>: without it no cell would be exposed",
                 ));
             }
-            if !write.is_empty() && actor.is_none() {
+            if !write.is_empty() && actor.is_none() && http.is_none() {
                 return Err(CliError::usage(
                     "`--write` needs `--actor <name>`: proposals must be attributable",
                 ));
@@ -1465,6 +1485,30 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                         "`--write {w}` names a cell that is not in `--cells`"
                     )));
                 }
+            }
+            if let Some(spec) = compat.as_deref()
+                && spec != "chatgpt"
+            {
+                return Err(CliError::usage(format!(
+                    "`--compat {spec}` non esiste (per ora solo `chatgpt`)"
+                )));
+            }
+            if http.is_some() && actor.is_some() {
+                return Err(CliError::usage(
+                    "`--actor` va con lo stdio: su HTTP l'attore nasce dal grant \
+                     (mcp:<etichetta>, scelto con `engramma oauth approve --label`)",
+                ));
+            }
+            if let Some(addr) = http {
+                return run_mcp_http(
+                    cli,
+                    cells.clone(),
+                    write.clone(),
+                    addr,
+                    public_url.clone(),
+                    *allow_dcr,
+                    compat.is_some(),
+                );
             }
             let names: Vec<String> = cells.clone();
             let writable: Vec<String> = write.clone();
@@ -2138,6 +2182,95 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
             }
             Ok(())
         }
+    }
+}
+
+/// `engramma mcp --http` (v0.5.2, P1): the HTTP surface — OAuth and `/mcp`
+/// on one loopback listener; TLS belongs to the tunnel in front of it.
+fn run_mcp_http(
+    cli: &Cli,
+    cells: Vec<String>,
+    write: Vec<String>,
+    addr: &str,
+    public_url: Option<String>,
+    allow_dcr: bool,
+    compat_chatgpt: bool,
+) -> Result<(), CliError> {
+    use engramma_mcp::http::{HttpConfig, HttpState};
+    let Some(public) = public_url else {
+        return Err(CliError::usage(
+            "`--http` needs `--public-url https://…`: it is the address the \
+             tunnel publishes, and every OAuth URL is derived from it",
+        ));
+    };
+    let bind: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| CliError::usage(format!("`--http {addr}` is not an address: {e}")))?;
+    let cfg = HttpConfig {
+        bind,
+        public_url: public.clone(),
+        cells,
+        write,
+        allow_dcr,
+        compat_chatgpt,
+        allow_insecure_public_url: false,
+        allow_loopback_cimd: false,
+    };
+    if let Err(why) = cfg.validate() {
+        return Err(CliError::usage(why));
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| CliError::internal(format!("tokio: {e}")))?;
+    rt.block_on(async move {
+        let root = root(cli);
+        let state = HttpState::open_with_mcp(&root, cfg)
+            .map_err(|e| CliError::internal(format!("mcp --http: {e}")))?;
+        let bound = cfg_bind_of(&state);
+        println!(
+            "mcp-http: in ascolto su http://{bound} — pubblico: {public} \
+             (approva i collegamenti con `engramma oauth pending`)"
+        );
+        let ct = tokio_util_shim::token();
+        let server = tokio::spawn(engramma_mcp::http::serve_until(
+            std::sync::Arc::new(state),
+            ct.clone(),
+        ));
+        // SIGINT or SIGTERM: cancel rmcp, let the listener drain, the
+        // cells close when the state drops
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut term = signal(SignalKind::terminate())
+                .map_err(|e| CliError::internal(format!("signal: {e}")))?;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = term.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        eprintln!("mcp-http: chiudo");
+        ct.cancel();
+        server
+            .await
+            .map_err(|e| CliError::internal(format!("join: {e}")))?
+            .map_err(|e| CliError::internal(format!("serve: {e}")))?;
+        Ok(())
+    })
+}
+
+fn cfg_bind_of(state: &engramma_mcp::http::HttpState) -> std::net::SocketAddr {
+    state.cfg.bind
+}
+
+/// A tiny indirection so the CLI does not name tokio-util directly.
+mod tokio_util_shim {
+    pub fn token() -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
     }
 }
 

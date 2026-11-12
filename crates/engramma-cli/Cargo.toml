@@ -20,6 +20,7 @@ serde_json.workspace = true
 time.workspace = true
 ulid.workspace = true
 tokio.workspace = true
+tokio-util = "0.7"
 axum.workspace = true
 # v0.5 (P5): the review page — the session/CSRF tokens (blake3, ring: both
 # already in the lock) and the form decoding (serde)

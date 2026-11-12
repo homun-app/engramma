@@ -48,6 +48,7 @@ use engramma_core::search::{Hit, Query, Semantic};
 use engramma_core::{Cell, CellError, Confidence, ModelState, Status};
 
 /// An open, exposed cell.
+#[derive(Clone)]
 pub struct MemoryServer {
     tool_router: ToolRouter<Self>,
     cells: HashMap<String, Cell>,
@@ -60,23 +61,72 @@ pub struct MemoryServer {
     write: Option<WriteSurface>,
 }
 
-/// The write side of the server (v0.5, P3).
+/// The write side of the server (v0.5, P3; v0.5.2: shared across every
+/// HTTP request of the process).
+#[derive(Clone)]
 pub struct WriteSurface {
-    /// The actor label from `--actor`; proposals sign as `mcp:<actor>`.
-    actor: String,
+    /// The actor label from `--actor` (stdio). Over HTTP the actor comes
+    /// from the GRANT of each request — `None` there.
+    actor: Option<String>,
     /// The cells that accept proposals through this server.
     cells: Vec<String>,
     /// The parsed `reviewers.yaml` of the data root, when one exists (P2).
     reviewers: Option<Reviewers>,
     /// The MRTR round's pending confirmations (2026-07-28 protocol):
-    /// request-state handle → what the retry will decide.
-    mrtr: Mutex<HashMap<String, MrtrPending>>,
+    /// request-state handle → what the retry will decide. Shared by every
+    /// clone: one map per process.
+    mrtr: std::sync::Arc<Mutex<HashMap<String, MrtrPending>>>,
 }
 
-/// One waiting MRTR confirmation.
+/// One waiting MRTR confirmation: the proposal, its cell, and (over HTTP,
+/// v0.5.2 P4) the grant whose token opened the round — a retry with
+/// another grant's token finds nothing.
 struct MrtrPending {
     cell: String,
     proposal: ulid::Ulid,
+    grant: Option<String>,
+}
+
+/// What a request's bearer token turned out to mean (v0.5.2, P4): the
+/// HTTP middleware resolves the token against `oauth.db` and puts this in
+/// the request's extensions; rmcp carries the HTTP `Parts` into the
+/// handler, and every grant-aware decision reads it from there.
+#[derive(Debug, Clone)]
+pub struct RequestGrant {
+    /// The grant's id in oauth.db (what the access log shows).
+    pub id: String,
+    /// The label chosen at approval: proposals sign as `mcp:<label>`.
+    pub label: String,
+    /// The cells this grant may see (already intersected with the
+    /// process's `--cells`).
+    pub cells: Vec<String>,
+    /// The granted scopes (`memory:read`, and `memory:propose` when the
+    /// policy allows).
+    pub scopes: Vec<String>,
+}
+
+impl RequestGrant {
+    #[must_use]
+    pub fn may_propose(&self) -> bool {
+        self.scopes.iter().any(|s| s == "memory:propose")
+    }
+
+    #[must_use]
+    pub fn may_read(&self) -> bool {
+        self.scopes.iter().any(|s| s == "memory:read")
+    }
+}
+
+/// The grant of a request, when the call arrived over HTTP with a valid
+/// token. rmcp's streamable-HTTP transport injects `http::request::Parts`
+/// into the JSON-RPC request extensions, which land in the request
+/// context; the middleware put the grant in the Parts' extensions.
+fn grant_of(parts: &rmcp::service::RequestContext<rmcp::RoleServer>) -> Option<RequestGrant> {
+    parts
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|p| p.extensions.get::<RequestGrant>())
+        .cloned()
 }
 
 /// Error conversion into MCP errors.
@@ -89,6 +139,29 @@ fn not_exposed(cell: &str, cells: &[String]) -> McpError {
         format!(
             "cell `{cell}` is not exposed by this server; exposed cells: {}",
             cells.join(", ")
+        ),
+        None,
+    )
+}
+
+/// The proposing actor of a call: the grant's label over HTTP, the
+/// command line's `--actor` over stdio.
+fn actor_for(grant: &Option<RequestGrant>, write: &WriteSurface) -> Option<String> {
+    match grant {
+        Some(g) => Some(format!("mcp:{}", g.label)),
+        None => write.actor.as_ref().map(|a| format!("mcp:{a}")),
+    }
+}
+
+/// The step-up refusal (P4): the token lacks `memory:propose`. HTTP-level
+/// 403s are not rmcp's to give inside a tool call — the error says the
+/// word, and the REPORT says why it lives here.
+fn insufficient_scope_error(grant: &RequestGrant) -> McpError {
+    McpError::invalid_request(
+        format!(
+            "insufficient_scope: this connection's token carries only `{}`;              `memory:propose` is granted when you approve the connection              (label `{}`) with a writable cell",
+            grant.scopes.join(" "),
+            grant.label
         ),
         None,
     )
@@ -132,10 +205,44 @@ impl MemoryServer {
             }
             return Self::open_readonly(root, cells);
         };
+        let mut server = Self::open_with_write(root, names, write, Some(actor))?;
+        // the one writing tool rides the same router the macros built
+        server.tool_router.add_route(propose_route());
+        Ok(server)
+    }
+
+    /// The write surface without a static actor — the HTTP mode (v0.5.2):
+    /// the actor of every proposal is the GRANT's label (`mcp:<label>`),
+    /// decided when you approve the connection.
+    ///
+    /// # Errors
+    /// [`anyhow::Error`] when a cell cannot be opened or `write` names a
+    /// cell that is not exposed.
+    pub fn open_http(root: &Path, names: &[String], write: &[String]) -> anyhow::Result<Self> {
+        let mut server = Self::open_with_write(root, names, write, None)?;
+        server.tool_router.add_route(propose_route());
+        Ok(server)
+    }
+
+    fn open_with_write(
+        root: &Path,
+        names: &[String],
+        write: &[String],
+        actor: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let mut cells = HashMap::new();
+        for name in names {
+            let path = root.join("cells").join(format!("{name}.sqlite"));
+            let cell = Cell::open(&path).map_err(|e| anyhow::anyhow!("cell {name}: {e}"))?;
+            cells.insert(name.clone(), cell);
+        }
         if write.is_empty() {
-            return Err(anyhow::anyhow!(
-                "`--actor` goes with `--write <cells>`: an actor without a writable cell does nothing"
-            ));
+            if actor.is_some() {
+                return Err(anyhow::anyhow!(
+                    "`--actor` goes with `--write <cells>`: an actor without a writable cell does nothing"
+                ));
+            }
+            return Self::open_readonly(root, cells);
         }
         for w in write {
             if !cells.contains_key(w) {
@@ -155,13 +262,11 @@ impl MemoryServer {
             }
         };
         server.write = Some(WriteSurface {
-            actor: actor.to_string(),
+            actor: actor.map(str::to_string),
             cells: write.to_vec(),
             reviewers,
-            mrtr: Mutex::new(HashMap::new()),
+            mrtr: std::sync::Arc::new(Mutex::new(HashMap::new())),
         });
-        // the one writing tool rides the same router the macros built
-        server.tool_router.add_route(propose_route());
         Ok(server)
     }
 
@@ -205,65 +310,109 @@ impl MemoryServer {
         n
     }
 
+    /// Whether `memory_propose` may appear at all for this grant: the
+    /// scope is granted AND at least one of the grant's cells accepts
+    /// proposals through this process.
+    fn propose_visible(&self, grant: &RequestGrant) -> bool {
+        let Some(write) = &self.write else {
+            return false;
+        };
+        grant.may_propose() && write.cells.iter().any(|c| grant.cells.contains(c))
+    }
+
     fn cell(&self, name: &str) -> Result<&Cell, McpError> {
         self.cells
             .get(name)
             .ok_or_else(|| not_exposed(name, &self.names()))
     }
 
-    /// The cell a tool call addresses: the named one, or the only exposed
-    /// cell when the caller left `cell` out.
-    fn cell_or_default(&self, name: &Option<String>) -> Result<&Cell, McpError> {
-        match name.as_deref() {
-            Some(n) => self.cell(n),
-            None => {
-                let mut cells = self.cells.values();
-                match (cells.next(), cells.next()) {
-                    // exactly one exposed cell: it is the default
-                    (Some(only), None) => Ok(only),
-                    _ => Err(McpError::invalid_params(
-                        format!(
-                            "which cell? This server exposes more than one: {}. Pass `cell`.",
-                            self.names().join(", ")
-                        ),
-                        None,
-                    )),
-                }
-            }
+    /// The cells the CALLER may address: all of them (stdio), or the
+    /// grant's (HTTP). The error lists only those, so it can never be an
+    /// oracle on cells the caller cannot see anyway.
+    fn visible_cells(&self, grant: Option<&RequestGrant>) -> Vec<String> {
+        match grant {
+            None => self.names(),
+            Some(g) => self
+                .names()
+                .into_iter()
+                .filter(|n| g.cells.contains(n))
+                .collect(),
         }
     }
 
-    /// The writable cell a propose addresses, with its `--actor`.
-    fn writable_cell(&self, name: &Option<String>) -> Result<(&Cell, &WriteSurface), McpError> {
+    /// The cell a tool call addresses: the named one, or the only VISIBLE
+    /// cell when the caller left `cell` out.
+    fn cell_or_default(
+        &self,
+        name: &Option<String>,
+        grant: Option<&RequestGrant>,
+    ) -> Result<&Cell, McpError> {
+        let visible = self.visible_cells(grant);
+        match name.as_deref() {
+            Some(n) => {
+                if !visible.iter().any(|v| v == n) {
+                    // the same answer for a cell that is not exposed and
+                    // one the grant does not cover: no oracle
+                    return Err(not_exposed(n, &visible));
+                }
+                self.cell(n)
+            }
+            None => match visible.as_slice() {
+                [only] => self.cell(only),
+                _ => Err(McpError::invalid_params(
+                    format!(
+                        "which cell? This server exposes more than one: {}. Pass `cell`.",
+                        visible.join(", ")
+                    ),
+                    None,
+                )),
+            },
+        }
+    }
+
+    /// The writable cell a propose addresses, with the actor's surface.
+    fn writable_cell(
+        &self,
+        name: &Option<String>,
+        grant: Option<&RequestGrant>,
+    ) -> Result<(&Cell, &WriteSurface), McpError> {
         let Some(write) = &self.write else {
             // the tool is not even listed without --write; reaching here
             // means a client called it by name anyway
             return Err(McpError::invalid_request(
-                "this server exposes no writing tool (start it with `--write <cell> --actor <name>`)".to_string(),
+                "this server exposes no writing tool (stdio: `--write <cell> --actor <name>`;                  HTTP: approve the connection with a `memory:propose` scope)"
+                    .to_string(),
                 None,
             ));
         };
+        // over HTTP the grant must carry the propose scope at all
+        if let Some(g) = grant
+            && !g.may_propose()
+        {
+            return Err(insufficient_scope_error(g));
+        }
+        let writable: Vec<String> = write
+            .cells
+            .iter()
+            .filter(|c| grant.is_none_or(|g| g.cells.contains(c)))
+            .cloned()
+            .collect();
         let name = name.clone().unwrap_or_else(|| {
             // the single-cell default, exactly like the read tools
-            if write.cells.len() == 1 {
-                write.cells[0].clone()
+            if writable.len() == 1 {
+                writable[0].clone()
             } else {
                 String::new()
             }
         });
-        if !write.cells.contains(&name) {
+        if !writable.contains(&name) {
             // the error is not an oracle: it names only what the caller
-            // already knows (this server's own configuration)
-            let exposed = self.names().join(", ");
-            if !self.cells.contains_key(&name) {
-                return Err(McpError::invalid_request(
-                    format!(
-                        "cell `{name}` is not exposed by this server; exposed cells: {exposed}"
-                    ),
-                    None,
-                ));
+            // may already know (the cells visible to THIS caller)
+            let visible = self.visible_cells(grant);
+            if !visible.contains(&name) {
+                return Err(not_exposed(&name, &visible));
             }
-            return Err(not_writable(&name, &write.cells));
+            return Err(not_writable(&name, &writable));
         }
         Ok((self.cell(&name)?, write))
     }
@@ -380,6 +529,16 @@ struct TimelineParams {
     entity: String,
 }
 
+/// The tools whose `cell` parameter the call gate normalizes.
+const CELL_TOOLS: [&str; 6] = [
+    "memory_search",
+    "memory_get",
+    "memory_neighbors",
+    "memory_tags",
+    "memory_timeline",
+    "memory_propose",
+];
+
 #[tool_router(router = tool_router)]
 impl MemoryServer {
     #[tool(name = "memory_search", annotations(read_only_hint = true))]
@@ -403,7 +562,7 @@ impl MemoryServer {
         params: Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let cell = self.cell_or_default(&p.cell)?;
+        let cell = self.cell_or_default(&p.cell, None)?;
         let mut q = Query::text(&p.query).k(p.limit.unwrap_or(10));
         if let Some(h) = p.graph_hops {
             q.graph_hops = h.min(2);
@@ -435,7 +594,7 @@ impl MemoryServer {
     /// content waiting for human confirmation.
     async fn memory_get(&self, params: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let cell = self.cell_or_default(&p.cell)?;
+        let cell = self.cell_or_default(&p.cell, None)?;
         // Hidden (quarantined/deleted) and absent notes answer with the same
         // error, which echoes only what the caller sent: resolving a short id
         // must not reveal a hidden note's full id or existence.
@@ -480,7 +639,7 @@ impl MemoryServer {
         params: Parameters<NeighborsParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let cell = self.cell_or_default(&p.cell)?;
+        let cell = self.cell_or_default(&p.cell, None)?;
         let ns = cell
             .neighbors(&p.entity, p.depth.unwrap_or(1).min(3), &[], false)
             .map_err(err)?;
@@ -506,7 +665,7 @@ impl MemoryServer {
         params: Parameters<TagsParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let cell = self.cell_or_default(&p.cell)?;
+        let cell = self.cell_or_default(&p.cell, None)?;
         let tags = cell
             .tags(p.prefix.as_deref().unwrap_or(""), false)
             .map_err(err)?;
@@ -527,7 +686,7 @@ impl MemoryServer {
         params: Parameters<TimelineParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let cell = self.cell_or_default(&p.cell)?;
+        let cell = self.cell_or_default(&p.cell, None)?;
         let tl = cell.timeline(&p.entity, false).map_err(err)?;
         let arr: Vec<serde_json::Value> = tl.iter().map(hit_json).collect();
         tool_ok(&serde_json::json!({ "entity": p.entity, "notes": arr }))
@@ -620,16 +779,25 @@ impl MemoryServer {
         &self,
         ctx: ToolCallContext<'_, Self>,
     ) -> Result<CallToolResponse, McpError> {
+        // over HTTP the actor IS the grant (v0.5.2 P1): `mcp:<label>`,
+        // chosen by the human who approved the connection
+        let grant = grant_of(&ctx.request_context);
         // the MRTR retry round: the client already answered the form
         if let Some(responses) = &ctx.input_responses {
             return self
-                .mrtr_round(responses, ctx.request_state.as_deref())
+                .mrtr_round(responses, ctx.request_state.as_deref(), grant.as_ref())
                 .await;
         }
         let raw = ctx.arguments.clone().unwrap_or_default();
         let p: ProposeParams = serde_json::from_value(serde_json::Value::Object(raw))
             .map_err(|e| McpError::invalid_params(format!("memory_propose: {e}"), None))?;
-        let (cell, write) = self.writable_cell(&p.cell)?;
+        let (cell, write) = self.writable_cell(&p.cell, grant.as_ref())?;
+        let Some(actor) = actor_for(&grant, write) else {
+            return Err(McpError::internal_error(
+                "no actor: HTTP without a grant cannot propose".to_string(),
+                None,
+            ));
+        };
         let cell_name = self
             .cells
             .iter()
@@ -669,7 +837,7 @@ impl MemoryServer {
             tags: p.tags,
             scope: None,
             lang: None,
-            source: format!("mcp:{}", write.actor),
+            source: actor.clone(),
             confidence,
             status: Status::Quarantined,
             valid_from: None,
@@ -702,7 +870,6 @@ impl MemoryServer {
         let p_reason = p.reason.clone().unwrap_or_default();
         // the engine call (and, under write:auto, the reviewer's own time
         // limit) must not block the async runtime
-        let actor = format!("mcp:{}", write.actor);
         let engine_cell = cell.clone();
         let embedder = self.embedder.clone();
         let reviewers = write.reviewers.clone();
@@ -783,6 +950,7 @@ impl MemoryServer {
                                     MrtrPending {
                                         cell: cell_name.clone(),
                                         proposal: outcome.id.unwrap_or_default(),
+                                        grant: grant.as_ref().map(|g| g.id.clone()),
                                     },
                                 )
                             })
@@ -947,6 +1115,7 @@ impl MemoryServer {
         &self,
         responses: &std::collections::BTreeMap<String, serde_json::Value>,
         state: Option<&str>,
+        grant: Option<&RequestGrant>,
     ) -> Result<CallToolResponse, McpError> {
         let Some(surface) = &self.write else {
             return Err(McpError::internal_error(
@@ -971,6 +1140,14 @@ impl MemoryServer {
                 None,
             ));
         };
+        // the round belongs to the grant that opened it (P4): another
+        // grant's token — or stdio's absence of one — finds nothing
+        if pending.grant.as_deref() != grant.map(|g| g.id.as_str()) {
+            return Err(McpError::invalid_request(
+                format!("unknown requestState `{state}`"),
+                None,
+            ));
+        }
         let cell = self.cell(&pending.cell)?;
         let Some(answer) = responses.get("confirm") else {
             return Err(McpError::invalid_params(
@@ -992,7 +1169,14 @@ impl MemoryServer {
         };
         let mut elicited = ElicitResult::new(action);
         elicited.content = answer.get("content").cloned();
-        let actor = format!("user@mcp:{}", surface.actor);
+        let owned = grant.cloned();
+        let Some(actor) = actor_for(&owned, surface) else {
+            return Err(McpError::internal_error(
+                "no actor for this retry".to_string(),
+                None,
+            ));
+        };
+        let actor = format!("user@{actor}");
         self.apply_form_answer(cell, Some(pending.proposal), &elicited, &actor)
             .await
     }
@@ -1081,6 +1265,80 @@ fn pending_result(outcome: ProposalOutcome, confirm: bool) -> Result<CallToolRes
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for MemoryServer {
+    /// v0.5.2 (P4): the tool list is PER TOKEN. A grant without the
+    /// propose scope never sees `memory_propose`; the read tools are
+    /// always there (they are the point of connecting). Over stdio there
+    /// is no grant and the list is the process's own.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let mut tools = self.tool_router.list_all();
+        if let Some(grant) = grant_of(&context)
+            && !self.propose_visible(&grant)
+        {
+            tools.retain(|t| t.name != "memory_propose");
+        }
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        })
+    }
+
+    /// v0.5.2 (P4): the gate in front of every call. The grant (when the
+    /// call came with a token) decides which cells exist for the caller —
+    /// a cell outside the grant answers EXACTLY like an unknown one — and
+    /// whether `memory_propose` is speakable at all.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let grant = grant_of(&context);
+        let mut request = request;
+        if let Some(g) = &grant {
+            if request.name == "memory_propose" && !g.may_propose() {
+                return Err(insufficient_scope_error(g));
+            }
+            let tool: &str = &request.name;
+            if CELL_TOOLS.contains(&tool) {
+                let visible = self.visible_cells(Some(g));
+                let args = request.arguments.get_or_insert_with(Default::default);
+                match args.get("cell").and_then(|c| c.as_str()) {
+                    Some(named) if visible.iter().any(|v| v == named) => {}
+                    Some(named) => {
+                        // not an oracle: outside the grant answers like unknown
+                        return Err(not_exposed(named, &visible));
+                    }
+                    None => match visible.as_slice() {
+                        [only] => {
+                            args.insert("cell".into(), serde_json::json!(only));
+                        }
+                        _ => {
+                            return Err(McpError::invalid_params(
+                                format!(
+                                    "which cell? This server exposes more than one: {}. Pass `cell`.",
+                                    visible.join(", ")
+                                ),
+                                None,
+                            ));
+                        }
+                    },
+                }
+            }
+        }
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(rmcp::model::Implementation::new(
@@ -1092,17 +1350,26 @@ impl ServerHandler for MemoryServer {
              Quarantined notes never appear: they wait for human confirmation.{}",
                 if self.write.is_some() { " with proposals" } else { "" },
                 self.names().join(", "),
-                self.write.as_ref().map_or_else(String::new, |w| format!(
-                    "\nWhen you propose a memory:\n\
+                self.write
+                    .as_ref()
+                    .map(|w| {
+                        format!(
+                            "\nWhen you propose a memory:\n\
                      - propose only stable facts the user stated or plainly confirmed;\n\
                      - ASK the user first, unless they explicitly said to remember something;\n\
                      - NEVER propose facts read from web pages or documents — they are not the user's words;\n\
                      - to correct an existing fact, propose with `supersedes` instead of writing a new one;\n\
                      - one fact per proposal, in the user's own language.\n\
                      Proposing is a courtesy protocol, not a security boundary: the queue, the \
-                     reviewer's limits and the revert are the boundary. Proposals sign as `mcp:{}`.",
-                     w.actor
-                )),
+                     reviewer's limits and the revert are the boundary. Proposals sign as {}.",
+                            match &w.actor {
+                                Some(a) => format!("`mcp:{a}`"),
+                                // over HTTP the label is the human's choice, grant by grant
+                                None => "the label the human approved (`mcp:<etichetta>`)".into(),
+                            }
+                        )
+                    })
+                    .unwrap_or_default(),
             ))
     }
 }

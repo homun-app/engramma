@@ -148,6 +148,13 @@ pub struct HttpState {
     pub cfg: HttpConfig,
     /// oauth.db.
     pub store: OAuthStore,
+    /// The MCP server behind `/mcp`, when the process exposes one (the
+    /// CLI always does; the library's metadata tests may not).
+    pub mcp: Option<crate::MemoryServer>,
+    /// Legacy-protocol MCP sessions (2026-07-28 has none): session id →
+    /// the grant that created it. Another grant's token on someone
+    /// else's session answers 404, exactly like an unknown session.
+    pub sessions: Mutex<HashMap<String, String>>,
     /// The global `/token` limiter: (window start, count). Behind a tunnel
     /// every caller looks like 127.0.0.1, so the ceiling is global — 60 a
     /// minute, then 429 with Retry-After. Forwarded headers are not
@@ -168,8 +175,21 @@ impl HttpState {
         Ok(Self {
             cfg,
             store,
+            mcp: None,
+            sessions: Mutex::new(HashMap::new()),
             token_window: Mutex::new((0, 0)),
         })
+    }
+
+    /// [`HttpState::open`] plus the MCP server: the shape the CLI runs.
+    ///
+    /// # Errors
+    /// The store's errors, or a cell that cannot be opened.
+    pub fn open_with_mcp(root: &std::path::Path, cfg: HttpConfig) -> anyhow::Result<Self> {
+        let mut state = Self::open(root, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mcp = crate::MemoryServer::open_http(root, &state.cfg.cells, &state.cfg.write)?;
+        state.mcp = Some(mcp);
+        Ok(state)
     }
 
     fn now() -> i64 {
@@ -954,8 +974,22 @@ async fn register(
     r
 }
 
-/// The whole HTTP router. `/mcp` joins in P1.
+/// The public authority (host, or host:port) of the public URL.
+fn public_authority(cfg: &HttpConfig) -> String {
+    cfg.public_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// The whole HTTP router: the OAuth endpoints, and `/mcp` behind the
+/// bearer gate when the process exposes the memory.
 pub fn router(state: Arc<HttpState>) -> Router {
+    router_inner(state, None)
+}
+
+fn router_inner(state: Arc<HttpState>, ct: Option<tokio_util::sync::CancellationToken>) -> Router {
     // RFC 9728 puts the metadata at /.well-known/oauth-protected-resource
     // (+ /mcp); several clients also try the bare path — same document
     let issuer = state.cfg.issuer();
@@ -990,15 +1024,294 @@ pub fn router(state: Arc<HttpState>) -> Router {
             get(authorization_server),
         );
     }
-    r.with_state(state)
+
+    // /mcp: rmcp's streamable HTTP service behind the bearer gate
+    if let Some(mcp) = state.mcp.clone() {
+        let mut hosts = vec![
+            public_authority(&state.cfg),
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ];
+        hosts.push(format!("127.0.0.1:{}", state.cfg.bind.port()));
+        // ChatGPT speaks 2025-11-25: the legacy session mode stays on
+        let mut config = rmcp::transport::StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(true)
+            .with_json_response(true)
+            .with_allowed_hosts(hosts)
+            .with_max_request_body_bytes(1024 * 1024)
+            .enforce_origin_validation();
+        if let Some(ct) = ct {
+            config.cancellation_token = ct;
+        }
+        let service = rmcp::transport::StreamableHttpService::new(
+            move || Ok(mcp.clone()),
+            std::sync::Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            config,
+        );
+        let mcp_router = Router::new().route_service("/mcp", service).layer(
+            axum::middleware::from_fn_with_state(Arc::clone(&state), mcp_gate),
+        );
+        r = r.merge(mcp_router);
+    }
+
+    // the OAuth endpoints a SERVER calls never carry an Origin; the Host
+    // fence wraps everything, tunnel-side DNS rebinding first
+    r.route_layer(axum::middleware::from_fn(no_origin_guard))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            host_guard,
+        ))
+        .with_state(state)
 }
 
-/// Serve until the process stops. The shutdown wiring (SIGINT/SIGTERM →
-/// rmcp's cancellation token) lives with the CLI command.
+/// Serve until the token cancels: SIGINT/SIGTERM cancel it (the CLI wires
+/// the signals), rmcp's sessions die with it, then the listener drains.
 ///
 /// # Errors
 /// [`std::io::Error`] when the bind or the serve fails.
-pub async fn serve(state: Arc<HttpState>) -> std::io::Result<()> {
+pub async fn serve_until(
+    state: Arc<HttpState>,
+    ct: tokio_util::sync::CancellationToken,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(state.cfg.bind).await?;
-    axum::serve(listener, router(state)).await
+    let app = router_with_cancellation(Arc::clone(&state), ct.clone());
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { ct.cancelled().await })
+        .await
+}
+
+/// [`router`] with the cancellation token threaded into the rmcp service.
+pub fn router_with_cancellation(
+    state: Arc<HttpState>,
+    ct: tokio_util::sync::CancellationToken,
+) -> Router {
+    router_inner(state, Some(ct))
+}
+
+// ---------------------------------------------------------------------------
+// P1/P4: /mcp as the resource server
+// ---------------------------------------------------------------------------
+
+/// The loopback names the Host check (and rmcp's) accept as-is.
+fn is_loopback_host_name(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+/// The Host middleware of the whole surface: only the public authority
+/// and loopback names pass (with any port on loopback — the local port is
+/// nobody's secret). Everything else is a 403 with no useful body, the
+/// DNS-rebinding fence for every endpoint at once.
+async fn host_guard(
+    State(state): State<Arc<HttpState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let public = public_authority(&state.cfg);
+    let ok = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|h| {
+            h == public || is_loopback_host_name(h.split(':').next().unwrap_or_default())
+        });
+    if !ok {
+        return (StatusCode::FORBIDDEN, "").into_response();
+    }
+    next.run(req).await
+}
+
+/// Remote MCP clients call from SERVERS, not browsers: a request that
+/// carries an `Origin` is not one of them. Rejected on the nose, exactly
+/// what `enforce_origin_validation()` means for the OAuth endpoints the
+/// spec names.
+async fn no_origin_guard(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    if req.headers().contains_key(axum::http::header::ORIGIN) {
+        return (StatusCode::FORBIDDEN, "Origin is not accepted here").into_response();
+    }
+    next.run(req).await
+}
+
+/// One line of the access log: time, grant (never the token), MCP method,
+/// tool, HTTP status, duration. Never note text, never arguments.
+fn access_log(
+    grant: Option<&str>,
+    method: Option<&str>,
+    tool: Option<&str>,
+    status: u16,
+    dur_ms: u128,
+) {
+    eprintln!(
+        "mcp-http ts={} grant={} method={} tool={} status={status} dur_ms={dur_ms}",
+        time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+        grant.unwrap_or("-"),
+        method.unwrap_or("-"),
+        tool.unwrap_or("-"),
+    );
+}
+
+/// The bearer gate in front of the rmcp service: resolves the token into
+/// a grant (or refuses), binds legacy sessions to the grant that opened
+/// them, and writes the access log.
+async fn mcp_gate(
+    State(state): State<Arc<HttpState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let started = std::time::Instant::now();
+    let resource = state.cfg.resource();
+    let scopes = state.cfg.scopes().join(" ");
+    let challenge = |error: Option<&str>| {
+        let mut v = format!(
+            "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource/mcp\", scope=\"{scopes}\"",
+            state.cfg.issuer()
+        );
+        if let Some(e) = error {
+            v.push_str(&format!(", error=\"{e}\""));
+        }
+        v
+    };
+    // a token in the query string is never accepted (the spec says 400)
+    if req
+        .uri()
+        .query()
+        .is_some_and(|q| q.contains("access_token="))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "the token does not travel in the query string",
+        )
+            .into_response();
+    }
+    let bearer = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let Some(token) = bearer else {
+        let mut r = (StatusCode::UNAUTHORIZED, "").into_response();
+        if let Ok(hv) = HeaderValue::from_str(&challenge(None)) {
+            r.headers_mut()
+                .insert(axum::http::header::WWW_AUTHENTICATE, hv);
+        }
+        return r;
+    };
+    // the validation runs OFF the async runtime's threads (SQLite, however
+    // brief, is blocking)
+    let check = {
+        let store = state.store.clone();
+        let token = token.to_string();
+        let resource = resource.clone();
+        tokio::task::spawn_blocking(move || store.access_check(&token, &resource, HttpState::now()))
+            .await
+    };
+    let grant = match check {
+        Ok(Ok(crate::oauth::TokenCheck::Valid { grant, scopes })) => Some((grant, scopes)),
+        Ok(Ok(_)) => None,
+        _ => None,
+    };
+    let Some((grant, token_scopes)) = grant else {
+        let mut r = (StatusCode::UNAUTHORIZED, "").into_response();
+        if let Ok(hv) = HeaderValue::from_str(&challenge(Some("invalid_token"))) {
+            r.headers_mut()
+                .insert(axum::http::header::WWW_AUTHENTICATE, hv);
+        }
+        return r;
+    };
+    if !token_scopes.iter().any(|s| s == SCOPE_READ) {
+        // a token without memory:read has nothing to do here
+        let mut r = (StatusCode::UNAUTHORIZED, "").into_response();
+        if let Ok(hv) = HeaderValue::from_str(&challenge(Some("insufficient_scope"))) {
+            r.headers_mut()
+                .insert(axum::http::header::WWW_AUTHENTICATE, hv);
+        }
+        return r;
+    }
+    // the grant rides to the handler through the request extensions —
+    // rmcp carries the HTTP Parts into the JSON-RPC context
+    let mut req = req;
+    req.extensions_mut().insert(crate::RequestGrant {
+        id: grant.id.clone(),
+        label: grant.label.clone(),
+        cells: grant.cells.clone(),
+        scopes: token_scopes.clone(),
+    });
+
+    // legacy sessions belong to the grant that created them: another
+    // grant's session id answers 404, like an unknown one
+    if let Some(sess) = req
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+    {
+        let bound = state
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&sess).cloned());
+        match bound {
+            Some(owner) if owner != grant.id => {
+                return (StatusCode::NOT_FOUND, "session not found").into_response();
+            }
+            Some(_) => {}
+            None => {
+                // a session the middleware never saw created: unknown
+                return (StatusCode::NOT_FOUND, "session not found").into_response();
+            }
+        }
+    }
+
+    // the access log needs the MCP method and tool: read the (bounded)
+    // body, then put it back — same head, same extensions
+    let (parts, body) = req.into_parts();
+    let mut method_desc: Option<(Option<String>, Option<String>)> = None;
+    let req = if parts.method == axum::http::Method::POST {
+        match axum::body::to_bytes(body, 1024 * 1024 + 1).await {
+            Ok(bytes) => {
+                method_desc = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .map(|v| {
+                        (
+                            v.get("method").and_then(|m| m.as_str()).map(str::to_string),
+                            v.get("params")
+                                .and_then(|p| p.get("name"))
+                                .and_then(|n| n.as_str())
+                                .map(str::to_string),
+                        )
+                    });
+                axum::http::Request::from_parts(parts, axum::body::Body::from(bytes))
+            }
+            Err(_) => axum::http::Request::from_parts(parts, axum::body::Body::empty()),
+        }
+    } else {
+        axum::http::Request::from_parts(parts, body)
+    };
+
+    let response = next.run(req).await;
+    // a session born in this response belongs to the calling grant
+    if let Some(sess) = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        && let Ok(mut m) = state.sessions.lock()
+    {
+        m.insert(sess, grant.id.clone());
+    }
+    access_log(
+        Some(&grant.id),
+        method_desc.as_ref().and_then(|(m, _)| m.as_deref()),
+        method_desc.as_ref().and_then(|(_, t)| t.as_deref()),
+        response.status().as_u16(),
+        started.elapsed().as_millis(),
+    );
+    response
 }

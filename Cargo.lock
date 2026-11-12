@@ -746,6 +746,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "tokio-util",
  "ulid",
  "ureq",
 ]
@@ -808,6 +809,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "tokio-util",
  "ulid",
  "ureq",
 ]

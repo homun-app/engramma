@@ -32,7 +32,19 @@ fn body(r: &mut ureq::http::Response<ureq::Body>) -> String {
 }
 
 fn json_of(r: &mut ureq::http::Response<ureq::Body>) -> Value {
-    serde_json::from_str(&body(r)).unwrap(/* t */)
+    let raw = body(r);
+    // an SSE answer carries the JSON in its `data:` line
+    let is_sse = raw.starts_with("event:") || raw.starts_with("data:") || raw.contains("\ndata:");
+    let json_text = if is_sse {
+        raw.lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        raw.clone()
+    };
+    serde_json::from_str(&json_text).unwrap_or_else(|e| panic!("not JSON: {e} — body: {raw}"))
 }
 
 /// One in-process server on a fresh root. The public URL is the honest
@@ -745,4 +757,488 @@ fn denial_redirects_with_access_denied() {
     let to = location(&r).unwrap(/* t */);
     assert!(to.contains("error=access_denied"), "{to}");
     assert!(to.contains("iss="), "{to}");
+}
+
+// ---------------------------------------------------------------------------
+// P1/P4: the binary itself — /mcp as the resource server
+// ---------------------------------------------------------------------------
+
+/// One `engramma mcp --http` child, with cells on disk and DCR open. The
+/// fake client speaks to the loopback port with the PUBLIC Host, exactly
+/// what the tunnel does for real.
+struct BinServer {
+    child: std::process::Child,
+    addr: std::net::SocketAddr,
+    err_path: std::path::PathBuf,
+    root: std::path::PathBuf,
+    #[allow(dead_code)]
+    dir: tempfile::TempDir,
+}
+
+impl Drop for BinServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn bin(root: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .arg("--root")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap(/* t */);
+    String::from_utf8_lossy(&out.stderr).to_string()
+}
+
+fn bin_ok(root: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .arg("--root")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap(/* t */);
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn start_bin(extra: &[&str]) -> BinServer {
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap(/* t */);
+    bin_ok(&root, &["init"]);
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(/* t */);
+        l.local_addr().unwrap(/* t */).port()
+    };
+    let err_path = dir.path().join("stderr.log");
+    let err_file = std::fs::File::create(&err_path).unwrap(/* t */);
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .arg("--root")
+        .arg(&root)
+        .args([
+            "mcp",
+            "--cells",
+            "default",
+            "--http",
+            &format!("127.0.0.1:{port}"),
+            "--public-url",
+            "https://memoria.example.net",
+        ])
+        .args(extra)
+        .stdout(std::process::Stdio::null())
+        .stderr(err_file.try_clone().unwrap(/* t */))
+        .spawn()
+        .unwrap(/* t */);
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap(/* t */);
+    // wait for the listener
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(addr).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(err_file); // the child writes; the test re-opens to read
+    BinServer {
+        child,
+        addr,
+        err_path,
+        root,
+        dir,
+    }
+}
+
+impl BinServer {
+    /// A POST to /mcp with the public Host and (optionally) a bearer.
+    fn mcp_post(&self, token: Option<&str>, body: &str) -> ureq::http::Response<ureq::Body> {
+        let mut req = still()
+            .post(&format!("http://{addr}/mcp", addr = self.addr))
+            .header("Host", "memoria.example.net")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        req.send(body.as_bytes()).unwrap(/* t */)
+    }
+
+    fn stderr_so_far(&self) -> String {
+        // a fresh handle at offset 0: the child's dup shares ITS offset,
+        // and reading from it would start at the child's end
+        std::fs::read_to_string(&self.err_path).unwrap_or_default()
+    }
+}
+
+/// Register a DCR client, run the flow with the binary's own oauth.db,
+/// and come back with an access token.
+fn bin_token(s: &BinServer) -> String {
+    // DCR: no CIMD fetch needed
+    let mut r = still()
+        .post(&format!("http://{addr}/register", addr = s.addr))
+        .header("Host", "memoria.example.net")
+        .send_json(serde_json::json!({
+            "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+            "client_name": "Claude",
+        }))
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 201, "{}", body(&mut r));
+    let client_id = json_of(&mut r)["client_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let (verifier, challenge) = pkce();
+    let q = format!(
+        "/authorize?response_type=code&client_id={cid}&redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback&code_challenge={ch}&code_challenge_method=S256&scope=memory%3Aread&state=b1",
+        cid = urlencode(&client_id),
+        ch = challenge,
+    );
+    let host = "memoria.example.net";
+    let r = still()
+        .get(&format!("http://{addr}{q}", addr = s.addr))
+        .header("Host", host)
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 303);
+    let mut page = still()
+        .get(&format!(
+            "http://{addr}{p}",
+            addr = s.addr,
+            p = location(&r).unwrap(/* t */)
+        ))
+        .header("Host", host)
+        .call()
+        .unwrap(/* t */);
+    let code = code_of(&body(&mut page));
+    bin_ok(
+        &s.root,
+        &["oauth", "approve", &code, "--label", "bin", "--yes"],
+    );
+    let page = still()
+        .get(&format!(
+            "http://{addr}{p}",
+            addr = s.addr,
+            p = location(&r).unwrap(/* t */)
+        ))
+        .header("Host", host)
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(page.status().as_u16(), 302);
+    let auth_code = location(&page)
+        .unwrap_or_default()
+        .split("code=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .unwrap_or_default()
+        .to_string();
+    let mut r = still()
+        .post(&format!("http://{addr}/token", addr = s.addr))
+        .header("Host", host)
+        .send_form(vec![
+            ("grant_type", "authorization_code"),
+            ("code", auth_code.as_str()),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", "https://claude.ai/api/mcp/auth_callback"),
+            ("code_verifier", verifier.as_str()),
+        ])
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 200, "{}", body(&mut r));
+    json_of(&mut r)["access_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn the_cli_refuses_what_it_must_refuse() {
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap(/* t */);
+    bin_ok(&root, &["init"]);
+    let cases: [(&str, &[&str]); 4] = [
+        (
+            "not loopback",
+            &[
+                "mcp",
+                "--cells",
+                "default",
+                "--http",
+                "0.0.0.0:8787",
+                "--public-url",
+                "https://m.example",
+            ],
+        ),
+        (
+            "no public url",
+            &["mcp", "--cells", "default", "--http", "127.0.0.1:8787"],
+        ),
+        (
+            "actor with http",
+            &[
+                "mcp",
+                "--cells",
+                "default",
+                "--http",
+                "127.0.0.1:8787",
+                "--public-url",
+                "https://m.example",
+                "--actor",
+                "x",
+            ],
+        ),
+        (
+            "http public url",
+            &[
+                "mcp",
+                "--cells",
+                "default",
+                "--http",
+                "127.0.0.1:8787",
+                "--public-url",
+                "http://m.example",
+            ],
+        ),
+    ];
+    for (why, args) in cases {
+        let err = bin(&root, args);
+        assert!(!err.is_empty(), "{why}: {err}");
+        assert!(err.contains("engramma:"), "{why}: {err}");
+    }
+}
+
+#[test]
+fn mcp_without_a_token_is_401_with_the_right_challenge() {
+    let s = start_bin(&["--allow-dcr"]);
+    let r = s.mcp_post(
+        None,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+    );
+    assert_eq!(
+        r.status().as_u16(),
+        401,
+        "no anonymous mode, not even initialize"
+    );
+    let challenge = r
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        challenge.contains("Bearer resource_metadata=\"https://memoria.example.net/.well-known/oauth-protected-resource/mcp\""),
+        "{challenge}"
+    );
+    assert!(challenge.contains("scope=\"memory:read\""), "{challenge}");
+}
+
+#[test]
+fn a_token_in_the_query_string_is_400() {
+    let s = start_bin(&["--allow-dcr"]);
+    let r = still()
+        .post(&format!(
+            "http://{addr}/mcp?access_token=eng_at_qualcosa",
+            addr = s.addr
+        ))
+        .header("Host", "memoria.example.net")
+        .send(&b"{}"[..])
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 400);
+}
+
+#[test]
+fn a_lying_host_or_a_present_origin_is_refused() {
+    let s = start_bin(&["--allow-dcr"]);
+    let token = bin_token(&s);
+    // lying Host (raw TCP, like the review-page tests)
+    let mut stream = std::net::TcpStream::connect(s.addr).unwrap(/* t */);
+    use std::io::Write as _;
+    let _ = stream.write_all(
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: evil.example\r\nAuthorization: Bearer {token}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        )
+        .as_bytes(),
+    );
+    let mut buf = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut stream, &mut buf);
+    let first = String::from_utf8_lossy(&buf);
+    assert!(
+        first.starts_with("HTTP/1.1 403"),
+        "the Host must be ours: {first}"
+    );
+    // Origin present on /mcp: remote clients are servers, not browsers
+    let r = still()
+        .post(&format!("http://{addr}/mcp", addr = s.addr))
+        .header("Host", "memoria.example.net")
+        .header("Origin", "https://chatgpt.com")
+        .header("Authorization", format!("Bearer {token}"))
+        .send(&b"{}"[..])
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 403);
+}
+
+#[test]
+fn the_tool_list_is_per_token_and_search_works() {
+    let s = start_bin(&["--allow-dcr"]);
+    // a note to find (put through the engine directly: the tools are the
+    // thing under test, not the CLI add)
+    let t = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(/* t */);
+    let note = engramma_core::Note {
+        id: engramma_core::id::new_ulid().unwrap(/* t */),
+        note_type: engramma_core::NoteType::Fact,
+        title: None,
+        body: "Fabio nuota il giovedì.".into(),
+        tags: vec![],
+        scope: None,
+        lang: Some(engramma_core::Lang::It),
+        source: "test".into(),
+        confidence: engramma_core::Confidence::Stated,
+        status: engramma_core::Status::Active,
+        valid_from: None,
+        valid_to: None,
+        supersedes: vec![],
+        created_at: engramma_core::format::At(t),
+        updated_at: engramma_core::format::At(t),
+        extensions: vec![],
+    };
+    engramma_core::Cell::open(&s.root.join("cells/default.sqlite"))
+        .unwrap(/* t */)
+        .put_note(&note, "test")
+        .unwrap(/* t */);
+    let token = bin_token(&s);
+
+    // initialize → session
+    let mut r = s.mcp_post(
+        Some(&token),
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+    );
+    assert_eq!(r.status().as_u16(), 200, "{}", body(&mut r));
+    let session = r
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let mut req = still()
+        .post(&format!("http://{addr}/mcp", addr = s.addr))
+        .header("Host", "memoria.example.net")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
+        .header("Authorization", format!("Bearer {token}"));
+    if let Some(sess) = &session {
+        req = req.header("Mcp-Session-Id", sess);
+    }
+    let mut r = req
+        .send(&br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#[..])
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 200);
+    let doc = json_of(&mut r);
+    let tools: Vec<String> = doc["result"]["tools"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        tools,
+        vec![
+            "memory_get",
+            "memory_neighbors",
+            "memory_search",
+            "memory_tags",
+            "memory_timeline",
+        ],
+        "a read-only grant sees the five read tools, exactly"
+    );
+
+    // memory_search finds the living note
+    let mut req = still()
+        .post(&format!("http://{addr}/mcp", addr = s.addr))
+        .header("Host", "memoria.example.net")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
+        .header("Authorization", format!("Bearer {token}"));
+    if let Some(sess) = &session {
+        req = req.header("Mcp-Session-Id", sess);
+    }
+    let mut r = req
+        .send(
+            &br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"nuota"}}}"#[..],
+        )
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 200);
+    let text = body(&mut r);
+    assert!(text.contains("Fabio nuota il giovedì"), "{text}");
+
+    // memory_propose with a read-only token: the step-up refusal
+    let mut req = still()
+        .post(&format!("http://{addr}/mcp", addr = s.addr))
+        .header("Host", "memoria.example.net")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
+        .header("Authorization", format!("Bearer {token}"));
+    if let Some(sess) = &session {
+        req = req.header("Mcp-Session-Id", sess);
+    }
+    let mut r = req
+        .send(
+            &br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_propose","arguments":{"text":"Fabio scala le montagne."}}}"#[..],
+        )
+        .unwrap(/* t */);
+    let text = body(&mut r);
+    assert!(text.contains("insufficient_scope"), "{text}");
+
+    // the access log says the grant, never the token nor the note text
+    let log = s.stderr_so_far();
+    assert!(log.contains("method=tools/call"), "{log}");
+    assert!(!log.contains(&token), "the token never appears: {log}");
+    assert!(!log.contains("nuota"), "the note text never appears: {log}");
+}
+
+#[test]
+fn a_revoked_grant_dies_at_the_next_request() {
+    let s = start_bin(&["--allow-dcr"]);
+    let token = bin_token(&s);
+    let r = s.mcp_post(
+        Some(&token),
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+    );
+    assert_eq!(r.status().as_u16(), 200);
+    bin_ok(&s.root, &["oauth", "revoke", "--all"]);
+    let r = s.mcp_post(
+        Some(&token),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    );
+    assert_eq!(r.status().as_u16(), 401, "the next request finds it dead");
+}
+
+#[test]
+fn sigterm_shuts_the_server_down() {
+    let mut s = start_bin(&["--allow-dcr"]);
+    let token = bin_token(&s);
+    let r = s.mcp_post(
+        Some(&token),
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+    );
+    assert_eq!(r.status().as_u16(), 200);
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(s.child.id().to_string())
+        .status();
+    // exits within a reasonable window
+    for _ in 0..100 {
+        if let Ok(Some(_)) = s.child.try_wait() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("SIGTERM did not stop the server");
 }
