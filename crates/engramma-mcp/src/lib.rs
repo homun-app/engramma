@@ -880,37 +880,43 @@ impl MemoryServer {
     ) -> Result<CallToolResponse, McpError> {
         let owned_actor = actor.to_string();
         let engine_cell = cell.clone();
-        let edited_for_log = edited_text.clone();
         let decision = tokio::task::spawn_blocking(move || {
             // accept-with-edit: the human fixed the text while accepting
+            // (the form comes back pre-filled: an unchanged text is a plain
+            // accept, not an accept-with-edit)
             let edited = match &edited_text {
                 Some(text) if !text.trim().is_empty() => {
                     let mut note = engine_cell.get(&id)?;
-                    if note.body != *text {
+                    if note.body == *text {
+                        None
+                    } else {
                         note.body = text.clone();
+                        Some(note)
                     }
-                    Some(note)
                 }
                 _ => None,
             };
-            engine_cell.decide(
-                &id,
-                &DecisionInput {
-                    action: if accept {
-                        DecisionAction::Accept { edited }
-                    } else {
-                        DecisionAction::Reject
+            let was_edited = edited.is_some();
+            engine_cell
+                .decide(
+                    &id,
+                    &DecisionInput {
+                        action: if accept {
+                            DecisionAction::Accept { edited }
+                        } else {
+                            DecisionAction::Reject
+                        },
+                        reason: Some("confermato dal modulo del client".into()),
+                        review: None,
                     },
-                    reason: Some("confermato dal modulo del client".into()),
-                    review: None,
-                },
-                &owned_actor,
-            )
+                    &owned_actor,
+                )
+                .map(|_| was_edited)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("join: {e}"), None))?
         .map_err(err)?;
-        let _ = decision;
+        let was_edited = decision;
         let note = tokio::task::spawn_blocking({
             let cell = cell.clone();
             move || cell.get(&id)
@@ -923,7 +929,7 @@ impl MemoryServer {
             "id": id.to_string(),
             "decided_by": actor,
             "reason": if accept {
-                if edited_for_log.is_some() { "confermato (con modifica) dal modulo" } else { "confermato dal modulo" }
+                if was_edited { "confermato (con modifica) dal modulo" } else { "confermato dal modulo" }
             } else {
                 "rifiutato dal modulo"
             },
@@ -1014,7 +1020,9 @@ fn confirm_request(text: &str, reason: &str) -> Result<rmcp::model::ElicitReques
     use rmcp::model::ElicitationSchemaBuilder;
     let schema = ElicitationSchemaBuilder::new()
         .required_string_property("text", |s| {
+            // pre-filled with the proposal: the human edits, never retypes
             s.description("Il testo della nota: puoi correggerlo prima di salvare")
+                .with_default(text)
         })
         .build()
         .map_err(|e| McpError::internal_error(format!("elicitation schema: {e}"), None))?;

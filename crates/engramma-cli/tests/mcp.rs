@@ -504,6 +504,14 @@ impl Mcp {
                     params["requestedSchema"]["properties"]["text"].is_object(),
                     "the editable text field: {params}"
                 );
+                // the field is PRE-FILLED with the proposal: the human edits,
+                // never retypes (v0.5 verification)
+                assert!(
+                    params["requestedSchema"]["properties"]["text"]["default"]
+                        .as_str()
+                        .is_some_and(|d| d.contains(shows)),
+                    "the text field carries the proposal as its default: {params}"
+                );
                 let answer = serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -777,7 +785,10 @@ fn confirm_with_the_server_requested_form_accepts_rejects_and_cancels() {
     mcp.send(&propose_call(3, "mem", "Fabio gioca a scacchi.").to_string());
     mcp.answer_elicitation("accept", "Fabio gioca a scacchi.", "scacchi");
     let res = mcp.read_response(3);
-    assert_eq!(tool_payload(&res)["status"], "accepted");
+    let payload = tool_payload(&res);
+    assert_eq!(payload["status"], "accepted");
+    // the unchanged text is a plain accept, not an accept-with-edit
+    assert_eq!(payload["reason"], "confermato dal modulo", "{payload}");
 
     // the RIFIUTA button rejects: the lapide keeps the text
     mcp.send(&propose_call(4, "mem", "Fabio vende la casa.").to_string());
