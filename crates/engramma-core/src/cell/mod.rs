@@ -1034,7 +1034,7 @@ impl Cell {
         let censorable: std::collections::HashSet<String> = {
             let mut stmt = inner.conn.prepare(
                 "SELECT o.op_id FROM ops o JOIN op_payloads p ON p.op_id = o.op_id
-                 WHERE o.kind IN ('supersede', 'decide')",
+                 WHERE o.kind IN ('supersede', 'decide', 'revert_decision')",
             )?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
                 .flatten()

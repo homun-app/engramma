@@ -249,7 +249,12 @@ fn v032_cell_migrates_roots_to_views_and_the_first_sync_adopts() {
              DROP TABLE vault_conflicts;
              ALTER TABLE vault_conflicts_v11 RENAME TO vault_conflicts;
              CREATE INDEX idx_vault_conflicts_note_v11 ON vault_conflicts(note_id);
-             UPDATE meta SET value = '11' WHERE key = 'schema_version';",
+             UPDATE meta SET value = '11' WHERE key = 'schema_version';
+             -- a real v0.3.2 cell has neither the v13 tables nor the v0.5
+             -- digest-widening bookmark
+             DROP TABLE IF EXISTS proposals;
+             DROP TABLE IF EXISTS decisions;
+             DELETE FROM meta WHERE key = 'dump_v13';",
         )
         .unwrap(/* test-only */);
     }

@@ -196,8 +196,64 @@ enum Command {
         #[arg(long)]
         include_quarantined: bool,
     },
-    /// Versions of a note
-    History { id: String },
+    /// Versions of a note (v0.5: who proposed, who decided, and why)
+    History {
+        id: String,
+        /// Line-by-line diff between consecutive versions
+        #[arg(long)]
+        diff: bool,
+    },
+    /// The proposals queue and its decisions (v0.5)
+    Proposals {
+        /// Only this state (pending | accepted | rejected | reverted)
+        #[arg(long)]
+        state: Option<String>,
+        /// Only this proposer (exact or prefix, e.g. `mcp:`)
+        #[arg(long)]
+        by: Option<String>,
+        #[command(subcommand)]
+        action: Option<ProposalsAction>,
+    },
+    /// The decisions registry: who, when, what, why (v0.5)
+    Decisions {
+        /// Only this actor (exact or prefix, e.g. `reviewer:`)
+        #[arg(long)]
+        by: Option<String>,
+        /// Decided since this date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Decided until this date (YYYY-MM-DD, inclusive)
+        #[arg(long)]
+        until: Option<String>,
+        /// Only this standing (active | reverted)
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// Cancel decisions — the git revert of the registry (v0.5)
+    Revert {
+        /// A decision op id (or its last-8 prefix)
+        decision: Option<String>,
+        /// Bulk: every decision of this actor (prefix), e.g. `reviewer:x`
+        #[arg(long)]
+        by: Option<String>,
+        /// Bulk: only decisions taken since this date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Bulk: only decisions taken until this date (YYYY-MM-DD)
+        #[arg(long)]
+        until: Option<String>,
+        /// Show what would happen, change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation (for scripts)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// The cell's policy: who may propose, how far the machine may go (v0.5)
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
     /// Restore a version
     Restore { id: String, version: i64 },
     /// Import a folder (Engramma export or `--obsidian` vault)
@@ -261,6 +317,38 @@ enum Command {
         #[arg(long)]
         actor: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ProposalsAction {
+    /// One proposal in full: note, proposer, decision, reviewer metadata
+    Show { id: String },
+    /// Accept it: the note becomes active (with --edit, fix the text first)
+    Accept {
+        id: String,
+        /// Edit the text in $EDITOR before accepting
+        #[arg(long)]
+        edit: bool,
+    },
+    /// Reject it: the lapide keeps the text, the revert can undo
+    Reject {
+        id: String,
+        /// Why
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Retry the FAILED automatic reviews (never the escalated ones)
+    Review,
+}
+
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// The current policy
+    Show,
+    /// Change it: `write=... reviewer=... min_confidence=... kinds=a,b
+    /// allow_supersede=... max_auto_per_hour=...` (only from here — never
+    /// from the web, never from MCP)
+    Set { pairs: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -974,33 +1062,10 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Command::History { id } => {
+        Command::History { id, diff } => {
             let cell = open_cell(cli)?;
             let id = cell.resolve_note_id(id)?;
-            let hist = cell.history(&id)?;
-            if cli.json {
-                let arr: Vec<serde_json::Value> = hist
-                    .iter()
-                    .map(|v| {
-                        serde_json::json!({
-                            "version": v.version,
-                            "op_id": v.op_id.to_string(),
-                            "note": note_json(&v.note),
-                        })
-                    })
-                    .collect();
-                print_json(&serde_json::json!({ "id": id.to_string(), "versions": arr }));
-            } else {
-                for v in &hist {
-                    println!(
-                        "v{}  {}  {}",
-                        v.version,
-                        v.note.updated_at,
-                        v.note.display_title()
-                    );
-                }
-            }
-            Ok(())
+            run_history(cli, &cell, &id, *diff)
         }
         Command::Restore { id, version } => {
             let cell = open_cell(cli)?;
@@ -1297,6 +1362,22 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Proposals { state, by, action } => run_proposals(cli, state, by, action),
+        Command::Decisions {
+            by,
+            since,
+            until,
+            state,
+        } => run_decisions(cli, by, since, until, state),
+        Command::Revert {
+            decision,
+            by,
+            since,
+            until,
+            dry_run,
+            yes,
+        } => run_revert(cli, decision, by, since, until, *dry_run, *yes),
+        Command::Policy { action } => run_policy(cli, action),
         Command::Vault { action } => run_vault(cli, action),
         Command::Mcp {
             cells,
@@ -1966,6 +2047,706 @@ fn parse_fusion(s: &str) -> Result<engramma_core::search::Fusion, CliError> {
 
 fn fusion_usage(s: &str) -> String {
     format!("unknown --fusion `{s}` (rrf, convex-0.3, convex-mm-0.5, convex-th-0.7, …)")
+}
+
+// ---------------------------------------------------------------------------
+// v0.5 (P4): the queue, the decisions, the revert, the policy
+// ---------------------------------------------------------------------------
+
+/// `--since/--until` as a day, inclusive: since = start of day,
+/// until = end of day (the engine compares fixed-width Z timestamps).
+fn parse_day(s: &str, end: bool) -> Result<time::OffsetDateTime, CliError> {
+    let v = Validity::parse(s)
+        .map_err(|e| CliError::usage(format!("--{}: {e}", if end { "until" } else { "since" })))?;
+    let day = v.start().date();
+    let t = if end {
+        day.with_hms(23, 59, 59)
+            .map_err(|e| CliError::usage(e.to_string()))?
+    } else {
+        day.with_hms(0, 0, 0)
+            .map_err(|e| CliError::usage(e.to_string()))?
+    };
+    Ok(t.assume_utc())
+}
+
+fn proposal_json(row: &engramma_core::cell::proposals::ProposalRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id.to_string(),
+        "state": row.state.as_str(),
+        "mode": match &row.mode {
+            engramma_core::cell::proposals::ProposalMode::New => "new",
+            engramma_core::cell::proposals::ProposalMode::Supersede(_) => "supersede",
+        },
+        "target": row.target.map(|t| t.to_string()),
+        "proposer": row.proposer,
+        "client": row.client,
+        "reason": row.reason,
+        "proposed_at": row.proposed_at,
+        "decided_by": row.decided_by,
+        "decided_at": row.decided_at,
+        "decision_reason": row.decision_reason,
+        "review": row.review,
+        "auto_failed": row.auto_failed,
+        "note": note_json(&row.note),
+    })
+}
+
+fn decision_json(row: &engramma_core::cell::proposals::DecisionRow) -> serde_json::Value {
+    serde_json::json!({
+        "op_id": row.op_id.to_string(),
+        "proposal": row.proposal.to_string(),
+        "target": row.target.map(|t| t.to_string()),
+        "decision": row.decision,
+        "actor": row.actor,
+        "decided_at": row.decided_at,
+        "reason": row.reason,
+        "review": row.review,
+        "reverted_by": row.reverted_by.map(|r| r.to_string()),
+        "state": if row.reverted_by.is_some() { "reverted" } else { "active" },
+    })
+}
+
+fn run_proposals(
+    cli: &Cli,
+    state: &Option<String>,
+    by: &Option<String>,
+    action: &Option<ProposalsAction>,
+) -> Result<(), CliError> {
+    let cell = open_cell(cli)?;
+    match action {
+        None => {
+            let state = match state {
+                None => None,
+                Some(s) => Some(parse_proposal_state(s)?),
+            };
+            let rows = cell.proposals(&engramma_core::cell::proposals::ProposalsFilter {
+                state,
+                by: by.clone(),
+                ..Default::default()
+            })?;
+            if cli.json {
+                let arr: Vec<serde_json::Value> = rows.iter().map(proposal_json).collect();
+                print_json(&serde_json::json!({ "cell": cli.cell, "proposals": arr }));
+            } else {
+                if rows.is_empty() {
+                    println!("coda vuota");
+                }
+                for r in &rows {
+                    let marker = match r.state {
+                        engramma_core::cell::proposals::ProposalState::Pending
+                        | engramma_core::cell::proposals::ProposalState::Reverted => "[in coda]",
+                        _ => "",
+                    };
+                    println!(
+                        "{} {} {} — {}",
+                        marker,
+                        engramma_core::id::id8(&r.id),
+                        r.proposer,
+                        r.note.display_title()
+                    );
+                    if let Some(reason) = &r.reason {
+                        println!("      motivo: {reason}");
+                    }
+                    if let engramma_core::cell::proposals::ProposalMode::Supersede(t) = &r.mode {
+                        println!("      rettifica di {}", engramma_core::id::id8(t));
+                    }
+                    if r.auto_failed {
+                        println!(
+                            "      revisione automatica fallita: riprova con `proposals review`"
+                        );
+                    }
+                    if let (Some(who), Some(at)) = (&r.decided_by, &r.decided_at) {
+                        println!("      decisa da {who} il {at}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        Some(ProposalsAction::Show { id }) => {
+            let id = cell.resolve_note_id(id)?;
+            let row = cell
+                .proposals(&engramma_core::cell::proposals::ProposalsFilter::default())?
+                .into_iter()
+                .find(|r| r.id == id)
+                .ok_or_else(|| CliError::not_found(format!("proposta {id}")))?;
+            if cli.json {
+                print_json(&proposal_json(&row));
+            } else {
+                println!(
+                    "{}",
+                    row.note
+                        .serialize()
+                        .map_err(|e| CliError::internal(e.to_string()))?
+                );
+                println!();
+                println!("proposta da {} il {}", row.proposer, row.proposed_at);
+                if let Some(c) = &row.client {
+                    println!("client dichiarato: {c}");
+                }
+                if let Some(r) = &row.reason {
+                    println!("motivo: {r}");
+                }
+                if let (Some(who), Some(at)) = (&row.decided_by, &row.decided_at) {
+                    println!(
+                        "decisa da {who} il {at}: {}",
+                        row.decision_reason.clone().unwrap_or_default()
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some(ProposalsAction::Accept { id, edit }) => {
+            let id = cell.resolve_note_id(id)?;
+            let edited = if *edit {
+                let note = cell.get(&id)?;
+                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+                let tmp = tempfile_in_engramma_tmp()?;
+                std::fs::write(
+                    &tmp,
+                    note.serialize()
+                        .map_err(|e| CliError::internal(e.to_string()))?,
+                )?;
+                let status = std::process::Command::new(&editor)
+                    .arg(&tmp)
+                    .status()
+                    .map_err(|e| CliError::internal(format!("{editor}: {e}")))?;
+                if !status.success() {
+                    std::fs::remove_file(&tmp).ok();
+                    return Err(CliError::internal(format!("{editor} exited with {status}")));
+                }
+                let text = std::fs::read_to_string(&tmp)?;
+                std::fs::remove_file(&tmp).ok();
+                let parsed = engramma_core::format::parse(&text, engramma_core::ParseMode::Strict)
+                    .map_err(CliError::from)?;
+                let mut n = parsed.note;
+                if n.id != note.id {
+                    return Err(CliError::usage(
+                        "the note id cannot change in accept --edit",
+                    ));
+                }
+                n.created_at = note.created_at;
+                Some(n)
+            } else {
+                None
+            };
+            cell.decide(
+                &id,
+                &engramma_core::cell::proposals::DecisionInput {
+                    action: engramma_core::cell::proposals::DecisionAction::Accept { edited },
+                    reason: Some("accettata dalla CLI".into()),
+                    review: None,
+                },
+                "user@cli",
+            )?;
+            report_ok(cli, "accettata", &id.to_string());
+            Ok(())
+        }
+        Some(ProposalsAction::Reject { id, reason }) => {
+            let id = cell.resolve_note_id(id)?;
+            cell.decide(
+                &id,
+                &engramma_core::cell::proposals::DecisionInput {
+                    action: engramma_core::cell::proposals::DecisionAction::Reject,
+                    reason: reason.clone(),
+                    review: None,
+                },
+                "user@cli",
+            )?;
+            report_ok(cli, "rifiutata (lapide)", &id.to_string());
+            Ok(())
+        }
+        Some(ProposalsAction::Review) => {
+            let reviewers = engramma_core::review::Reviewers::load(&root(cli))
+                .map_err(|e| CliError::usage(e.to_string()))?;
+            let embedder = load_embedder_or_warn(cli)?;
+            let ctx = engramma_core::cell::proposals::ProposeContext {
+                embedder: embedder.as_deref(),
+                reviewers: Some(&reviewers),
+            };
+            let decided = cell
+                .review_failed(&ctx)
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            if cli.json {
+                print_json(&serde_json::json!({ "decided": decided }));
+            } else {
+                match decided {
+                    0 => println!("nulla da ritentare (o niente da decidere per il revisore)"),
+                    n => println!("ritentate e decise: {n}"),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn parse_proposal_state(
+    s: &str,
+) -> Result<engramma_core::cell::proposals::ProposalState, CliError> {
+    Ok(match s {
+        "pending" => engramma_core::cell::proposals::ProposalState::Pending,
+        "accepted" => engramma_core::cell::proposals::ProposalState::Accepted,
+        "rejected" => engramma_core::cell::proposals::ProposalState::Rejected,
+        "reverted" => engramma_core::cell::proposals::ProposalState::Reverted,
+        other => {
+            return Err(CliError::usage(format!(
+                "`{other}` is not a proposal state (pending | accepted | rejected | reverted)"
+            )));
+        }
+    })
+}
+
+fn run_decisions(
+    cli: &Cli,
+    by: &Option<String>,
+    since: &Option<String>,
+    until: &Option<String>,
+    state: &Option<String>,
+) -> Result<(), CliError> {
+    let cell = open_cell(cli)?;
+    let state = match state {
+        None => None,
+        Some(s) => Some(match s.as_str() {
+            "active" => engramma_core::cell::proposals::DecisionState::Active,
+            "reverted" => engramma_core::cell::proposals::DecisionState::Reverted,
+            other => {
+                return Err(CliError::usage(format!(
+                    "`{other}` is not a decision state (active | reverted)"
+                )));
+            }
+        }),
+    };
+    let rows = cell.decisions(&engramma_core::cell::proposals::DecisionsFilter {
+        by: by.clone(),
+        since: since.as_deref().map(|s| parse_day(s, false)).transpose()?,
+        until: until.as_deref().map(|s| parse_day(s, true)).transpose()?,
+        state,
+    })?;
+    if cli.json {
+        let arr: Vec<serde_json::Value> = rows.iter().map(decision_json).collect();
+        print_json(&serde_json::json!({ "cell": cli.cell, "decisions": arr }));
+    } else {
+        if rows.is_empty() {
+            println!("nessuna decisione");
+        }
+        for r in &rows {
+            println!(
+                "{}  {}  {}  {}",
+                engramma_core::id::id8(&r.op_id),
+                if r.decision == "accept" {
+                    "accetta"
+                } else {
+                    "rifiuta"
+                },
+                r.actor,
+                r.decided_at
+            );
+            println!("      proposta {}", engramma_core::id::id8(&r.proposal));
+            if let Some(reason) = &r.reason {
+                println!("      perché: {reason}");
+            }
+            if let Some(review) = &r.review {
+                println!(
+                    "      revisore {} modello {} confidenza {} prompt {}",
+                    review["name"].as_str().unwrap_or("?"),
+                    review["model"].as_str().unwrap_or("?"),
+                    review["confidence"],
+                    &review["prompt_hash"].as_str().unwrap_or("?")[..8],
+                );
+            }
+            if r.reverted_by.is_some() {
+                println!("      annullata");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_revert(
+    cli: &Cli,
+    decision: &Option<String>,
+    by: &Option<String>,
+    since: &Option<String>,
+    until: &Option<String>,
+    dry_run: bool,
+    yes: bool,
+) -> Result<(), CliError> {
+    let cell = open_cell(cli)?;
+    if let Some(id) = decision {
+        if by.is_some() || since.is_some() || until.is_some() {
+            return Err(CliError::usage(
+                "a single revert takes a decision id, not --by/--since/--until",
+            ));
+        }
+        let full = resolve_decision_op(&cell, id)?;
+        let outcome = cell
+            .revert_decision(&full, "annullata dalla CLI", "user@cli")
+            .map_err(CliError::from)?;
+        if cli.json {
+            print_json(&serde_json::json!({
+                "outcome": match &outcome {
+                    engramma_core::cell::proposals::RevertOutcome::Reverted { decision, proposal } =>
+                        serde_json::json!({ "reverted": true, "decision": decision.to_string(), "proposal": proposal.to_string() }),
+                    engramma_core::cell::proposals::RevertOutcome::Purged { decision } =>
+                        serde_json::json!({ "reverted": false, "purged": true, "decision": decision.to_string() }),
+                }
+            }));
+        } else {
+            match outcome {
+                engramma_core::cell::proposals::RevertOutcome::Reverted { proposal, .. } => {
+                    report_ok(
+                        cli,
+                        "annullata: proposta di nuovo in coda",
+                        &id8_or(&proposal),
+                    );
+                }
+                engramma_core::cell::proposals::RevertOutcome::Purged { .. } => {
+                    println!("annullata, ma il contenuto era purgato: non torna");
+                }
+            }
+        }
+        return Ok(());
+    }
+    if by.is_none() && since.is_none() && until.is_none() {
+        return Err(CliError::usage(
+            "either a decision id, or --by/--since/--until for the bulk revert",
+        ));
+    }
+    let filter = engramma_core::cell::proposals::RevertFilter {
+        by: by.clone(),
+        since: since.as_deref().map(|s| parse_day(s, false)).transpose()?,
+        until: until.as_deref().map(|s| parse_day(s, true)).transpose()?,
+    };
+    let report = cell
+        .revert_decisions(&filter, true)
+        .map_err(CliError::from)?;
+    // the human preview stays out of --json (the JSON answers carry it all)
+    if !cli.json {
+        println!("annullerò {} decisioni:", report.reverted);
+        println!("  conflitti: {} (non toccati)", report.conflicts.len());
+        for c in &report.conflicts {
+            println!("    {c}");
+        }
+        println!(
+            "  purgate: {} (annullate nel registro, il contenuto non torna)",
+            report.purged
+        );
+    }
+    if dry_run {
+        if cli.json {
+            print_json(&serde_json::json!({
+                "dry_run": true,
+                "reverted": report.reverted,
+                "conflicts": report.conflicts,
+                "purged": report.purged,
+            }));
+        }
+        return Ok(());
+    }
+    if !yes {
+        if !cli.json {
+            print!("procedo? [s/N] ");
+        }
+        use std::io::Write as _;
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_to_string(&mut answer)
+            .map_err(|e| CliError::internal(format!("stdin: {e}")))?;
+        if !answer.trim().eq_ignore_ascii_case("s") {
+            if cli.json {
+                print_json(&serde_json::json!({ "aborted": true }));
+            } else {
+                println!("annullato");
+            }
+            return Ok(());
+        }
+    }
+    let report = cell
+        .revert_decisions(&filter, false)
+        .map_err(CliError::from)?;
+    if cli.json {
+        print_json(&serde_json::json!({
+            "reverted": report.reverted,
+            "conflicts": report.conflicts,
+            "purged": report.purged,
+        }));
+    } else {
+        println!(
+            "annullate {}, conflitti {}, purgate {}",
+            report.reverted,
+            report.conflicts.len(),
+            report.purged
+        );
+    }
+    Ok(())
+}
+
+fn id8_or(u: &Ulid) -> String {
+    engramma_core::id::id8(u)
+}
+
+/// A decision op id, or its unique last-8 prefix.
+fn resolve_decision_op(cell: &Cell, input: &str) -> Result<Ulid, CliError> {
+    let rows = cell
+        .decisions(&engramma_core::cell::proposals::DecisionsFilter::default())
+        .map_err(CliError::from)?;
+    if input.len() == 26 {
+        return Ulid::from_string(input)
+            .map_err(|_| CliError::usage(format!("`{input}` is not a ULID")));
+    }
+    let matches: Vec<&engramma_core::cell::proposals::DecisionRow> = rows
+        .iter()
+        .filter(|r| r.op_id.to_string().ends_with(input))
+        .collect();
+    match matches.first() {
+        Some(only) if matches.len() == 1 => Ok(only.op_id),
+        None => Err(CliError::not_found(format!(
+            "no decision ends with `{input}`"
+        ))),
+        Some(_) => Err(CliError::usage(format!("`{input}` is ambiguous"))),
+    }
+}
+
+fn run_policy(cli: &Cli, action: &PolicyAction) -> Result<(), CliError> {
+    let cell = open_cell(cli)?;
+    match action {
+        PolicyAction::Show => {
+            let policy = cell.policy_of().map_err(CliError::from)?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "cell": cli.cell,
+                    "set": cell.policy().map_err(CliError::from)?.is_some(),
+                    "policy": {
+                        "write": policy.write.as_str(),
+                        "reviewer": policy.reviewer,
+                        "min_confidence": policy.min_confidence,
+                        "kinds": policy.kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
+                        "allow_supersede": policy.allow_supersede.as_str(),
+                        "max_auto_per_hour": policy.max_auto_per_hour,
+                    }
+                }));
+            } else {
+                println!("write: {}", policy.write.as_str());
+                if let Some(r) = &policy.reviewer {
+                    println!("reviewer: {r}");
+                }
+                println!("min_confidence: {}", policy.min_confidence);
+                println!(
+                    "kinds: {}",
+                    if policy.kinds.is_empty() {
+                        "tutti".into()
+                    } else {
+                        policy
+                            .kinds
+                            .iter()
+                            .map(|k| k.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    }
+                );
+                println!("allow_supersede: {}", policy.allow_supersede.as_str());
+                println!("max_auto_per_hour: {}", policy.max_auto_per_hour);
+            }
+            Ok(())
+        }
+        PolicyAction::Set { pairs } => {
+            if pairs.is_empty() {
+                return Err(CliError::usage(
+                    "policy set wants key=value pairs (write=propose reviewer=bravo …)",
+                ));
+            }
+            // the current document (or the defaults), then the pairs on top
+            let mut doc = cell
+                .policy()
+                .map_err(CliError::from)?
+                .unwrap_or_else(|| serde_json::json!({}));
+            for pair in pairs {
+                let (k, v) = pair
+                    .split_once('=')
+                    .ok_or_else(|| CliError::usage(format!("`{pair}` is not key=value")))?;
+                doc[k] = parse_policy_value(k, v)?;
+            }
+            // refuse to store what the engine could not read back
+            engramma_core::cell::policy::Policy::parse(&doc).map_err(CliError::from)?;
+            cell.set_policy(doc.clone(), "cli")?;
+            if cli.json {
+                print_json(&doc);
+            } else {
+                println!("politica aggiornata");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn parse_policy_value(key: &str, raw: &str) -> Result<serde_json::Value, CliError> {
+    match key {
+        "write" | "allow_supersede" => Ok(serde_json::Value::String(raw.to_string())),
+        "reviewer" => Ok(serde_json::Value::String(raw.to_string())),
+        "min_confidence" => raw
+            .parse::<f64>()
+            .map(serde_json::Value::from)
+            .map_err(|_| CliError::usage("min_confidence wants a number in [0, 1]")),
+        "max_auto_per_hour" => raw
+            .parse::<u32>()
+            .map(serde_json::Value::from)
+            .map_err(|_| CliError::usage("max_auto_per_hour wants a whole number")),
+        "kinds" => Ok(serde_json::Value::Array(
+            raw.split(',')
+                .map(str::to_string)
+                .map(serde_json::Value::String)
+                .collect(),
+        )),
+        other => Err(CliError::usage(format!(
+            "`{other}` is not a policy field (write, reviewer, min_confidence, kinds, \
+             allow_supersede, max_auto_per_hour)"
+        ))),
+    }
+}
+
+/// v0.5 (P4): the note's history — the proposal's story (who proposed,
+/// who decided, why) and the versions, with the line diff between them.
+fn run_history(cli: &Cli, cell: &Cell, id: &Ulid, diff: bool) -> Result<(), CliError> {
+    let hist = cell.history(id)?;
+    let all_ops = cell.ops().map_err(CliError::from)?;
+    let ops: std::collections::HashMap<String, &engramma_core::cell::ops::Op> =
+        all_ops.iter().map(|o| (o.op_id.to_string(), o)).collect();
+    // the queue row, when this note ever was a proposal
+    let proposal = cell
+        .proposals(&engramma_core::cell::proposals::ProposalsFilter::default())
+        .map_err(CliError::from)?
+        .into_iter()
+        .find(|r| r.id == *id);
+
+    if cli.json {
+        let arr: Vec<serde_json::Value> = hist
+            .iter()
+            .map(|v| {
+                let mut entry = serde_json::json!({
+                    "version": v.version,
+                    "op_id": v.op_id.to_string(),
+                    "note": note_json(&v.note),
+                });
+                if let Some(op) = ops.get(&v.op_id.to_string()) {
+                    entry["op"] = serde_json::json!({
+                        "kind": op.kind.as_str(),
+                        "actor": op.actor,
+                    });
+                }
+                entry
+            })
+            .collect();
+        let mut out = serde_json::json!({ "id": id.to_string(), "versions": arr });
+        if let Some(r) = &proposal {
+            out["proposal"] = serde_json::json!({
+                "proposer": r.proposer,
+                "client": r.client,
+                "reason": r.reason,
+                "state": r.state.as_str(),
+                "proposed_at": r.proposed_at,
+                "decided_by": r.decided_by,
+                "decided_at": r.decided_at,
+            });
+        }
+        print_json(&out);
+        return Ok(());
+    }
+
+    if let Some(r) = &proposal {
+        println!(
+            "proposta da {} il {} — {}",
+            r.proposer,
+            r.proposed_at,
+            r.reason
+                .clone()
+                .unwrap_or_else(|| "senza motivo dichiarato".into())
+        );
+        if let (Some(who), Some(at)) = (&r.decided_by, &r.decided_at) {
+            println!("decisa da {who} il {at}");
+        }
+    }
+    if diff {
+        // each snapshot is the state BEFORE its op: the diff of consecutive
+        // snapshots shows what the later op changed, and the last window is
+        // the newest snapshot against the CURRENT note
+        let current = cell.get(id)?;
+        let mut prev: Option<&engramma_core::cell::VersionEntry> = None;
+        for (i, v) in hist.iter().enumerate() {
+            if let Some(p) = prev {
+                let op_line = ops
+                    .get(&v.op_id.to_string())
+                    .map_or_else(String::new, |op| {
+                        format!("  ({}, {})", op.kind.as_str(), op.actor)
+                    });
+                println!("v{} → v{}{op_line}", p.version, v.version);
+                for line in line_diff(&p.note.body, &v.note.body) {
+                    println!("  {line}");
+                }
+            }
+            prev = Some(v);
+            if i + 1 == hist.len() && v.note.body != current.body {
+                println!("v{} → ora  (stato attuale)", v.version);
+                for line in line_diff(&v.note.body, &current.body) {
+                    println!("  {line}");
+                }
+            }
+        }
+    } else {
+        for v in &hist {
+            let op_line = ops
+                .get(&v.op_id.to_string())
+                .map_or_else(String::new, |op| {
+                    format!("  [{}, {}]", op.kind.as_str(), op.actor)
+                });
+            println!(
+                "v{}  {}  {}{op_line}",
+                v.version,
+                v.note.updated_at,
+                v.note.display_title()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A tiny line diff (LCS over the lines): `-` removed, `+` added.
+fn line_diff(old: &str, new: &str) -> Vec<String> {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    // dp[i][j] = LCS length of a[i..], b[j..]
+    let mut dp = vec![vec![0_usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0_usize, 0_usize);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            out.push(format!("- {}", a[i]));
+            i += 1;
+        } else {
+            out.push(format!("+ {}", b[j]));
+            j += 1;
+        }
+    }
+    while i < a.len() {
+        out.push(format!("- {}", a[i]));
+        i += 1;
+    }
+    while j < b.len() {
+        out.push(format!("+ {}", b[j]));
+        j += 1;
+    }
+    out
 }
 
 #[cfg(test)]

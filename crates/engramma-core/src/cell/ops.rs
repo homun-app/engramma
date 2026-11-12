@@ -1449,7 +1449,8 @@ fn forget_note_payloads(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellError
     let mut stmt = tx.prepare(
         "DELETE FROM op_payloads WHERE op_id IN (
              SELECT op_id FROM ops
-             WHERE note_id = ?1 AND kind NOT IN ('purge', 'supersede', 'decide'))",
+             WHERE note_id = ?1
+               AND kind NOT IN ('purge', 'supersede', 'decide', 'revert_decision'))",
     )?;
     stmt.execute([id.to_string()])?;
     Ok(())
@@ -1470,22 +1471,48 @@ fn censor_purged_ops(
 ) -> Result<(), CellError> {
     let id_str = id.to_string();
     let mut stmt = tx.prepare(
-        "SELECT o.op_id, p.body FROM ops o JOIN op_payloads p ON p.op_id = o.op_id
-         WHERE o.kind IN ('supersede', 'decide')",
+        "SELECT o.op_id, o.note_id, p.body FROM ops o
+         JOIN op_payloads p ON p.op_id = o.op_id
+         WHERE o.kind IN ('supersede', 'decide', 'revert_decision')",
     )?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let rows: Vec<(String, Option<String>, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .flatten()
         .collect();
     drop(stmt);
     let mut censored: Vec<(i64, String, String)> = Vec::new(); // (seq, op_id, body)
     let mut plain_deleted: Vec<String> = Vec::new();
-    for (op_id, body) in rows {
+    for (op_id, op_note, body) in rows {
         let parsed = serde_json::from_str::<Value>(&body).ok();
         // what survives the purge, per kind — everything is derived from the
         // ORIGINAL body alone, so the live censor and the in-snapshot censor
         // build byte-identical replacements (a value read from the notes
         // table would fork the two logs)
+        // a revert_decision about this note (and ONLY this note — a purge
+        // never rewrites the reverts of other proposals): its own proposal
+        // is gone with the purge, but a TARGET it reopened must stay
+        // reopened in every replay — forgetting the whole body diverged the
+        // target's version bumps (found by the replay property tests)
+        if op_note.as_deref() == Some(id_str.as_str())
+            && parsed
+                .as_ref()
+                .is_some_and(|b| b.get("decision").is_some() && b.get("proposal").is_none())
+        {
+            let mut kept = serde_json::Map::new();
+            kept.insert("censored".into(), Value::Bool(true));
+            for k in ["decision", "decided_at", "restore_target"] {
+                if let Some(v) = parsed.as_ref().and_then(|b| b.get(k)) {
+                    kept.insert(k.into(), v.clone());
+                }
+            }
+            let seq: i64 = tx
+                .query_row("SELECT seq FROM ops WHERE op_id = ?1", [&op_id], |r| {
+                    r.get(0)
+                })
+                .unwrap_or(0);
+            censored.push((seq, op_id, Value::Object(kept).to_string()));
+            continue;
+        }
         let kept: Option<serde_json::Map<String, Value>> = match parsed
             .as_ref()
             .and_then(|b| b.get("proposal"))
@@ -2007,6 +2034,14 @@ fn apply_revert_decision(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError>
     let decided_at = crate::format::At::parse(&body_str(op, "decided_at")?)
         .map_err(|e| CellError::Invalid(format!("bad `decided_at`: {e}")))?;
     let body = op.body.as_ref().unwrap_or(&Value::Null);
+    if body.get("censored").and_then(Value::as_bool) == Some(true) {
+        // the purge of the proposal kept only what outlives it: a target it
+        // reopened stays reopened. The registry rows it touched are gone on
+        // both sides (the live purge deleted them; this replay never wrote
+        // them — the decide op is censored too).
+        reopen_target(tx, op, body, decided_at)?;
+        return Ok(());
+    }
     if body.get("purged").and_then(Value::as_bool) == Some(true) {
         return Ok(()); // nothing survives the purge: audit only
     }
@@ -2054,36 +2089,50 @@ fn apply_revert_decision(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError>
     reindex_note(tx, &id, Some(&old))?;
     // a closed supersede target reopens exactly as it was (the restore
     // values were recorded in the decide body when the decision was taken)
-    if let Some(v) = body.get("restore_target").filter(|v| !v.is_null()) {
-        let t_id = v
-            .get("id")
-            .and_then(Value::as_str)
-            .and_then(|s| Ulid::from_string(s).ok())
-            .ok_or_else(|| CellError::Invalid(format!("op {}: bad restore_target", op.op_id)))?;
-        let status = Status::parse(v.get("status").and_then(Value::as_str).unwrap_or("active"))
-            .map_err(|e| CellError::Invalid(format!("op {}: bad restore status: {e}", op.op_id)))?;
-        let valid_to = v
-            .get("valid_to")
-            .and_then(Value::as_str)
-            .map(Validity::parse)
-            .transpose()
-            .map_err(|e| {
-                CellError::Invalid(format!("op {}: bad restore valid_to: {e}", op.op_id))
-            })?;
-        if let Some(trow) = read_note(tx, &t_id)? {
-            snapshot(tx, &t_id, trow.version, &op.op_id)?;
-            let mut t = trow.note.clone();
-            t.status = status;
-            t.valid_to = valid_to;
-            t.updated_at = decided_at;
-            write_note(tx, &t, true, false)?;
-            reindex_note(tx, &t_id, Some(&trow))?;
-        }
-        tx.execute(
-            "DELETE FROM supersedes WHERE new_id = ?1 AND old_id = ?2",
-            rusqlite::params![id.to_string(), t_id.to_string()],
-        )?;
+    reopen_target(tx, op, body, decided_at)?;
+    Ok(())
+}
+
+/// Reopen the supersede target a revert restores, when the recorded state is
+/// there and the target still exists.
+fn reopen_target(
+    tx: &Transaction<'_>,
+    op: &Op,
+    body: &Value,
+    decided_at: crate::format::At,
+) -> Result<(), CellError> {
+    let Some(v) = body.get("restore_target").filter(|v| !v.is_null()) else {
+        return Ok(());
+    };
+    let t_id = v
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|s| Ulid::from_string(s).ok())
+        .ok_or_else(|| CellError::Invalid(format!("op {}: bad restore_target", op.op_id)))?;
+    let status = Status::parse(v.get("status").and_then(Value::as_str).unwrap_or("active"))
+        .map_err(|e| CellError::Invalid(format!("op {}: bad restore status: {e}", op.op_id)))?;
+    let valid_to = v
+        .get("valid_to")
+        .and_then(Value::as_str)
+        .map(Validity::parse)
+        .transpose()
+        .map_err(|e| CellError::Invalid(format!("op {}: bad restore valid_to: {e}", op.op_id)))?;
+    if let Some(trow) = read_note(tx, &t_id)? {
+        snapshot(tx, &t_id, trow.version, &op.op_id)?;
+        let mut t = trow.note.clone();
+        t.status = status;
+        t.valid_to = valid_to;
+        t.updated_at = decided_at;
+        write_note(tx, &t, true, false)?;
+        reindex_note(tx, &t_id, Some(&trow))?;
     }
+    tx.execute(
+        "DELETE FROM supersedes WHERE new_id = ?1 AND old_id = ?2",
+        rusqlite::params![
+            op.note_id.map(|n| n.to_string()).unwrap_or_default(),
+            t_id.to_string()
+        ],
+    )?;
     Ok(())
 }
 
