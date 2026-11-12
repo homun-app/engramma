@@ -5322,3 +5322,56 @@ Non rifatti: `scripts/linux.sh`, perché le correzioni non toccano niente
 di specifico della piattaforma, e il `.node`, perché le correzioni stanno
 in `engramma-mcp` e `engramma-cli`, che il modulo Node non linka. Restano
 del revisore il tunnel vero e i connettori veri di claude.ai e ChatGPT.
+
+## Prova col tunnel vero (2026-11-12, revisore)
+
+**Montaggio:**
+- ngrok gratuito davanti a `engramma mcp --http`, con `--write default`
+  e `--compat chatgpt`;
+- una radice usa e getta con tre note finte e la cella in
+  `write=confirm`;
+- connettori veri nell'account dell'utente.
+
+**Esito: funziona con tutti e tre i client, dopo due correzioni** (commit
+qui sotto, ognuna con il suo test rosso).
+
+| Client | Collegamento | Lettura | Proposta | Revoca |
+|---|---|---|---|---|
+| claude.ai (2026-07-28, senza sessione) | CIMD, codice confrontato, token | `memory_search` ok | modulo precompilato, accettata da `user@mcp:claude` | 401, refresh → `invalid_grant`, «connessione invalidata, ricollegare» |
+| ChatGPT web (2026-07-28) | CIMD vero (dopo la correzione 1), `none` + PKCE | `memory_search` ok | in coda, `pending`, testo senza URL né token | revocato; ChatGPT non ha più chiamato il server (risponde dal contesto) |
+| Codex / ChatGPT Work (sessioni, protocollo precedente) | CIMD `chatgpt.com/oauth/codex/client.json`, redirect di loopback su porta effimera (RFC 8252 regge) | — | — | — |
+
+**Altri controlli:**
+- curl attraverso il tunnel: PRM e metadati AS esatti, 401 con la
+  challenge, Origin 403, token nella query 400, `/register` senza flag
+  404, redirect estraneo → pagina e non redirect;
+- registro d'accesso: zero token e zero testo delle note;
+- `oauth approve` con il codice minuscolo funziona.
+
+**Corretto:**
+1. **ChatGPT veniva rifiutato.** Il suo documento client dichiara
+   `token_endpoint_auth_method: private_key_jwt`, ma elenca `none` in
+   `token_endpoint_auth_methods_supported`. Ora un client che supporta
+   anche `none` si accetta come pubblico con PKCE. Il `private_key_jwt`
+   puro resta rifiutato.
+2. **`oauth pending` non elencava mai niente:** il filtro leggeva la data
+   di creazione al posto della scadenza. I test di GLM approvavano
+   leggendo il codice dalla pagina, mai dalla CLI.
+
+**Osservazioni** (non difetti di questa fase):
+- **ngrok gratuito** risponde alle GET con User-Agent da browser con una
+  pagina HTML d'avviso. I tre client sono passati lo stesso, perché i
+  loro backend non si presentano come browser. Scritto in `docs/http.md`,
+  insieme alla tabella dei client provati.
+- **Codex e la chat di ChatGPT** hanno elenchi di server MCP separati
+  (scritto in `docs/http.md`).
+- **ChatGPT chiede `/.well-known/openid-configuration`**: 404, poi usa
+  RFC 8414. Va bene così.
+- **Con `--compat chatgpt` anche Claude vede `search`/`fetch`** accanto a
+  `memory_search`, perché un processo serve tutti i client. Possibile
+  seguito: mostrare gli strumenti di compatibilità solo ai grant il cui
+  client è `chatgpt.com`.
+- **`explain.bm25_rank`** numera prima dei filtri (scelta della v0.1,
+  fissata da un test). Via HTTP, un rango che manca (2 e 3 senza 1)
+  rivela a un client remoto che una nota in quarantena corrisponde alla
+  ricerca. Da rinumerare dopo i filtri in una fase prossima.

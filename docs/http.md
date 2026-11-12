@@ -62,6 +62,14 @@ stesso per ngrok.
 ngrok http 127.0.0.1:8787 --domain=memoria-example.ngrok.app
 ```
 
+Con il piano gratuito ngrok mette una pagina d'avviso davanti alle
+richieste GET che si presentano come un browser: chi legge i metadati con
+un User-Agent da browser riceve HTML invece del JSON. Nella prova del
+2026-11-12 claude.ai, ChatGPT e Codex sono passati lo stesso, perché i
+loro backend non si presentano come browser, ma non è una garanzia. Il
+dominio gratuito casuale cambia a ogni avvio (vedi sotto). Va bene per
+provare, non per restare collegati.
+
 ### Perché l'URL deve essere stabile
 
 Un tunnel «veloce» cambia indirizzo a ogni avvio. Ma l'indirizzo È
@@ -78,6 +86,27 @@ nome che resti.
   `--compat chatgpt` (gli strumenti `search`/`fetch` a schema fisso).
 - **claude.ai**: Impostazioni → Connettori → «Custom connector», URL
   `<public-url>/mcp`.
+- **Codex** (anche il lato «Work» dell'app ChatGPT): ha un elenco di
+  server MCP suo, separato dai connettori della chat. Si collega come
+  client nativo, con redirect su `http://127.0.0.1:<porta>`, e la pagina
+  d'attesa te lo segnala. Aggiungere il server lì non lo rende visibile
+  nella chat di ChatGPT, e viceversa.
+
+Provati davvero il 2026-11-12, attraverso un tunnel:
+
+| Client | Documento client (CIMD) | Redirect | Protocollo |
+|---|---|---|---|
+| claude.ai | `https://claude.ai/oauth/mcp-oauth-client-metadata` | `claude.ai/api/mcp/auth_callback` | 2026-07-28, senza sessione |
+| ChatGPT | `https://chatgpt.com/oauth/client.json` | `chatgpt.com/connector_platform_oauth_redirect` | 2026-07-28 |
+| Codex | `https://chatgpt.com/oauth/codex/client.json` | loopback, porta qualsiasi | a sessioni (precedente) |
+
+Il documento di ChatGPT preferisce `private_key_jwt`, ma fra i metodi
+supportati elenca anche `none`. Engramma offre solo `none` (client
+pubblico con PKCE), ed è quello che ChatGPT usa. Con un client che
+supporta il modulo di conferma (claude.ai), una proposta si decide subito
+nella chat. Senza modulo (ChatGPT) resta in coda: `engramma proposals` o
+`engramma review`.
+
 - Poi, **sul computer dove gira Engramma**:
 
 ```
