@@ -4953,7 +4953,7 @@ erano tutte presenti; le ho solo dichiarate dove servivano.
 `d57859a` (P2 store/CIMD/monete), `afa42bd` (P2 metadati), `3adf741`
 (P3), `cf2a7f0` (P1+P4 insieme — sotto, il perché), `74a6096` (P5, con
 dentro un difetto trovato dai test nuovi), `048e130` (P6), `9b6f9e8`
-(P7), `0d0edac` (i casi restanti), più questo (REPORT). Test rossi prima
+(P7), `3c2770f` (i casi restanti), più questo (REPORT). Test rossi prima
 di ogni correzione.
 
 ## P0 — Le tre note della v0.5, che con HTTP diventano vere
@@ -5191,7 +5191,9 @@ v0.5 sullo schema 13 restano.
   `cargo test -p engramma-bench --example longmemeval` 3/3;
   `cargo deny check licenses bans` verde.
 - **Linux:** `scripts/linux.sh` (fmt + clippy + test nel container
-  arm64, offline, rete chiusa) verde; volume `engramma-linux-target`
+  arm64, offline, rete chiusa) verde — alla prima passata il test SIGTERM
+  cadeva: nel container minimale `kill` non è un eseguibile esterno,
+  ora il segnale passa da `sh -c kill`; volume `engramma-linux-target`
   rimosso.
 - **Test JS:** Node 24.22.1; `test:electron` **29/29**, `test:electron-main`
   ok — senza cambiare le attese.
@@ -5206,5 +5208,5 @@ v0.5 sullo schema 13 restano.
   un involucro sopra `memory_search`, che resta com'era).
 - **Disco:** `du -sh target` **16G** all'inizio, **22G** alla fine
   (build di sviluppo + release del `.node` + la build Linux nel volume,
-  rimosso; `~/.cache/cargo-target` mai toccato).
+  rimossa; `~/.cache/cargo-target` — 3,7G — mai toccato).
 - **Tag:** `fase-v0.5.2` annotato; temporanei cancellati; nessun push.
