@@ -5106,7 +5106,7 @@ trasporto su cui valere.
   successiva (test con token vivo). Sessioni legacy legate al grant:
   il token di B sulla sessione di A → 404 come una sconosciuta, e il
   `requestState` 2026-07-28 è monouso e legato al grant (entrambi
-  provati, `0d0edac`).
+  provati, `3c2770f`).
 - **403 insufficient_scope**: rmcp non offre uno stato HTTP dentro una
   chiamata di strumento (la chiamata è JSON-RPC dentro un 200). Il
   rifiuto viaggia come errore dello strumento con la parola
@@ -5210,3 +5210,115 @@ v0.5 sullo schema 13 restano.
   (build di sviluppo + release del `.node` + la build Linux nel volume,
   rimossa; `~/.cache/cargo-target` — 3,7G — mai toccato).
 - **Tag:** `fase-v0.5.2` annotato; temporanei cancellati; nessun push.
+
+# Verifica v0.5.2 (2026-11-12, revisore)
+
+Esito: **passata dopo correzioni** (`70ea576`; fmt, clippy, 380 test del workspace + 3 LongMemEval, deny verdi). L'impianto è giusto e completo. Ci
+sono:
+- server di autorizzazione con approvazione locale;
+- CIMD col recinto SSRF;
+- token opachi a hash;
+- gate Bearer davanti a rmcp;
+- lista strumenti per token;
+- registro senza segreti.
+
+Il binario vero, provato a mano con curl, risponde come la spec:
+- PRM esatta;
+- 401 con la challenge giusta;
+- 403 per Host falso e per Origin su `/token`;
+- pagina d'errore senza redirect per un client ignoto;
+- CIMD verso `169.254.169.254` rifiutato e registrato;
+- ascolto non-loopback e URL pubblico `http` rifiutati;
+- `oauth.db` con permessi 0600.
+
+La rilettura ha però trovato un difetto di sicurezza vero, altri tre seri
+e alcuni minori. Sono corretti in verifica, ciascuno con il suo test visto
+rosso prima della correzione.
+
+**Seri:**
+- **`/token` non legava il codice al client né al redirect.** Le due
+  risposte `invalid_grant` venivano costruite e **scartate** (mancava il
+  `return`). Così un codice emesso per il client A e il redirect R si
+  riscattava con qualunque `client_id` e `redirect_uri`, purché il
+  chiamante avesse il verifier PKCE. PKCE resta un secondo lucchetto, ma
+  OAuth 2.1 § 4.1.3 li vuole tutti e due, e il test «PKCE sbagliato» non
+  poteva accorgersene. Test:
+  `the_token_endpoint_binds_the_code_to_its_client_and_redirect`.
+- **La rotazione del refresh non era atomica.** La lettura e il «segna
+  ruotato» stavano in due sezioni del lock. Due refresh concorrenti con lo
+  stesso token vedevano entrambi `revoked = 0` e ruotavano entrambi: due
+  catene vive e nessun allarme di furto. Ora il segno è un
+  `UPDATE … WHERE revoked = 0` e chi perde la gara è un riuso. Test
+  (store, 8 thread × 20 giri): prima ne vincevano più d'uno.
+- **Le conferme `[s/N]` aspettavano la fine di stdin.** `read_to_string`
+  in `oauth approve` senza `--yes`, e lo stesso difetto anche in `purge`
+  (dalla v0.3) e in `revert` (v0.5). Un umano al terminale digitava `s` e
+  Invio, e il comando restava fermo: un terminale non manda EOF. Ora si
+  legge una riga. Test con la pipe lasciata aperta, per `oauth approve` e
+  per `purge`. I test di GLM usavano sempre `--yes`.
+- **Un'etichetta non tornava mai libera.** `grants.label` era UNIQUE su
+  tutta la tabella. Dopo `oauth revoke chatgpt`, o allo scadere dei 90
+  giorni, riapprovare con la stessa etichetta dava «UNIQUE constraint
+  failed», mentre `docs/http.md` promette revoca e ricollegamento. Ora
+  l'etichetta è unica fra i grant **vivi**: indice parziale
+  `WHERE revoked_at IS NULL`, e i grant scaduti cedono l'etichetta.
+  `oauth revoke <etichetta>` colpisce quello vivo, e un'etichetta in uso
+  dà un errore d'uso chiaro.
+  **Nota:** lo schema v1 è cambiato sul posto (nessuna migrazione). Un
+  `oauth.db` creato con la build di GLM tiene il vecchio vincolo:
+  cancellarlo e ricollegare.
+
+**Minori:**
+- `--cells` con un nome non offerto produceva un grant **senza celle**
+  che sembrava approvato. Ora è un errore d'uso che nomina la cella, e la
+  richiesta resta da decidere.
+- Il codice d'approvazione ora si accetta minuscolo e senza trattino.
+- Un `requestState` presentato da un altro grant veniva **consumato**
+  prima del controllo di appartenenza: un estraneo bruciava il turno del
+  proprietario. Ora si controlla prima di rimuovere. In più, il test del
+  legame fra `requestState` e grant, che il REPORT dava per fatto, non
+  esisteva: ora c'è.
+- «Codice già emesso» guardava solo i codici vivi: dopo 60 s un rinfresco
+  della pagina d'attesa coniava un secondo codice per lo stesso grant.
+  Ora un codice si conia una volta sola.
+- Lo scaricamento CIMD usava il proxy dell'ambiente (`HTTPS_PROXY`, che
+  ureq legge di default): la connessione sarebbe andata al proxy e il
+  recinto avrebbe giudicato l'host sbagliato. Ora `proxy(None)`. Il test è
+  rosso se lanciato con `HTTPS_PROXY` impostato.
+- `Host: [::1]:porta` veniva rifiutato: il recinto tagliava al primo `:`.
+- La lista strumenti, che ora dipende dal token, si dichiarava
+  `cacheScope: public`. Con un grant ora è `private`.
+- Rinforzo senza test proprio: il server costruito per HTTP rifiuta una
+  chiamata **senza** grant, invece di ricadere nel significato stdio
+  («tutte le celle»). Il gate ne mette sempre uno, quindi è la rete sotto
+  la rete; la suite HTTP intera passa con il rinforzo attivo.
+- Messaggi `insufficient_scope` e «nessuno strumento di scrittura» con
+  spazi spuri al posto degli a-capo.
+
+**Precisazioni al REPORT di GLM:**
+- citava `0d0edac`, un commit riscritto che non è nella storia di `main`:
+  ora dice `3c2770f`;
+- il totale dei test era rimasto «368+32 = vedi sotto»;
+- «requestState legato al grant: provato» non era vero (vedi sopra);
+- `target` è passato da 16G a 22G.
+
+**Note lasciate per dopo** (non bloccanti, da scrivere se servono):
+- **Tetto delle richieste in attesa:** cinque richieste globali da 10
+  minuti, che chiunque conosca l'URL può tenere occupate di continuo.
+  Blocca solo i collegamenti nuovi (difesa: rifiutarle con
+  `oauth deny`). Lo stesso vale per i download CIMD falliti, che non vanno
+  in cache.
+- **Recinto SSRF:** non scarta gli indirizzi 6to4 (`2002::/16`) e NAT64
+  locale (`64:ff9b:1::/48`) che incorporano un IPv4 privato. Su reti
+  normali sono irraggiungibili.
+- **Mappa delle sessioni legacy:** non si svuota mai, cresce di una voce
+  per `initialize`.
+- **`/revoke` di un refresh:** revoca solo quel token, non gli accessi
+  della stessa famiglia (RFC 7009 lo raccomanda).
+- **Codice d'approvazione:** il modulo su 31 lettere ha un bias minimo.
+  Il codice non è un segreto, quindi è irrilevante.
+
+Non rifatti: `scripts/linux.sh`, perché le correzioni non toccano niente
+di specifico della piattaforma, e il `.node`, perché le correzioni stanno
+in `engramma-mcp` e `engramma-cli`, che il modulo Node non linka. Restano
+del revisore il tunnel vero e i connettori veri di claude.ai e ChatGPT.
