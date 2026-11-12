@@ -244,6 +244,39 @@ fn the_address_is_loopback_and_the_token_gates_everything() {
 }
 
 #[test]
+fn the_session_token_is_compared_in_constant_time() {
+    // v0.5.2 (P0): a plain `==`/`!=` on the token leaks its length and its
+    // prefix byte by byte. The comparison must go through blake3 (both
+    // sides hashed, then the fixed digests compared) — the source scan is
+    // the test: there is no honest timing test, but the pattern cannot
+    // come back unnoticed.
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/review.rs"))
+        .unwrap(/* t */);
+    assert!(!src.contains("== self.token"), "no plain equality in guard");
+    assert!(
+        !src.contains("== review.token") && !src.contains("!= review.token"),
+        "no plain equality in entra"
+    );
+    assert!(
+        src.matches("same_secret(").count() >= 3,
+        "the constant-time helper exists and both paths use it"
+    );
+    // and the behavior is unchanged: the wrong token still does not enter
+    let s = start();
+    let r = still()
+        .get(&format!(
+            "http://127.0.0.1:{}/entra?token={}",
+            s.port,
+            "0".repeat(64)
+        ))
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 401);
+    let client = s.client();
+    assert_eq!(client.get("/coda").unwrap(/* t */).status().as_u16(), 200);
+}
+
+#[test]
 fn a_lying_host_is_refused() {
     let s = start();
     let _client = s.client();

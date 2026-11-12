@@ -65,6 +65,14 @@ fn csrf_of(review: &Review, form: &str) -> String {
         .to_string()
 }
 
+/// v0.5.2 (P0): constant-time equality of two secrets — blake3 of both,
+/// then the fixed 256-bit digests compared. A plain `==` on the strings
+/// would leak the token's length and prefix byte by byte; everything born
+/// in this phase (the OAuth tokens too) compares secrets this way.
+fn same_secret(a: &str, b: &str) -> bool {
+    blake3::hash(a.as_bytes()) == blake3::hash(b.as_bytes())
+}
+
 fn page(title: &str, body: &str) -> Response {
     Html(format!(
         "<!doctype html>\n<html lang=\"it\"><head><meta charset=\"utf-8\">\
@@ -160,7 +168,7 @@ impl Review {
             .split(';')
             .filter_map(|c| c.trim().strip_prefix("engramma_review="))
             .next()
-            .is_some_and(|t| t == self.token);
+            .is_some_and(|t| same_secret(t, &self.token));
         if !mine {
             return Err(Box::new(unauthorized()));
         }
@@ -216,7 +224,7 @@ async fn entra(State(review): State<Arc<Review>>, Query(q): Query<Q>) -> Respons
     let Some(token) = q.get("token") else {
         return unauthorized();
     };
-    if token.as_str() != review.token.as_str() {
+    if !same_secret(token, &review.token) {
         return unauthorized();
     }
     let mut r = see_other("/coda");
