@@ -16,3 +16,17 @@ schemars.workspace = true
 time.workspace = true
 anyhow.workspace = true
 ulid.workspace = true
+# v0.5.2 (P2/P3): the OAuth surface — oauth.db, the CIMD fetch's fence,
+# opaque tokens and their digests. All already in the lock (ring came with
+# rustls, base64 with rmcp; axum mounts both the OAuth routes and rmcp's
+# StreamableHttpService).
+rusqlite.workspace = true
+blake3.workspace = true
+ring.workspace = true
+ureq.workspace = true
+axum.workspace = true
+base64 = "0.23.1"
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true

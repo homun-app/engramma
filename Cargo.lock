@@ -793,15 +793,23 @@ name = "engramma-mcp"
 version = "0.1.0-dev"
 dependencies = [
  "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "blake3",
  "engramma-core",
  "engramma-embed",
+ "proptest",
+ "ring",
  "rmcp",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "ulid",
+ "ureq",
 ]
 
 [[package]]
