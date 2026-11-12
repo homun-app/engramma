@@ -781,7 +781,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 std::io::stdout().flush().ok();
                 let mut answer = String::new();
                 std::io::stdin()
-                    .read_to_string(&mut answer)
+                    .read_line(&mut answer)
                     .map_err(|e| CliError::internal(format!("stdin: {e}")))?;
                 if !answer.trim().eq_ignore_ascii_case("s") {
                     if !cli.json {
@@ -1991,6 +1991,7 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                     "`--label {label}` non va: servono 1-32 caratteri fra a-z, 0-9 e -"
                 )));
             }
+            let code = &engramma_mcp::oauth::normalize_approval_code(code);
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
             let Some(req) = store
                 .request_by_code(code)
@@ -2020,14 +2021,34 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                 std::io::stdout().flush().ok();
                 let mut answer = String::new();
                 std::io::stdin()
-                    .read_to_string(&mut answer)
+                    .read_line(&mut answer)
                     .map_err(|e| CliError::internal(format!("stdin: {e}")))?;
                 if !answer.trim().eq_ignore_ascii_case("s") {
                     println!("annullato");
                     return Ok(());
                 }
             }
-            // the grant can only RESTRICT what the server offered
+            // one live connection per label: the label is the actor
+            // `mcp:<label>` of its proposals, two would sign alike
+            let label_taken = store
+                .grants()
+                .map_err(|e| CliError::internal(format!("{e}")))?
+                .iter()
+                .any(|g| &g.label == label && g.revoked_at.is_none() && g.absolute_expiry > now);
+            if label_taken {
+                return Err(CliError::usage(format!(
+                    "l'etichetta `{label}` è già di un collegamento vivo: revocalo \
+                     (`engramma oauth revoke {label}`) o scegline un'altra"
+                )));
+            }
+            // the grant can only RESTRICT what the server offered: a name
+            // outside the offer is a typo, said before anything is written
+            if let Some(stray) = cells.iter().find(|c| !req.offered_cells.contains(c)) {
+                return Err(CliError::usage(format!(
+                    "`--cells {stray}`: il server offre solo {}",
+                    req.offered_cells.join(", ")
+                )));
+            }
             let cells: Vec<String> = req
                 .offered_cells
                 .iter()
@@ -2069,6 +2090,7 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
             Ok(())
         }
         OauthAction::Deny { code } => {
+            let code = &engramma_mcp::oauth::normalize_approval_code(code);
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
             let denied = store
                 .request_deny(code, now)
@@ -2131,7 +2153,12 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                     let grants = store
                         .grants()
                         .map_err(|e| CliError::internal(format!("{e}")))?;
-                    match grants.iter().find(|g| &g.label == label) {
+                    // the LIVE one first: a label comes back after a revoke
+                    let pick = grants
+                        .iter()
+                        .find(|g| &g.label == label && g.revoked_at.is_none())
+                        .or_else(|| grants.iter().find(|g| &g.label == label));
+                    match pick {
                         Some(g) => (Some(g.id.clone()), label.clone()),
                         None => {
                             return Err(CliError::not_found(format!(
@@ -2916,7 +2943,7 @@ fn run_revert(
         std::io::stdout().flush().ok();
         let mut answer = String::new();
         std::io::stdin()
-            .read_to_string(&mut answer)
+            .read_line(&mut answer)
             .map_err(|e| CliError::internal(format!("stdin: {e}")))?;
         if !answer.trim().eq_ignore_ascii_case("s") {
             if cli.json {

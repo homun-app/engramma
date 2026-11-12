@@ -260,3 +260,48 @@ fn unreachable_view_holding_the_note_exits_five_and_names_itself() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// verifica v0.5.2: the `[s/N]` prompts read a LINE. With `read_to_string`
+/// a human at a terminal typed `s` + Enter and the command waited for an
+/// end-of-file that a terminal never sends.
+#[test]
+fn the_purge_prompt_answers_to_one_line() {
+    use std::io::Write as _;
+    let fx = Fixture::new(1);
+    let mut child = fx
+        .cmd()
+        .arg("purge")
+        .arg("00000001")
+        .arg("--reason")
+        .arg("oblio")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap(/* test-only */);
+    let mut stdin = child.stdin.take().unwrap(/* test-only */);
+    stdin.write_all(b"s\n").unwrap(/* test-only */);
+    stdin.flush().unwrap(/* test-only */);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap(/* test-only */) {
+            break Some(st);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    if status.is_none() {
+        let _ = child.kill();
+        panic!("`purge` waits for the end of stdin instead of the answer line");
+    }
+    drop(stdin);
+    assert_eq!(status.and_then(|s| s.code()), Some(0));
+    let cell = Cell::open(&fx.cell_path).unwrap(/* test-only */);
+    assert!(
+        cell.get(&ulid::Ulid::from_string(&format!("01{:024}", 1)).unwrap(/* t */))
+            .is_err(),
+        "purged"
+    );
+}

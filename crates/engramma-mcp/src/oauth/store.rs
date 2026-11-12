@@ -732,6 +732,17 @@ impl OAuthStore {
         if req.status != RequestStatus::Pending || req.expires_at <= now {
             return Ok(None);
         }
+        // a grant past its 90 days is dead even if nobody revoked it: it
+        // gives its label back before the new one takes it
+        {
+            let conn = self.lock()?;
+            conn.execute(
+                "UPDATE grants SET revoked_at = ?2
+                 WHERE label = ?1 AND revoked_at IS NULL AND absolute_expiry <= ?2",
+                rusqlite::params![label, now],
+            )
+            .map_err(db)?;
+        }
         let grant = Grant {
             id: engramma_core::id::new_ulid()
                 .map(|u| u.to_string())
@@ -762,7 +773,8 @@ impl OAuthStore {
             )
             .map_err(db)?;
             conn.execute(
-                "UPDATE requests SET status = 'approved', grant_id = ?2 WHERE approval_code = ?1",
+                "UPDATE requests SET status = 'approved', grant_id = ?2
+                 WHERE approval_code = ?1 AND status = 'pending'",
                 rusqlite::params![approval_code, grant.id],
             )
             .map_err(db)?;
@@ -869,8 +881,8 @@ impl OAuthStore {
         let conn = self.lock()?;
         let n: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM codes WHERE handle = ?1 AND expires_at > ?2",
-                rusqlite::params![handle, now()],
+                "SELECT COUNT(*) FROM codes WHERE handle = ?1",
+                [handle],
                 |r| r.get(0),
             )
             .map_err(db)?;
@@ -1123,13 +1135,23 @@ impl OAuthStore {
                 .cloned()
                 .collect()
         };
-        {
+        // the claim is ONE conditional step: of two concurrent uses only
+        // one flips `revoked` 0 → 1; the loser is a reuse, exactly like a
+        // late replay (verifica v0.5.2: the read above and this write were
+        // two lock sections, and both racers rotated)
+        let claimed = {
             let conn = self.lock()?;
             conn.execute(
-                "UPDATE tokens SET revoked = 1, last_used_at = ?2 WHERE token_hash = ?1",
+                "UPDATE tokens SET revoked = 1, last_used_at = ?2
+                 WHERE token_hash = ?1 AND revoked = 0",
                 rusqlite::params![hash, now],
             )
-            .map_err(db)?;
+            .map_err(db)?
+        };
+        if claimed == 0 {
+            self.revoke_family(&family, now)?;
+            self.event(now, "refresh_reused", &format!("grant={grant_id}"));
+            return Ok(Err(RefreshUse::Reused));
         }
         let (access, access_exp) = self.access_issue(&grant, &scopes, audience, &family, now)?;
         let (new_refresh, refresh_exp) =
@@ -1408,7 +1430,9 @@ CREATE TABLE codes (
 );
 CREATE TABLE grants (
   id          TEXT PRIMARY KEY,
-  label       TEXT NOT NULL UNIQUE,
+  -- unique among LIVE grants only (the index below): a revoked or
+  -- expired connection gives its label back for the reconnection
+  label       TEXT NOT NULL,
   client_id   TEXT NOT NULL,
   cells       TEXT NOT NULL,
   scopes      TEXT NOT NULL,
@@ -1417,6 +1441,7 @@ CREATE TABLE grants (
   revoked_at  INTEGER,
   absolute_expiry INTEGER NOT NULL
 );
+CREATE UNIQUE INDEX grants_live_label ON grants(label) WHERE revoked_at IS NULL;
 CREATE TABLE tokens (
   id         TEXT PRIMARY KEY,
   kind       TEXT NOT NULL CHECK (kind IN ('access', 'refresh')),
@@ -1576,6 +1601,88 @@ mod tests {
         );
         // and the grant
         assert!(s.grant("g1", now).unwrap(/* t */).is_none());
+    }
+
+    #[test]
+    fn parallel_rotations_of_one_refresh_cannot_both_win() {
+        // verifica v0.5.2: the read and the «mark rotated» were two lock
+        // sections — two concurrent refreshes both saw `revoked = 0` and
+        // both rotated, forking the chain with no theft alarm
+        for round in 0..20 {
+            let (_d, s) = store();
+            let s = std::sync::Arc::new(s);
+            let now = 1_000_i64;
+            let grant = seed_grant(&s, "g1", "prova", now);
+            let (rt, _) = s
+                .refresh_issue(&grant, &[SCOPE_READ.into()], "https://mem.example", "fam1", now)
+                .unwrap(/* t */);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let s = std::sync::Arc::clone(&s);
+                    let b = std::sync::Arc::clone(&barrier);
+                    let rt = rt.clone();
+                    std::thread::spawn(move || {
+                        b.wait();
+                        s.refresh_rotate(&rt, &[], "https://mem.example", now)
+                            .unwrap(/* t */)
+                            .is_ok()
+                    })
+                })
+                .collect();
+            let won = handles
+                .into_iter()
+                .map(|h| h.join().unwrap(/* t */))
+                .filter(|ok| *ok)
+                .count();
+            assert!(
+                won <= 1,
+                "round {round}: {won} rotations of one refresh won"
+            );
+        }
+    }
+
+    #[test]
+    fn a_minted_code_is_never_minted_again_even_after_it_expires() {
+        // verifica v0.5.2: «already minted» looked only at LIVE codes, so a
+        // refresh of the waiting page after 60 s minted a second code
+        let (_d, s) = store();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        s.request_insert(&AuthRequest {
+            handle: "h1".into(),
+            approval_code: "ABCD-EFGH".into(),
+            client_id: "https://chatgpt.com/oauth/client.json".into(),
+            client_name: None,
+            redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect".into(),
+            scopes: vec![SCOPE_READ.into()],
+            resource: None,
+            code_challenge: "challenge".into(),
+            state: None,
+            offered_cells: vec!["default".into()],
+            offered_write: vec![],
+            status: RequestStatus::Pending,
+            grant_id: None,
+            created_at: now - 120,
+            expires_at: now + 480,
+        })
+        .unwrap(/* t */);
+        s.request_approve(
+            "ABCD-EFGH",
+            "prova",
+            &["default".to_string()],
+            &[SCOPE_READ.to_string()],
+            now - 120,
+        )
+        .unwrap(/* t */);
+        // minted two minutes ago: its 60 s are over
+        let minted = s
+            .code_mint("h1", "https://mem.example/mcp", now - 120)
+            .unwrap(/* t */);
+        assert!(minted.is_some());
+        assert!(
+            s.code_already_minted("h1").unwrap(/* t */),
+            "an expired code was still minted once"
+        );
     }
 
     #[test]

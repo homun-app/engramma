@@ -325,10 +325,15 @@ The human surface of the HTTP authorization flow (state in
 - `approve <XXXX-XXXX> --label chatgpt [--cells a] [--scope memory:read]
   [--yes]` — the code is the one the **user's browser** shows. The label
   (`[a-z0-9-]{1,32}`) becomes the actor `mcp:<label>` of the proposals;
-  `--cells`/`--scope` only restrict what the server offers. Before the
-  confirmation the CLI prints the client's host and the redirect's.
+  `--cells`/`--scope` only restrict what the server offers (a cell the
+  server does not offer is a usage error). Before the confirmation the CLI
+  prints the client's host and the redirect's. The code may be typed in
+  lowercase and without the dash. A label belongs to one **live**
+  connection at a time: after `revoke` (or the 90-day expiry) the same
+  label can be approved again for the reconnection.
 - `deny <XXXX-XXXX>` — refuse it.
 - `grants` — label, client, cells, scopes, creation, last use, standing.
-- `revoke <label> | --all` — the tokens die at their next request.
+- `revoke <label> | --all` — the tokens die at their next request (by
+  label: the live grant under that label).
 - `log` — the event history: approvals, refusals, revocations, reuse
   alarms, rejected clients. No secrets, no note text.

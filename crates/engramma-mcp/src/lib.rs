@@ -59,6 +59,11 @@ pub struct MemoryServer {
     /// v0.5 (P3): the write surface, when `--write` named cells. `actor`
     /// comes from the command line — the configuration, not the client.
     write: Option<WriteSurface>,
+    /// v0.5.2 (verifica): built by [`MemoryServer::open_http`]. Over HTTP
+    /// a call WITHOUT a grant is refused instead of falling back to the
+    /// stdio meaning «every cell»: the gate always puts one in, and if it
+    /// ever did not, the server must fail closed, not open.
+    http: bool,
 }
 
 /// The write side of the server (v0.5, P3; v0.5.2: shared across every
@@ -129,6 +134,12 @@ fn grant_of(parts: &rmcp::service::RequestContext<rmcp::RoleServer>) -> Option<R
         .cloned()
 }
 
+/// Over HTTP, a request that reached the handler without a grant (the
+/// bearer gate always adds one: this is the net under the net).
+fn no_grant_error() -> McpError {
+    McpError::invalid_request("no grant for this request".to_string(), None)
+}
+
 /// Error conversion into MCP errors.
 fn err(e: impl std::fmt::Display) -> McpError {
     McpError::internal_error(e.to_string(), None)
@@ -159,7 +170,9 @@ fn actor_for(grant: &Option<RequestGrant>, write: &WriteSurface) -> Option<Strin
 fn insufficient_scope_error(grant: &RequestGrant) -> McpError {
     McpError::invalid_request(
         format!(
-            "insufficient_scope: this connection's token carries only `{}`;              `memory:propose` is granted when you approve the connection              (label `{}`) with a writable cell",
+            "insufficient_scope: this connection's token carries only `{}`; \
+             `memory:propose` is granted when you approve the connection \
+             (label `{}`) with a writable cell",
             grant.scopes.join(" "),
             grant.label
         ),
@@ -225,6 +238,7 @@ impl MemoryServer {
         compat_chatgpt: bool,
     ) -> anyhow::Result<Self> {
         let mut server = Self::open_with_write(root, names, write, None)?;
+        server.http = true;
         server.tool_router.add_route(propose_route());
         if compat_chatgpt {
             // P6: the fixed-schema wrappers ChatGPT's deep research and
@@ -298,6 +312,7 @@ impl MemoryServer {
             cells,
             embedder,
             write: None,
+            http: false,
         })
     }
 
@@ -392,7 +407,8 @@ impl MemoryServer {
             // the tool is not even listed without --write; reaching here
             // means a client called it by name anyway
             return Err(McpError::invalid_request(
-                "this server exposes no writing tool (stdio: `--write <cell> --actor <name>`;                  HTTP: approve the connection with a `memory:propose` scope)"
+                "this server exposes no writing tool (stdio: `--write <cell> --actor <name>`; \
+                 HTTP: approve the connection with a `memory:propose` scope)"
                     .to_string(),
                 None,
             ));
@@ -1141,25 +1157,26 @@ impl MemoryServer {
                 None,
             ));
         };
-        let pending = surface
-            .mrtr
-            .lock()
-            .map_err(|_| McpError::internal_error("mrtr state poisoned".to_string(), None))?
-            .remove(state);
-        let Some(pending) = pending else {
-            return Err(McpError::invalid_request(
-                format!("unknown requestState `{state}`").to_string(),
-                None,
-            ));
-        };
         // the round belongs to the grant that opened it (P4): another
-        // grant's token — or stdio's absence of one — finds nothing
-        if pending.grant.as_deref() != grant.map(|g| g.id.as_str()) {
+        // grant's token — or stdio's absence of one — finds nothing, and
+        // finding nothing must not BURN the owner's round (verifica
+        // v0.5.2: the state was removed before the ownership check)
+        let pending = {
+            let mut rounds = surface
+                .mrtr
+                .lock()
+                .map_err(|_| McpError::internal_error("mrtr state poisoned".to_string(), None))?;
+            let owned = rounds
+                .get(state)
+                .is_some_and(|p| p.grant.as_deref() == grant.map(|g| g.id.as_str()));
+            if owned { rounds.remove(state) } else { None }
+        };
+        let Some(pending) = pending else {
             return Err(McpError::invalid_request(
                 format!("unknown requestState `{state}`"),
                 None,
             ));
-        }
+        };
         let cell = self.cell(&pending.cell)?;
         let Some(answer) = responses.get("confirm") else {
             return Err(McpError::invalid_params(
@@ -1466,9 +1483,13 @@ impl ServerHandler for MemoryServer {
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let grant = grant_of(&context);
+        if self.http && grant.is_none() {
+            return Err(no_grant_error());
+        }
         let mut tools = self.tool_router.list_all();
-        if let Some(grant) = grant_of(&context)
-            && !self.propose_visible(&grant)
+        if let Some(grant) = &grant
+            && !self.propose_visible(grant)
         {
             tools.retain(|t| t.name != "memory_propose");
         }
@@ -1478,7 +1499,12 @@ impl ServerHandler for MemoryServer {
             meta: None,
             next_cursor: None,
             ttl_ms: supports_cache_hints.then_some(0),
-            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+            // over HTTP the list depends on the TOKEN: never a shared cache
+            cache_scope: supports_cache_hints.then_some(if grant.is_some() {
+                rmcp::model::CacheScope::Private
+            } else {
+                rmcp::model::CacheScope::Public
+            }),
         })
     }
 
@@ -1492,6 +1518,9 @@ impl ServerHandler for MemoryServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let grant = grant_of(&context);
+        if self.http && grant.is_none() {
+            return Err(no_grant_error());
+        }
         let mut request = request;
         if let Some(g) = &grant {
             if request.name == "memory_propose" && !g.may_propose() {

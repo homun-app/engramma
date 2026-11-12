@@ -753,11 +753,14 @@ async fn token_code(state: &HttpState, f: &Q, now: i64) -> Response {
             )
         }
         Ok(Ok(rec)) => {
+            // verifica v0.5.2: these two answers were built and DROPPED
+            // (no `return`), so any client with the verifier could redeem
+            // a code issued to another client or redirect
             if rec.client_id != *client_id {
-                token_error("invalid_grant", "il codice è di un altro client");
+                return token_error("invalid_grant", "il codice è di un altro client");
             }
             if !redirect_matches(&rec.redirect_uri, redirect) {
-                token_error("invalid_grant", "redirect_uri non corrispondente");
+                return token_error("invalid_grant", "redirect_uri non corrispondente");
             }
             if let Some(want) = f.get("resource")
                 && Some(want.as_str()) != rec.resource.as_deref()
@@ -1097,6 +1100,14 @@ pub fn router_with_cancellation(
 // ---------------------------------------------------------------------------
 
 /// The loopback names the Host check (and rmcp's) accept as-is.
+/// `[::1]:8787` → `[::1]`, `localhost:8787` → `localhost`.
+fn host_without_port(h: &str) -> &str {
+    if h.starts_with('[') {
+        return h.find(']').map_or(h, |i| &h[..=i]);
+    }
+    h.split(':').next().unwrap_or_default()
+}
+
 fn is_loopback_host_name(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
@@ -1115,9 +1126,7 @@ async fn host_guard(
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok())
-        .is_some_and(|h| {
-            h == public || is_loopback_host_name(h.split(':').next().unwrap_or_default())
-        });
+        .is_some_and(|h| h == public || is_loopback_host_name(host_without_port(h)));
     if !ok {
         return (StatusCode::FORBIDDEN, "").into_response();
     }

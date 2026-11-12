@@ -82,17 +82,7 @@ pub fn fetch(client_id: &str, mode: CimdFetch) -> Result<FetchedClient, CimdErro
         return Err(CimdError::NotAClientUrl);
     }
 
-    let agent = ureq::Agent::with_parts(
-        ureq::Agent::config_builder()
-            .max_redirects(0)
-            .timeout_global(Some(TIMEOUT))
-            .http_status_as_error(false)
-            .build(),
-        ureq::unversioned::transport::DefaultConnector::default(),
-        PublicOnlyResolver {
-            allow_loopback: mode.allow_loopback,
-        },
-    );
+    let agent = fenced_agent(mode);
 
     let mut response = agent
         .get(client_id)
@@ -201,6 +191,26 @@ pub fn fetch(client_id: &str, mode: CimdFetch) -> Result<FetchedClient, CimdErro
     })
 }
 
+/// The fetch's agent: no redirects, the global budget, no environment
+/// proxy, and the public-only resolver.
+fn fenced_agent(mode: CimdFetch) -> ureq::Agent {
+    ureq::Agent::with_parts(
+        ureq::Agent::config_builder()
+            .max_redirects(0)
+            // no proxy from the environment: HTTPS_PROXY would send the
+            // fetch through a host the resolver fence never sees
+            // (verifica v0.5.2)
+            .proxy(None)
+            .timeout_global(Some(TIMEOUT))
+            .http_status_as_error(false)
+            .build(),
+        ureq::unversioned::transport::DefaultConnector::default(),
+        PublicOnlyResolver {
+            allow_loopback: mode.allow_loopback,
+        },
+    )
+}
+
 /// The SSRF fence: a resolver that hands ureq only PUBLIC addresses.
 /// The connection goes to the verified IP while SNI, `Host` and the TLS
 /// certificate check keep using the NAME — which is exactly the point.
@@ -236,6 +246,16 @@ impl ureq::unversioned::resolver::Resolver for PublicOnlyResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fetch_never_goes_through_an_environment_proxy() {
+        // ureq reads HTTPS_PROXY/ALL_PROXY by default: through a proxy the
+        // connection goes to the PROXY's address and the resolver fence
+        // judges the wrong host (verifica v0.5.2 — red when run with
+        // `HTTPS_PROXY=http://10.0.0.1:3128` in the environment)
+        let agent = fenced_agent(CimdFetch::default());
+        assert!(agent.config().proxy().is_none());
+    }
 
     /// A minimal CIMD server on loopback, served by a raw thread. The
     /// body's `{URL}` placeholder is replaced with the real address, so

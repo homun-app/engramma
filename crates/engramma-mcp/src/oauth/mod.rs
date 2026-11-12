@@ -19,7 +19,8 @@ pub mod store;
 
 pub use cimd::{CimdError, CimdFetch, fetch};
 pub use mint::{
-    APPROVAL_ALPHABET, approval_code, handle, hash_hex, opaque_token, pkce_s256, pkce_verify,
+    APPROVAL_ALPHABET, approval_code, handle, hash_hex, normalize_approval_code, opaque_token,
+    pkce_s256, pkce_verify,
 };
 pub use net::{RedirectUri, is_public_ip, parse_redirect_uri, redirect_matches, redirect_uri_ok};
 pub use store::{

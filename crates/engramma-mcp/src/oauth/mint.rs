@@ -51,6 +51,23 @@ pub fn approval_code() -> Result<String, std::io::Error> {
     Ok(format!("{}-{}", &code[..4], &code[4..]))
 }
 
+/// What the human typed, back to the stored `XXXX-XXXX` shape: case and
+/// the dash (or spaces) do not matter — the code is read off a page and
+/// retyped, and it is no secret to begin with.
+#[must_use]
+pub fn normalize_approval_code(typed: &str) -> String {
+    let bare: String = typed
+        .chars()
+        .filter(|c| !matches!(c, '-' | ' '))
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if bare.len() == 8 && bare.is_ascii() {
+        format!("{}-{}", &bare[..4], &bare[4..])
+    } else {
+        typed.to_string()
+    }
+}
+
 /// blake3 of a secret, hex — the only form ever stored or compared.
 pub fn hash_hex(secret: &str) -> String {
     blake3::hash(secret.as_bytes()).to_hex().to_string()

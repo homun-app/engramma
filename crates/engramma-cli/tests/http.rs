@@ -1316,6 +1316,29 @@ fn the_confirmation_form_arrives_over_http_prefilled() {
         .unwrap_or_default()
         .to_string();
 
+    // verifica v0.5.2: ANOTHER grant presenting this requestState finds
+    // nothing — and its attempt must not burn the owner's round
+    let other = bin_token_scopes(&s, "memory:read memory:propose");
+    let res = stateless_call(
+        &s,
+        &other,
+        30,
+        serde_json::json!({
+            "name": "memory_propose",
+            "arguments": { "text": "Fabio va in barca." },
+            "_meta": meta,
+            "inputResponses": {
+                "confirm": { "action": "accept", "content": { "text": "dirottata" } }
+            },
+            "requestState": state
+        }),
+    );
+    let as_text = res.to_string();
+    assert!(
+        res.get("error").is_some() || as_text.contains("unknown requestState"),
+        "a foreign grant's retry: {res}"
+    );
+
     // round 2: the retry brings the answer (accept with an edit)
     let res = stateless_call(
         &s,
@@ -1896,4 +1919,243 @@ fn the_token_endpoint_slams_the_door_at_sixty_a_minute() {
         .unwrap(/* t */);
     assert_eq!(r.status().as_u16(), 429);
     assert!(r.headers().contains_key("retry-after"));
+}
+
+// ---------------------------------------------------------------------------
+// verifica v0.5.2 (il revisore): i difetti trovati alla rilettura
+// ---------------------------------------------------------------------------
+
+/// Run the flow up to an authorization code (approved by the real CLI):
+/// the verifier and the code, ready for /token.
+fn to_auth_code(s: &Server, cimd_url: &str, label: &str) -> (String, String) {
+    let (verifier, challenge) = pkce();
+    let r = s.get(&authorize_query(cimd_url, &challenge, ""));
+    let attesa = location(&r).unwrap(/* t */);
+    let mut page = s.get(&attesa);
+    let code = code_of(&body(&mut page));
+    bin_ok(
+        &s.root,
+        &["oauth", "approve", &code, "--label", label, "--yes"],
+    );
+    let r = s.get(&attesa);
+    let auth_code = location(&r)
+        .unwrap_or_default()
+        .split("code=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .unwrap_or_default()
+        .to_string();
+    assert!(auth_code.starts_with("eng_code_"), "{auth_code}");
+    (verifier, auth_code)
+}
+
+fn token_post(s: &Server, form: Vec<(&str, &str)>) -> ureq::http::Response<ureq::Body> {
+    still()
+        .post(&format!("http://{addr}/token", addr = s.addr))
+        .header("Host", host_of(&s.public))
+        .send_form(form)
+        .unwrap(/* t */)
+}
+
+#[test]
+fn the_token_endpoint_binds_the_code_to_its_client_and_redirect() {
+    // OAuth 2.1 § 4.1.3: the code answers only to the client and the
+    // redirect_uri it was issued for — PKCE is a second lock, not the only one
+    let (cimd_url, _cimd) = cimd_server();
+    let s = Server::start(|cfg| cfg.allow_loopback_cimd = true);
+
+    let (verifier, auth_code) = to_auth_code(&s, &cimd_url, "uno");
+    let mut r = token_post(
+        &s,
+        vec![
+            ("grant_type", "authorization_code"),
+            ("code", auth_code.as_str()),
+            ("client_id", "https://altro.example/client.json"),
+            (
+                "redirect_uri",
+                "https://chatgpt.com/connector_platform_oauth_redirect",
+            ),
+            ("code_verifier", verifier.as_str()),
+        ],
+    );
+    assert_eq!(r.status().as_u16(), 400, "another client's code");
+    assert_eq!(json_of(&mut r)["error"], "invalid_grant");
+
+    let (verifier, auth_code) = to_auth_code(&s, &cimd_url, "due");
+    let mut r = token_post(
+        &s,
+        vec![
+            ("grant_type", "authorization_code"),
+            ("code", auth_code.as_str()),
+            ("client_id", cimd_url.as_str()),
+            ("redirect_uri", "https://chatgpt.com/altro_redirect"),
+            ("code_verifier", verifier.as_str()),
+        ],
+    );
+    assert_eq!(r.status().as_u16(), 400, "another redirect_uri");
+    assert_eq!(json_of(&mut r)["error"], "invalid_grant");
+}
+
+/// A pending request on an in-process server: its approval code.
+fn pending_code(s: &Server, cimd_url: &str) -> String {
+    let (_v, challenge) = pkce();
+    let r = s.get(&authorize_query(cimd_url, &challenge, ""));
+    let attesa = location(&r).unwrap(/* t */);
+    let mut page = s.get(&attesa);
+    code_of(&body(&mut page))
+}
+
+#[test]
+fn the_interactive_approval_answers_to_one_line() {
+    // without --yes the CLI asks [s/N]: a human types `s` and Enter, and
+    // the terminal stays open — the answer is a LINE, not the whole stdin
+    use std::io::Write as _;
+    let (cimd_url, _cimd) = cimd_server();
+    let s = Server::start(|cfg| cfg.allow_loopback_cimd = true);
+    let code = pending_code(&s, &cimd_url);
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .arg("--root")
+        .arg(&s.root)
+        .args(["oauth", "approve", &code, "--label", "umano"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap(/* t */);
+    let mut stdin = child.stdin.take().unwrap(/* t */);
+    stdin.write_all(b"s\n").unwrap(/* t */);
+    stdin.flush().unwrap(/* t */);
+    // the pipe stays OPEN, like a terminal
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap(/* t */) {
+            break Some(st);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    if status.is_none() {
+        let _ = child.kill();
+        panic!("`oauth approve` waits for the end of stdin instead of the answer line");
+    }
+    drop(stdin);
+    assert!(status.is_some_and(|st| st.success()));
+    let grants = s.state.store.grants().unwrap(/* t */);
+    assert!(grants.iter().any(|g| g.label == "umano"), "approved");
+}
+
+#[test]
+fn approving_with_a_cell_the_server_does_not_offer_is_refused() {
+    // `--cells` only narrows: a name outside the offer is a typo, and a
+    // grant with NO cell would be a useless connection that looks approved
+    let (cimd_url, _cimd) = cimd_server();
+    let s = Server::start(|cfg| cfg.allow_loopback_cimd = true);
+    let code = pending_code(&s, &cimd_url);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .arg("--root")
+        .arg(&s.root)
+        .args([
+            "oauth", "approve", &code, "--label", "x", "--cells", "famigila", "--yes",
+        ])
+        .output()
+        .unwrap(/* t */);
+    assert!(!out.status.success(), "a cell outside the offer");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("famigila"),
+        "the error names the cell: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // the request is still there to decide
+    bin_ok(
+        &s.root,
+        &["oauth", "approve", &code, "--label", "x", "--yes"],
+    );
+}
+
+#[test]
+fn a_bracketed_ipv6_loopback_host_is_a_loopback_host() {
+    // `Host: [::1]:port` is what a client on ::1 sends: the fence used to
+    // cut at the first `:` and refuse it
+    let s = Server::start(|_| {});
+    let r = still()
+        .get(&format!(
+            "http://{addr}/.well-known/oauth-protected-resource",
+            addr = s.addr
+        ))
+        .header("Host", format!("[::1]:{}", s.addr.port()))
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 200);
+}
+
+#[test]
+fn the_approval_code_is_forgiving_about_case_and_dash() {
+    // the human reads XXXX-XXXX off a page and types it: lowercase and a
+    // missing dash are the same code
+    let (cimd_url, _cimd) = cimd_server();
+    let s = Server::start(|cfg| cfg.allow_loopback_cimd = true);
+    let code = pending_code(&s, &cimd_url);
+    let typed = code.replace('-', "").to_ascii_lowercase();
+    bin_ok(
+        &s.root,
+        &["oauth", "approve", &typed, "--label", "minuscolo", "--yes"],
+    );
+    let code = pending_code(&s, &cimd_url);
+    bin_ok(&s.root, &["oauth", "deny", &code.to_ascii_lowercase()]);
+}
+
+#[test]
+fn a_revoked_label_can_be_approved_again_and_a_live_one_cannot() {
+    // «revoca e ricollegamento» (docs/http.md): after `oauth revoke chatgpt`
+    // the human reconnects and approves with the SAME label — the label is
+    // unique among LIVE grants, not forever (verifica v0.5.2: UNIQUE on the
+    // whole table made the reconnection fail with a SQL error)
+    let (cimd_url, _cimd) = cimd_server();
+    let s = Server::start(|cfg| cfg.allow_loopback_cimd = true);
+    let code = pending_code(&s, &cimd_url);
+    bin_ok(
+        &s.root,
+        &["oauth", "approve", &code, "--label", "chatgpt", "--yes"],
+    );
+
+    // a second connection under a label that is alive: a clear refusal
+    let code = pending_code(&s, &cimd_url);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .arg("--root")
+        .arg(&s.root)
+        .args(["oauth", "approve", &code, "--label", "chatgpt", "--yes"])
+        .output()
+        .unwrap(/* t */);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("chatgpt") && !err.contains("UNIQUE"), "{err}");
+
+    // revoke, then the same label again: fine
+    bin_ok(&s.root, &["oauth", "revoke", "chatgpt"]);
+    bin_ok(
+        &s.root,
+        &["oauth", "approve", &code, "--label", "chatgpt", "--yes"],
+    );
+    let live: Vec<_> = s
+        .state
+        .store
+        .grants()
+        .unwrap(/* t */)
+        .into_iter()
+        .filter(|g| g.label == "chatgpt" && g.revoked_at.is_none())
+        .collect();
+    assert_eq!(live.len(), 1, "one live grant under the label");
+    // and `revoke chatgpt` now hits the LIVE one, not the old revoked one
+    bin_ok(&s.root, &["oauth", "revoke", "chatgpt"]);
+    assert!(
+        s.state
+            .store
+            .grants()
+            .unwrap(/* t */)
+            .iter()
+            .all(|g| g.revoked_at.is_some()),
+        "both revoked"
+    );
 }
