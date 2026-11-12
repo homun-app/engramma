@@ -689,6 +689,22 @@ impl Cell {
                 .write_lock
                 .lock()
                 .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+            // the reviewer's window (write: auto) is deliberately
+            // unguarded — a slow model must not freeze the cell — so the
+            // duplicate check runs AGAIN here, under the lock, right
+            // before the write: whatever slipped past the first check
+            // while a review was running is caught now (found by the
+            // hand-proof session of the v0.5 REPORT)
+            if let Some(existing) = self.duplicate_of(&note)? {
+                return Ok(ProposalOutcome {
+                    status: ProposalStatus::Duplicate,
+                    id: None,
+                    existing: Some(existing),
+                    possible_duplicates: possible,
+                    decided_by: None,
+                    decision_reason: None,
+                });
+            }
             let mut inner = self.lock()?;
             super::execute_op(&mut inner, OpKind::Propose, Some(note.id), actor, payload)?;
         }
@@ -729,6 +745,31 @@ impl Cell {
             decided_by: None,
             decision_reason: None,
         })
+    }
+
+    /// The normalized-duplicate check: `Some(existing)` when the text is
+    /// already among the ACTIVE notes or the QUEUE.
+    fn duplicate_of(&self, note: &Note) -> Result<Option<Ulid>, CellError> {
+        let inner = self.lock()?;
+        let key = dup_key(note.title.as_deref(), &note.body);
+        let mut stmt = inner.conn.prepare(
+            "SELECT id, title, body FROM notes WHERE status = 'active'
+             UNION ALL
+             SELECT n.id, n.title, n.body FROM notes n
+             JOIN proposals p ON p.note_id = n.id
+             WHERE p.state IN ('pending', 'reverted')",
+        )?;
+        let rows: Vec<(String, Option<String>, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .flatten()
+            .collect();
+        drop(stmt);
+        for (id, title, body) in rows {
+            if dup_key(title.as_deref(), &body) == key {
+                return Ok(Ulid::from_string(&id).ok());
+            }
+        }
+        Ok(None)
     }
 
     /// The decisions an actor (a reviewer) took in the last hour — the

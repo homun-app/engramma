@@ -165,6 +165,7 @@ Il trait `CellStore` isola SQL, FTS e vettori: un'implementazione SQLite oggi, T
   - promosse ad `active` solo con `confirm(note_id, actor)`, scritto nel registro.
 - **«Perché lo so?»:** ogni risultato porta la sua `source`. L'applicazione la trasforma in un collegamento, per esempio la conversazione di Homun.
 - **Fatti che cambiano.** Una nota che sostituisce un'altra (`supersedes`) le mette `valid_to` e la marca `superseded`. Restano nello storico e rispondono alle domande «com'era prima».
+- **Le proposte (v0.5).** Accanto alla quarantena dei contenuti `external` c'è la **coda delle proposte**: una nota che un assistente propone nasce in quarantena — la ricerca non la vede, il grafo non la semina — con i suoi metadati (chi propone, client dichiarato, modo `new`/`supersede`, motivazione). Le due cose sono distinte: `external` è quarantena di *contenuto* (terze parti), la coda è quarantena di *autore* (un modello). Se ne decide in § 8.5: politica per cella, revisore automatico, decisioni applicate nell'operazione che le registra, annullamento che non riscrive mai la storia.
 
 ## 6. La ricerca mista
 
@@ -275,8 +276,12 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 - **Errori:** tipizzati, mai un `panic` attraverso un confine FFI (napi-rs li trasforma in eccezioni JS).
 
 ### 8.3 Server MCP
-- **Strumenti** (in sola lettura nella v0.1): `memory_search`, `memory_get`, `memory_neighbors`, `memory_tags`, `memory_timeline`. Più avanti `memory_propose`, che **scrive solo in quarantena**.
-- **Ambiti:** il server si avvia con l'elenco delle celle esposte (`engramma mcp --cells famiglia,preferenze`). In HTTP si usano token per ambito. Ogni lettura finisce nel registro di audit della cella.
+- **Strumenti di lettura** (dalla v0.1, tutti con `readOnlyHint: true`): `memory_search`, `memory_get`, `memory_neighbors`, `memory_tags`, `memory_timeline`.
+- **Scrittura (v0.5):** con `engramma mcp --cells a,b --write a --actor claude-desktop` il server espone **un solo** strumento in più, `memory_propose` (`readOnlyHint: false`, `destructiveHint: false`, `openWorldHint: false`), che **propone** un fatto — la nota nasce in quarantena, nella coda. `--write` è un sottoinsieme di `--cells` e richiede `--actor`: l'identità viene dalla configurazione, **mai** dal `clientInfo` dichiarato (che viaggia solo come metadato della proposta); le proposte firmano `mcp:<actor>`. **Nessuno strumento** conferma, scarta, cancella, purga o cambia la politica: quelle restano superfici umane (CLI, pagina `review`, modulo del client). Un test fissa la lista esatta degli strumenti, con e senza `--write`.
+- **Le `instructions` del server** dicono all'assistente l'etichetta: proporre solo fatti stabili che l'utente ha detto o confermato, **chiedere prima**, mai proporre contenuti letti dal web, correggere con `supersedes`. È cortesia, non sicurezza: il confine vero è la coda, i limiti del revisore e il revert.
+- **Elicitation (politica `confirm`).** Il client che dichiara la capacità riceve un **modulo** con il testo modificabile e i tasti accetta/rifiuta: accetta → `decide(accept)` con attore `user@mcp:<actor>` (il testo editato diventa *accetto con modifica*), rifiuta → `reject`, annulla o silenzio → la proposta resta in coda. Le due forme del protocollo, come le offre rmcp 3.8: **richiesta dal server** (`elicitation/create`, fino alla 2025-11-25) e **`InputRequiredResult`** col ritento del client (2026-07-28, flusso *discover*: la proposta è già in coda quando il tool risponde `input_required`; il `requestState` è monouso). Un client senza elicitation riceve `pending` e l'indirizzo dove decidere. La **modalità URL** — aprire la pagina di revisione passando un token nell'URL al client — NON è nella v0.5: un token in un URL dato a un modello va pensato a parte.
+- **Ambiti:** il server si avvia con l'elenco delle celle esposte (`engramma mcp --cells famiglia,preferenze`). In HTTP si usano token per ambito. Ogni lettura finisce nel registro di audit della cella. Gli errori non sono un oracolo: una cella non esposta e una cella non scrivibile danno risposte che non rivelano altro.
+- **Il confine dichiarato:** un agente che ha una shell con l'utente del sistema (per esempio Claude Code) può lanciare `engramma proposals accept`. **Chi ha la tua shell è te** — è fuori dal modello delle minacce, e non facciamo finta del contrario.
 
 ### 8.4 Homun (v0.4)
 - **Collegamento in-process:** il daemon carica il modulo `napi-rs` — `crates/engramma-node`, **N-API** (stabile tra versioni di Node ed Electron: il `.node` non si ricompila a ogni aggiornamento). Il contratto JS (`Engine`, `Cell`) è in `docs/node.md`: ogni metodo che tocca disco o modello è asincrono sul pool di libuv, gli errori sono `Error` con `code` stabile e senza contenuti di note (l'oracolo chiuso vale anche per `get`: una nota in quarantena risponde `null`). Il modello sta nel demone, una volta (la RAM misurata sta nel § 7); la ricerca su più celle fonde le classifiche con RRF k=60, dichiarata approssimata. Dal v0.4.4 le allocazioni Rust del modulo passano per **mimalloc** (§ 7): Node ed Electron restano col loro allocatore.
@@ -292,6 +297,40 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 - **Quarantena:** ciò che il bot ricava in un turno contaminato si scrive come `external` — nasce in quarantena e la ricerca non la vede finché qualcuno non la conferma.
 - **Oblio:** `purge` non mente — se il WAL o una vista markdown trattengono ancora byte, la risposta lo dice (`pending`) e il chiamante finisce il lavoro.
 - **La sezione Memoria di Homun** è un'interfaccia sul motore: elenco, ricerca, grafo, «perché lo so?» (l'explain, peso del grafo compreso), conferma della quarantena, storico.
+
+## 8.5 Proposte, revisori, storico e rollback (v0.5)
+
+Claude, ChatGPT e Cursor leggono Engramma via MCP; la v0.5 fa sì che un assistente possa **proporre** un fatto («vuoi salvarlo su Engramma?»), che un modello di fiducia possa **decidere al posto dell'utente** se lui lo configura, e che ogni decisione sia **annullabile**.
+
+### Il modello delle minacce
+
+1. **Avvelenamento della memoria.** Un assistente legge una pagina ostile e «propone un fatto». Se quel fato diventasse attivo, Homun e gli altri lo leggerebbero come vero. Per questo ogni proposta nasce **in quarantena**, e la ricerca non la vede.
+2. **Chi propone non conferma.** Nessuno strumento MCP conferma, scarta o cancella. Si decide da superfici umane (CLI, pagina locale `review`, modulo di elicitation) o da un revisore automatico che l'**utente** ha configurato.
+3. **Il revisore automatico può essere ingannato** dal testo della proposta. Quindi: decide dentro limiti fissati dalla politica; per ogni errore o dubbio **fallisce in sicurezza** (la proposta va all'umano); ogni decisione resta nello storico ed è **annullabile**, anche in blocco.
+4. **Il confine dichiarato:** un agente con una shell dell'utente può lanciare la CLI. Chi ha la tua shell è te: fuori dal modello delle minacce.
+5. **Il testo delle note è ostile per la pagina web.** Ogni testo è escapato; il token, l'host e l'origine si controllano; la pagina non interpreta il markdown (i collegamenti restano testo).
+
+### La politica per cella
+
+Un'**operazione** del registro (`set_policy`), così lo storico dice chi ha permesso cosa, e quando. Si legge con `engramma policy show <cella>` e si cambia **solo** dalla CLI (`engramma policy set <cella> write=… reviewer=… …`): mai dal web, mai da MCP. `write: off` è il predefinito — una cella che nessuno ha aperto resta chiusa, su ogni superficie.
+
+- **`write`:** `off` | `propose` (tutto in coda) | `confirm` (modulo del client se lo supporta, altrimenti coda) | `auto` (decide il revisore).
+- **I limiti di `auto`:** `reviewer` (nome di uno configurato), `min_confidence` (0,8 predefinito: sotto, la decisione va all'umano), `kinds` (tipi di nota ammessi), `allow_supersede` (`none` predefinito | `inferred` | `any`), `max_auto_per_hour` (**l'interruttore**, 20 predefinito: oltre il tetto ogni proposta va all'umano e la CLI lo mostra). **Mai in automatico:** le proposte `confidence: external` e quelle su note purgate o in lapide.
+
+### I revisori
+
+Si configurano nella radice dei dati, `reviewers.yaml` (saphyr): il file contiene il **nome della variabile d'ambiente** della chiave, mai la chiave — una `api_key` scritta nel file non parsa affatto. Due tipi: **`command`** (programma esterno, argv fisso, niente shell: richiesta JSON su stdin, risposta su stdout, tempo massimo) e **`openai`** (endpoint compatibile `/v1/chat/completions` con uscita a schema JSON: OpenAI, llama-server, Ollama e chiunque parli quell'interfaccia). Il contratto: in ingresso la proposta (testo, titolo, tipo, tag, confidenza, modo, testo del bersaglio, motivo), fino a 5 note simili, il nome della cella, un riassunto della politica e la versione del prompt — tutto il personale fra delimitatori `<<<BEGIN/END …>>>`; in uscita `{decision: accept|reject|escalate, reason ≤ 500, confidence 0..1}`. **Lettura severa:** qualunque altra cosa vale `escalate`. Solo un fallimento di trasporto (timeout, crash, risposta illeggibile) marca la proposta «revisione automatica fallita» — ritentabile con `engramma proposals review`, che non tocca ciò che il revisore ha passato all'umano di proposito.
+
+Il **prompt** sta nel repo (`prompt-v1.md`, `include_str!`), ha una versione, e il suo blake3 entra in ogni decisione: lo storico può dire *sotto quale prompt* un modello ha deciso. Il prompt dichiara che i contenuti sono dati e non istruzioni — e che questo **riduce** il rischio ma non lo elimina: il resto lo fanno i limiti, l'interruttore e il revert.
+
+### Le due proprietà del revert
+
+L'annullamento (`revert_decision`) è il `git revert` del registro: una **nuova operazione** che riporta la proposta in coda; la storia non si riscrive mai.
+
+- **Mai sopra una correzione umana.** Se la nota o il bersaglio hanno operazioni successive alla decisione, il revert si rifiuta con `CONFLICT` e le nomina. Niente `--force` in questa fase.
+- **Il purgato non torna.** Se il contenuto è stato purgato, il revert lo dice (`purged`): l'op d'audit resta, il contenuto no.
+
+Le decisioni dei revisori firmano `reviewer:<nome>`: l'annullamento in blocco (`engramma revert --by reviewer:x [--since …] [--until …]`, con anteprima e conferma) è un filtro, niente di più. Un difetto trovato dai property test mentre li scrivevamo: anche i `revert_decision` della nota purgata vanno **censurati** (non dimenticati) dalla purge, perché il revert riapre un bersaglio — il rigioco deve riaprirlo allo stesso modo, bump di versione compresi.
 
 ## 9. Server e cluster (architettura, non costruita prima della v0.6)
 
@@ -355,10 +394,13 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 | v0.4.4 | Consolidamento: profili di build (`line-tables-only`), mimalloc nei due artefatti (§ 7), Linux arm64 provato in Docker (`scripts/linux.sh`), LongMemEval come numero esterno (§ 11), DESIGN alla verità | v0.4.3 | **fatta** (`fase-v0.4.4`) |
 | v0.4.5 | Il peso della fusione e il picco della RAM: metriche LongMemEval ufficiali (ndcg di sessione), α ritarato su due banchi e confermato su domande tenute da parte (0,5, § 6.3), lotti di embedding con tetto di token + ordinamento per lunghezza + pool fisso (§ 7), allocatore per piattaforma, cache NNEF provata e scartata | v0.4.4 | **fatta** (`fase-v0.4.5`) |
 | v0.4.6 | I lotti di embedding, davvero: il riempimento BatchLongest del tokenizer tolto (la v0.4.5 lo riempiva al più lungo: l'ordinamento era morto e una nota corta pagava la più lunga), offset dei lotti a somma prefissa, predefiniti budget 4096 × 1 lavoratore seguendo la regola della v0.4.5, griglia e banco rimisurati (§ 7); **v0.4.6.1** (correzione di verifica): budget predefinito 512 — picco 878 MB, 100 note/s a 10k | v0.4.5 | **fatta** (`fase-v0.4.6`, `fase-v0.4.6.1`) |
-| v0.5 | Identità, abbinamento, sincronizzazione cifrata del registro tra pari, permessi per cella, conflitti. **Opzione sul tavolo dalla v0.4.5:** l'embedding in un processo separato (le soglie RAM di riposo del § 7 non sono state raggiunte: la memoria liberata resta residente con entrambi gli allocatori su macOS) | v0.4 | da fare |
-| v0.6 | `engramma serve`: API, autenticazione, molte celle | v0.5 | da fare |
-| v0.7 | Cluster: posizionamento Raft, router, replica multi-Raft, spostamento celle, backup su storage a oggetti | v0.6 | da fare |
+| v0.5 | Scrivere da altri assistenti: proposte in quarantena con decisioni e rollback, politiche per cella e revisore automatico (§ 8.5), MCP in scrittura con elicitation (§ 8.3), CLI della coda, pagina locale di revisione, guardia sugli schemi più nuovi | v0.4.6 | **fatta** (`fase-v0.5`) |
+| v0.6 | Identità, abbinamento, sincronizzazione cifrata del registro tra pari, permessi per cella, conflitti. **Opzione sul tavolo dalla v0.4.5:** l'embedding in un processo separato (le soglie RAM di riposo del § 7 non sono state raggiunte: la memoria liberata resta residente con entrambi gli allocatori su macOS) | v0.5 | da fare |
+| v0.7 | `engramma serve`: API, autenticazione, molte celle | v0.6 | da fare |
+| v0.8 | Cluster: posizionamento Raft, router, replica multi-Raft, spostamento celle, backup su storage a oggetti | v0.7 | da fare |
 | poi | Python, Swift, Kotlin, WASM; MLS per i gruppi; messaggi A2A sul canale | — | — |
+
+**Candidata per una v0.5.x (da decidere con l'utente, nessuna data):** MCP su HTTP con OAuth 2.1 — serve per ChatGPT, che non si collega a server locali — e la **modalità URL** dell'elicitation (un token nell'URL dato al client: va progettata, non sommata).
 
 ## 13. v0.1 nel dettaglio (sarà il primo prompt per GLM)
 

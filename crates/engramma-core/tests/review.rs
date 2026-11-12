@@ -829,3 +829,75 @@ fn the_prompt_travels_with_the_request_and_the_delimiters_hold() {
     assert!(raw.contains("BEGIN PROPOSAL TEXT"), "delimited: {raw}");
     assert!(raw.contains("END PROPOSAL TEXT"), "delimited: {raw}");
 }
+
+/// The reviewer runs between the duplicate check and the write, outside
+/// every lock (a slow model must not freeze the cell): two proposals of
+/// the same text could both pass the check and both land. The write is
+/// guarded by a RE-CHECK under the lock — the second one answers
+/// `duplicate` (found by the hand-proof session of the v0.5 REPORT).
+#[test]
+fn a_duplicate_cannot_slip_through_the_review_window() {
+    let (d, cell) = cell();
+    auto_policy(&cell, json!({}));
+    // a reviewer that accepts, but slowly
+    let rev = reviewers_yaml(&command_yaml(
+        &script_reviewer(
+            d.path(),
+            "slow-accept",
+            "sleep 1\necho '{\"decision\":\"accept\",\"reason\":\"ok\",\"confidence\":0.9}'",
+        ),
+        30,
+    ));
+    let text = "Fabio colleziona sassi del Balteo.";
+    let first = {
+        let cell2 = cell.clone();
+        let rev2 = rev.clone();
+        std::thread::spawn(move || {
+            cell2.propose(
+                &ProposalInput {
+                    note: note(text),
+                    mode: ProposalMode::New,
+                    client: None,
+                    reason: None,
+                },
+                "mcp:claude",
+                &ProposeContext {
+                    embedder: None,
+                    reviewers: Some(&rev2),
+                },
+            )
+        })
+    };
+    // the first proposal is now parked inside its slow review; the second
+    // one passes the first check (nothing is written yet) and must be
+    // caught by the re-check at the write
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let second = cell
+        .propose(
+            &ProposalInput {
+                note: note(text),
+                mode: ProposalMode::New,
+                client: None,
+                reason: None,
+            },
+            "mcp:claude",
+            &ctx(&rev),
+        )
+        .unwrap(/* t */);
+    let first = first.join().unwrap(/* t */).unwrap(/* t */);
+    // exactly one copy of the fact is in the memory
+    let queue: Vec<_> = cell
+        .proposals(&ProposalsFilter::default())
+        .unwrap(/* t */)
+        .into_iter()
+        .filter(|r| r.note.body == text)
+        .collect();
+    assert_eq!(queue.len(), 1, "one copy, not two");
+    let one_is_dup = matches!(first.status, ProposalStatus::Duplicate)
+        || matches!(second.status, ProposalStatus::Duplicate);
+    assert!(
+        one_is_dup,
+        "the loser is told: {:?} / {:?}",
+        first.status, second.status
+    );
+}
