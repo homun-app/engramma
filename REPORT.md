@@ -4886,3 +4886,54 @@ correzione resta una copia sola e il perdente riceve `duplicate`.
   volume — rimosso — e i tre artefatti; `~/.cache/cargo-target` da 1,2G
   mai toccato).
 - **Tag:** `fase-v0.5` annotato; temporanei cancellati; nessun push.
+
+# Verifica v0.5 (2026-11-12, revisore)
+
+Esito: **passata**, con tre correzioni piccole fatte in verifica (un commit
+ciascuna, test rosso prima):
+
+- `bfdb1f5` — **il modulo di conferma arrivava vuoto.** Il campo `text`
+  dell'elicitation non aveva `default`: Claude Code (o qualunque client)
+  mostrava un campo obbligatorio vuoto e l'utente doveva riscrivere la
+  proposta. Ora è precompilato col testo proposto. In più, un'accettazione a
+  testo invariato veniva registrata come «con modifica»: ora è
+  un'accettazione semplice. Trovato con una sessione JSON-RPC a mano;
+  i test vecchi passavano perché rispondevano sempre con un testo scelto
+  da loro.
+- `da0d293` — **`strict` fuori posto nella chiamata `openai`.** Stava dentro
+  lo schema JSON; le structured outputs lo vogliono in
+  `response_format.json_schema`, accanto a `name` e `schema`. Il guasto
+  restava sicuro (risposta illeggibile = in coda), ma l'uscita non era
+  garantita conforme.
+- `c5e009e` — **tornano i 16 semi storici** di
+  `props.proptest-regressions`, cancellati dal commit P4 senza dirlo.
+
+Controllato e a posto: fmt, clippy `-D warnings`, 307 test del workspace +
+3 di LongMemEval, `cargo deny`; lista esatta degli strumenti MCP con e
+senza `--write` e annotazioni; errori non-oracolo; `external` rifiutato
+dallo strumento; elicitation accetta / accetta con modifica / annulla;
+pagina di revisione a mano con curl (Host falso 403, senza cookie 401, POST
+senza Origin / Origin estraneo / CSRF falso 403, CSP e intestazioni,
+`<script>`, `onerror` e `javascript:` escapati, ascolto solo su
+127.0.0.1); il revisore fallisce sempre in sicurezza (nessun percorso
+d'errore porta ad `accept`).
+
+Precisazione: «il lockfile è invariato» del REPORT è impreciso. Nessuna
+crate nuova, ma `Cargo.lock` registra le dipendenze nuove fra crate già
+presenti (blake3, ring, serde e ureq per la CLI; ureq per il core; time per
+l'MCP).
+
+Note lasciate per dopo (non bloccanti):
+- l'interruttore conta le decisioni dell'ultima ora prima della revisione,
+  fuori dal lock: due processi MCP concorrenti possono superare il tetto di
+  qualche unità. Conta sia le accettazioni sia i rifiuti (più severo della
+  spec);
+- i token della pagina si confrontano con `==` e non a tempo costante
+  (solo loopback, rischio trascurabile);
+- il cookie `engramma_review` non dipende dalla porta: due `engramma
+  review` aperti insieme si sovrascrivono la sessione (basta rientrare
+  dall'indirizzo stampato).
+
+Build: `npm run build` rifatto dopo le correzioni; il `.node` è
+**identico bit per bit** (`c302c3ea…`): il codice toccato non arriva al
+modulo Node. `index.js` e `index.d.ts` invariati. `du -sh target`: 16G.
