@@ -573,10 +573,16 @@ const FREQUENT_TERM_MIN_DOCS: i64 = 1_000;
 /// alone almost never matches; the pairs carry the namesake signal the v0.1
 /// comment promised.
 fn or_match_expr(words: &[crate::text::QueryWord]) -> String {
+    let single = words.len() == 1;
     let mut alts: Vec<String> = words
         .iter()
-        .flat_map(|w| w.forms.iter())
-        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .flat_map(|w| {
+            w.forms.iter().map(|f| {
+                // the raw form carries its column filter; stems match anywhere
+                let raw = w.raw.as_ref() == Some(f);
+                crate::text::QueryWord::fragment(f, raw, single)
+            })
+        })
         .collect();
     if words.len() >= 2 {
         let primary: Vec<&str> = words.iter().map(|w| w.primary.as_str()).collect();
@@ -612,7 +618,7 @@ fn match_expr_for(
     qt: &crate::text::QueryTerms,
 ) -> Result<String, SearchError> {
     let total = visible_note_count(conn, false);
-    let df = doc_frequencies(conn, &qt.flat(), false)?;
+    let df = doc_frequencies(conn, &qt.flat(), &qt.fragments(), false)?;
     Ok(match_expr_with(qt, &df, total))
 }
 
@@ -644,6 +650,7 @@ pub(crate) fn visible_note_count(conn: &rusqlite::Connection, include_quarantine
 fn doc_frequencies(
     conn: &rusqlite::Connection,
     terms: &[String],
+    fragments: &[(String, String)],
     include_quarantined: bool,
 ) -> Result<HashMap<String, i64>, SearchError> {
     if terms.is_empty() {
@@ -682,9 +689,14 @@ fn doc_frequencies(
             let mut corrected = HashMap::with_capacity(df.len());
             for (term, d) in df {
                 let hidden_hits: i64 = if d > 0 {
-                    // quoted like the MATCH alternatives: a term is never an
-                    // FTS expression here
-                    let needle = format!("\"{}\"", term.replace('"', ""));
+                    // the SAME fragment the MATCH would use (a raw form
+                    // carries its column filter; a term is never an FTS
+                    // expression here)
+                    let needle = fragments
+                        .iter()
+                        .find(|(t, _)| t == &term)
+                        .map(|(_, frag)| frag.clone())
+                        .unwrap_or_else(|| format!("\"{}\"", term.replace('"', "")));
                     conn.query_row(
                         "SELECT COUNT(*) FROM notes n
                          CROSS JOIN notes_fts ON notes_fts.rowid = n.rowid
@@ -2343,7 +2355,12 @@ fn semantic_pipeline(
     let total_notes = visible_note_count(conn, q.filters.include_quarantined);
     // document frequencies once: the MATCH drops the ubiquitous terms and
     // the support labels discount text matches that rest on them alone
-    let df = doc_frequencies(conn, &terms.flat(), q.filters.include_quarantined)?;
+    let df = doc_frequencies(
+        conn,
+        &terms.flat(),
+        &terms.fragments(),
+        q.filters.include_quarantined,
+    )?;
     if !terms.is_empty() {
         let match_expr = match_expr_with(&terms, &df, total_notes);
         // v0.4.2 (P0.1): the window follows the asked `k`, floor 50 — no

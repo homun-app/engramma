@@ -117,11 +117,38 @@ pub struct QueryWord {
     /// question, one stem per language of the cell. They are ALTERNATIVES:
     /// the MATCH takes them as an OR.
     pub forms: Vec<String>,
+    /// The raw form, when this word carries one (uncertain question): it is
+    /// ALSO in `forms`, but it matches differently — see [`QueryWord::raw`].
+    pub raw: Option<String>,
     /// The canonical form — the stem in the question's language, or in the
     /// cell's most frequent language when the question was uncertain (the
     /// raw token when the cell stems nothing). The adjacent-pair phrases and
     /// the whole-question phrase are built on these.
     pub primary: String,
+}
+
+impl QueryWord {
+    /// The MATCH fragment of one form. A STEM is searched everywhere (the
+    /// raw `title` column holds unstemmed text, and a title token that IS
+    /// the stem is a fair match). The RAW form is searched in the STEMMED
+    /// columns — `body_norm` (which holds the raw tokens exactly when the
+    /// note had no language, the reason the raw form exists) and the tags —
+    /// EXCEPT when it is the whole question: titles are always unstemmed
+    /// and a raw word of a LONGER question would match every note titled
+    /// with it, drowning the graph answers under title-weight hits (found
+    /// on the golden semantic bank: «dove lavora la sorella di Giulia»).
+    /// A ONE-WORD question, though, is a name lookup, and the title is
+    /// where a name lives («Luca» must rank «Luca Ferrari» first: found on
+    /// the short-question bank).
+    #[must_use]
+    pub fn fragment(form: &str, raw: bool, single_word_question: bool) -> String {
+        let q = form.replace('"', "");
+        if raw && !single_word_question {
+            format!("{{body_norm tags_text}} : \"{q}\"")
+        } else {
+            format!("\"{q}\"")
+        }
+    }
 }
 
 /// The terms of a question, word by word (v0.5.3, P0).
@@ -136,6 +163,23 @@ impl QueryTerms {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.words.is_empty()
+    }
+
+    /// Every form with the MATCH fragment it would use — the exact needle
+    /// the quarantined-document correction must repeat.
+    #[must_use]
+    pub fn fragments(&self) -> Vec<(String, String)> {
+        let single = self.words.len() == 1;
+        let mut out: Vec<(String, String)> = Vec::new();
+        for w in &self.words {
+            for f in &w.forms {
+                let raw = w.raw.as_ref() == Some(f);
+                if !out.iter().any(|(t, _)| t == f) {
+                    out.push((f.clone(), QueryWord::fragment(f, raw, single)));
+                }
+            }
+        }
+        out
     }
 
     /// Every form of every word, deduplicated, in insertion order — the list
@@ -217,12 +261,14 @@ pub fn query_terms(text: &str, lang: Option<Lang>, cell_langs: &[Lang]) -> Query
                 forms.push(f);
             }
         };
+        let mut raw: Option<String> = None;
         match detected {
             Some(l) => push(normalize(token, Some(l))),
             None => {
                 // the raw form: what the index holds when the note had no
                 // language of its own
                 push(token.to_string());
+                raw = Some(token.to_string());
                 for l in expand {
                     push(normalize(token, Some(*l)));
                 }
@@ -242,7 +288,11 @@ pub fn query_terms(text: &str, lang: Option<Lang>, cell_langs: &[Lang]) -> Query
         } else {
             forms[0].clone()
         };
-        words.push(QueryWord { forms, primary });
+        words.push(QueryWord {
+            forms,
+            raw,
+            primary,
+        });
     }
     QueryTerms { words }
 }
