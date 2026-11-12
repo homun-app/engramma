@@ -42,7 +42,7 @@ struct Server {
     token: String,
     port: u16,
     #[allow(dead_code)]
-    dir: tempfile::TempDir,
+    dir: Option<tempfile::TempDir>,
     root: std::path::PathBuf,
 }
 
@@ -67,21 +67,33 @@ fn start() -> Server {
     let dir = tempfile::tempdir().unwrap(/* t */);
     let root = dir.path().join("root");
     std::fs::create_dir_all(&root).unwrap(/* t */);
+    let mut s = start_at(&root, None);
+    s.dir = Some(dir);
+    s
+}
+
+/// A free loopback port (bound to 0, read, released — best effort).
+fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(/* t */);
+    l.local_addr().unwrap(/* t */).port()
+}
+
+/// Start `engramma review` on a prepared root, on this port (None: any).
+/// The caller owns the root's directory: here it only stays alive.
+fn start_at(root: &std::path::Path, port: Option<u16>) -> Server {
     let out = Command::new(env!("CARGO_BIN_EXE_engramma"))
         .arg("--root")
-        .arg(&root)
+        .arg(root)
         .args(["init"])
         .output()
         .unwrap(/* t */);
     assert!(out.status.success());
-    let mut child = Command::new(env!("CARGO_BIN_EXE_engramma"))
-        .arg("--root")
-        .arg(&root)
-        .args(["review"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap(/* t */);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_engramma"));
+    cmd.arg("--root").arg(root).args(["review"]);
+    if let Some(p) = port {
+        cmd.args(["--port", &p.to_string()]);
+    }
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap(/* t */);
     // the first line carries the address with the token
     let line = {
         let stdout = child.stdout.as_mut().unwrap(/* t */);
@@ -107,8 +119,8 @@ fn start() -> Server {
         url,
         token,
         port,
-        dir,
-        root,
+        dir: None,
+        root: root.to_path_buf(),
     }
 }
 
@@ -151,7 +163,7 @@ impl Server {
         assert_eq!(r.status().as_u16(), 303);
         Client {
             agent,
-            cookie: format!("engramma_review={}", self.token),
+            cookie: format!("engramma_review_{}={}", self.port, self.token),
             port: self.port,
         }
     }
@@ -226,8 +238,8 @@ fn the_address_is_loopback_and_the_token_gates_everything() {
         r.headers().get("set-cookie").and_then(|v| v.to_str().ok()),
         Some(
             format!(
-                "engramma_review={}; Path=/; HttpOnly; SameSite=Strict",
-                s.token
+                "engramma_review_{}={}; Path=/; HttpOnly; SameSite=Strict",
+                s.port, s.token
             )
             .as_str()
         )
@@ -277,6 +289,55 @@ fn the_session_token_is_compared_in_constant_time() {
 }
 
 #[test]
+fn two_review_servers_on_different_ports_never_share_the_cookie() {
+    // v0.5.2 (P0): the cookie's NAME carries the port, so the token of one
+    // `engramma review` never travels to another one open at the same time
+    // (nor to anything else on that host).
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap(/* t */);
+    let a = start_at(&root, Some(free_port()));
+    let b = start_at(&root, Some(free_port()));
+    assert_ne!(a.port, b.port);
+
+    // entering A sets a cookie named after A's port
+    let r = still()
+        .get(&format!("http://127.0.0.1:{}/entra?token={}", a.port, a.token))
+        .call()
+        .unwrap(/* t */);
+    let set = r
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        set.starts_with(&format!("engramma_review_{}=", a.port)),
+        "A's cookie is port-scoped: {set}"
+    );
+
+    // A's token under B's cookie name does not enter B: the two sessions
+    // are separate secrets on separate names
+    let r = still()
+        .get(&format!("http://127.0.0.1:{}/coda", b.port))
+        .header("Cookie", format!("engramma_review_{}={}", b.port, a.token))
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 401, "B does not know A's token");
+    // and the old, port-less name is simply ignored
+    let r = still()
+        .get(&format!("http://127.0.0.1:{}/coda", b.port))
+        .header("Cookie", format!("engramma_review={}", b.token))
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(
+        r.status().as_u16(),
+        401,
+        "the port-less name no longer exists"
+    );
+}
+
+#[test]
 fn a_lying_host_is_refused() {
     let s = start();
     let _client = s.client();
@@ -290,7 +351,7 @@ fn a_lying_host_is_refused() {
     );
     assert_eq!(status, 403, "the Host must be the loopback one");
     // with the cookie but the wrong host: still 403 (checked before the cookie)
-    let cookie = format!("engramma_review={}", s.token);
+    let cookie = format!("engramma_review_{}={}", s.port, s.token);
     let (status, _, _) = raw(
         s.port,
         &format!(

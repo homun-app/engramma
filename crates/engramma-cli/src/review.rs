@@ -65,6 +65,13 @@ fn csrf_of(review: &Review, form: &str) -> String {
         .to_string()
 }
 
+/// v0.5.2 (P0): the cookie's NAME carries the port. Two `engramma review`
+/// servers open together (or a leftover cookie in the browser) must never
+/// exchange their session tokens: each port gets its own name.
+fn cookie_name(port: u16) -> String {
+    format!("engramma_review_{port}")
+}
+
 /// v0.5.2 (P0): constant-time equality of two secrets — blake3 of both,
 /// then the fixed 256-bit digests compared. A plain `==` on the strings
 /// would leak the token's length and prefix byte by byte; everything born
@@ -166,7 +173,10 @@ impl Review {
         };
         let mine = cookies
             .split(';')
-            .filter_map(|c| c.trim().strip_prefix("engramma_review="))
+            .filter_map(|c| {
+                c.trim()
+                    .strip_prefix(&format!("{}=", cookie_name(self.port)))
+            })
             .next()
             .is_some_and(|t| same_secret(t, &self.token));
         if !mine {
@@ -231,7 +241,8 @@ async fn entra(State(review): State<Arc<Review>>, Query(q): Query<Q>) -> Respons
     r.headers_mut().append(
         axum::http::header::SET_COOKIE,
         HeaderValue::from_str(&format!(
-            "engramma_review={token}; Path=/; HttpOnly; SameSite=Strict"
+            "{}={token}; Path=/; HttpOnly; SameSite=Strict",
+            cookie_name(review.port)
         ))
         .unwrap_or(HeaderValue::from_static("")),
     );
