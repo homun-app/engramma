@@ -75,6 +75,7 @@ impl Server {
             write: vec![],
             allow_dcr: false,
             compat_chatgpt: false,
+            chatgpt_client_id: engramma_mcp::CHATGPT_CLIENT_ID.to_string(),
             allow_insecure_public_url: false,
             allow_loopback_cimd: false,
         };
@@ -275,6 +276,7 @@ fn the_config_refuses_what_the_cli_must_refuse() {
             write: vec![],
             allow_dcr: false,
             compat_chatgpt: false,
+            chatgpt_client_id: engramma_mcp::CHATGPT_CLIENT_ID.to_string(),
             allow_insecure_public_url: false,
             allow_loopback_cimd: false,
         };
@@ -288,6 +290,7 @@ fn the_config_refuses_what_the_cli_must_refuse() {
         write: vec![],
         allow_dcr: false,
         compat_chatgpt: false,
+        chatgpt_client_id: engramma_mcp::CHATGPT_CLIENT_ID.to_string(),
         allow_insecure_public_url: true,
         allow_loopback_cimd: false,
     };
@@ -301,6 +304,7 @@ fn the_config_refuses_what_the_cli_must_refuse() {
         write: vec!["b".into()],
         allow_dcr: false,
         compat_chatgpt: false,
+        chatgpt_client_id: engramma_mcp::CHATGPT_CLIENT_ID.to_string(),
         allow_insecure_public_url: false,
         allow_loopback_cimd: false,
     };
@@ -316,6 +320,7 @@ fn the_resource_never_carries_a_trailing_slash() {
         write: vec![],
         allow_dcr: false,
         compat_chatgpt: false,
+        chatgpt_client_id: engramma_mcp::CHATGPT_CLIENT_ID.to_string(),
         allow_insecure_public_url: false,
         allow_loopback_cimd: false,
     };
@@ -2177,4 +2182,298 @@ fn oauth_pending_lists_what_waits() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains(&code), "the waiting code is listed: {text}");
     assert!(text.contains("ChatGPT di prova"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// v0.5.3 (P2): the compatibility wrappers belong to the ChatGPT grant alone
+// ---------------------------------------------------------------------------
+
+/// A CIMD server on loopback serving a GIVEN document body, with `{URL}`
+/// replaced by the document's own address (a CIMD must claim itself).
+fn cimd_doc(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(/* t */);
+    let port = listener.local_addr().unwrap(/* t */).port();
+    let handle = std::thread::spawn(move || {
+        use std::io::Read as _;
+        use std::io::Write as _;
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let url = format!("http://127.0.0.1:{port}/client.json");
+            let body = body.replace("{URL}", &url);
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (format!("http://127.0.0.1:{port}/client.json"), handle)
+}
+
+/// The three real documents (fetched 2026-11-12, the tunnel test of
+/// v0.5.2.2): only `client_id` becomes the loopback URL of the test
+/// server, because a CIMD must claim its own address.
+const CHATGPT_CIMD: &str = r#"{"client_id":"{URL}","client_uri":"https://chatgpt.com/","redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"],"token_endpoint_auth_method":"private_key_jwt","token_endpoint_auth_methods_supported":["none","private_key_jwt"],"grant_types":["authorization_code","refresh_token","urn:ietf:params:oauth:grant-type:jwt-bearer"],"response_types":["code"],"client_name":"ChatGPT","token_endpoint_auth_signing_alg":"RS256","jwks_uri":"https://chatgpt.com/oauth/jwks.json"}"#;
+const CODEX_CIMD: &str = r#"{"client_id":"{URL}","client_uri":"https://chatgpt.com/","redirect_uris":["http://127.0.0.1/callback","http://localhost/callback"],"token_endpoint_auth_method":"none","client_name":"Codex"}"#;
+const CLAUDE_CIMD: &str = r#"{"client_id":"{URL}","client_uri":"https://claude.ai/","redirect_uris":["https://claude.ai/api/mcp/auth_callback"],"token_endpoint_auth_method":"none","client_name":"Claude"}"#;
+
+/// One grant for a CIMD client of `addr`'s server: authorize, approve in
+/// the store, mint the code at the waiting page, exchange it. Returns an
+/// access token.
+fn compat_flow_token(
+    state: &Arc<HttpState>,
+    addr: &SocketAddr,
+    client_id: &str,
+    redirect: &str,
+    label: &str,
+) -> String {
+    let (verifier, challenge) = pkce();
+    let q = format!(
+        "/authorize?response_type=code&client_id={cid}&redirect_uri={ru}&code_challenge={ch}&code_challenge_method=S256&scope=memory%3Aread&state=st",
+        cid = urlencode(client_id),
+        ru = urlencode(redirect),
+        ch = challenge,
+    );
+    let host = "memoria.example.net";
+    let r = still()
+        .get(&format!("http://{addr}{q}", addr = addr))
+        .header("Host", host)
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 303, "to the waiting page");
+    let attesa = location(&r).unwrap(/* t */);
+    let mut page = still()
+        .get(&format!("http://{addr}{attesa}", addr = addr))
+        .header("Host", host)
+        .call()
+        .unwrap(/* t */);
+    let html = body(&mut page);
+    let code = code_of(&html);
+    assert!(!code.is_empty(), "no approval code in {html}");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    state
+        .store
+        .request_approve(
+            &code,
+            label,
+            &state.cfg.cells.clone(),
+            &[engramma_mcp::oauth::store::SCOPE_READ.to_string()],
+            now,
+        )
+        .unwrap(/* t */)
+        .expect("approved");
+    let mut r = still()
+        .get(&format!("http://{addr}{attesa}", addr = addr))
+        .header("Host", host)
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 302);
+    let to = location(&r).unwrap(/* t */);
+    let auth_code = to
+        .split("code=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .unwrap_or_default()
+        .to_string();
+    let mut r = still()
+        .post(&format!("http://{addr}/token", addr = addr))
+        .header("Host", host)
+        .send_form(vec![
+            ("grant_type", "authorization_code"),
+            ("code", auth_code.as_str()),
+            ("client_id", client_id),
+            ("redirect_uri", redirect),
+            ("code_verifier", verifier.as_str()),
+        ])
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 200, "{}", body(&mut r));
+    json_of(&mut r)["access_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One JSON-RPC call over /mcp with a token (initialize first, session
+/// carried). Returns the parsed response of the LAST request.
+fn mcp_rpc(
+    addr: &SocketAddr,
+    token: &str,
+    method: &str,
+    params: &str,
+    id: i64,
+) -> serde_json::Value {
+    let host = "memoria.example.net";
+    let mut r = still()
+        .post(&format!("http://{addr}/mcp", addr = addr))
+        .header("Host", host)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
+        .header("Authorization", format!("Bearer {token}"))
+        .send(&br#"{"jsonrpc":"2.0","id":900,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#[..])
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 200, "{}", body(&mut r));
+    let session = r
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let mut req = still()
+        .post(&format!("http://{addr}/mcp", addr = addr))
+        .header("Host", host)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
+        .header("Authorization", format!("Bearer {token}"));
+    if let Some(sess) = &session {
+        req = req.header("Mcp-Session-Id", sess);
+    }
+    let call = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#);
+    let mut r = req.send(call.as_bytes()).unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 200, "{}", body(&mut r));
+    json_of(&mut r)
+}
+
+/// v0.5.3 (P2): with `--compat chatgpt`, the `search`/`fetch` wrappers
+/// exist ONLY for the grant whose client is ChatGPT's own CIMD. Codex and
+/// claude.ai (their real documents, loopback client_ids) list the normal
+/// tools, and calling `search` by name answers EXACTLY like a tool that
+/// does not exist — no oracle.
+#[test]
+fn compat_wrappers_belong_to_the_chatgpt_grant_alone() {
+    let (gpt_url, _g) = cimd_doc(CHATGPT_CIMD);
+    let (codex_url, _c) = cimd_doc(CODEX_CIMD);
+    let (claude_url, _l) = cimd_doc(CLAUDE_CIMD);
+    let keep = tempfile::tempdir().unwrap(/* t */);
+    let root = keep.path().join("root");
+    std::fs::create_dir_all(&root).unwrap(/* t */);
+    // the cell the server exposes (empty: the tool LIST is the test)
+    std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
+    std::fs::write(
+        root.join("cells/famiglia.sqlite"),
+        {
+            // a real (empty) cell: the server opens it at startup
+            let dir = tempfile::tempdir().unwrap(/* t */);
+            let c = engramma_core::Cell::create(&dir.path().join("x.sqlite"), "famiglia", "t")
+                .unwrap(/* t */);
+            drop(c);
+            std::fs::read(dir.path().join("x.sqlite")).unwrap(/* t */)
+        },
+    )
+    .unwrap(/* t */);
+    let cfg = HttpConfig {
+        bind: "127.0.0.1:0".parse().unwrap(/* t */),
+        public_url: "https://memoria.example.net".into(),
+        cells: vec!["famiglia".into()],
+        write: vec![],
+        allow_dcr: false,
+        compat_chatgpt: true,
+        chatgpt_client_id: gpt_url.clone(),
+        allow_insecure_public_url: false,
+        allow_loopback_cimd: true,
+    };
+    let state = Arc::new(HttpState::open_with_mcp(&root, cfg).unwrap(/* t */));
+    let addr = start_router(engramma_mcp::http::router(Arc::clone(&state)));
+
+    let gpt = compat_flow_token(
+        &state,
+        &addr,
+        &gpt_url,
+        "https://chatgpt.com/connector_platform_oauth_redirect",
+        "gpt",
+    );
+    let codex = compat_flow_token(
+        &state,
+        &addr,
+        &codex_url,
+        "http://127.0.0.1/callback",
+        "codex",
+    );
+    let claude = compat_flow_token(
+        &state,
+        &addr,
+        &claude_url,
+        "https://claude.ai/api/mcp/auth_callback",
+        "claude",
+    );
+
+    let tool_names = |token: &str| -> Vec<String> {
+        let doc = mcp_rpc(&addr, token, "tools/list", "{}", 1);
+        let mut names: Vec<String> = doc["result"]["tools"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+    // ChatGPT: the five read tools PLUS the wrappers
+    assert_eq!(
+        tool_names(&gpt),
+        vec![
+            "fetch",
+            "memory_get",
+            "memory_neighbors",
+            "memory_search",
+            "memory_tags",
+            "memory_timeline",
+            "search",
+        ]
+    );
+    // Codex and claude.ai: the normal tools, exactly
+    for (name, token) in [("codex", &codex), ("claude", &claude)] {
+        assert_eq!(
+            tool_names(token),
+            vec![
+                "memory_get",
+                "memory_neighbors",
+                "memory_search",
+                "memory_tags",
+                "memory_timeline",
+            ],
+            "{name} must not see the wrappers"
+        );
+    }
+
+    // calling `search` with claude's token answers EXACTLY like a tool
+    // that does not exist — same code, same message: no oracle
+    let via_wrapper = mcp_rpc(
+        &addr,
+        &claude,
+        "tools/call",
+        r#"{"name":"search","arguments":{"query":"x"}}"#,
+        2,
+    );
+    let via_unknown = mcp_rpc(
+        &addr,
+        &claude,
+        "tools/call",
+        r#"{"name":"strumento_che_non_esiste","arguments":{}}"#,
+        3,
+    );
+    let strip_id = |v: &serde_json::Value| -> serde_json::Value {
+        let mut c = v.clone();
+        if let Some(obj) = c.as_object_mut() {
+            obj.remove("id");
+        }
+        c
+    };
+    assert_eq!(
+        strip_id(&via_wrapper["error"]),
+        strip_id(&via_unknown["error"]),
+        "the wrapper refusal must be the unknown-tool answer byte for byte"
+    );
+    assert!(
+        via_wrapper["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m == "tool not found"),
+        "{via_wrapper:?}"
+    );
 }

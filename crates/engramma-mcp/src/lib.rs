@@ -64,7 +64,20 @@ pub struct MemoryServer {
     /// stdio meaning «every cell»: the gate always puts one in, and if it
     /// ever did not, the server must fail closed, not open.
     http: bool,
+    /// v0.5.3 (P2): the client the `--compat chatgpt` wrappers belong to
+    /// (see [`CHATGPT_CLIENT_ID`]); `None` means the wrappers do not exist
+    /// on this server.
+    chatgpt_client_id: Option<String>,
 }
+
+/// v0.5.3 (P2): the Client ID Metadata Document URL that means «this grant
+/// is ChatGPT» — the only client the fixed-schema `search`/`fetch` wrappers
+/// are exposed to. Codex speaks its own CIMD
+/// (`…/oauth/codex/client.json`) and the normal tools; claude.ai too. A
+/// configuration field, not a string in the code: the integration tests
+/// serve ChatGPT-shaped documents on loopback URLs and substitute this
+/// value.
+pub const CHATGPT_CLIENT_ID: &str = "https://chatgpt.com/oauth/client.json";
 
 /// The write side of the server (v0.5, P3; v0.5.2: shared across every
 /// HTTP request of the process).
@@ -102,6 +115,8 @@ pub struct RequestGrant {
     pub id: String,
     /// The label chosen at approval: proposals sign as `mcp:<label>`.
     pub label: String,
+    /// The client this grant was approved for (its client_id URL).
+    pub client_id: String,
     /// The cells this grant may see (already intersected with the
     /// process's `--cells`).
     pub cells: Vec<String>,
@@ -228,6 +243,12 @@ impl MemoryServer {
     /// the actor of every proposal is the GRANT's label (`mcp:<label>`),
     /// decided when you approve the connection.
     ///
+    /// `compat_client_id` (v0.5.3, P2) names the ONE client the
+    /// fixed-schema `search`/`fetch` wrappers belong to
+    /// ([`CHATGPT_CLIENT_ID`] in production, a loopback URL in the tests):
+    /// every other grant never sees them — not in `tools/list`, and a call
+    /// by name answers exactly like a tool that does not exist.
+    ///
     /// # Errors
     /// [`anyhow::Error`] when a cell cannot be opened or `write` names a
     /// cell that is not exposed.
@@ -235,15 +256,17 @@ impl MemoryServer {
         root: &Path,
         names: &[String],
         write: &[String],
-        compat_chatgpt: bool,
+        compat_client_id: Option<&str>,
     ) -> anyhow::Result<Self> {
         let mut server = Self::open_with_write(root, names, write, None)?;
         server.http = true;
+        server.chatgpt_client_id = compat_client_id.map(str::to_string);
         server.tool_router.add_route(propose_route());
-        if compat_chatgpt {
+        if compat_client_id.is_some() {
             // P6: the fixed-schema wrappers ChatGPT's deep research and
             // custom connectors call — nothing memory_search and
-            // memory_get cannot already do
+            // memory_get cannot already do. Registered once for the whole
+            // process; WHO may call them is decided per grant (P2).
             server.tool_router.add_route(search_route());
             server.tool_router.add_route(fetch_route());
         }
@@ -313,6 +336,7 @@ impl MemoryServer {
             embedder,
             write: None,
             http: false,
+            chatgpt_client_id: None,
         })
     }
 
@@ -345,6 +369,17 @@ impl MemoryServer {
             return false;
         };
         grant.may_propose() && write.cells.iter().any(|c| grant.cells.contains(c))
+    }
+
+    /// v0.5.3 (P2): whether the `--compat chatgpt` wrappers (`search`,
+    /// `fetch`) belong to THIS grant's client. Only ChatGPT's own CIMD
+    /// (`client_id` exactly the configured one) sees them: Codex and
+    /// claude.ai speak the normal tools, and a wrapper called by name by
+    /// anyone else answers like a tool that does not exist.
+    fn compat_visible(&self, grant: &RequestGrant) -> bool {
+        self.chatgpt_client_id
+            .as_deref()
+            .is_some_and(|want| want == grant.client_id)
     }
 
     fn cell(&self, name: &str) -> Result<&Cell, McpError> {
@@ -1488,10 +1523,16 @@ impl ServerHandler for MemoryServer {
             return Err(no_grant_error());
         }
         let mut tools = self.tool_router.list_all();
-        if let Some(grant) = &grant
-            && !self.propose_visible(grant)
-        {
-            tools.retain(|t| t.name != "memory_propose");
+        if let Some(grant) = &grant {
+            if !self.propose_visible(grant) {
+                tools.retain(|t| t.name != "memory_propose");
+            }
+            // v0.5.3 (P2): the ChatGPT wrappers ride the list of the
+            // ChatGPT grant alone — every other client's list says they do
+            // not exist
+            if !self.compat_visible(grant) {
+                tools.retain(|t| t.name != "search" && t.name != "fetch");
+            }
         }
         Ok(rmcp::model::ListToolsResult {
             result_type: Some(rmcp::model::ResultType::COMPLETE),
@@ -1525,6 +1566,13 @@ impl ServerHandler for MemoryServer {
         if let Some(g) = &grant {
             if request.name == "memory_propose" && !g.may_propose() {
                 return Err(insufficient_scope_error(g));
+            }
+            // v0.5.3 (P2): the wrappers called by name by any other client
+            // answer EXACTLY like a name the router does not carry — the
+            // same code, the same message, no oracle on their existence
+            // (this is rmcp's ToolRouter error verbatim)
+            if (request.name == "search" || request.name == "fetch") && !self.compat_visible(g) {
+                return Err(McpError::invalid_params("tool not found".to_string(), None));
             }
             let tool: &str = &request.name;
             if CELL_TOOLS.contains(&tool) {

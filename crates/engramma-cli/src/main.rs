@@ -1493,6 +1493,14 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "`--compat {spec}` non esiste (per ora solo `chatgpt`)"
                 )));
             }
+            // v0.5.3 (P2): the wrappers are a per-grant HTTP matter — over
+            // stdio there is no grant to bind them to, and no ChatGPT
+            // either: the flag was silently ignored before
+            if compat.is_some() && http.is_none() {
+                return Err(CliError::usage(
+                    "`--compat chatgpt` va con `--http`: su stdio non esiste il                      grant (il client ChatGPT) a cui legare gli strumenti di                      compatibilità",
+                ));
+            }
             if http.is_some() && actor.is_some() {
                 return Err(CliError::usage(
                     "`--actor` va con lo stdio: su HTTP l'attore nasce dal grant \
@@ -2240,6 +2248,7 @@ fn run_mcp_http(
         write,
         allow_dcr,
         compat_chatgpt,
+        chatgpt_client_id: engramma_mcp::CHATGPT_CLIENT_ID.to_string(),
         allow_insecure_public_url: false,
         allow_loopback_cimd: false,
     };

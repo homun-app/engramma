@@ -984,3 +984,24 @@ fn mcp_search_is_indistinguishable_with_hidden_notes() {
     // even SQLite's idf wobble cancels in the normalised answer)
     assert_eq!(hits, text_after, "the wire answer changed");
 }
+
+/// v0.5.3 (P2): `--compat chatgpt` without `--http` is a usage error —
+/// over stdio there is no grant to bind the wrappers to (and no ChatGPT
+/// either); it was silently ignored before.
+#[test]
+fn compat_chatgpt_over_stdio_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    cell_root(dir.path());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .arg("--root")
+        .arg(dir.path())
+        .args(["mcp", "--cells", "famiglia", "--compat", "chatgpt"])
+        .output()
+        .unwrap(/* t */);
+    assert!(
+        !out.status.success(),
+        "--compat chatgpt over stdio must fail, it did not"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--compat chatgpt` va con `--http"), "{err}");
+}

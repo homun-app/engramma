@@ -56,6 +56,11 @@ pub struct HttpConfig {
     pub allow_dcr: bool,
     /// The `search`/`fetch` wrappers for ChatGPT's connectors (P6).
     pub compat_chatgpt: bool,
+    /// v0.5.3 (P2): the client_id URL that means «this grant is ChatGPT»
+    /// — the one client the wrappers above are exposed to. The base value
+    /// is [`crate::CHATGPT_CLIENT_ID`]; the library's own tests substitute
+    /// a loopback URL (their CIMD documents must claim their own URL).
+    pub chatgpt_client_id: String,
     /// TEST HATCH: accept `http://127.0.0.1:<port>` as the public URL.
     /// Never set from the CLI.
     pub allow_insecure_public_url: bool,
@@ -186,9 +191,18 @@ impl HttpState {
     /// # Errors
     /// The store's errors, or a cell that cannot be opened.
     pub fn open_with_mcp(root: &std::path::Path, cfg: HttpConfig) -> anyhow::Result<Self> {
-        let compat = cfg.compat_chatgpt;
+        let compat = if cfg.compat_chatgpt {
+            Some(cfg.chatgpt_client_id.clone())
+        } else {
+            None
+        };
         let mut state = Self::open(root, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mcp = crate::MemoryServer::open_http(root, &state.cfg.cells, &state.cfg.write, compat)?;
+        let mcp = crate::MemoryServer::open_http(
+            root,
+            &state.cfg.cells,
+            &state.cfg.write,
+            compat.as_deref(),
+        )?;
         state.mcp = Some(mcp);
         Ok(state)
     }
@@ -1250,6 +1264,7 @@ async fn mcp_gate(
     req.extensions_mut().insert(crate::RequestGrant {
         id: grant.id.clone(),
         label: grant.label.clone(),
+        client_id: grant.client_id.clone(),
         cells: grant.cells.clone(),
         scopes: token_scopes.clone(),
     });
