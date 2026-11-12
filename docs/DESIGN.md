@@ -280,8 +280,9 @@ for op in cell.changes_since(seq)? { .. }                  // flusso delle modif
 - **Scrittura (v0.5):** con `engramma mcp --cells a,b --write a --actor claude-desktop` il server espone **un solo** strumento in più, `memory_propose` (`readOnlyHint: false`, `destructiveHint: false`, `openWorldHint: false`), che **propone** un fatto — la nota nasce in quarantena, nella coda. `--write` è un sottoinsieme di `--cells` e richiede `--actor`: l'identità viene dalla configurazione, **mai** dal `clientInfo` dichiarato (che viaggia solo come metadato della proposta); le proposte firmano `mcp:<actor>`. **Nessuno strumento** conferma, scarta, cancella, purga o cambia la politica: quelle restano superfici umane (CLI, pagina `review`, modulo del client). Un test fissa la lista esatta degli strumenti, con e senza `--write`.
 - **Le `instructions` del server** dicono all'assistente l'etichetta: proporre solo fatti stabili che l'utente ha detto o confermato, **chiedere prima**, mai proporre contenuti letti dal web, correggere con `supersedes`. È cortesia, non sicurezza: il confine vero è la coda, i limiti del revisore e il revert.
 - **Elicitation (politica `confirm`).** Il client che dichiara la capacità riceve un **modulo** con il testo modificabile e i tasti accetta/rifiuta: accetta → `decide(accept)` con attore `user@mcp:<actor>` (il testo editato diventa *accetto con modifica*), rifiuta → `reject`, annulla o silenzio → la proposta resta in coda. Le due forme del protocollo, come le offre rmcp 3.8: **richiesta dal server** (`elicitation/create`, fino alla 2025-11-25) e **`InputRequiredResult`** col ritento del client (2026-07-28, flusso *discover*: la proposta è già in coda quando il tool risponde `input_required`; il `requestState` è monouso). Un client senza elicitation riceve `pending` e l'indirizzo dove decidere. La **modalità URL** — aprire la pagina di revisione passando un token nell'URL al client — NON è nella v0.5: un token in un URL dato a un modello va pensato a parte.
-- **Ambiti:** il server si avvia con l'elenco delle celle esposte (`engramma mcp --cells famiglia,preferenze`). In HTTP si usano token per ambito. Ogni lettura finisce nel registro di audit della cella. Gli errori non sono un oracolo: una cella non esposta e una cella non scrivibile danno risposte che non rivelano altro.
+- **Ambiti:** il server si avvia con l'elenco delle celle esposte (`engramma mcp --cells famiglia,preferenze`). Ogni lettura finisce nel registro d'accesso. Gli errori non sono un oracolo: una cella non esposta e una cella non scrivibile danno risposte che non rivelano altro.
 - **Il confine dichiarato:** un agente che ha una shell con l'utente del sistema (per esempio Claude Code) può lanciare `engramma proposals accept`. **Chi ha la tua shell è te** — è fuori dal modello delle minacce, e non facciamo finta del contrario.
+- **HTTP (v0.5.2):** `engramma mcp --http 127.0.0.1:8787 --public-url https://…` serve lo stesso server di strumenti sul trasporto Streamable HTTP di rmcp, dietro un token Bearer risolto in un **grant** (§ 8.6). L'attore delle proposte non è più `--actor`: è l'etichetta del grant (`mcp:<etichetta>`), scelta dall'umano che approva il collegamento. `--cells` e `--write` restano il **tetto del processo**; il grant può solo restringerlo: la lista degli strumenti è **per token** (cinque strumenti di lettura per un grant di sola lettura), le celle visibili sono l'intersezione grant ∩ `--cells`, e una cella fuori dal grant risponde esattamente come una che non esiste. Con `--compat chatgpt` si aggiungono `search` e `fetch`, involucri a schema fisso di `memory_search`/`memory_get` (id completi, `url` sempre vuota: la nota non ha indirizzo pubblico, e ChatGPT allora non cita la fonte). Come si espone e chi vede che cosa: `docs/http.md`.
 
 ### 8.4 Homun (v0.4)
 - **Collegamento in-process:** il daemon carica il modulo `napi-rs` — `crates/engramma-node`, **N-API** (stabile tra versioni di Node ed Electron: il `.node` non si ricompila a ogni aggiornamento). Il contratto JS (`Engine`, `Cell`) è in `docs/node.md`: ogni metodo che tocca disco o modello è asincrono sul pool di libuv, gli errori sono `Error` con `code` stabile e senza contenuti di note (l'oracolo chiuso vale anche per `get`: una nota in quarantena risponde `null`). Il modello sta nel demone, una volta (la RAM misurata sta nel § 7); la ricerca su più celle fonde le classifiche con RRF k=60, dichiarata approssimata. Dal v0.4.4 le allocazioni Rust del modulo passano per **mimalloc** (§ 7): Node ed Electron restano col loro allocatore.
@@ -331,6 +332,104 @@ L'annullamento (`revert_decision`) è il `git revert` del registro: una **nuova 
 - **Il purgato non torna.** Se il contenuto è stato purgato, il revert lo dice (`purged`): l'op d'audit resta, il contenuto no.
 
 Le decisioni dei revisori firmano `reviewer:<nome>`: l'annullamento in blocco (`engramma revert --by reviewer:x [--since …] [--until …]`, con anteprima e conferma) è un filtro, niente di più. Un difetto trovato dai property test mentre li scrivevamo: anche i `revert_decision` della nota purgata vanno **censurati** (non dimenticati) dalla purge, perché il revert riapre un bersaglio — il rigioco deve riaprirlo allo stesso modo, bump di versione compresi.
+
+### 8.6 MCP su HTTP e OAuth 2.1 (v0.5.2)
+
+ChatGPT, claude.ai e le app mobili raggiungono solo server remoti HTTPS:
+per loro Engramma sale su HTTP restando ciò che è — un programma locale
+con un solo proprietario. Ascolta **solo su loopback** (un indirizzo
+d'ascolto non loopback è rifiutato: il TLS e l'interfaccia pubblica
+appartengono al tunnel, `docs/http.md`); il server MCP è un *resource
+server* (metadati RFC 9728) ed Engramma è anche il *server di
+autorizzazione* (RFC 8414): client pubblici con **PKCE S256**, mai
+segreti client, mai token nella query string.
+
+**Il modello delle minacce di questa fase:**
+
+1. *L'indirizzo è pubblico.* Chiunque lo conosca può chiamare ogni
+   endpoint; quindi ogni tool vuole un token (niente modalità anonima:
+   anche `initialize`), e **nessun token esiste finché un umano non
+   approva sul computer dove gira Engramma** digitando il codice che il
+   **suo browser** mostra (lo schema del flusso dispositivo, RFC 8628
+   § 5.4: il codice, da solo, non autorizza niente — conta dove viene
+   digitato). Nessun segreto indovinabile sta su Internet.
+2. *Furto del token.* Accesso di un'ora; refresh a **rotazione** con
+   revoca dell'intera famiglia al riuso di uno già consumato (OAuth 2.1
+   § 4.1.3 vale anche per il codice d'autorizzazione, monouso da 60 s);
+   token conservati solo come `blake3`; revoca immediata da CLI, con
+   effetto alla richiesta successiva (provato con una sessione aperta).
+3. *Phishing del consenso.* L'approvazione mostra host del client_id e
+   host del redirect; la pagina d'attesa (senza JavaScript, CSP chiusa,
+   `X-Frame-Options: DENY`, `no-referrer`, `no-store`) mostra gli
+   stessi nomi e l'avviso per i redirect di loopback; e la conferma
+   passa per il codice riscritto a mano. Tetto di cinque richieste in
+   attesa (10 minuti ciascuna).
+4. *SSRF dal CIMD.* Il `client_id` è un URL scelto da chi chiama: lo
+   scaricamento risolve il DNS e **si collega solo a indirizzi
+   pubblici** (loopback, RFC 1918, link-local con i metadati cloud,
+   CGNAT, ULA, multicast, non specificati, IPv4 mappati in IPv6 e i
+   blocchi di documentazione sono scartati, qualunque forma testuale —
+   proptest), senza redirect, 5 KiB, 5 secondi, solo JSON. L'eccezione
+   loopback per i test esiste solo nella configurazione della
+   libreria, mai dalla CLI. `private_key_jwt` è rifiutato dichiarando
+   il perché.
+5. *Rebinding DNS e CSRF.* `Host` ammessi solo l'autorità pubblica e i
+   nomi di loopback (403 altrimenti, su tutta la superficie); ogni
+   richiesta con `Origin` è rifiutata (i client remoti chiamano da
+   server, non da browser: `enforce_origin_validation` di rmcp su
+   `/mcp`, guardia uguale su `/token`, `/register`, `/revoke`).
+6. *Confusione token-sessione.* Una sessione MCP dei protocolli
+   precedenti appartiene al grant che l'ha creata (un altro token
+   risponde 404, come una sessione ignota — provato scambiandole); un
+   `requestState` 2026-07-28 è legato al grant e resta monouso.
+7. *L'avvelenamento della memoria resta quello della v0.5:* un client
+   remoto può solo **proporre**; coda, politica, revisore e revert sono
+   quelli di § 8.5, riprovati via HTTP (quarantena invisibile,
+   `external` rifiutato, oracolo chiuso).
+8. *Chi vede in chiaro:* il fornitore dell'assistente vede ciò che il
+   client legge; il fornitore del tunnel vede tutto se termina lui il
+   TLS (Cloudflare, ngrok) e niente con Tailscale Funnel (`docs/http.md`).
+
+**Le scelte:**
+
+- **Token opachi, non JWT:** server di autorizzazione e server di
+  risorse sono lo stesso processo con lo stesso archivio; la ricerca
+  locale dà revoca immediata, nessuna chiave da ruotare, nessun
+  algoritmo da scegliere. I JWT servono quando è la risorsa a validare
+  da sola: il cluster della v0.7+.
+- **`oauth.db` staccato dal registro delle celle:** sono credenziali,
+  non memoria — non devono viaggiare con la sincronizzazione della v0.6
+  e la loro revoca dev'essere immediata e locale. Schema proprio con la
+  stessa guardia delle celle (uno schema più novo si rifiuta);
+  permessi 0600; di ogni segreto solo il digest; una tabella `events`
+  senza segreti né testo di note.
+- **CIMD come default, DCR spento:** la registrazione dinamica
+  (RFC 7591) è deprecata dalla specifica, apre una superficie in
+  scrittura a chiunque e nessuno dei due client la serve davvero. Con
+  `--allow-dcr`: solo client pubblici, redirect validi, 20 inutilizzati
+  al massimo, quelli mai usati scadono in 24 ore. I redirect si
+  confrontano **esatti**, con l'unica eccezione di RFC 8252 § 7.3 (la
+  porta si ignora solo per `http` su loopback: serve a Claude Code).
+- **Approvazione = superficie umana e locale:** `engramma oauth
+  pending/approve/deny/grants/revoke/log`. L'etichetta dell'approvazione
+  diventa l'attore `mcp:<etichetta>` delle proposte. La pagina di
+  revisione non espone l'approvazione in questa fase: è legata a una
+  cella, il grant è di tutto il processo (possibile seguito).
+- **Ambiti:** `memory:read` è il pavimento; `memory:propose` esiste solo
+  se il processo ha `--write` e l'approvazione tiene una cella
+  scrivibile. Gli ambiti sconosciuti (ChatGPT chiede `openid email
+  profile`) si **ignorano**: non emettiamo `id_token` e non parliamo
+  OIDC; la risposta del token dice cosa è concesso davvero. Il tetto
+  globale di `/token` è 60 richieste al minuto (dietro un tunnel ogni
+  chiamante è 127.0.0.1: le intestazioni inoltrate non sono affidabili
+  e non si usano).
+- **Registro d'accesso** su stderr: ora, id del grant, metodo MCP,
+  strumento, stato, durata. Mai token né testo; provato a cattura.
+- **Modalità URL dell'elicitation: fuori anche da qui.** Una pagina di
+  conferma raggiungibile dal web richiede di autenticare il
+  proprietario **sul web pubblico**: senza un segreto indovinabile
+  serve una passkey (WebAuthn) — una crate e una fase a sé. Candidata
+  per la v0.7 insieme a `engramma serve` (§ 12).
 
 ## 9. Server e cluster (architettura, non costruita prima della v0.6)
 
@@ -395,12 +494,13 @@ Le decisioni dei revisori firmano `reviewer:<nome>`: l'annullamento in blocco (`
 | v0.4.5 | Il peso della fusione e il picco della RAM: metriche LongMemEval ufficiali (ndcg di sessione), α ritarato su due banchi e confermato su domande tenute da parte (0,5, § 6.3), lotti di embedding con tetto di token + ordinamento per lunghezza + pool fisso (§ 7), allocatore per piattaforma, cache NNEF provata e scartata | v0.4.4 | **fatta** (`fase-v0.4.5`) |
 | v0.4.6 | I lotti di embedding, davvero: il riempimento BatchLongest del tokenizer tolto (la v0.4.5 lo riempiva al più lungo: l'ordinamento era morto e una nota corta pagava la più lunga), offset dei lotti a somma prefissa, predefiniti budget 4096 × 1 lavoratore seguendo la regola della v0.4.5, griglia e banco rimisurati (§ 7); **v0.4.6.1** (correzione di verifica): budget predefinito 512 — picco 878 MB, 100 note/s a 10k | v0.4.5 | **fatta** (`fase-v0.4.6`, `fase-v0.4.6.1`) |
 | v0.5 | Scrivere da altri assistenti: proposte in quarantena con decisioni e rollback, politiche per cella e revisore automatico (§ 8.5), MCP in scrittura con elicitation (§ 8.3), CLI della coda, pagina locale di revisione, guardia sugli schemi più nuovi | v0.4.6 | **fatta** (`fase-v0.5`) |
+| v0.5.2 | MCP su HTTP con OAuth 2.1 (§ 8.6): resource server + server di autorizzazione con approvazione locale, CIMD col recinto SSRF, token opachi a rotazione, grant per token; `--compat chatgpt` | v0.5 | **fatta** (`fase-v0.5.2`) |
 | v0.6 | Identità, abbinamento, sincronizzazione cifrata del registro tra pari, permessi per cella, conflitti. **Opzione sul tavolo dalla v0.4.5:** l'embedding in un processo separato (le soglie RAM di riposo del § 7 non sono state raggiunte: la memoria liberata resta residente con entrambi gli allocatori su macOS) | v0.5 | da fare |
 | v0.7 | `engramma serve`: API, autenticazione, molte celle | v0.6 | da fare |
 | v0.8 | Cluster: posizionamento Raft, router, replica multi-Raft, spostamento celle, backup su storage a oggetti | v0.7 | da fare |
 | poi | Python, Swift, Kotlin, WASM; MLS per i gruppi; messaggi A2A sul canale | — | — |
 
-**Candidata per una v0.5.x (da decidere con l'utente, nessuna data):** MCP su HTTP con OAuth 2.1 — serve per ChatGPT, che non si collega a server locali — e la **modalità URL** dell'elicitation (un token nell'URL dato al client: va progettata, non sommata).
+**Candidati per la v0.7 (da decidere con l'utente, nessuna data):** la **modalità URL** dell'elicitation — una pagina di conferma raggiungibile dal web esige di autenticare il proprietario sul web pubblico: una **passkey** (WebAuthn), crate e fase a sé — e `engramma serve` (§ 9). L'approvazione OAuth potrebbe salire sulla pagina di revisione, se le celle e i grant si riconciliano.
 
 ## 13. v0.1 nel dettaglio (sarà il primo prompt per GLM)
 

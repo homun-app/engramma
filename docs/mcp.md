@@ -1,9 +1,21 @@
 # Engramma via MCP — leggere e proporre (v0.5)
 
 Engramma espone la memoria a Claude Desktop, Claude Code e a ogni client
-MCP su stdio. Dalla v0.5 un assistente può anche **proporre** un fatto:
-non scrive mai — la proposta finisce in una coda che la ricerca non vede,
-finché non la decidi tu (o un revisore che hai configurato tu).
+MCP su stdio; dalla v0.5.2 anche **su HTTP**, per i client che si
+collegano solo a server remoti (ChatGPT, claude.ai): vedi
+`docs/http.md`. Dalla v0.5 un assistente può anche **proporre** un
+fatto: non scrive mai — la proposta finisce in una coda che la ricerca
+non vede, finché non la decidi tu (o un revisore che hai configurato
+tu).
+
+| | stdio | HTTP (v0.5.2) |
+|---|---|---|
+| chi si collega | client locali (Claude Desktop, Claude Code) | client remoti (ChatGPT, claude.ai, app), via tunnel |
+| comando | `engramma mcp --cells a --write a --actor x` | `engramma mcp --cells a --http 127.0.0.1:8787 --public-url https://… [--write a]` |
+| chi è il proponente | `--actor` dalla riga di comando | l'etichetta del grant (`mcp:<etichetta>`, scelta con `engramma oauth approve`) |
+| accesso | chi ha la tua shell è te | solo con un token OAuth approvato da te, per grant |
+| celle visibili | `--cells` | `--cells` ∩ grant (il token vede solo le sue) |
+| strumenti extra | — | `search`/`fetch` con `--compat chatgpt` |
 
 ## 1. Sola lettura
 

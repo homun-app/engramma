@@ -188,8 +188,9 @@ old model retires and its vectors are deleted, in one transaction).
 `add` and `import` run the pass automatically (`--no-embed` skips it: the
 notes stay pending).
 
-### `mcp --cells a,b`
-Starts the read-only MCP server on stdio. Without `--cells` it refuses to
+### `mcp --cells a,b [--write a --actor name]`
+Starts the read-only MCP server on stdio (the HTTP transport is a v0.5.2
+flag of the same command, see below). Without `--cells` it refuses to
 start (no cell would be exposed). `memory_search` joins the vector branch
 automatically when the cell has a `ready` model matching the embedder in
 `<root>/config.json`; without a configuration every search is the v0.1
@@ -295,3 +296,39 @@ Near duplicates (cosine ≥ 0.95 on the ready model AND entity Jaccard
 relation — `lives_in`, `works_at`, `partner_of` — two destinations,
 overlapping validity). Proposals only: the engine never merges. Not
 exposed over MCP.
+
+## v0.5.2 commands
+
+### `mcp --http 127.0.0.1:8787 --public-url https://memoria.example.net [--cells a,b] [--write a] [--allow-dcr] [--compat chatgpt]`
+
+The HTTP transport (see `docs/http.md`): the loopback listen address is
+mandatory and only loopback is accepted; `--public-url` (https, no query,
+no fragment) is the address the tunnel publishes and every OAuth URL is
+derived from it. `--write` names the cells that accept proposals (a
+subset of `--cells`) — but there is **no `--actor`** here: over HTTP the
+proposing actor is the grant's label (`mcp:<etichetta>`), chosen when you
+approve the connection. `--allow-dcr` turns on RFC 7591 dynamic
+registration (deprecated by the spec; off by default), `--compat chatgpt`
+adds the fixed-schema `search`/`fetch` wrappers. Every request to `/mcp`
+wants a bearer token; the access log on stderr carries time, grant id,
+MCP method, tool, status and duration — never tokens or note text.
+SIGINT/SIGTERM cancel the transport, drain the listener and close the
+cells.
+
+### `engramma oauth pending | approve | deny | grants | revoke | log`
+
+The human surface of the HTTP authorization flow (state in
+`<root>/oauth.db`, 0600):
+
+- `pending` — the requests waiting for you: code, client, redirect host,
+  scopes, age.
+- `approve <XXXX-XXXX> --label chatgpt [--cells a] [--scope memory:read]
+  [--yes]` — the code is the one the **user's browser** shows. The label
+  (`[a-z0-9-]{1,32}`) becomes the actor `mcp:<label>` of the proposals;
+  `--cells`/`--scope` only restrict what the server offers. Before the
+  confirmation the CLI prints the client's host and the redirect's.
+- `deny <XXXX-XXXX>` — refuse it.
+- `grants` — label, client, cells, scopes, creation, last use, standing.
+- `revoke <label> | --all` — the tokens die at their next request.
+- `log` — the event history: approvals, refusals, revocations, reuse
+  alarms, rejected clients. No secrets, no note text.
