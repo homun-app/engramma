@@ -186,8 +186,9 @@ impl HttpState {
     /// # Errors
     /// The store's errors, or a cell that cannot be opened.
     pub fn open_with_mcp(root: &std::path::Path, cfg: HttpConfig) -> anyhow::Result<Self> {
+        let compat = cfg.compat_chatgpt;
         let mut state = Self::open(root, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mcp = crate::MemoryServer::open_http(root, &state.cfg.cells, &state.cfg.write)?;
+        let mcp = crate::MemoryServer::open_http(root, &state.cfg.cells, &state.cfg.write, compat)?;
         state.mcp = Some(mcp);
         Ok(state)
     }

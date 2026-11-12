@@ -218,9 +218,21 @@ impl MemoryServer {
     /// # Errors
     /// [`anyhow::Error`] when a cell cannot be opened or `write` names a
     /// cell that is not exposed.
-    pub fn open_http(root: &Path, names: &[String], write: &[String]) -> anyhow::Result<Self> {
+    pub fn open_http(
+        root: &Path,
+        names: &[String],
+        write: &[String],
+        compat_chatgpt: bool,
+    ) -> anyhow::Result<Self> {
         let mut server = Self::open_with_write(root, names, write, None)?;
         server.tool_router.add_route(propose_route());
+        if compat_chatgpt {
+            // P6: the fixed-schema wrappers ChatGPT's deep research and
+            // custom connectors call — nothing memory_search and
+            // memory_get cannot already do
+            server.tool_router.add_route(search_route());
+            server.tool_router.add_route(fetch_route());
+        }
         Ok(server)
     }
 
@@ -1229,6 +1241,181 @@ fn confirm_request(text: &str, reason: &str) -> Result<rmcp::model::ElicitReques
             requested_schema: schema,
         },
     ))
+}
+
+// ---------------------------------------------------------------------------
+// P6: the ChatGPT compatibility wrappers (`--compat chatgpt`)
+// ---------------------------------------------------------------------------
+
+/// A tool answer that carries BOTH the `structuredContent` and the JSON
+/// text, as ChatGPT's connectors expect.
+fn compat_result(value: &serde_json::Value) -> Result<CallToolResponse, McpError> {
+    let text = serde_json::to_string_pretty(value).map_err(err)?;
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+    result.structured_content = Some(value.clone());
+    Ok(result.into())
+}
+
+/// `search(query)`: the fixed-schema wrapper over `memory_search`. Same
+/// quarantine, same no-oracle, the grant's cells — across every one of
+/// them, since the schema has no `cell` parameter.
+fn search_route() -> ToolRoute<MemoryServer> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["query"],
+        "properties": {
+            "query": { "type": "string", "description": "Natural-language query, same language as the notes." }
+        }
+    });
+    let tool = Tool::new(
+        "search",
+        "Search the person's memory. Returns `results`: the id, title and \
+         url of each relevant note (the url is empty: notes have no public \
+         address). Pass an id to `fetch` to read it.",
+        rmcp::model::object(schema),
+    )
+    .with_annotations({
+        let mut a = ToolAnnotations::default();
+        a.read_only_hint = Some(true);
+        a
+    });
+    ToolRoute::new_dyn(tool, |ctx: ToolCallContext<'_, MemoryServer>| {
+        Box::pin(async move { ctx.service.compat_search(ctx).await })
+    })
+}
+
+/// `fetch(id)`: the fixed-schema wrapper over `memory_get` — the FULL id
+/// (search returns full ones), never a prefix.
+fn fetch_route() -> ToolRoute<MemoryServer> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+            "id": { "type": "string", "description": "The full note id from `search`." }
+        }
+    });
+    let tool = Tool::new(
+        "fetch",
+        "Read one note of the memory in full: `text`, `title` and the \
+         note's `metadata`. Hidden and absent notes answer alike.",
+        rmcp::model::object(schema),
+    )
+    .with_annotations({
+        let mut a = ToolAnnotations::default();
+        a.read_only_hint = Some(true);
+        a
+    });
+    ToolRoute::new_dyn(tool, |ctx: ToolCallContext<'_, MemoryServer>| {
+        Box::pin(async move { ctx.service.compat_fetch(ctx).await })
+    })
+}
+
+impl MemoryServer {
+    async fn compat_search(
+        &self,
+        ctx: ToolCallContext<'_, Self>,
+    ) -> Result<CallToolResponse, McpError> {
+        let grant = grant_of(&ctx.request_context);
+        let raw = ctx.arguments.clone().unwrap_or_default();
+        let p: compat::SearchParams = serde_json::from_value(serde_json::Value::Object(raw))
+            .map_err(|e| McpError::invalid_params(format!("search: {e}"), None))?;
+        // every VISIBLE cell, merged: the schema has no `cell` parameter
+        let visible = self.visible_cells(grant.as_ref());
+        let mut all: Vec<(f32, String, String)> = Vec::new();
+        for name in &visible {
+            let Some(cell) = self.cells.get(name) else {
+                continue;
+            };
+            let q = Query::text(&p.query).k(8);
+            let hits = cell.search(&q).map_err(err)?;
+            for h in hits {
+                all.push((
+                    h.score as f32,
+                    h.note.id.to_string(),
+                    h.note.display_title().to_string(),
+                ));
+            }
+        }
+        all.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        all.truncate(10);
+        let results: Vec<serde_json::Value> = all
+            .into_iter()
+            .map(|(_, id, title)| serde_json::json!({ "id": id, "title": title, "url": "" }))
+            .collect();
+        compat_result(&serde_json::json!({ "results": results }))
+    }
+
+    async fn compat_fetch(
+        &self,
+        ctx: ToolCallContext<'_, Self>,
+    ) -> Result<CallToolResponse, McpError> {
+        let grant = grant_of(&ctx.request_context);
+        let raw = ctx.arguments.clone().unwrap_or_default();
+        let p: compat::FetchParams = serde_json::from_value(serde_json::Value::Object(raw))
+            .map_err(|e| McpError::invalid_params(format!("fetch: {e}"), None))?;
+        let Ok(id) = ulid::Ulid::from_string(&p.id) else {
+            return Err(McpError::invalid_params(
+                "fetch wants the FULL note id (search returns full ones)".to_string(),
+                None,
+            ));
+        };
+        let visible = self.visible_cells(grant.as_ref());
+        // hidden (quarantined/deleted) and absent answer alike, in every
+        // visible cell
+        let mut note = None;
+        for name in &visible {
+            let Some(cell) = self.cells.get(name) else {
+                continue;
+            };
+            if let Ok(n) = cell.get(&id)
+                && n.status == Status::Active
+            {
+                note = Some(n);
+                break;
+            }
+        }
+        let Some(note) = note else {
+            return Err(McpError::invalid_params(
+                format!("note `{}` not found", p.id),
+                None,
+            ));
+        };
+        compat_result(&serde_json::json!({
+            "id": note.id.to_string(),
+            "title": note.display_title(),
+            "text": note.body,
+            "url": "",
+            "metadata": {
+                "type": note.note_type.as_str(),
+                "tags": note.tags,
+                "created_at": note.created_at.to_db_string(),
+                "updated_at": note.updated_at.to_db_string(),
+                "valid_from": note.valid_from.as_ref().map(|v| v.to_db_string()),
+                "valid_to": note.valid_to.as_ref().map(|v| v.to_db_string()),
+            }
+        }))
+    }
+}
+
+mod compat {
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    #[derive(Deserialize, JsonSchema)]
+    #[schemars(deny_unknown_fields)]
+    pub struct SearchParams {
+        /// Natural-language query, same language as the notes.
+        pub query: String,
+    }
+
+    #[derive(Deserialize, JsonSchema)]
+    #[schemars(deny_unknown_fields)]
+    pub struct FetchParams {
+        /// The full note id from `search`.
+        pub id: String,
+    }
 }
 
 /// The propose outcome as the tool's stable JSON.

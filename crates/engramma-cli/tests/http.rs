@@ -1605,3 +1605,187 @@ fn the_old_invariants_hold_over_http() {
         "no oracle on cells: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P6: --compat chatgpt — the fixed-schema wrappers
+// ---------------------------------------------------------------------------
+
+/// A bare stateless request (2026-07-28 carries its own _meta).
+fn stateless_req(s: &BinServer, token: &str, id: i64, method: &str) -> Value {
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": method,
+        "params": { "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        } }
+    });
+    let mut r = still()
+        .post(&format!("http://{addr}/mcp", addr = s.addr))
+        .header("Host", "memoria.example.net")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", method)
+        .header("Authorization", format!("Bearer {token}"))
+        .send(call.to_string().as_bytes())
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 200, "{}", body(&mut r));
+    json_of(&mut r)
+}
+
+fn tool_names(res: &Value) -> Vec<String> {
+    res["result"]["tools"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn the_chatgpt_wrappers_exist_only_with_the_flag() {
+    // without the flag: the five read tools, nothing else
+    let s = start_bin(&["--allow-dcr"]);
+    let token = bin_token(&s);
+    let res = stateless_req(&s, &token, 2, "tools/list");
+    assert_eq!(
+        tool_names(&res),
+        vec![
+            "memory_get",
+            "memory_neighbors",
+            "memory_search",
+            "memory_tags",
+            "memory_timeline",
+        ],
+        "{res}"
+    );
+
+    // with it: search and fetch join, and nothing else changes
+    let s = start_bin(&["--allow-dcr", "--compat", "chatgpt"]);
+    let token = bin_token(&s);
+    let res = stateless_req(&s, &token, 2, "tools/list");
+    assert_eq!(
+        tool_names(&res),
+        vec![
+            "fetch",
+            "memory_get",
+            "memory_neighbors",
+            "memory_search",
+            "memory_tags",
+            "memory_timeline",
+            "search",
+        ],
+        "Claude clients must not see doubles: {res}"
+    );
+}
+
+#[test]
+fn search_and_fetch_wrap_the_engine_over_http() {
+    let s = start_bin(&["--allow-dcr", "--compat", "chatgpt"]);
+    let token = bin_token(&s);
+    let meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    // a living note (and a quarantined one to stay honest)
+    let t = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(/* t */);
+    let cell = engramma_core::Cell::open(&s.root.join("cells/default.sqlite")).unwrap(/* t */);
+    let make = |body: &str, status| {
+        let note = engramma_core::Note {
+            id: engramma_core::id::new_ulid().unwrap(/* t */),
+            note_type: engramma_core::NoteType::Fact,
+            title: None,
+            body: body.into(),
+            tags: vec![],
+            scope: None,
+            lang: Some(engramma_core::Lang::It),
+            source: "test".into(),
+            confidence: engramma_core::Confidence::Stated,
+            status,
+            valid_from: None,
+            valid_to: None,
+            supersedes: vec![],
+            created_at: engramma_core::format::At(t),
+            updated_at: engramma_core::format::At(t),
+            extensions: vec![],
+        };
+        let id = note.id;
+        cell.put_note(&note, "test").unwrap(/* t */);
+        id
+    };
+    make("Fabio nuota il giovedì.", engramma_core::Status::Active);
+    let hidden = make(
+        "Fabio vince i tornei di scarabeo.",
+        engramma_core::Status::Quarantined,
+    );
+
+    // search: id, title, EMPTY url
+    let res = stateless_call(
+        &s,
+        &token,
+        2,
+        serde_json::json!({
+            "name": "search",
+            "arguments": { "query": "nuota" },
+            "_meta": meta
+        }),
+    );
+    let structured = &res["result"]["structuredContent"];
+    let results = structured["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!results.is_empty(), "{res}");
+    assert!(results[0]["url"] == "", "no public url for a note: {res}");
+    let id = results[0]["id"].as_str().unwrap_or_default().to_string();
+    assert_eq!(id.len(), 26, "the FULL id, search-side too: {id}");
+
+    // fetch: text and metadata, structured AND in content
+    let res = stateless_call(
+        &s,
+        &token,
+        3,
+        serde_json::json!({
+            "name": "fetch",
+            "arguments": { "id": id },
+            "_meta": meta
+        }),
+    );
+    let structured = &res["result"]["structuredContent"];
+    assert_eq!(structured["id"], id.as_str());
+    assert!(
+        structured["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("nuota")),
+        "{res}"
+    );
+    assert!(structured["url"] == "", "{res}");
+    assert!(structured["metadata"]["type"] == "fact", "{res}");
+    let content_text = res["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        content_text.contains("nuota"),
+        "the JSON rides in content too"
+    );
+
+    // the hidden note is not fetchable: same answer as a missing one
+    for probe in [
+        hidden.to_string(),
+        "01AROTONONEXISTE0000000000AA".to_string(),
+    ] {
+        let res = stateless_call(
+            &s,
+            &token,
+            4,
+            serde_json::json!({
+                "name": "fetch",
+                "arguments": { "id": probe },
+                "_meta": meta
+            }),
+        );
+        assert!(res.get("error").is_some(), "no oracle: {probe} — {res}");
+    }
+}
