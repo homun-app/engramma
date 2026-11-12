@@ -1242,3 +1242,366 @@ fn sigterm_shuts_the_server_down() {
     }
     panic!("SIGTERM did not stop the server");
 }
+
+// ---------------------------------------------------------------------------
+// P5: proposals over HTTP — the form (2026-07-28) and the queue
+// ---------------------------------------------------------------------------
+
+/// A tools/call POST carrying the 2026-07-28 per-request `_meta`.
+fn stateless_call(s: &BinServer, token: &str, id: i64, params: serde_json::Value) -> Value {
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": params
+    });
+    // the 2026-07-28 per-request _meta wants its header too
+    let version = params["_meta"]["io.modelcontextprotocol/protocolVersion"]
+        .as_str()
+        .unwrap_or("2025-06-18");
+    let mut r = still()
+        .post(&format!("http://{addr}/mcp", addr = s.addr))
+        .header("Host", "memoria.example.net")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", version)
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", params["name"].as_str().unwrap_or_default())
+        .header("Authorization", format!("Bearer {token}"))
+        .send(call.to_string().as_bytes())
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 200, "{}", body(&mut r));
+    let mut doc = json_of(&mut r);
+    // an SSE envelope unwraps to the same JSON-RPC answer
+    if doc.get("result").is_none() && doc.get("error").is_none() {
+        doc = json_of(&mut r);
+    }
+    doc
+}
+
+#[test]
+fn the_confirmation_form_arrives_over_http_prefilled() {
+    let s = start_bin(&["--allow-dcr", "--write", "default"]);
+    // the policy of the cell decides: write: confirm
+    bin_ok(&s.root, &["policy", "set", "write=confirm"]);
+    let token = bin_token_scopes(&s, "memory:read memory:propose");
+    let meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+    });
+
+    // round 1: input_required with the form, PRE-FILLED with the text
+    let res = stateless_call(
+        &s,
+        &token,
+        2,
+        serde_json::json!({
+            "name": "memory_propose",
+            "arguments": { "text": "Fabio va in barca." },
+            "_meta": meta
+        }),
+    );
+    assert_eq!(res["result"]["resultType"], "input_required", "{res}");
+    let request = &res["result"]["inputRequests"]["confirm"];
+    assert!(request.is_object(), "{res}");
+    let default_text = request["params"]["requestedSchema"]["properties"]["text"]["default"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        default_text, "Fabio va in barca.",
+        "the correction bfdb1f5, over HTTP: {res}"
+    );
+    let state = res["result"]["requestState"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // round 2: the retry brings the answer (accept with an edit)
+    let res = stateless_call(
+        &s,
+        &token,
+        3,
+        serde_json::json!({
+            "name": "memory_propose",
+            "arguments": { "text": "Fabio va in barca." },
+            "_meta": meta,
+            "inputResponses": {
+                "confirm": { "action": "accept", "content": { "text": "Fabio va in barca a vela." } }
+            },
+            "requestState": state
+        }),
+    );
+    let payload: Value = serde_json::from_str(
+        res["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .unwrap_or(Value::Null);
+    assert_eq!(payload["status"], "accepted", "{res}");
+    assert_eq!(
+        payload["decided_by"], "user@mcp:bin",
+        "one prefix, not two: {res}"
+    );
+    let id = payload["id"].as_str().unwrap_or_default().to_string();
+    let cell = engramma_core::Cell::open(&s.root.join("cells/default.sqlite")).unwrap(/* t */);
+    let note = cell
+        .get(&ulid::Ulid::from_string(&id).unwrap(/* t */))
+        .unwrap(/* t */);
+    assert_eq!(note.body, "Fabio va in barca a vela.");
+    // the actor is the grant's label
+    assert_eq!(note.source, "mcp:bin");
+
+    // a reused requestState finds nothing: the state is one-shot
+    let res = stateless_call(
+        &s,
+        &token,
+        4,
+        serde_json::json!({
+            "name": "memory_propose",
+            "arguments": { "text": "Fabio dorme." },
+            "_meta": meta,
+            "inputResponses": {
+                "confirm": { "action": "accept", "content": { "text": "Fabio dorme." } }
+            },
+            "requestState": state
+        }),
+    );
+    assert!(res.get("error").is_some(), "{res}");
+}
+
+#[test]
+fn a_client_without_forms_gets_the_queue_and_no_secrets_in_the_answer() {
+    let s = start_bin(&["--allow-dcr", "--write", "default"]);
+    bin_ok(&s.root, &["policy", "set", "write=confirm"]);
+    let token = bin_token_scopes(&s, "memory:read memory:propose");
+    // no elicitation capability declared: the ChatGPT shape
+    let meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    let res = stateless_call(
+        &s,
+        &token,
+        2,
+        serde_json::json!({
+            "name": "memory_propose",
+            "arguments": { "text": "Fabio colleziona dischi." },
+            "_meta": meta
+        }),
+    );
+    let payload: Value = serde_json::from_str(
+        res["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .unwrap_or(Value::Null);
+    assert_eq!(payload["status"], "pending", "{res}");
+    let note_line = payload["note"].as_str().unwrap_or_default().to_string();
+    assert!(
+        note_line.contains("engramma proposals") && note_line.contains("engramma review"),
+        "the pointer is the local CLI, not a URL: {note_line}"
+    );
+    assert!(
+        !note_line.contains("https://"),
+        "no URL in the answer: {note_line}"
+    );
+    assert!(
+        !note_line.contains("token"),
+        "no token in the answer: {note_line}"
+    );
+}
+
+/// [`bin_token`] with a chosen scope string.
+fn bin_token_scopes(s: &BinServer, scopes: &str) -> String {
+    bin_token_inner(s, Some(scopes))
+}
+
+fn bin_token_inner(s: &BinServer, scopes: Option<&str>) -> String {
+    let mut r = still()
+        .post(&format!("http://{addr}/register", addr = s.addr))
+        .header("Host", "memoria.example.net")
+        .send_json(serde_json::json!({
+            "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+            "client_name": "Claude",
+        }))
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 201, "{}", body(&mut r));
+    let client_id = json_of(&mut r)["client_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let (verifier, challenge) = pkce();
+    let scope = scopes.unwrap_or("memory:read");
+    let q = format!(
+        "/authorize?response_type=code&client_id={cid}&redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback&code_challenge={ch}&code_challenge_method=S256&scope={sc}&state=b1",
+        cid = urlencode(&client_id),
+        ch = challenge,
+        sc = urlencode(scope),
+    );
+    let host = "memoria.example.net";
+    let r = still()
+        .get(&format!("http://{addr}{q}", addr = s.addr))
+        .header("Host", host)
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 303);
+    let attesa = location(&r).unwrap(/* t */);
+    let mut page = still()
+        .get(&format!("http://{addr}{p}", addr = s.addr, p = attesa))
+        .header("Host", host)
+        .call()
+        .unwrap(/* t */);
+    let code = code_of(&body(&mut page));
+    bin_ok(
+        &s.root,
+        &["oauth", "approve", &code, "--label", "bin", "--yes"],
+    );
+    let page = still()
+        .get(&format!("http://{addr}{p}", addr = s.addr, p = attesa))
+        .header("Host", host)
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(page.status().as_u16(), 302);
+    let auth_code = location(&page)
+        .unwrap_or_default()
+        .split("code=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .unwrap_or_default()
+        .to_string();
+    let mut r = still()
+        .post(&format!("http://{addr}/token", addr = s.addr))
+        .header("Host", host)
+        .send_form(vec![
+            ("grant_type", "authorization_code"),
+            ("code", auth_code.as_str()),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", "https://claude.ai/api/mcp/auth_callback"),
+            ("code_verifier", verifier.as_str()),
+        ])
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 200, "{}", body(&mut r));
+    json_of(&mut r)["access_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// P4's remaining invariants, proven over HTTP
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_old_invariants_hold_over_http() {
+    let s = start_bin(&["--allow-dcr", "--write", "default"]);
+    bin_ok(&s.root, &["policy", "set", "write=propose"]);
+    let token = bin_token_scopes(&s, "memory:read memory:propose");
+    let meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    // a living note, and a quarantined proposal
+    let t = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(/* t */);
+    let cell = engramma_core::Cell::open(&s.root.join("cells/default.sqlite")).unwrap(/* t */);
+    for body in ["Fabio nuota il giovedì.", "Fabio vince le gare di tuffi."] {
+        let note = engramma_core::Note {
+            id: engramma_core::id::new_ulid().unwrap(/* t */),
+            note_type: engramma_core::NoteType::Fact,
+            title: None,
+            body: body.into(),
+            tags: vec![],
+            scope: None,
+            lang: Some(engramma_core::Lang::It),
+            source: "test".into(),
+            confidence: engramma_core::Confidence::Stated,
+            status: engramma_core::Status::Active,
+            valid_from: None,
+            valid_to: None,
+            supersedes: vec![],
+            created_at: engramma_core::format::At(t),
+            updated_at: engramma_core::format::At(t),
+            extensions: vec![],
+        };
+        cell.put_note(&note, "test").unwrap(/* t */);
+    }
+    let res = stateless_call(
+        &s,
+        &token,
+        2,
+        serde_json::json!({
+            "name": "memory_propose",
+            "arguments": { "text": "Fabio vince le gare di apnea." },
+            "_meta": meta
+        }),
+    );
+    let propose_payload: Value = serde_json::from_str(
+        res["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .unwrap_or(Value::Null);
+    assert_eq!(propose_payload["status"], "pending", "{res}");
+
+    // the quarantine does not leak: the proposal is invisible to search
+    let res = stateless_call(
+        &s,
+        &token,
+        3,
+        serde_json::json!({
+            "name": "memory_search",
+            "arguments": { "query": "apnea" },
+            "_meta": meta
+        }),
+    );
+    let text = res.to_string();
+    assert!(
+        !text.contains("gare di apnea"),
+        "the queue stays invisible: {text}"
+    );
+    // and the living note IS there, same words
+    let res = stateless_call(
+        &s,
+        &token,
+        6,
+        serde_json::json!({
+            "name": "memory_search",
+            "arguments": { "query": "giovedì" },
+            "_meta": meta
+        }),
+    );
+    let text = res.to_string();
+    assert!(text.contains("nuota"), "the living note is there: {text}");
+
+    // external confidence is refused: that is the import path's badge
+    let res = stateless_call(
+        &s,
+        &token,
+        4,
+        serde_json::json!({
+            "name": "memory_propose",
+            "arguments": { "text": "Fabio legge il giornale.", "confidence": "external" },
+            "_meta": meta
+        }),
+    );
+    assert!(res.get("error").is_some(), "{res}");
+
+    // a cell outside the server answers like one that does not exist
+    let res = stateless_call(
+        &s,
+        &token,
+        5,
+        serde_json::json!({
+            "name": "memory_search",
+            "arguments": { "query": "x", "cell": "segreta" },
+            "_meta": meta
+        }),
+    );
+    let err = res["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        err.contains("not exposed") && !err.contains("segreta is not exposed"),
+        "no oracle on cells: {err}"
+    );
+}

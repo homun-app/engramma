@@ -1176,7 +1176,9 @@ impl MemoryServer {
                 None,
             ));
         };
-        let actor = format!("user@{actor}");
+        // apply_form_answer adds the `user@` prefix itself: passing it
+        // pre-prefixed produced `user@user@mcp:…` (a v0.5 slip the HTTP
+        // test caught)
         self.apply_form_answer(cell, Some(pending.proposal), &elicited, &actor)
             .await
     }
