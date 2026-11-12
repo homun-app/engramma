@@ -1,0 +1,22 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6eff93b640a4bc2cecb9502468870c3d9496706e654a51e3ef56530acb9acc13 # shrinks to seed = 5057102026775464
+cc 1c29e8336e817a32844e9709f2e5a03c611806ef4828578e0dd26457dbc8a601 # shrinks to seed = 5241886955120911949
+cc 7f8fcd8763c16fa16ece47f7ed06d8f3bbd32a131fc8aaa2788b3b61a3ce18fb # shrinks to note = Note { id: Ulid(2243072242887045535525174414223081472), note_type: Fact, title: None, body: "", tags: ["0o0"], scope: None, lang: None, source: "0", confidence: Stated, status: Active, valid_from: None, valid_to: None, supersedes: [Ulid(2243072242887045535525174414223081472)], created_at: At(2023-11-14 22:30:00.0 +00:00:00), updated_at: At(2023-11-14 22:30:00.0 +00:00:00), extensions: [] }
+cc 75936345a54389cf66f56a0a20ac49378bc1994cd9b2779c4f8d55921b6957fb # shrinks to seed = 8814876244029561882
+cc 85a221c82de83e0617e37da2e5fed418d23bd7323eab2be0449e74218f74d7f5 # shrinks to note = Note { id: Ulid(2243072242887045535525174414223081472), note_type: Fact, title: Some("'"), body: "", tags: [], scope: None, lang: None, source: "_", confidence: Stated, status: Active, valid_from: None, valid_to: None, supersedes: [Ulid(2243072242887045535525174414223081472)], created_at: At(2023-11-14 22:30:00.0 +00:00:00), updated_at: At(2023-11-14 22:30:00.0 +00:00:00), extensions: [] }
+cc 9d40e4351bc64904402b67175fb8a760e084929baebec51c1a1698c16e179ed3 # shrinks to seed = 12308383466465802360
+cc 53865eb17a67576df686b932acb0de1accefa44d84e3595c95e33322171720b0 # shrinks to note = Note { id: Ulid(1329227995784915872903807060280344576), note_type: Fact, title: None, body: "", tags: [], scope: None, lang: None, source: "a", confidence: Stated, status: Active, valid_from: None, valid_to: None, supersedes: [Ulid(1329227995784915872903807060280344576)], created_at: At(2023-11-14 22:30:00.0 +00:00:00), updated_at: At(2023-11-14 22:30:00.0 +00:00:00), extensions: [("x-a", Map([("x-z", Null), ("x-z", Null)]))] }
+cc cf68493995b54837e7f597eef288425d56646858791a491f3c949d9d2852402c # shrinks to seed = 1224821043315249140
+cc 93f48b9c06200071e9c496ae7a19fe3fc8ff275baf7c84286e69a53a423a8c32 # shrinks to seed = 166672137659027308
+cc 26965c82fa55d11f33472f9b176a5e04d097b1708f045caa068df56447e97556 # shrinks to seed = 7350765648906651961
+cc d7d1f7e32b1770c50433a9b5f782c33c5a5c3ff38d97178dac0a53e76d4962c7 # shrinks to seed = 760729182993756820
+cc c8e55d7bbc7a9bc59f925af838d14d9f8e87e73ac38420f7144f8fb23167d323 # shrinks to seed = 2725885473388159590
+cc b35c8ffd9f1071ceb3adfeadd70ce0d8392ae6994f1cf5ab64c1aed713ea2b4d # shrinks to seed = 2944375863509193808
+cc 0dd2f3a0dddf3c7014bfb8540647cccd3f6f836d4dce7480db4f761746efa8fa # shrinks to seed = 15260592341025757410
+cc af508d51dbf3a7e628130bd812ebfd28822f7e2f8a627d486429c141c391a2cb # shrinks to seed = 13478671827932394862
+cc 70c0bdbef31f435886c0f922dc0d51fa14b0a62be1a32d139ed1e188801c07e4 # shrinks to seed = 7791630710899652036
