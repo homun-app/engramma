@@ -463,6 +463,19 @@ pub(crate) struct GraphState {
     pub(crate) index: crate::graph::GraphIndex,
 }
 
+/// The stemming-language histogram of the visible notes (v0.5.3, P0) and its
+/// freshness bookkeeping, same pattern as the graph: the languages the
+/// `body_norm` of the living notes was actually stemmed in, most frequent
+/// first, so that an uncertain (short) question expands its stems over the
+/// languages the cell really speaks instead of trusting one guess.
+pub(crate) struct LangHistState {
+    /// `PRAGMA data_version` at build time: another process writing the cell
+    /// bumps it, and the next uncertain question rebuilds.
+    pub(crate) data_version: i64,
+    /// `(language, notes)` sorted by count desc, then by wire name.
+    pub(crate) langs: Vec<(crate::format::Lang, usize)>,
+}
+
 /// What this cell's own writes did to the graph since the last use: the
 /// touched notes (their declared edges are patched into an overlay) and
 /// whether something global happened (manual edges, purge) that only a full
@@ -484,6 +497,11 @@ pub(crate) struct Inner {
     pub(crate) graph: Option<GraphState>,
     /// Own writes since the graph index was last used.
     pub(crate) graph_dirt: GraphDirt,
+    /// The language histogram of the visible notes (v0.5.3, P0), lazily
+    /// built by the first UNCERTAIN question.
+    pub(crate) lang_hist: Option<LangHistState>,
+    /// Own writes since the histogram was last built.
+    pub(crate) lang_hist_dirty: bool,
     /// LRU cache of embedded queries, per model (default 4 096 entries,
     /// v0.3: the v0.2.1 256-slot cache made every "warm" benchmark question
     /// a re-embedding).
@@ -715,6 +733,8 @@ impl Cell {
         inner.index = None;
         inner.graph = None;
         inner.graph_dirt = GraphDirt::default();
+        inner.lang_hist = None;
+        inner.lang_hist_dirty = false;
         inner.query_cache.clear();
         inner.pending_scrub.clear();
         drop(inner);
@@ -770,6 +790,8 @@ impl Cell {
                 index: None,
                 graph: None,
                 graph_dirt: GraphDirt::default(),
+                lang_hist: None,
+                lang_hist_dirty: false,
                 query_cache: std::collections::HashMap::new(),
                 query_cache_cap: crate::graph::QUERY_CACHE_CAPACITY,
                 pending_scrub: Vec::new(),
@@ -2724,6 +2746,9 @@ fn execute_op(
     // The graph index follows the same writes (v0.3): manual edges and
     // anything that reshapes entities need a rebuild, a note write only
     // patches that note's declared edges into the overlay.
+    // The language histogram (v0.5.3, P0) is cheaper to invalidate than to
+    // patch: any write may have changed a note's language or status.
+    inner.lang_hist_dirty = true;
     match kind {
         OpKind::Link | OpKind::Unlink | OpKind::Purge => inner.graph_dirt.global = true,
         _ => {

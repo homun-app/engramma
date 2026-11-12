@@ -14,7 +14,15 @@ use crate::format::Lang;
 /// stemming.
 pub fn detect_lang(text: &str) -> Option<Lang> {
     let info = whatlang::detect(text)?;
-    match info.lang() {
+    supported_lang(info.lang())
+}
+
+/// The six bundled stemming languages, in the canonical order the unknown
+/// fallback has always used.
+pub const ALL_STEM_LANGS: [Lang; 6] = [Lang::It, Lang::En, Lang::Fr, Lang::De, Lang::Es, Lang::Pt];
+
+fn supported_lang(l: WhatLang) -> Option<Lang> {
+    match l {
         WhatLang::Ita => Some(Lang::It),
         WhatLang::Eng => Some(Lang::En),
         WhatLang::Fra => Some(Lang::Fr),
@@ -72,14 +80,83 @@ pub fn normalize_for_index(title: Option<&str>, body: &str, lang: Option<Lang>) 
     }
 }
 
-/// Query terms for the FTS index: the stems the index may hold for each query
-/// token. With an explicit language only its stem is used; without one, the
-/// detection runs on the query and — when it does not land on a supported
-/// language (queries are short) — the token is searched in its raw form and in
-/// the stem of every supported language (deduplicated). Recall-oriented: BM25
-/// still ranks better-fitting documents first.
+/// Below this many significant words (stopwords out) a question is too short
+/// for a trustworthy language detection (v0.5.3, P0): «Zebedeo» is a word of
+/// no language in particular, and `whatlang` guessing German for it stemmed
+/// the query away from the Italian index. The threshold is measured against
+/// the recall bank of short questions (`tests/golden/queries-short.json`).
+pub const MIN_CONFIDENT_QUERY_WORDS: usize = 4;
+
+/// The stemming language of a QUESTION (v0.5.3, P0): `None` means
+/// «uncertain — expand». A question is uncertain when it has fewer than
+/// [`MIN_CONFIDENT_QUERY_WORDS`] significant words or when `whatlang` itself
+/// calls its own detection unreliable; notes keep using [`detect_lang`],
+/// which has a whole text to look at and a language that wins anyway (the
+/// index was stemmed with it).
+pub fn detect_query_lang(text: &str) -> Option<Lang> {
+    let folded = strip_diacritics(&text.to_lowercase());
+    let significant = tokenize(&folded)
+        .into_iter()
+        .filter(|t| !STOPWORDS.contains(t))
+        .count();
+    if significant < MIN_CONFIDENT_QUERY_WORDS {
+        return None;
+    }
+    let info = whatlang::detect(text)?;
+    if !info.is_reliable() {
+        return None;
+    }
+    supported_lang(info.lang())
+}
+
+/// One significant word of a question: every form the index may hold for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryWord {
+    /// The alternatives of this word, deduplicated: the raw token (which the
+    /// index holds when the note had no language) and, on an uncertain
+    /// question, one stem per language of the cell. They are ALTERNATIVES:
+    /// the MATCH takes them as an OR.
+    pub forms: Vec<String>,
+    /// The canonical form — the stem in the question's language, or in the
+    /// cell's most frequent language when the question was uncertain (the
+    /// raw token when the cell stems nothing). The adjacent-pair phrases and
+    /// the whole-question phrase are built on these.
+    pub primary: String,
+}
+
+/// The terms of a question, word by word (v0.5.3, P0).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QueryTerms {
+    /// One entry per significant query word, in order.
+    pub words: Vec<QueryWord>,
+}
+
+impl QueryTerms {
+    /// Whether the question left no usable word at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// Every form of every word, deduplicated, in insertion order — the list
+    /// the document frequencies and the ubiquitous-term dropping look at.
+    #[must_use]
+    pub fn flat(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for w in &self.words {
+            for f in &w.forms {
+                if !out.contains(f) {
+                    out.push(f.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Italian and English question words and fillers: they match almost every
-/// document and carry no signal, so they are dropped from queries.
+/// document and carry no signal, so they are dropped from queries (raw and
+/// after stemming — "è" stems to "e" in Italian, both spellings must go).
 const STOPWORDS: &[&str] = &[
     // italiano
     "dove", "chi", "che", "cosa", "quando", "quale", "quali", "quanto", "quanti", "quanta",
@@ -100,43 +177,74 @@ const STOPWORDS: &[&str] = &[
     "his", "her", "their", "its", "and", "or", "but", "not", "now", "still", "then",
 ];
 
-pub fn query_terms(text: &str, lang: Option<Lang>) -> Vec<String> {
+/// The query terms for the FTS index, word by word: the forms the index may
+/// hold for each significant query word. With an explicit language (or a
+/// confident detection, [`detect_query_lang`]) each word keeps its single
+/// stem, exactly as before; an UNCERTAIN question (short or unreliably
+/// detected) expands every word into its raw form plus one stem per language
+/// of the cell — the six bundled stemmers when the cell stems nothing.
+/// Recall-oriented: BM25 still ranks better-fitting documents first.
+///
+/// `cell_langs` is the stemming-language histogram of the cell's visible
+/// notes, most frequent first (the caller builds and caches it); it decides
+/// the expansion set and, when the question is uncertain, the canonical form
+/// of each word (the stem in the most frequent language — the adjacent-pair
+/// phrases of v0.2.1 P1.7 are built on those).
+pub fn query_terms(text: &str, lang: Option<Lang>, cell_langs: &[Lang]) -> QueryTerms {
     let lowered = text.to_lowercase();
     let tokens = tokenize(&lowered);
-    let mut out: Vec<String> = Vec::new();
-    let mut push = |t: String| {
-        if !out.contains(&t) {
-            out.push(t);
-        }
+    let detected = lang.or_else(|| detect_query_lang(text));
+    // the expansion set: empty when the language is confident
+    let expand: &[Lang] = match detected {
+        Some(_) => &[],
+        None if cell_langs.is_empty() => &ALL_STEM_LANGS,
+        None => cell_langs,
     };
-    let detected = lang.or_else(|| detect_lang(text));
+    // the canonical language of the pairs: the confident one, else the most
+    // frequent of the cell, else none (the cell stems nothing: the index
+    // holds raw forms, and so does `primary`)
+    let primary_lang = detected.or_else(|| cell_langs.first().copied());
+    let mut words: Vec<QueryWord> = Vec::new();
     for token in tokens {
         // Stopwords are dropped both raw and after stemming ("è" stems to
         // "e" in Italian: both spellings must go).
         if STOPWORDS.contains(&token) {
             continue;
         }
-        match detected {
-            Some(l) => {
-                let stem = normalize(token, Some(l));
-                if !STOPWORDS.contains(&stem.as_str()) {
-                    push(stem);
-                }
+        let mut forms: Vec<String> = Vec::new();
+        let mut push = |f: String| {
+            if !STOPWORDS.contains(&f.as_str()) && !forms.contains(&f) {
+                forms.push(f);
             }
+        };
+        match detected {
+            Some(l) => push(normalize(token, Some(l))),
             None => {
-                let mut stems: Vec<String> = vec![token.to_string()];
-                for l in [Lang::It, Lang::En, Lang::Fr, Lang::De, Lang::Es, Lang::Pt] {
-                    stems.push(normalize(token, Some(l)));
-                }
-                for stem in stems {
-                    if !STOPWORDS.contains(&stem.as_str()) {
-                        push(stem);
-                    }
+                // the raw form: what the index holds when the note had no
+                // language of its own
+                push(token.to_string());
+                for l in expand {
+                    push(normalize(token, Some(*l)));
                 }
             }
         }
+        if forms.is_empty() {
+            continue;
+        }
+        let prim = match primary_lang {
+            Some(l) => normalize(token, Some(l)),
+            None => token.to_string(),
+        };
+        // the canonical form must be one of the word's forms: a stem the
+        // stopword filter threw away falls back to the first alternative
+        let primary = if forms.contains(&prim) {
+            prim
+        } else {
+            forms[0].clone()
+        };
+        words.push(QueryWord { forms, primary });
     }
-    out
+    QueryTerms { words }
 }
 
 fn tokenize(lowered: &str) -> Vec<&str> {
@@ -327,12 +435,82 @@ mod tests {
     #[test]
     fn query_terms_include_all_languages_when_unknown() {
         // A word in an unsupported language (Russian): raw token plus the
-        // stems of every supported language.
-        let terms = query_terms("Привет", None);
-        // The raw token survives; stems that coincide with it are deduplicated.
-        assert_eq!(terms, vec!["привет".to_string()]);
-        // A detected short Italian word stems once.
-        let it = query_terms("traslocato", Some(Lang::It));
-        assert_eq!(it, vec!["trasloc".to_string()]);
+        // stems of every language of an empty cell (the six, deduplicated —
+        // stems that coincide with the raw form collapse).
+        let terms = query_terms("Привет", None, &[]);
+        assert_eq!(terms.flat(), vec!["привет".to_string()]);
+        // A confident short Italian question stems once, as ever.
+        let it = query_terms("traslocato", Some(Lang::It), &[]);
+        assert_eq!(it.flat(), vec!["trasloc".to_string()]);
+    }
+
+    /// v0.5.3 (P0): a one-word question is never a confident detection.
+    #[test]
+    fn short_questions_are_uncertain_whatever_the_guess() {
+        for q in [
+            "Zebedeo",
+            "tonno",
+            "Aurora",
+            "martedì",
+            "gatto Zebedeo",
+            "crocchette tonno",
+        ] {
+            assert_eq!(
+                detect_query_lang(q),
+                None,
+                "`{q}`: one to three words never carry a language"
+            );
+        }
+        // a real sentence is confident
+        assert_eq!(
+            detect_query_lang("il gatto di prova si chiama Zebedeo e mangia crocchette"),
+            Some(Lang::It)
+        );
+    }
+
+    /// v0.5.3 (P0): an uncertain question expands over the CELL's languages.
+    #[test]
+    fn uncertain_questions_expand_over_the_cell_languages() {
+        // an Italian-only cell: raw form plus the Italian stem — «Zebedeo»
+        // finds the note whatever `whatlang` guesses for one word
+        let terms = query_terms("Zebedeo", None, &[Lang::It]);
+        assert_eq!(terms.words.len(), 1);
+        assert_eq!(
+            terms.words[0].forms,
+            vec!["zebedeo".to_string(), normalize("zebedeo", Some(Lang::It))]
+        );
+        assert_eq!(terms.words[0].primary, normalize("zebedeo", Some(Lang::It)));
+        // a cell that stems nothing: the six languages, as ever
+        let six = query_terms("tonno", None, &[]);
+        assert!(six.flat().contains(&"tonn".to_string()), "{six:?}");
+        // a mixed cell expands only over what it holds: Italian and English
+        // give two distinct forms of «tonno» (dedup collapses what coincides)
+        let mixed = query_terms("tonno", None, &[Lang::It, Lang::En]);
+        assert_eq!(
+            mixed.words[0].forms,
+            vec!["tonno".to_string(), "tonn".to_string()]
+        );
+    }
+
+    /// v0.5.3 (P0): a question `whatlang` trusts stems exactly as an
+    /// explicit language would — no expansion, one form per word, the
+    /// canonical form IS that form.
+    #[test]
+    fn confident_questions_stem_as_they_always_did() {
+        let q = "il gatto di prova si chiama Zebedeo e mangia crocchette";
+        let detected = query_terms(q, None, &[Lang::It]);
+        let explicit = query_terms(q, Some(Lang::It), &[]);
+        assert_eq!(
+            detected, explicit,
+            "a reliable detection is the explicit language"
+        );
+        assert_eq!(detected.words.len(), 6, "{detected:?}");
+        assert!(
+            detected
+                .words
+                .iter()
+                .all(|w| w.forms.len() == 1 && w.forms[0] == w.primary),
+            "one form per word, and it is the canonical one: {detected:?}"
+        );
     }
 }

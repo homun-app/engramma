@@ -303,7 +303,8 @@ fn paraphrase_questions_share_no_roots_with_their_notes() {
     assert!(paraphrases.len() >= 15, "want 15 paraphrases");
     for gq in paraphrases {
         let q_terms: std::collections::BTreeSet<String> =
-            engramma_core::text::query_terms(&gq.q, Some(Lang::It))
+            engramma_core::text::query_terms(&gq.q, Some(Lang::It), &[])
+                .flat()
                 .into_iter()
                 .collect();
         assert!(!q_terms.is_empty(), "`{}` has no usable terms", gq.q);

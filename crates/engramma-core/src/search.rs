@@ -563,28 +563,32 @@ const FREQUENT_TERM_FRACTION: f64 = 0.20;
 /// not filler (found while re-running the golden tests, v0.2.1).
 const FREQUENT_TERM_MIN_DOCS: i64 = 1_000;
 
-/// The MATCH expression over `terms`: quoted stems joined by OR, plus the
-/// phrase of all the stems and — v0.2.1 (P1.7) — a phrase per **adjacent
-/// pair**: «il partner di Anna Rossi» yields "anna ross", which matches the
-/// partner's own note («Partner di [[Anna Rossi]]») and the subject's
-/// notes, not every Anna in the vault. The all-stems phrase alone almost
-/// never matches; the pairs carry the namesake signal the v0.1 comment
-/// promised.
-fn or_match_expr(terms: &[String]) -> String {
-    let mut alts: Vec<String> = terms
+/// The MATCH expression over the query words: every form of every word
+/// quoted and joined by OR (an uncertain question carries alternatives,
+/// v0.5.3 P0 — they are the SAME word in the languages of the cell), plus
+/// the phrase of all the canonical forms and — v0.2.1 (P1.7) — a phrase per
+/// **adjacent pair** of them: «il partner di Anna Rossi» yields "anna ross",
+/// which matches the partner's own note («Partner di [[Anna Rossi]]») and
+/// the subject's notes, not every Anna in the vault. The all-stems phrase
+/// alone almost never matches; the pairs carry the namesake signal the v0.1
+/// comment promised.
+fn or_match_expr(words: &[crate::text::QueryWord]) -> String {
+    let mut alts: Vec<String> = words
         .iter()
+        .flat_map(|w| w.forms.iter())
         .map(|t| format!("\"{}\"", t.replace('"', "")))
         .collect();
-    if terms.len() >= 2 {
+    if words.len() >= 2 {
+        let primary: Vec<&str> = words.iter().map(|w| w.primary.as_str()).collect();
         alts.push(format!(
             "\"{}\"",
-            terms
+            primary
                 .iter()
                 .map(|t| t.replace('"', ""))
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
-        for w in terms.windows(2) {
+        for w in primary.windows(2) {
             alts.push(format!(
                 "\"{} {}\"",
                 w[0].replace('"', ""),
@@ -603,7 +607,10 @@ fn or_match_expr(terms: &[String]) -> String {
 /// (`fts5vocab`, created with the schema); a term is dropped only while at
 /// least one other term stays in the MATCH. Dropped terms still count in
 /// the explain's found terms and in the coverage factor.
-fn match_expr_for(conn: &rusqlite::Connection, terms: &[String]) -> Result<String, SearchError> {
+fn match_expr_for(
+    conn: &rusqlite::Connection,
+    qt: &crate::text::QueryTerms,
+) -> Result<String, SearchError> {
     let total: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM notes WHERE status != 'deleted'",
@@ -611,11 +618,11 @@ fn match_expr_for(conn: &rusqlite::Connection, terms: &[String]) -> Result<Strin
             |r| r.get(0),
         )
         .unwrap_or(0);
-    let df = doc_frequencies(conn, terms)?;
-    Ok(match_expr_with(terms, &df, total))
+    let df = doc_frequencies(conn, &qt.flat())?;
+    Ok(match_expr_with(qt, &df, total))
 }
 
-/// Document frequency of each term, from the index's own vocabulary.
+/// Document frequency of each form, from the index's own vocabulary.
 /// SQLite 3.54's fts5vocab yields ONE row per term: (term, doc, cnt) where
 /// `doc` is the document frequency and `cnt` the total occurrences (probed
 /// by hand on the bundled 3.54.1; older fts5vocab emitted one row per
@@ -666,26 +673,39 @@ fn non_discriminative(df: i64, total: i64) -> bool {
 }
 
 /// The MATCH expression given precomputed document frequencies: ubiquitous
-/// terms leave (a frequent term can go only while a term that MATCHES
-/// something stays behind — a MATCH made only of zero-frequency terms
-/// would find nothing; when every matching term is frequent they all stay,
-/// the query is inherently broad and the old, costly behaviour is honest).
-fn match_expr_with(terms: &[String], df: &HashMap<String, i64>, total: i64) -> String {
-    if terms.len() < 2 || total == 0 {
-        return or_match_expr(terms);
+/// words leave (a frequent word can go only while a word that MATCHES
+/// something stays behind — a MATCH made only of zero-frequency words would
+/// find nothing; when every matching word is frequent they all stay, the
+/// query is inherently broad and the old, costly behaviour is honest).
+/// A WORD's document frequency is the best of its forms: they are
+/// alternatives of the same word (v0.5.3, P0), and a word is dropped only
+/// when every language the cell speaks calls it filler.
+fn match_expr_with(qt: &crate::text::QueryTerms, df: &HashMap<String, i64>, total: i64) -> String {
+    if qt.words.len() < 2 || total == 0 {
+        return or_match_expr(&qt.words);
     }
-    let df_of = |t: &String| df.get(t.as_str()).copied().unwrap_or(0);
-    let is_frequent = |t: &String| frequent_term(df_of(t), total);
-    let matching = terms.iter().filter(|t| df_of(t) > 0).count();
-    let kept: Vec<String> = if matching >= 2 {
-        let kept: Vec<String> = terms.iter().filter(|t| !is_frequent(t)).cloned().collect();
-        if kept.iter().any(|t| df_of(t) > 0) {
+    let df_of = |w: &crate::text::QueryWord| {
+        w.forms
+            .iter()
+            .map(|f| df.get(f.as_str()).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0)
+    };
+    let matching = qt.words.iter().filter(|w| df_of(w) > 0).count();
+    let kept: Vec<crate::text::QueryWord> = if matching >= 2 {
+        let kept: Vec<crate::text::QueryWord> = qt
+            .words
+            .iter()
+            .filter(|w| !frequent_term(df_of(w), total))
+            .cloned()
+            .collect();
+        if kept.iter().any(|w| df_of(w) > 0) {
             kept
         } else {
-            terms.to_vec()
+            qt.words.clone()
         }
     } else {
-        terms.to_vec()
+        qt.words.clone()
     };
     or_match_expr(&kept)
 }
@@ -812,20 +832,38 @@ fn read_candidates(
 }
 
 /// Query terms found in a note's indexed text and tags, with the coverage
-/// factor (1.0 every term matches, 0.5 none does) — pure: the columns come
-/// from [`read_candidates`].
-fn coverage_of(body_norm: &str, tags_text: &str, terms: &[String]) -> (Vec<String>, f64) {
+/// factor (1.0 every word matches, 0.5 none does) — pure: the columns come
+/// from [`read_candidates`]. A word counts as matched when ANY of its forms
+/// appears (they are alternatives of the same word, v0.5.3 P0); the matched
+/// list reports the forms that are actually there.
+fn coverage_of(
+    body_norm: &str,
+    tags_text: &str,
+    qt: &crate::text::QueryTerms,
+) -> (Vec<String>, f64) {
     let words: BTreeSet<&str> = body_norm.split(' ').filter(|w| !w.is_empty()).collect();
     let tag_words: BTreeSet<&str> = tags_text.split(' ').filter(|w| !w.is_empty()).collect();
-    let matched: Vec<String> = terms
-        .iter()
-        .filter(|t| words.contains(t.as_str()) || tag_words.contains(t.as_str()))
-        .cloned()
-        .collect();
-    let coverage = if terms.is_empty() {
+    let mut matched: Vec<String> = Vec::new();
+    let mut matched_words = 0_usize;
+    for w in &qt.words {
+        let hits: Vec<&String> = w
+            .forms
+            .iter()
+            .filter(|f| words.contains(f.as_str()) || tag_words.contains(f.as_str()))
+            .collect();
+        if !hits.is_empty() {
+            matched_words += 1;
+            for h in hits {
+                if !matched.contains(h) {
+                    matched.push(h.clone());
+                }
+            }
+        }
+    }
+    let coverage = if qt.words.is_empty() {
         1.0
     } else {
-        0.5 + 0.5 * (matched.len() as f64 / terms.len() as f64)
+        0.5 + 0.5 * (matched_words as f64 / qt.words.len() as f64)
     };
     (matched, coverage)
 }
@@ -856,6 +894,14 @@ impl Cell {
         if q.graph_hops > 0 && q.weights.graph_weight > 0.0 {
             ensure_graph(&mut inner)?;
         }
+        // v0.5.3 (P0): the language histogram only serves an UNCERTAIN
+        // question, and must be built before `conn` is borrowed for the rest
+        // of the pipeline
+        let cell_langs = if q.lang.is_none() && text::detect_query_lang(&q.text).is_none() {
+            ensure_lang_hist(&mut inner)?
+        } else {
+            Vec::new()
+        };
         let conn = &inner.conn;
 
         // 1. BM25 candidates, with the ubiquitous terms out of the MATCH
@@ -863,7 +909,11 @@ impl Cell {
         // `max(50, k)` — a fixed 50 silently cut every explicit `k` above it,
         // and the caller never knew. The default profile (k ≤ 50) is the same
         // as ever.
-        let terms = text::query_terms(&q.text, q.lang);
+        // v0.5.3 (P0): an uncertain question (short, or unreliably detected)
+        // expands its stems over the languages of the cell (`cell_langs`,
+        // built above); a confident or explicit-language question stems once,
+        // as it always did.
+        let terms = text::query_terms(&q.text, q.lang, &cell_langs);
         if terms.is_empty() {
             return Err(SearchError::Invalid("query has no usable terms".into()));
         }
@@ -1395,6 +1445,67 @@ pub(crate) struct VecCand {
     pub(crate) rank: usize,
     pub(crate) note: Note,
     pub(crate) chunk: usize,
+}
+
+/// The stemming-language histogram of the VISIBLE notes (v0.5.3, P0):
+/// `(language, notes)`, most frequent first — what an uncertain question
+/// expands its stems over. Same freshness pattern as the graph: this
+/// process's own writes flip a dirt flag, another process's writes bump
+/// `PRAGMA data_version`. Only the first uncertain question pays the scan.
+pub(crate) fn ensure_lang_hist(inner: &mut Inner) -> Result<Vec<crate::format::Lang>, SearchError> {
+    let data_version: i64 = inner
+        .conn
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    let fresh = !inner.lang_hist_dirty
+        && inner
+            .lang_hist
+            .as_ref()
+            .is_some_and(|h| h.data_version == data_version);
+    if !fresh {
+        // the effective language of a note is the one `write_note` stemmed
+        // `body_norm` with: the explicit one, else the detection on its
+        // title and body
+        let mut tally: HashMap<crate::format::Lang, usize> = HashMap::new();
+        let mut stmt = inner.conn.prepare(
+            "SELECT frontmatter_json, title, body FROM notes
+             WHERE status IN ('active', 'superseded')",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (fm, title, body) = row?;
+            let explicit = serde_json::from_str::<serde_json::Value>(&fm)
+                .ok()
+                .and_then(|v| v.get("lang").and_then(|l| l.as_str()).map(str::to_string))
+                .and_then(|l| crate::format::Lang::parse(&l).ok());
+            let lang = explicit.or_else(|| {
+                let title = title.as_deref().unwrap_or_default();
+                text::detect_lang(&format!("{title}\n{body}"))
+            });
+            if let Some(l) = lang {
+                *tally.entry(l).or_default() += 1;
+            }
+        }
+        drop(stmt);
+        let mut langs: Vec<(crate::format::Lang, usize)> = tally.into_iter().collect();
+        langs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.as_str().cmp(b.0.as_str())));
+        inner.lang_hist = Some(crate::cell::LangHistState {
+            data_version,
+            langs,
+        });
+        inner.lang_hist_dirty = false;
+    }
+    Ok(inner
+        .lang_hist
+        .as_ref()
+        .map(|h| h.langs.iter().map(|(l, _)| *l).collect())
+        .unwrap_or_default())
 }
 
 /// Build or reuse the in-memory index of the cell's `ready` model.
@@ -2120,14 +2231,21 @@ fn semantic_pipeline(
     if q.graph_hops > 0 && q.weights.graph_weight > 0.0 {
         ensure_graph(inner)?;
     }
+    // v0.5.3 (P0): the language histogram, before `conn` is borrowed — only
+    // an uncertain question needs it (see `search_with_now`)
+    let cell_langs = if q.lang.is_none() && text::detect_query_lang(&q.text).is_none() {
+        ensure_lang_hist(inner)?
+    } else {
+        Vec::new()
+    };
     let conn = &inner.conn;
 
     // --- text list (BM25, as in v0.1; skipped in vector mode). Ubiquitous
     // terms leave the MATCH (P0.3); they still count for coverage.
     let terms = if sem.mode == Mode::Vector {
-        Vec::new()
+        crate::text::QueryTerms::default()
     } else {
-        text::query_terms(&q.text, q.lang)
+        text::query_terms(&q.text, q.lang, &cell_langs)
     };
     let mut text_hits: Vec<(String, f64)> = Vec::new();
     let total_notes: i64 = conn
@@ -2139,7 +2257,7 @@ fn semantic_pipeline(
         .unwrap_or(0);
     // document frequencies once: the MATCH drops the ubiquitous terms and
     // the support labels discount text matches that rest on them alone
-    let df = doc_frequencies(conn, &terms)?;
+    let df = doc_frequencies(conn, &terms.flat())?;
     if !terms.is_empty() {
         let match_expr = match_expr_with(&terms, &df, total_notes);
         // v0.4.2 (P0.1): the window follows the asked `k`, floor 50 — no
@@ -2767,6 +2885,152 @@ mod tests {
         assert_eq!(hits[0].explain.bm25_rank, Some(2));
     }
 
+    /// v0.5.3 (P0): the three-note cell of the phase, and the one-word
+    /// questions the tunnel test could not answer. `whatlang` guesses
+    /// German for «Zebedeo» and French for «tonno»; an uncertain question
+    /// must not stem on one guess.
+    fn short_questions_cell() -> (tempfile::TempDir, Cell) {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let cell = Cell::create(&dir.path().join("corte.sqlite"), "corte", "t")
+            .unwrap(/* test-only */);
+        cell.put_note(
+            &note(
+                1,
+                "Gatto",
+                "Il gatto di prova si chiama Zebedeo e mangia solo crocchette al tonno.",
+                NoteType::Fact,
+            ),
+            "t",
+        )
+        .unwrap(/* test-only */);
+        cell.put_note(
+            &note(
+                2,
+                "Aurora",
+                "Aurora viene in ufficio ogni martedì con la sua bicicletta rossa.",
+                NoteType::Fact,
+            ),
+            "t",
+        )
+        .unwrap(/* test-only */);
+        cell.put_note(
+            &note(
+                3,
+                "Cena",
+                "Stasera cuciniamo le melanzane alla parmigiana per gli amici.",
+                NoteType::Fact,
+            ),
+            "t",
+        )
+        .unwrap(/* test-only */);
+        (dir, cell)
+    }
+
+    /// v0.5.3 (P0): the MATCH of an uncertain question carries every form of
+    /// every word as singles, and the ADJACENT PAIRS on the canonical stems
+    /// only (v0.2.1 P1.7): pairs across stem alternatives of the same word
+    /// would be garbage phrases.
+    #[test]
+    fn uncertain_match_phrases_pair_the_canonical_stems() {
+        let qt = text::query_terms("Anna Rossi", None, &[crate::format::Lang::It]);
+        let expr = or_match_expr(&qt.words);
+        // singles: raw and stem forms, every one quoted
+        assert!(expr.contains("\"anna\""), "{expr}");
+        assert!(expr.contains("\"rossi\""), "{expr}");
+        assert!(expr.contains("\"ross\""), "{expr}");
+        // the pair: the Italian stems in order — not "anna rossi", not a
+        // pair across two forms of the same word
+        assert!(expr.contains("\"anna ross\""), "{expr}");
+        assert!(!expr.contains("\"rossi ross\""), "{expr}");
+        // a confident question is the v0.2.1 shape exactly (with two words
+        // the whole-question phrase and the single pair coincide, as ever)
+        let old = text::query_terms("Anna Rossi", Some(crate::format::Lang::It), &[]);
+        assert_eq!(
+            or_match_expr(&old.words),
+            "\"anna\" OR \"ross\" OR \"anna ross\" OR \"anna ross\""
+        );
+    }
+
+    /// v0.5.3 (P0.5): «Zebedeo», «tonno», «Aurora» e «martedì» find the
+    /// right note on a three-note cell, with AND without `--lang` — the
+    /// explicit language always worked; the uncertain path is the fix.
+    #[test]
+    fn one_word_questions_find_their_note_with_and_without_lang() {
+        let (_d, cell) = short_questions_cell();
+        let cases: &[(&str, &str)] = &[
+            ("Zebedeo", "Gatto"),
+            ("tonno", "Gatto"),
+            ("Aurora", "Aurora"),
+            ("martedì", "Aurora"),
+        ];
+        for (q, title) in cases {
+            for lang in [None, Some(crate::format::Lang::It)] {
+                let query = Query {
+                    lang,
+                    ..Query::text(*q).k(5)
+                };
+                let hits = cell
+                    .search_with_now(&query, now())
+                    .unwrap_or_else(|e| panic!("`{q}` ({lang:?}): {e}"));
+                assert!(
+                    hits.first()
+                        .is_some_and(|h| h.note.display_title() == *title),
+                    "`{q}` ({lang:?}): wanted `{title}` first, got {:?}",
+                    hits.iter()
+                        .map(|h| h.note.display_title().to_string())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// v0.5.3 (P0.5): a cell of English-only notes expands an uncertain
+    /// question over English alone (plus the raw form) — not over the six
+    /// stemmers, and never over a language the cell does not speak. The
+    /// notes carry no explicit `lang`: the write-time detection stems them
+    /// English, and the histogram sees the same.
+    #[test]
+    fn an_english_cell_expands_only_in_english() {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let cell = Cell::create(&dir.path().join("en.sqlite"), "en", "t")
+            .unwrap(/* test-only */);
+        for (i, body) in [
+            "The gardener waters the orchard every morning before the heat.",
+            "Her brother studies medieval history at the college library.",
+            "They sailed the wooden boat across the harbour at dawn.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut n = note(i as u16, "note", body, NoteType::Fact);
+            n.lang = None;
+            cell.put_note(&n, "t").unwrap(/* test-only */);
+        }
+        let hist = {
+            let mut inner = cell.inner.lock().unwrap(/* test-only */);
+            ensure_lang_hist(&mut inner).unwrap(/* test-only */)
+        };
+        assert_eq!(
+            hist,
+            vec![crate::format::Lang::En],
+            "the cell speaks English"
+        );
+        // "gardener": raw + the English stem (deduplicated)
+        let qt = text::query_terms("gardener", None, &hist);
+        assert_eq!(
+            qt.words[0].forms,
+            vec![
+                "gardener".to_string(),
+                text::normalize("gardener", Some(crate::format::Lang::En))
+            ]
+        );
+        // and it finds the note
+        let hits = cell.search_with_now(&Query::text("gardener").k(5), now())
+            .unwrap(/* test-only */);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].note.body.contains("gardener"));
+    }
+
     /// v0.4.2 (P0.1): an explicit `k` is respected AS GIVEN. The BM25
     /// candidate window was a fixed 50: a caller asking `k(150)` on a corpus
     /// where the term matches more notes got a silent cut. The window is now
@@ -3259,7 +3523,8 @@ mod tests {
                 pinco_id = Some(n.id);
             }
         }
-        let stems = text::query_terms("pinco lavora spesso", Some(crate::format::Lang::It));
+        let terms = text::query_terms("pinco lavora spesso", Some(crate::format::Lang::It), &[]);
+        let stems = terms.flat();
         assert_eq!(stems.len(), 3, "{stems:?}");
         {
             let inner = cell.inner.lock().unwrap(/* test-only */);
@@ -3273,7 +3538,7 @@ mod tests {
                 .collect();
             eprintln!("dfs {stems:?} -> {dfs:?}");
             // "lavora" (above the fraction AND the 1000-document floor) leaves
-            let expr = match_expr_for(&inner.conn, &stems).unwrap(/* test-only */);
+            let expr = match_expr_for(&inner.conn, &terms).unwrap(/* test-only */);
             assert!(
                 !expr.contains(&format!("\"{}\"", stems[1])),
                 "the ubiquitous term must leave the MATCH: {expr}"
@@ -3286,11 +3551,12 @@ mod tests {
             // (below the floor the term is signal, not filler)
             // every matching term frequent (lavora+squadra, both ≥ 1000
             // documents): everything stays — an empty MATCH is worse
-            let both = text::query_terms("lavora squadra", Some(crate::format::Lang::It));
-            assert_eq!(both.len(), 2, "{both:?}");
+            let both = text::query_terms("lavora squadra", Some(crate::format::Lang::It), &[]);
+            let both_flat = both.flat();
+            assert_eq!(both_flat.len(), 2, "{both_flat:?}");
             let expr2 = match_expr_for(&inner.conn, &both).unwrap(/* test-only */);
             assert!(
-                expr2.contains(both[0].as_str()) && expr2.contains(both[1].as_str()),
+                expr2.contains(both_flat[0].as_str()) && expr2.contains(both_flat[1].as_str()),
                 "no term may be dropped when every matching term is frequent: {expr2}"
             );
         }

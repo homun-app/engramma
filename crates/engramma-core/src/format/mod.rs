@@ -208,7 +208,7 @@ impl Status {
 }
 
 /// Supported stemming languages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
     /// Italian.
     It,
