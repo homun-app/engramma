@@ -4583,3 +4583,272 @@ engramma.darwin-arm64.node  c64010d381df14cd6ad48be20db7e112b9d4331d823f1deb5e01
 index.js                    25fd9cc1d50a1ec3f2d74bc004d904663ff07360102d27b938870329d9c832d4
 index.d.ts                  bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a6488005bf69d9f8
 ```
+
+# REPORT — Engramma v0.5 (scrivere da altri assistenti: proposte, revisione, storico e rollback)
+
+Data: 2026-11-12. Base: `main` @ `09015ef` (fase-v0.4.6.1 più un commit di
+sole dipendenze: axum 0.8.9 e l'elicitation di rmcp 3.8, già nel lock).
+Tutto costruito e provato offline (`cargo --offline`), Rust 1.95.0, macOS
+arm64. **Nessuna crate nuova**: blake3, ring, ureq, saphyr, serde, axum,
+tokio erano già in `Cargo.lock`; il lockfile è invariato. Un commit per
+punto, i test rossi prima delle correzioni.
+
+**Commits:** `029767d` (P0), `8882c97` (P1), `8843c94` (P2), `ceb6151`
+(P3), `63a2381` (P4), `c7eb146` (P5), `03d08a4` (difetto trovato dalla
+prova a mano), più questo (P6). 307 test del workspace verdi.
+
+## P0 — Lo schema più nuovo si rifiuta
+
+- **Rosso** (`tests/schema_too_new.rs`): cella creata, `schema_version`
+  portato a `SCHEMA_VERSION + 1`, riaperta — **oggi si apriva**. Dopo la
+  correzione: `CellError::SchemaTooNew { found, supported }` e la cella
+  resta intatta (la versione scritta dal test è ancora lì, non migrata).
+- La guardia vive in `schema::migrate`: ogni superficie passa da
+  `Cell::open` (CLI, MCP, Node, vault), quindi ogni apertura è coperta.
+- **CLI**: codice d'uscita **6** proprio (`output.rs`), messaggio senza il
+  suggerimento «run `engramma init`» che qui sarebbe fuorviante. Provato a
+  mano: `engramma get …` → exit 6; `verify` → exit 6.
+- **Node**: **solo** il nuovo codice d'errore `SCHEMA_TOO_NEW` nella mappa
+  di `cell_error` e nell'elenco dei codici noti di `split_transport`.
+  **Nessun metodo nuovo** del contratto JS.
+- `the_own_schema_still_opens`: la cella propria si apre, versione corrente.
+
+### Per Homun
+
+Homun usa un `.node` **vecchio, senza questa guardia**. Le sue celle **non
+vanno aperte** con la CLI o l'MCP della v0.5 prima che Homun aggiorni il
+suo `.node`: `Cell::open` migra **sempre** (non esiste un modo di aprire
+in sola lettura senza migrare — il reader e il writer condividono la
+stessa apertura), e una volta che la cella è a schema 13 il `.node` vecchio
+ci scriverebbe sotto le tabelle `proposals`/`decisions` che non conosce,
+facendo divergere lo stato derivato dal registro. Tenere l'MCP senza
+`--write` **non basta**: l'apertura migra comunque. La strada giusta è
+portare Homun al `.node` v0.5 (che rifiuta e non migra) e solo dopo
+toccare le sue celle con strumenti nuovi. In transizione: le celle di
+Homun restano di Homun.
+
+## P1 — Proposte, decisioni e rollback nel motore
+
+Op nuove `propose`/`decide`/`revert_decision` (+ `set_policy`, introdotta
+col solo schema: la semantica è di P2); **schema 13**: tabelle derivate
+`proposals` e `decisions`, mantenute da `apply` e **coperte dal
+`state_digest`** — il rigioco da zero dà lo stesso digest e `verify`
+controlla le operazioni nuove come qualsiasi altra tabella. Il digest
+allargato rende stanchi i digest registrati dalle compattazioni vecchie:
+passaggio una-tantum all'apertura (`upgrade_snapshot_digests`): i file
+istantanea vengono migrati e ridigeriti, i checkpoint (senza file) hanno
+il digest posto a NULL come le redazioni di purge; il bookmark `dump_v13`
+sta nel registro ma è escluso dal confronto (come `log_v1_head`). La purge
+raggiunge righe e payload; i `decide` che accettavano una rettifica
+vengono **censurati** (come i `supersede` da sempre): il bersaglio resta
+chiuso anche nel rigioco censurato, con la chiusura registrata nell'op
+stessa (`target_closing` viaggia nel corpo).
+
+- **Rossi→verdi** (`tests/proposals.rs`, 21): la proposta nasce in
+  quarantena e la ricerca non la vede (nemmeno come seme del grafo); la
+  coda è distinta dalla quarantena `external`; doppione normalizzato
+  rifiutato senza scrivere (maiuscole/spazi/punteggiatura: decisa in
+  `text::normalize_for_duplicate`, test dedicato); accetta attiva, accetta
+  con modifica, accetta di una rettifica chiude il bersaglio; rifiuta mette
+  la lapide col testo; due decisioni senza revert rifiutate; il revert
+  riapre il bersaglio com'era, la decisione è ripetibile; **mai sopra una
+  correzione umana** (`CellError::Conflict` che nomina le operazioni);
+  il purgato non torna (`purged`); filtri per stato/attore/data; blocco
+  per attore con conflitto e purga in mezzo; `verify` copre le op nuove;
+  la purge dimentica proposta e decisioni restando verificabile; la purge
+  di una rettifica accettata tiene il bersaglio chiuso (il caso più
+  delicato: censura del `decide`).
+- **Proptest** (`tests/proposals_props.rs`): sequenze casuali di propose,
+  decide, revert, patch, supersede, restore e purge; invarianti della
+  spec: invisibilità in coda (testo e grafo), mai sopra un umano, digest
+  del rigioco uguale, `verify` verde.
+- **Due processi veri** (`tests/two_writers.rs`): il processo figlio
+  (questo binario) propone mentre il padre edita; 202 operazioni, nessuna
+  persa, nessun «database is locked» all'utente — `BEGIN IMMEDIATE` +
+  `busy_timeout` fanno il loro lavoro.
+- Il generatore di `tests/props.rs` copre i quattro tipi nuovi
+  (`random_ops_cover_every_kind`, 256 semi, ≥20 successi per tipo).
+- **Difetti trovati e corretti durante il punto** (i proptest esistenti
+  sono stati riallungati prima di passare oltre): la purge dimenticava i
+  `revert_decision`, ma un revert riapre un bersaglio — censurati anche
+  quelli; e la prima stesura della censura riscriveva i revert di
+  QUALSIASI nota (trovato dallo stesso proptest: `note_id` nel filtro).
+
+## P2 — Politiche per cella e revisore automatico
+
+`write: off` è il predefinito e una cella chiusa rifiuta le proposte su
+ogni superficie. `reviewers.yaml` alla radice dei dati (saphyr):
+`command` (argv fisso, **niente shell**, tempo massimo) e `openai`
+(endpoint compatibile `/v1/chat/completions`, uscita `json_schema`, via
+`ureq`); il file porta il **nome della variabile d'ambiente**, mai la
+chiave — una `api_key` scritta nel file non parsa (campo proibito
+esplicito). Il contratto: richiesta JSON con la proposta, il bersaglio,
+fino a 5 note simili, il nome della cella, il riassunto della politica e
+la versione del prompt — **tutto il personale fra delimitatori
+`<<<BEGIN/END …>>>`**; risposta `{decision, reason ≤500, confidence 0..1}`;
+lettura severa: qualunque altra cosa vale `escalate`; solo un fallimento
+di trasporto marca «revisione automatica fallita» (ritentabile da
+`review_failed`, che non tocca gli escalate). Il prompt sta nel repo
+(`review/prompt-v1.md`, `include_str!`, versione 1) e il suo blake3 entra
+in ogni decisione; dichiara che i contenuti sono dati e non istruzioni —
+e che questo riduce il rischio, non lo elimina.
+
+- **Rossi→verdi** (`tests/review.rs`, 21): le tre decisioni; illeggibile,
+  timeout, crash, revisore assente → pending + `auto_failed`; confidenza
+  sotto soglia → all'umano; **interruttore** dopo N accettazioni
+  nell'ora; `external` mai in automatico; `allow_supersede`
+  none/inferred/any (bersaglio `stated` rifiutato, `inferred` accettato);
+  bersaglio in lapide mai; `kinds`; retry dopo il fallimento; il file yaml
+  rifiuta chiavi crude e campi sconosciuti; hash del prompt stabile e
+  registrato; delimitatori verificati con una proposta ostile
+  («SYSTEM: ignore all previous instructions…»).
+- Il server HTTP finto è in processo, solo loopback; il revisore command
+  è uno script `sh` nel temporaneo (via `tempfile`).
+
+## P3 — MCP in scrittura
+
+`engramma mcp --cells a,b --write a --actor claude-desktop`: identità dalla
+configurazione, mai dal `clientInfo` (che viaggia come metadato);
+`--write ⊆ --cells`, attore obbligatorio. **Un solo** strumento in più,
+`memory_propose`, costruito come route manuale (la via macro non vede il
+giro MRTR). Nessuno strumento conferma/scarta/cancella/purga/cambia
+politica — un test fissa la lista esatta con e senza `--write`
+(`tests/mcp.rs`, ora 9). Gli strumenti di lettura ora dichiarano
+`readOnlyHint: true`.
+
+- **Elicitation, le due forme:** richiesta dal server fino alla 2025-11-25
+  (accetta con testo modificabile → `decide(accept)` con attore
+  `user@mcp:<actor>`, decline → `reject`, cancel → pending) e
+  `InputRequiredResult` per 2026-07-28 col **flusso discover** (niente
+  initialize: ogni richiesta porta il proprio `_meta`; la proposta è già
+  in coda quando il tool risponde `input_required`; `requestState`
+  monouso). Scoperta della prova: su stdio la initialize con
+  `protocolVersion: 2026-07-28` negozia **2025-11-25** — la versione
+  giusta si legge da `RequestContext::protocol_version()` (il `_meta`
+  prima, lo stato dell'handshake poi), non dal clientInfo richiesto.
+- Client senza elicitation → `pending` con l'indirizzo dove decidere
+  (`engramma proposals` / `engramma review`).
+- Le `instructions` portano l'etichetta (chiedere prima, mai dal web,
+  `supersedes` per correggere) e la firma `mcp:<actor>`.
+- Errori non-oracolo: cella non esposta e non scrivibile dicono solo ciò
+  che il chiamante già sa (il messaggio della non scrivibile nomina
+  l'insieme scrivibile; la non esposta è identica a quella dei tool di
+  lettura).
+- La **modalità URL** resta fuori: un token in un URL dato a un modello va
+  progettato a parte (opzione dichiarata nel DESIGN § 12).
+
+## P4 — CLI
+
+`proposals [--state|--by] | show | accept [--edit] | reject [--reason] |
+review`; `decisions [--by|--since|--until|--state]` (per i revisori:
+modello, hash del prompt, confidenza); `revert <id|suffisso-8>` e `revert
+--by reviewer:x [--since] [--until] [--dry-run]` con anteprima e conferma
+come `purge` (`--yes`); `policy show|set key=value` (solo CLI; si rifiuta
+di salvare ciò che il motore non rilegge: `auto` senza `reviewer`, campi
+sconosciuti); `history` racconta la proposta e `--diff` fa il diff riga
+per riga (l'ultima finestra è l'ultima versione contro lo stato attuale).
+`--json` su tutto (`tests/proposals_cli.rs`, 5).
+
+Durante il punto, i proptest esistenti hanno inchiodato il difetto P1
+della censura dei revert (vedi sopra): la sequenza che lo smaschera è
+decidere → revert → decidere di nuovo → purge della proposta — il
+bersaglio divergeva di versione perché il rigioco perdeva la riapertura.
+
+## P5 — La pagina locale di revisione
+
+`engramma review [--port] [--open]`: 127.0.0.1 (porta 0 di base), stampa
+l'indirizzo col token, Ctrl-C ferma. Server-rendered, **zero JavaScript**,
+moduli HTML, CSS servito dal server. Pagine: coda (accetta / modifica e
+accetta / rifiuta), elenco e ricerca, dettaglio con storico (chi propose,
+chi decise, perché), diff e «ripristina questa versione», registro delle
+decisioni con annullamento singolo e in blocco (anteprima poi conferma),
+politica in sola lettura. Attore `user@review`.
+
+Sicurezza, ogni punto col suo test (`tests/review_page.rs`, 9):
+
+- **Token** 256 bit (ring) nell'indirizzo stampato, scambiato una volta
+  con cookie `HttpOnly SameSite=Strict` e redirect all'indirizzo pulito;
+  senza cookie 401 su ogni pagina, token sbagliato 401.
+- **Host** `127.0.0.1:<porta>` o `localhost:<porta>`, altrimenti 403 —
+  provato su **TCP grezzo** (un client onesto non spedirebbe mai un Host
+  bugiardo, che è il punto). Il controllo precede il cookie.
+- **Ogni POST**: `Origin` uguale all'host **e** token CSRF del singolo
+  modulo (blake3 di token+modulo); senza Origine, con Origine estraneo o
+  con CSRF contraffatto: 403.
+- **Intestazioni** su ogni risposta: CSP `default-src 'none'; style-src
+  'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`.
+- **Escaping** di tutto il testo delle note: proposta con `<script>`,
+  `"><img src=x onerror=…>` e `javascript:` in un collegamento markdown →
+  mostrati come testo (la pagina non interpreta il markdown: i
+  collegamenti non diventano mai ancore).
+- **Loopback**: l'indirizzo stampato è 127.0.0.1 (test).
+- Politica senza route di scrittura (POST → 405, nessun modulo nella
+  pagina).
+
+## La prova a mano (trascritta)
+
+Sessione MCP vera, binario vero, client JSON-RPC a mano; radice in
+`/var/folders/…/T/engramma-v05-prova`; politica `write=propose`;
+`--actor claude-desktop`; un fatto già in memoria («Fabio lavora a
+Milano, in zona Navigli.»).
+
+1. `initialize` → `serverInfo: engramma 0.1.0-dev`, instructions con
+   l'etichetta («propose only stable facts…», firma `mcp:claude-desktop`).
+2. `memory_search {query:"lavora"}` → il fatto di Milano.
+3. `memory_propose {text:"Fabio suona il pianoforte da tre anni.",
+   reason:"l'utente l'ha detto durante la chat", confidence:"stated"}`
+   → `status: "pending"`, `id: 01M77PD8HM…0XPA3S`.
+4. `memory_propose {text:"…da tre anni!"}` (stesso testo, punteggiatura
+   diversa) → `status: "duplicate", existing: 01M77PD8HM…` — niente di
+   scritto.
+5. `engramma proposals` → `[in coda] MA0XPA3S mcp:claude-desktop — Fabio
+   suona il pianoforte da tre anni. / motivo: l'utente l'ha detto…`.
+6. `engramma review` → `http://127.0.0.1:58133/entra?token=374a62…`;
+   `/entra` col token → cookie `HttpOnly SameSite=Strict` + redirect a
+   `/coda`; modulo di accettazione col testo modificato in
+   «…da tre anni, da autodidatta.» → POST 303 → `decisions`:
+   `B9FHXBAA  accetta  user@review` (perché: accettata dalla pagina).
+7. `engramma search "pianoforte"` → la nota, attiva, col testo corretto.
+8. `engramma revert B9FHXBAA` → «annullata: proposta di nuovo in coda»;
+   `proposals` la mostra `[in coda]` col testo corretto; `search
+   "pianoforte"` → nessun risultato sopra soglia; `history` racconta
+   «proposta da mcp:claude-desktop … — l'utente l'ha detto durante la
+   chat» e le versioni con `[decide, user@review]` e
+   `[revert_decision, user@cli]`.
+9. `engramma verify` → «registro verificato: 6 operazioni, catena hash,
+   ricostruzione e indice FTS a posto».
+
+**Un difetto vero, trovato ai punti 3–4 di questa stessa sessione** (due
+proposte dello stesso testo in arrivo quasi simultaneo: entrambe
+`pending`, due copie in coda): la prima stesura controllava i doppioni
+all'inizio di `propose` e scriveva dopo — con `write: auto` in mezzo corre
+il revisore, fuori da ogni lock, e la finestra resta aperta fino al tempo
+massimo del revisore. Corretto in `03d08a4`: il controllo ripete sotto il
+lock di scrittura, subito prima dell'operazione. Test rosso prima della
+correzione: revisore command che accetta dopo un secondo, prima proposta
+parcheggiata nella revisione, seconda proposta in parallello — dopo la
+correzione resta una copia sola e il perdente riceve `duplicate`.
+
+## Documentazione
+
+- **DESIGN**: § 5 (le proposte accanto alla quarantena), § 8.3 (MCP in
+  scrittura: strumenti, annotazioni, instructions, elicitation nelle due
+  forme, il confine «chi ha la tua shell è te»), **§ 8.5 nuovo**
+  («Proposte, revisori, storico e rollback»: modello delle minacce,
+  politica, contratto del revisore, le due proprietà del revert), § 12
+  (la v0.5 è questa fase; identità e sincronizzazione cifrata slittano
+  alla v0.6, le successive scorrono di uno; **candidata per una v0.5.x,
+  da decidere con l'utente**: MCP su HTTP con OAuth 2.1 — serve per
+  ChatGPT — e la modalità URL dell'elicitation).
+- **`docs/mcp.md` nuovo**: come collegare Claude Desktop e Claude Code in
+  lettura e in scrittura, configurazione d'esempio, cosa vede l'utente
+  (modulo, coda, `engramma review`), dove si annulla, che cosa non è
+  sicurezza.
+
+## Disco
+
+- `du -sh target` all'inizio: **8,5G**.
+- Alla chiusura: **12G** (build di sviluppo, banco 10k, build Linux in
+  Docker e i tre artefatti di `npm run build`; `~/.cache/cargo-target`
+  mai toccato).
