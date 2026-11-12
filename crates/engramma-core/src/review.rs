@@ -491,8 +491,7 @@ fn answer_schema() -> Value {
             "decision": { "type": "string", "enum": ["accept", "reject", "escalate"] },
             "reason": { "type": "string", "maxLength": 500 },
             "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
-        },
-        "strict": true
+        }
     })
 }
 
@@ -520,7 +519,8 @@ fn run_openai(
         "temperature": 0,
         "response_format": {
             "type": "json_schema",
-            "json_schema": { "name": "engramma_review", "schema": answer_schema() }
+            // `strict` belongs here, beside the schema — not inside it
+            "json_schema": { "name": "engramma_review", "strict": true, "schema": answer_schema() }
         }
     });
     let mut call = ureq::post(&url)

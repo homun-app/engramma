@@ -702,6 +702,18 @@ fn the_openai_reviewer_decides_through_the_compatibile_endpoint() {
         parsed["response_format"]["json_schema"]["name"], "engramma_review",
         "structured output: {body}"
     );
+    // OpenAI's structured outputs: `strict` sits beside `name` and
+    // `schema`, never inside the JSON schema itself (v0.5 verification)
+    assert_eq!(
+        parsed["response_format"]["json_schema"]["strict"], true,
+        "strict structured output: {body}"
+    );
+    assert!(
+        parsed["response_format"]["json_schema"]["schema"]
+            .get("strict")
+            .is_none(),
+        "no foreign keyword in the schema: {body}"
+    );
     let content = parsed["messages"][0]["content"]
         .as_str()
         .unwrap_or_default();
