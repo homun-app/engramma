@@ -14,6 +14,7 @@
 //! that has the user's shell can run `engramma proposals accept` — who has
 //! your shell is you, and that boundary is declared in the DESIGN.
 
+pub mod http;
 pub mod oauth;
 
 use std::collections::HashMap;

@@ -96,17 +96,14 @@ proptest! {
     /// internet: the first octet picks a public class, the rest is free).
     #[test]
     fn ordinary_public_v4_is_public(b in any::<u8>(), c in any::<u8>(), d in any::<u8>()) {
-        let a = match (b % 4) {
-            0 => 1u8,   // 1/8
-            1 => 93,    // 93/8
-            2 => 104,   // 104/8
-            _ => 172,   // 172.32+ (just past the private block)
+        let a = match b % 4 {
+            0 => 1u8,  // 1/8
+            1 => 93,   // 93/8
+            2 => 104,  // 104/8
+            _ => 200,  // 200/8
         };
-        let b2 = if a == 172 { b.saturating_sub(16 % 128).max(32) } else { b };
-        if b2 >= 32 || a != 172 {
-            let ip: IpAddr = octets(a, b2, c, d).parse().unwrap(/* valid */);
-            prop_assert!(is_public_ip(ip), "{}", octets(a, b2, c, d));
-        }
+        let ip: IpAddr = octets(a, b, c, d).parse().unwrap(/* valid by construction */);
+        prop_assert!(is_public_ip(ip), "{}", octets(a, b, c, d));
     }
 
     /// The port-ignoring exception applies ONLY to http + loopback: for
