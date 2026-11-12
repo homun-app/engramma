@@ -752,6 +752,7 @@ dependencies = [
  "thiserror",
  "time",
  "ulid",
+ "ureq",
  "whatlang",
 ]
 

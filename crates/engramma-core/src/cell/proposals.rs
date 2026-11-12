@@ -51,6 +51,55 @@ impl ProposalMode {
     }
 }
 
+/// What the propose call may use beyond the cell itself: the embedding
+/// model (semantic hints) and the configured reviewers (the automatic
+/// decision). Both optional — a propose without a context queues.
+#[derive(Clone, Copy, Default)]
+pub struct ProposeContext<'a> {
+    /// The embedder, when the process has the model loaded.
+    pub embedder: Option<&'a dyn Embedder>,
+    /// The parsed `reviewers.yaml`, when the data root has one.
+    pub reviewers: Option<&'a crate::review::Reviewers>,
+}
+
+/// The fence: may the MACHINE take this decision? Whatever is not plainly
+/// allowed lands on the human — a limit never refuses the proposal, it
+/// only declines to decide it.
+fn machine_may_decide(
+    policy: &super::policy::Policy,
+    note: &Note,
+    target: Option<&Note>,
+    accept: bool,
+) -> bool {
+    // never in automatic, either direction: external content, and the
+    // corrections of notes the policy does not allow to close
+    if note.confidence == crate::format::Confidence::External {
+        return false;
+    }
+    if accept {
+        if !policy.kinds.is_empty() && !policy.kinds.contains(&note.note_type) {
+            return false;
+        }
+        if let Some(target) = target {
+            use super::policy::AllowSupersede;
+            let ok = match policy.allow_supersede {
+                AllowSupersede::None => false,
+                AllowSupersede::Inferred => target.confidence != crate::format::Confidence::Stated,
+                AllowSupersede::Any => true,
+            };
+            if !ok {
+                return false;
+            }
+            // a tombstone (or anything not living) is never closed by the
+            // machine — a purged target does not reach here (it must exist)
+            if target.status != Status::Active {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// What [`Cell::propose`] is asked to store.
 #[derive(Debug, Clone)]
 pub struct ProposalInput {
@@ -173,6 +222,10 @@ pub struct ProposalRow {
     /// The reviewer metadata of an automatic decision (name, model, prompt
     /// hash, declared confidence), when any.
     pub review: Option<Value>,
+    /// An automatic review was ATTEMPTED and FAILED (error, timeout,
+    /// unreadable answer): the proposal waits for a human or a retry. An
+    /// escalation is a choice — this stays false.
+    pub auto_failed: bool,
     /// The current note.
     pub note: Note,
 }
@@ -371,6 +424,7 @@ type ProposalRaw = (
     Option<String>,
     Option<String>,
     Option<String>,
+    bool,
 );
 
 /// One raw `decisions` row (with the joined proposal target), before parsing.
@@ -428,36 +482,49 @@ impl Cell {
         &self,
         input: &ProposalInput,
         actor: &str,
-        embedder: Option<&dyn Embedder>,
+        ctx: &ProposeContext<'_>,
     ) -> Result<ProposalOutcome, CellError> {
         let mut note = input.note.clone();
         note.status = Status::Quarantined;
         note.source = actor.to_string();
 
-        // The semantic hints embed OUTSIDE every lock (the engine's rule),
-        // before anything is written: a failed or absent embedding never
-        // fails the propose — the hints are optional.
-        let qv: Option<(Vec<f32>, String)> = match embedder {
+        // The policy is the first word: a cell nobody opened to proposals
+        // (write: off, the default) refuses them on every surface.
+        let policy = self.policy_of()?;
+        if policy.write == super::policy::WritePolicy::Off {
+            return Err(CellError::Invalid(
+                "the cell does not accept proposals (policy `write: off`): \
+                 `engramma policy set` opens it"
+                    .into(),
+            ));
+        }
+
+        // The semantic neighbours embed OUTSIDE every lock (the engine's
+        // rule), before anything is written: a failed or absent embedding
+        // never fails the propose — they are hints for the human AND
+        // context for the reviewer.
+        let neighbours: Vec<crate::search::VecCand> = match ctx.embedder {
             Some(e) => {
                 let text = crate::embed::note_embedding_text(note.title.as_deref(), &note.body);
                 e.embed(&[&text], crate::embed::TextKind::Query)
                     .ok()
                     .and_then(|vs| vs.into_iter().next())
-                    .map(|v| (v, e.model_id().to_string()))
+                    .and_then(|v| self.semantic_neighbours(&v, e.model_id()).ok())
+                    .unwrap_or_default()
             }
-            None => None,
-        };
-        let possible: Vec<(Ulid, f32)> = match &qv {
-            Some((v, model)) => self.semantic_hints(v, model)?,
             None => Vec::new(),
         };
+        let possible: Vec<(Ulid, f32)> = neighbours
+            .iter()
+            .filter_map(|c| Some((Ulid::from_string(&c.id).ok()?, c.cosine as f32)))
+            .collect();
 
-        // Everything below reads and writes under the cell's write lock.
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
-        {
+        // The creation-time checks, under the cell's write lock.
+        let target_note = {
+            let _guard = self
+                .write_lock
+                .lock()
+                .map_err(|_| CellError::Db("write lock poisoned".into()))?;
             let inner = self.lock()?;
             if super::ops::note_exists(&inner.conn, &note.id)? {
                 return Err(CellError::Invalid(format!(
@@ -494,13 +561,117 @@ impl Cell {
                     });
                 }
             }
-            // The supersede target must exist.
-            if let ProposalMode::Supersede(target) = input.mode
-                && !super::ops::note_exists(&inner.conn, &target)?
-            {
-                return Err(CellError::NoteNotFound(target.to_string()));
+            // The supersede target must exist (and its text rides with the
+            // reviewer's request).
+            match input.mode {
+                ProposalMode::Supersede(target) => {
+                    if !super::ops::note_exists(&inner.conn, &target)? {
+                        return Err(CellError::NoteNotFound(target.to_string()));
+                    }
+                    let tx = inner.conn.unchecked_transaction()?;
+                    Some(super::get_note_tx(&tx, &target)?)
+                }
+                ProposalMode::New => None,
+            }
+        };
+
+        // The automatic review (write: auto) runs INSIDE the propose, with
+        // the reviewer's own time limit — and outside every lock: a slow
+        // model must not freeze the cell. Every failure lands on the human.
+        let mut auto_failed = false;
+        let mut review_error: Option<String> = None;
+        let mut machine: Option<(bool, String, ReviewMeta)> = None; // (accept?, reason, meta)
+        if policy.write == super::policy::WritePolicy::Auto {
+            let reviewer_name = policy.reviewer.clone().unwrap_or_default(); // Policy::parse guarantees a name for auto
+            let reviewer_actor = format!("reviewer:{reviewer_name}");
+            let def = ctx.reviewers.and_then(|rs| rs.get(&reviewer_name));
+            let breaker = self.recent_auto_decisions(&reviewer_actor)?;
+            match def {
+                None => {
+                    auto_failed = true;
+                    review_error = Some(format!("reviewer `{reviewer_name}` is not configured"));
+                }
+                Some(_) if breaker >= u64::from(policy.max_auto_per_hour) => {
+                    // THE BREAKER: the machine stops, the human takes over.
+                    // Not a failure — a deliberate stop.
+                }
+                Some(def) => {
+                    let request = crate::review::ReviewRequest {
+                        cell: self
+                            .meta()
+                            .ok()
+                            .and_then(|m| m.get("cell_name").cloned())
+                            .unwrap_or_default(),
+                        proposal: serde_json::json!({
+                            "text": note.body,
+                            "title": note.title,
+                            "kind": note.note_type.as_str(),
+                            "tags": note.tags,
+                            "confidence": note.confidence.as_str(),
+                            "mode": match input.mode {
+                                ProposalMode::New => "new",
+                                ProposalMode::Supersede(_) => "supersede",
+                            },
+                            "reason": input.reason,
+                        }),
+                        target_text: target_note.as_ref().map(|t| {
+                            crate::embed::note_embedding_text(t.title.as_deref(), &t.body)
+                        }),
+                        similar: neighbours
+                            .iter()
+                            .map(|c| {
+                                (
+                                    c.id.clone(),
+                                    crate::embed::note_embedding_text(
+                                        c.note.title.as_deref(),
+                                        &c.note.body,
+                                    ),
+                                )
+                            })
+                            .collect(),
+                        policy: policy.summary(),
+                    };
+                    match def.review(&request) {
+                        crate::review::ReviewVerdict::Failed { error } => {
+                            auto_failed = true;
+                            review_error = Some(error);
+                        }
+                        crate::review::ReviewVerdict::Escalate { .. } => {
+                            // the reviewer's own choice: the human, no marker
+                        }
+                        verdict => {
+                            let (accept, reason, confidence) = match verdict {
+                                crate::review::ReviewVerdict::Accept { reason, confidence } => {
+                                    (true, reason, confidence)
+                                }
+                                crate::review::ReviewVerdict::Reject { reason, confidence } => {
+                                    (false, reason, confidence)
+                                }
+                                other => unreachable!("the other arms returned above: {other:?}"),
+                            };
+                            let meta = ReviewMeta {
+                                reviewer: reviewer_name.clone(),
+                                model: def.model_name(),
+                                prompt_hash: crate::review::prompt_hash(),
+                                confidence,
+                            };
+                            // the limits: whatever is not plainly allowed
+                            // goes to the human — never a refusal, never an
+                            // acceptance. The declared confidence gates BOTH
+                            // directions: a doubtful decision is no decision.
+                            if confidence >= policy.min_confidence
+                                && machine_may_decide(&policy, &note, target_note.as_ref(), accept)
+                            {
+                                machine = Some((accept, reason, meta));
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        // The propose op itself. `auto_failed` and the error ride in the
+        // body: the queue row is derived from THIS op, so the marker replays.
         let proposed_at = self.now_at()?;
         let (mode, target) = input.mode.parts();
         let payload = serde_json::json!({
@@ -510,13 +681,48 @@ impl Cell {
             "client": input.client,
             "reason": input.reason,
             "proposed_at": proposed_at.to_db_string(),
+            "auto_failed": auto_failed,
+            "review_error": review_error,
         });
-        let mut inner = self.lock()?;
-        super::execute_op(&mut inner, OpKind::Propose, Some(note.id), actor, payload)?;
+        {
+            let _guard = self
+                .write_lock
+                .lock()
+                .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+            let mut inner = self.lock()?;
+            super::execute_op(&mut inner, OpKind::Propose, Some(note.id), actor, payload)?;
+        }
+        // A machine decision applies right after its proposal, as its own
+        // operation (actor `reviewer:<name>`, with the review metadata).
+        if let Some((accept, reason, meta)) = machine {
+            let reviewer_actor = format!("reviewer:{}", meta.reviewer);
+            let input = DecisionInput {
+                action: if accept {
+                    DecisionAction::Accept { edited: None }
+                } else {
+                    DecisionAction::Reject
+                },
+                reason: Some(reason.clone()),
+                review: Some(meta),
+            };
+            self.decide(&note.id, &input, &reviewer_actor)?;
+            return Ok(ProposalOutcome {
+                status: if accept {
+                    ProposalStatus::Accepted
+                } else {
+                    ProposalStatus::Rejected
+                },
+                // the queue's key is the NOTE, not the op: every caller
+                // (CLI, review page, MCP) shows and accepts this one
+                id: Some(note.id),
+                existing: None,
+                possible_duplicates: possible,
+                decided_by: Some(reviewer_actor),
+                decision_reason: Some(reason),
+            });
+        }
         Ok(ProposalOutcome {
             status: ProposalStatus::Pending,
-            // the queue's key is the NOTE, not the op: every caller (CLI,
-            // review page, MCP) shows and accepts this one
             id: Some(note.id),
             existing: None,
             possible_duplicates: possible,
@@ -525,10 +731,28 @@ impl Cell {
         })
     }
 
-    /// Up to 5 semantically similar ACTIVE notes for a propose (the hints).
-    /// Builds the vector index when the cell has a ready model; an absent or
-    /// mismatched model returns nothing.
-    fn semantic_hints(&self, qv: &[f32], model: &str) -> Result<Vec<(Ulid, f32)>, CellError> {
+    /// The decisions an actor (a reviewer) took in the last hour — the
+    /// breaker's count.
+    fn recent_auto_decisions(&self, actor: &str) -> Result<u64, CellError> {
+        let since = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let inner = self.lock()?;
+        let n: i64 = inner.conn.query_row(
+            "SELECT COUNT(*) FROM decisions WHERE actor = ?1 AND decided_at >= ?2",
+            rusqlite::params![actor, crate::format::At(since).to_db_string()],
+            |r| r.get(0),
+        )?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    /// Up to 5 semantically similar ACTIVE notes for a propose (the hints
+    /// for the human, the context for the reviewer). Builds the vector
+    /// index when the cell has a ready model; an absent or mismatched
+    /// model returns nothing.
+    fn semantic_neighbours(
+        &self,
+        qv: &[f32],
+        model: &str,
+    ) -> Result<Vec<crate::search::VecCand>, CellError> {
         let mut inner = self.lock()?;
         let Some((ready, _dim)) =
             crate::search::ensure_index(&mut inner).map_err(|e| CellError::Db(e.to_string()))?
@@ -552,13 +776,7 @@ impl Cell {
             &ready,
         )
         .map_err(|e| CellError::Db(e.to_string()))?;
-        Ok(cands
-            .into_iter()
-            .filter_map(|c| {
-                let id = Ulid::from_string(&c.id).ok()?;
-                Some((id, c.cosine as f32))
-            })
-            .collect())
+        Ok(cands)
     }
 
     /// The proposals queue (or its history, by state).
@@ -571,7 +789,8 @@ impl Cell {
         let until = bound(&filter.until);
         let mut stmt = inner.conn.prepare(
             "SELECT p.note_id, p.mode, p.target, p.proposer, p.client, p.reason, p.state,
-                    p.proposed_at, p.decided_by, p.decided_at, p.decision_reason, p.review_json
+                    p.proposed_at, p.decided_by, p.decided_at, p.decision_reason, p.review_json,
+                    p.auto_failed
              FROM proposals p ORDER BY p.proposed_at, p.note_id",
         )?;
         let raw: Vec<ProposalRaw> = stmt
@@ -589,6 +808,7 @@ impl Cell {
                     r.get(9)?,
                     r.get(10)?,
                     r.get(11)?,
+                    r.get::<_, i64>(12)? != 0,
                 ))
             })?
             .flatten()
@@ -608,6 +828,7 @@ impl Cell {
             decided_at,
             decision_reason,
             review_json,
+            auto_failed,
         ) in raw
         {
             let state = ProposalState::parse(&state)?;
@@ -654,6 +875,7 @@ impl Cell {
                     .map(|s| serde_json::from_str::<Value>(&s))
                     .transpose()
                     .map_err(|e| CellError::Db(format!("bad review_json: {e}")))?,
+                auto_failed,
                 note,
             });
         }
@@ -1001,6 +1223,150 @@ impl Cell {
             }
         }
         Ok(report)
+    }
+
+    /// Retry the FAILED automatic reviews (`engramma proposals review`):
+    /// only proposals that are pending AND marked `auto_failed` — never the
+    /// ones the reviewer deliberately passed to the human. A retry that
+    /// decides, decides with the current policy and the current reviewer
+    /// (`reviewer:<name>`); one that fails again simply stays marked.
+    /// Returns how many were decided.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failures; [`CellError::Invalid`] when the
+    /// policy refuses (it must be `write: auto` to retry).
+    pub fn review_failed(&self, ctx: &ProposeContext<'_>) -> Result<usize, CellError> {
+        let policy = self.policy_of()?;
+        if policy.write != super::policy::WritePolicy::Auto {
+            return Err(CellError::Invalid(
+                "the retry wants the policy `write: auto`".into(),
+            ));
+        }
+        let failed: Vec<Ulid> = self
+            .proposals(&ProposalsFilter {
+                state: Some(ProposalState::Pending),
+                ..Default::default()
+            })?
+            .into_iter()
+            .filter(|p| p.auto_failed)
+            .map(|p| p.id)
+            .collect();
+        let mut decided = 0;
+        for id in failed {
+            // the same path a fresh propose walks, minus the new note: the
+            // reviewer sees the stored proposal
+            let row = self
+                .proposals(&ProposalsFilter::default())?
+                .into_iter()
+                .find(|p| p.id == id)
+                .ok_or_else(|| CellError::Db("the queue row vanished".into()))?;
+            let target_note = match row.mode {
+                ProposalMode::Supersede(t) => Some(self.get(&t)?),
+                ProposalMode::New => None,
+            };
+            let reviewer_name = policy.reviewer.clone().unwrap_or_default();
+            let actor = format!("reviewer:{reviewer_name}");
+            let Some(def) = ctx.reviewers.and_then(|rs| rs.get(&reviewer_name)) else {
+                continue; // still not configured: stays failed, the CLI says so
+            };
+            if self.recent_auto_decisions(&actor)? >= u64::from(policy.max_auto_per_hour) {
+                break; // the breaker holds on retries too
+            }
+            let neighbours: Vec<crate::search::VecCand> = match ctx.embedder {
+                Some(e) => {
+                    let text = crate::embed::note_embedding_text(
+                        row.note.title.as_deref(),
+                        &row.note.body,
+                    );
+                    e.embed(&[&text], crate::embed::TextKind::Query)
+                        .ok()
+                        .and_then(|vs| vs.into_iter().next())
+                        .and_then(|v| self.semantic_neighbours(&v, e.model_id()).ok())
+                        .unwrap_or_default()
+                }
+                None => Vec::new(),
+            };
+            let request = crate::review::ReviewRequest {
+                cell: self
+                    .meta()
+                    .ok()
+                    .and_then(|m| m.get("cell_name").cloned())
+                    .unwrap_or_default(),
+                proposal: serde_json::json!({
+                    "text": row.note.body,
+                    "title": row.note.title,
+                    "kind": row.note.note_type.as_str(),
+                    "tags": row.note.tags,
+                    "confidence": row.note.confidence.as_str(),
+                    "mode": match row.mode {
+                        ProposalMode::New => "new",
+                        ProposalMode::Supersede(_) => "supersede",
+                    },
+                    "reason": row.reason,
+                }),
+                target_text: target_note
+                    .as_ref()
+                    .map(|t| crate::embed::note_embedding_text(t.title.as_deref(), &t.body)),
+                similar: neighbours
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.id.clone(),
+                            crate::embed::note_embedding_text(
+                                c.note.title.as_deref(),
+                                &c.note.body,
+                            ),
+                        )
+                    })
+                    .collect(),
+                policy: policy.summary(),
+            };
+            let meta = ReviewMeta {
+                reviewer: reviewer_name,
+                model: def.model_name(),
+                prompt_hash: crate::review::prompt_hash(),
+                confidence: 0.0,
+            };
+            match def.review(&request) {
+                crate::review::ReviewVerdict::Accept { reason, confidence } => {
+                    if confidence >= policy.min_confidence
+                        && machine_may_decide(&policy, &row.note, target_note.as_ref(), true)
+                    {
+                        let meta = ReviewMeta { confidence, ..meta };
+                        self.decide(
+                            &id,
+                            &DecisionInput {
+                                action: DecisionAction::Accept { edited: None },
+                                reason: Some(reason),
+                                review: Some(meta),
+                            },
+                            &actor,
+                        )?;
+                        decided += 1;
+                    }
+                }
+                crate::review::ReviewVerdict::Reject { reason, confidence } => {
+                    if confidence >= policy.min_confidence
+                        && machine_may_decide(&policy, &row.note, target_note.as_ref(), false)
+                    {
+                        let meta = ReviewMeta { confidence, ..meta };
+                        self.decide(
+                            &id,
+                            &DecisionInput {
+                                action: DecisionAction::Reject,
+                                reason: Some(reason),
+                                review: Some(meta),
+                            },
+                            &actor,
+                        )?;
+                        decided += 1;
+                    }
+                }
+                crate::review::ReviewVerdict::Escalate { .. }
+                | crate::review::ReviewVerdict::Failed { .. } => {}
+            }
+        }
+        Ok(decided)
     }
 
     /// Set the cell's policy. The op and the schema arrived with P1; the

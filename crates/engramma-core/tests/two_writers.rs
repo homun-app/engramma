@@ -49,7 +49,7 @@ fn child(cell: &Cell) {
                     reason: Some("concorrenza".into()),
                 },
                 "mcp:test",
-                None,
+                &engramma_core::cell::proposals::ProposeContext::default(),
             )
             .unwrap(/* test-only: a locked cell must not surface here */);
         assert!(out.id.is_some(), "distinct texts cannot be duplicates");
@@ -66,6 +66,8 @@ fn two_processes_share_one_cell_without_lost_writes_or_locks() {
         return;
     }
     let cell = Cell::create(&path, "t", "t").unwrap(/* t */);
+    cell.set_policy(serde_json::json!({ "write": "propose" }), "t")
+        .unwrap(/* t */);
     let exe = std::env::current_exe().unwrap(/* t */);
     let mut kid = Command::new(exe)
         .args([
@@ -88,7 +90,11 @@ fn two_processes_share_one_cell_without_lost_writes_or_locks() {
     // nothing lost: reopen (a fresh HLC and view of the file) and count
     let cell = Cell::open(&path).unwrap(/* t */);
     let ops = cell.ops().unwrap(/* t */);
-    assert_eq!(ops.len(), 1 + 100 + 100, "init + 100 edits + 100 proposals");
+    assert_eq!(
+        ops.len(),
+        2 + 100 + 100,
+        "init + policy + 100 edits + 100 proposals"
+    );
     let queued = cell
         .proposals(&ProposalsFilter {
             state: Some(ProposalState::Pending),

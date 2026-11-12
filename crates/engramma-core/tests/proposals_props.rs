@@ -74,6 +74,8 @@ proptest! {
     ) {
         let dir = tempfile::tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* test-only */);
+        cell.set_policy(serde_json::json!({ "write": "propose" }), "t")
+            .unwrap(/* test-only */);
         let mut rng = Rng(seed);
         let mut clock = 0_u64;
         let mut counter = 0_u64;
@@ -116,7 +118,7 @@ proptest! {
                             reason: Some("perché".into()),
                         },
                         "mcp:test",
-                        None,
+                        &engramma_core::cell::proposals::ProposeContext::default(),
                     )
                     .unwrap(/* test-only */);
                     if out.id.is_some() {
@@ -137,7 +139,8 @@ proptest! {
                                 reason: None,
                             },
                             "mcp:test",
-                            None,
+
+                            &engramma_core::cell::proposals::ProposeContext::default(),
                         )
                         .unwrap(/* test-only */);
                         if out.id.is_some() {

@@ -18,6 +18,9 @@ pulldown-cmark.workspace = true
 regex.workspace = true
 time.workspace = true
 thiserror.workspace = true
+# v0.5 (P2): the `openai` reviewer — ureq is already in the lock (via
+# engramma-embed), declaring it here adds no crate to Cargo.lock.
+ureq.workspace = true
 
 tempfile.workspace = true
 

@@ -7,6 +7,7 @@
 //! (search, get) share the same connection in WAL mode.
 
 pub mod ops;
+pub mod policy;
 pub mod proposals;
 pub mod schema;
 pub mod vectors;

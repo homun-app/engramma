@@ -1720,8 +1720,9 @@ fn apply_propose(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     write_note(tx, &note, false, false)?;
     reindex_note(tx, &note.id, None)?;
     tx.execute(
-        "INSERT INTO proposals (note_id, mode, target, proposer, client, reason, state, proposed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+        "INSERT INTO proposals (note_id, mode, target, proposer, client, reason, state,
+                                proposed_at, auto_failed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
         rusqlite::params![
             note.id.to_string(),
             mode,
@@ -1736,6 +1737,13 @@ fn apply_propose(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
                 .and_then(|b| b.get("reason"))
                 .and_then(Value::as_str),
             body_str(op, "proposed_at")?,
+            // v0.5 (P2): the automatic review ran inside the propose and
+            // failed — the marker replays with the op that carried it
+            op.body
+                .as_ref()
+                .and_then(|b| b.get("auto_failed"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         ],
     )?;
     Ok(())
@@ -1955,7 +1963,7 @@ fn apply_decide(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     }
     tx.execute(
         "UPDATE proposals SET state = ?2, decision_op = ?3, decided_by = ?4, decided_at = ?5,
-                             decision_reason = ?6, review_json = ?7
+                             decision_reason = ?6, review_json = ?7, auto_failed = 0
          WHERE note_id = ?1",
         rusqlite::params![
             id.to_string(),

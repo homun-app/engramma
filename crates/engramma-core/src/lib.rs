@@ -12,6 +12,7 @@ pub mod graph;
 pub mod hlc;
 pub mod id;
 pub mod port;
+pub mod review;
 pub mod search;
 pub mod text;
 pub mod vector;

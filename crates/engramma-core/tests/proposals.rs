@@ -44,6 +44,10 @@ fn note(body: &str) -> Note {
 fn cell() -> (tempfile::TempDir, Cell) {
     let dir = tempfile::tempdir().unwrap(/* t */);
     let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* t */);
+    // v0.5 (P2): the default policy is closed (write: off); these tests
+    // exercise the queue, so they open it
+    cell.set_policy(serde_json::json!({ "write": "propose" }), "t")
+        .unwrap(/* t */);
     (dir, cell)
 }
 
@@ -56,7 +60,7 @@ fn propose(cell: &Cell, body: &str) -> engramma_core::cell::proposals::ProposalO
             reason: Some("l'utente l'ha detto".into()),
         },
         "mcp:claude-desktop",
-        None,
+        &engramma_core::cell::proposals::ProposeContext::default(),
     )
     .unwrap(/* t */)
 }
@@ -144,7 +148,8 @@ fn a_normalized_duplicate_is_refused_without_writing_an_op() {
             reason: None,
         },
         "mcp:claude",
-        None,
+
+        &engramma_core::cell::proposals::ProposeContext::default(),
     )
     .unwrap(/* t */);
     assert!(matches!(out.status, ProposalStatus::Duplicate));
@@ -258,7 +263,7 @@ fn accept_of_a_supersede_closes_the_target() {
                 reason: Some("l'utente ha corretto".into()),
             },
             "mcp:claude",
-            None,
+            &engramma_core::cell::proposals::ProposeContext::default(),
         )
         .unwrap(/* t */);
     let id = out.id.unwrap(/* t */);
@@ -360,7 +365,7 @@ fn revert_returns_the_proposal_to_the_queue_and_reopens_the_target() {
                 reason: None,
             },
             "mcp:claude",
-            None,
+            &engramma_core::cell::proposals::ProposeContext::default(),
         )
         .unwrap(/* t */);
     let id = out.id.unwrap(/* t */);
@@ -464,7 +469,7 @@ fn a_revert_never_lands_on_a_later_human_correction() {
                 reason: None,
             },
             "mcp:claude",
-            None,
+            &engramma_core::cell::proposals::ProposeContext::default(),
         )
         .unwrap(/* t */);
     let id2 = out.id.unwrap(/* t */);
@@ -629,7 +634,7 @@ fn verify_covers_the_new_operations_and_the_replay_matches() {
                 reason: Some("correzione".into()),
             },
             "mcp:claude",
-            None,
+            &engramma_core::cell::proposals::ProposeContext::default(),
         )
         .unwrap(/* t */);
     accept(&cell, &out.id.unwrap(/* t */), "user@cli");
@@ -677,7 +682,7 @@ fn purging_an_accepted_supersede_keeps_the_target_closed_and_verifiable() {
                 reason: Some("correzione".into()),
             },
             "mcp:claude",
-            None,
+            &engramma_core::cell::proposals::ProposeContext::default(),
         )
         .unwrap(/* t */);
     let id = out.id.unwrap(/* t */);

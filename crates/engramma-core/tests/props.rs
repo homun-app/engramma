@@ -642,7 +642,7 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) -> std::collections::HashMap<O
                         reason: Some("prop".into()),
                     },
                     "mcp:prop",
-                    None,
+                    &engramma_core::cell::proposals::ProposeContext::default(),
                 ) && let Some(id) = out.id
                 {
                     // the row lands only when it is not a duplicate
@@ -747,6 +747,8 @@ fn random_ops_cover_every_kind() {
     for seed in 0..256u64 {
         let dir = tempfile::tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* t */);
+        cell.set_policy(serde_json::json!({ "write": "propose" }), "prop")
+            .unwrap(/* t */);
         // the cell's own creation is the init op
         *totals.entry(OpKind::Init).or_insert(0) += 1;
         for (kind, n) in run_random_ops(&cell, seed, ops_count(seed)) {
