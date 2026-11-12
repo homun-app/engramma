@@ -2159,3 +2159,22 @@ fn a_revoked_label_can_be_approved_again_and_a_live_one_cannot() {
         "both revoked"
     );
 }
+
+#[test]
+fn oauth_pending_lists_what_waits() {
+    // verifica v0.5.2 (prova col tunnel): the pending filter compared the
+    // CREATION time with now, so `oauth pending` — the human's first
+    // command — never listed anything
+    let (cimd_url, _cimd) = cimd_server();
+    let s = Server::start(|cfg| cfg.allow_loopback_cimd = true);
+    let code = pending_code(&s, &cimd_url);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .arg("--root")
+        .arg(&s.root)
+        .args(["oauth", "pending"])
+        .output()
+        .unwrap(/* t */);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(&code), "the waiting code is listed: {text}");
+    assert!(text.contains("ChatGPT di prova"), "{text}");
+}

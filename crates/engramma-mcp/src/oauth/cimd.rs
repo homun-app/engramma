@@ -129,13 +129,21 @@ pub fn fetch(client_id: &str, mode: CimdFetch) -> Result<FetchedClient, CimdErro
             "the document's client_id is not its own URL".into(),
         ));
     }
-    // the auth method: absent or `none`. `private_key_jwt` is not spoken
-    // in this phase, and the refusal says so.
+    // the auth method: absent or `none` — or a client that ALSO speaks
+    // `none` (ChatGPT's real document prefers `private_key_jwt` but lists
+    // `none` among `token_endpoint_auth_methods_supported`; our metadata
+    // offers only `none`, so that is what it uses). `private_key_jwt` alone
+    // is not spoken in this phase, and the refusal says so.
+    let also_none = doc
+        .get("token_endpoint_auth_methods_supported")
+        .and_then(Value::as_array)
+        .is_some_and(|a| a.iter().any(|m| m.as_str() == Some("none")));
     match doc
         .get("token_endpoint_auth_method")
         .and_then(Value::as_str)
     {
         None | Some("none") => {}
+        Some(_) if also_none => {}
         Some(other) => {
             return Err(CimdError::BadDocument(format!(
                 "token_endpoint_auth_method `{other}` is not supported here (only `none`, \
@@ -357,6 +365,26 @@ mod tests {
             Err(CimdError::NotAClientUrl) => panic!("expected a refusal, got NotAClientUrl"),
             Ok(_) => panic!("expected a refusal, got a document"),
         }
+    }
+
+    #[test]
+    fn a_client_that_also_speaks_none_is_accepted_as_public() {
+        // ChatGPT's real document (fetched 2026-11-12 in the tunnel test):
+        // the preferred method is private_key_jwt, but `none` is among the
+        // supported ones — and our metadata offers only `none`, so the
+        // client speaks it. Refusing it meant ChatGPT could never connect.
+        let (url, _h) = cimd_server(
+            200,
+            &[("content-type", "application/json")],
+            r#"{"client_id":"{URL}","redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"],"token_endpoint_auth_method":"private_key_jwt","token_endpoint_auth_methods_supported":["none","private_key_jwt"],"client_name":"ChatGPT"}"#,
+        );
+        let got = fetch(
+            &url,
+            CimdFetch {
+                allow_loopback: true,
+            },
+        );
+        assert!(got.is_ok(), "{:?}", got.err().map(|e| e.to_string()));
     }
 
     #[test]

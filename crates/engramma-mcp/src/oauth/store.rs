@@ -573,10 +573,13 @@ impl OAuthStore {
                 ))
             })
             .map_err(db)?
-            .flatten()
-            .collect::<Vec<_>>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db)?
             .into_iter()
-            .filter(|r| r.13 > now || r.11 != "pending")
+            // a pending request lives until its EXPIRY (field 14; verifica
+            // v0.5.2: the filter read field 13, the creation time, and
+            // `oauth pending` never listed anything)
+            .filter(|r| r.14 > now || r.11 != "pending")
             .collect::<Vec<_>>();
         drop(stmt);
         let mut out = Vec::new();
