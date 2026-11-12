@@ -166,13 +166,14 @@ Il trait `CellStore` isola SQL, FTS e vettori: un'implementazione SQLite oggi, T
 - **«Perché lo so?»:** ogni risultato porta la sua `source`. L'applicazione la trasforma in un collegamento, per esempio la conversazione di Homun.
 - **Fatti che cambiano.** Una nota che sostituisce un'altra (`supersedes`) le mette `valid_to` e la marca `superseded`. Restano nello storico e rispondono alle domande «com'era prima».
 - **Le proposte (v0.5).** Accanto alla quarantena dei contenuti `external` c'è la **coda delle proposte**: una nota che un assistente propone nasce in quarantena — la ricerca non la vede, il grafo non la semina — con i suoi metadati (chi propone, client dichiarato, modo `new`/`supersede`, motivazione). Le due cose sono distinte: `external` è quarantena di *contenuto* (terze parti), la coda è quarantena di *autore* (un modello). Se ne decide in § 8.5: politica per cella, revisore automatico, decisioni applicate nell'operazione che le registra, annullamento che non riscrive mai la storia.
+- **L'invariante d'indistinguibilità (v0.5.3).** La visibilità di stato entra **dentro** ogni lista, prima di ranghi e normalizzazioni: la query BM25 porta il filtro di stato nel JOIN (gli stessi stati della lettura), i ranghi vettoriali si numerano dopo il filtro, il grafo espelle le note nascoste dall'uscita del push prima della finestra e della normalizzazione, e le frequenze/totali contano i soli visibili. Ne segue la proprietà che il codice mantiene come invariante (proptest dedicato, tre modalità): **la stessa domanda dà gli stessi risultati — stessi id, ranghi densi da 1, massimo normalizzato a 1, stessi coseni, supporti e percorsi — con o senza note in quarantena e lapidi che corrispondono alla domanda**. L'eccezione dichiarata: i *valori* dei punteggi portano l'ε dell'IDF di FTS5, che SQLite calcola sull'indice intero (le righe in quarantena devono restarci: `include_quarantined` è contratto); l'ε è misurata nel banco (≈0,8% a tre note con match puliti, fino a ~0,8 su corpus minimi patologici, trascurabile a dimensioni reali) e non è leggibile da nessun controfattuale. Su HTTP, `explain` non è più un oracolo sulle note nascoste: i ranghi non partono da 2, il `fused_score` del primo è 1, nessun visibile è spinto fuori dalla finestra.
 
 ## 6. La ricerca mista
 
 ### 6.1 Testo
 - FTS5 (BM25) su `title`, `body_norm` e `tags`.
 - `body_norm` è il testo minuscolo, senza accenti, **con le parole ridotte alla radice** nella lingua della nota (`rust-stemmers`, Snowball: italiano, inglese e altre). Il tokenizzatore predefinito di FTS5 non sa l'italiano. La lingua si rileva (`whatlang`) o si dichiara.
-- La stessa normalizzazione si applica alla domanda.
+- La stessa normalizzazione si applica alla domanda — ma **la lingua di una domanda corta non si indovina** (v0.5.3): «Zebedeo» era tedesco e «tonno» francese per `whatlang`, e la radice della domanda non coincideva con quella dell'indice (dalla v0.1). Una domanda è **incerta** con meno di 4 parole significative (stopword escluse) o quando `whatlang` dichiara la rilevazione inaffidabile (`is_reliable`); le note continuano a usare la rilevazione piena: hanno testo a sufficienza e la loro lingua vince comunque (l'indice è stato stemmato con quella). Su una domanda incerta ogni parola si cerca nella **forma intera** (che l'indice contiene quando la nota non ha lingua) più la radice in **ogni lingua presente nella cella** — l'istogramma delle lingue delle note visibili, in cache in memoria come il grafo e invalidato dalle scritture; senza lingue note, le sei di sempre. `q.lang` esplicito vince sempre; le coppie adiacenti (frasi) si fanno sulle radici della lingua più frequente. Misurato: il banco delle domande corte (`tests/golden/queries-short.json`, 48 domande da 1–3 parole sul vault dorato) passa da richiamo@5 0,979 a **1,000** (prima mancava «Esposito», indovinato portoghese); banco italiano e LongMemEval entro le soglie della fase (REPORT v0.5.3).
 
 ### 6.2 Significato (v0.2)
 > **Rivisto il 2026-11-05, misurando:** in v0.2 niente `sqlite-vec`.
@@ -358,21 +359,35 @@ segreti client, mai token nella query string.
    § 4.1.3 vale anche per il codice d'autorizzazione, monouso da 60 s);
    token conservati solo come `blake3`; revoca immediata da CLI, con
    effetto alla richiesta successiva (provato con una sessione aperta).
+   **`/revoke` di un refresh porta con sé gli accessi della stessa
+   famiglia** (RFC 7009 § 2.1); revocare un accesso tocca solo lui e il
+   client continua a rinfrescare (v0.5.3).
 3. *Phishing del consenso.* L'approvazione mostra host del client_id e
    host del redirect; la pagina d'attesa (senza JavaScript, CSP chiusa,
    `X-Frame-Options: DENY`, `no-referrer`, `no-store`) mostra gli
    stessi nomi e l'avviso per i redirect di loopback; e la conferma
-   passa per il codice riscritto a mano. Tetto di cinque richieste in
-   attesa (10 minuti ciascuna).
+   passa per il codice riscritto a mano. **Tetti in attesa (v0.5.3):**
+   due richieste per `client_id` e dieci in tutto (10 minuti ciascuna) —
+   un client solo non riempie la coda; uno spammatore con molti domini
+   resta possibile ed è la ragione per cui esiste `engramma oauth deny
+   --all`. `/authorize` ha anche un tetto globale di 30 richieste al
+   minuto (pagina 429 con `Retry-After`, come `/token`) e una **cache
+   negativa del CIMD**: un documento rifiutato o irraggiungibile non si
+   riscarica per cinque minuti (l'URL esatto, un evento solo).
 4. *SSRF dal CIMD.* Il `client_id` è un URL scelto da chi chiama: lo
    scaricamento risolve il DNS e **si collega solo a indirizzi
    pubblici** (loopback, RFC 1918, link-local con i metadati cloud,
-   CGNAT, ULA, multicast, non specificati, IPv4 mappati in IPv6 e i
+   CGNAT, ULA, multicast, non specificati, IPv4 mappati in IPv6, **6to4
+   — giudicato dall'IPv4 che incorpora, come i mappati —, NAT64 locale
+   RFC 8215, Teredo e IPv4-compatibili — rifiutati** (v0.5.3), e i
    blocchi di documentazione sono scartati, qualunque forma testuale —
    proptest), senza redirect, 5 KiB, 5 secondi, solo JSON. L'eccezione
    loopback per i test esiste solo nella configurazione della
-   libreria, mai dalla CLI. `private_key_jwt` è rifiutato dichiarando
-   il perché.
+   libreria, mai dalla CLI. `private_key_jwt` da solo è rifiutato
+   dichiarando il perché (un documento che dichiara *anche* `none` —
+   come quello vero di ChatGPT — passa). Il rifiuto sul filo resta
+   generico; l'**evento locale porta la causa** (DNS, nessun indirizzo
+   pubblico, timeout, stato HTTP, TLS, regola infranta).
 5. *Rebinding DNS e CSRF.* `Host` ammessi solo l'autorità pubblica e i
    nomi di loopback (403 altrimenti, su tutta la superficie); ogni
    richiesta con `Origin` è rifiutata (i client remoti chiamano da
@@ -381,7 +396,12 @@ segreti client, mai token nella query string.
 6. *Confusione token-sessione.* Una sessione MCP dei protocolli
    precedenti appartiene al grant che l'ha creata (un altro token
    risponde 404, come una sessione ignota — provato scambiandole); un
-   `requestState` 2026-07-28 è legato al grant e resta monouso.
+   `requestState` 2026-07-28 è legato al grant, resta monouso ed è
+   **256 bit casuali** come gli altri segreti, con **TTL di 10 minuti**
+   (uno scaduto risponde come uno sconosciuto) e tetto di 1000 turni
+   (v0.5.3). Anche la mappa delle sessioni ha un tetto (1000, escono le
+   più vecchie) e un'ora di inattività, e il `DELETE` accettato dal
+   trasporto la svuota: nessuna delle due cresce per sempre.
 7. *L'avvelenamento della memoria resta quello della v0.5:* un client
    remoto può solo **proporre**; coda, politica, revisore e revert sono
    quelli di § 8.5, riprovati via HTTP (quarantena invisibile,
@@ -417,7 +437,15 @@ segreti client, mai token nella query string.
   cella, il grant è di tutto il processo (possibile seguito).
 - **Ambiti:** `memory:read` è il pavimento; `memory:propose` esiste solo
   se il processo ha `--write` e l'approvazione tiene una cella
-  scrivibile. Gli ambiti sconosciuti (ChatGPT chiede `openid email
+  scrivibile. **Gli strumenti di compatibilità (v0.5.3):** con
+  `--compat chatgpt`, `search` e `fetch` esistono **solo** per il grant
+  il cui `client_id` è il documento CIMD di ChatGPT
+  (`https://chatgpt.com/oauth/client.json`, un campo di configurazione
+  della libreria che i test sostituiscono con l'URL di loopback del
+  loro documento): Codex (CIMD suo) e claude.ai usano gli strumenti
+  normali, non li vedono nell'elenco e chiamarli per nome risponde
+  *esattamente* come uno strumento che non esiste — lo stesso errore,
+  byte per byte. Su stdio il flag è un errore d'uso. Gli ambiti sconosciuti (ChatGPT chiede `openid email
   profile`) si **ignorano**: non emettiamo `id_token` e non parliamo
   OIDC; la risposta del token dice cosa è concesso davvero. Il tetto
   globale di `/token` è 60 richieste al minuto (dietro un tunnel ogni
@@ -495,6 +523,7 @@ segreti client, mai token nella query string.
 | v0.4.6 | I lotti di embedding, davvero: il riempimento BatchLongest del tokenizer tolto (la v0.4.5 lo riempiva al più lungo: l'ordinamento era morto e una nota corta pagava la più lunga), offset dei lotti a somma prefissa, predefiniti budget 4096 × 1 lavoratore seguendo la regola della v0.4.5, griglia e banco rimisurati (§ 7); **v0.4.6.1** (correzione di verifica): budget predefinito 512 — picco 878 MB, 100 note/s a 10k | v0.4.5 | **fatta** (`fase-v0.4.6`, `fase-v0.4.6.1`) |
 | v0.5 | Scrivere da altri assistenti: proposte in quarantena con decisioni e rollback, politiche per cella e revisore automatico (§ 8.5), MCP in scrittura con elicitation (§ 8.3), CLI della coda, pagina locale di revisione, guardia sugli schemi più nuovi | v0.4.6 | **fatta** (`fase-v0.5`) |
 | v0.5.2 | MCP su HTTP con OAuth 2.1 (§ 8.6): resource server + server di autorizzazione con approvazione locale, CIMD col recinto SSRF, token opachi a rotazione, grant per token; `--compat chatgpt` | v0.5 | **fatta** (`fase-v0.5.2`) |
+| v0.5.3 | La lingua delle domande corte (§ 6.1: domanda incerta, espansione sulle lingue della cella; banco delle domande corte); l'indistinguibilità delle note nascoste (§ 5: visibilità dentro le liste, prima di ranghi e normalizzazioni); `search`/`fetch` solo al grant ChatGPT; le rifiniture HTTP di § 8.6 (tetti di `/authorize`, cache negativa del CIMD, `deny --all`, sessioni e turni MRTR con tetto e TTL, revoca per famiglia, recinto SSRF esteso, eventi con la causa) | v0.5.2 | **fatta** (`fase-v0.5.3`) |
 | v0.6 | Identità, abbinamento, sincronizzazione cifrata del registro tra pari, permessi per cella, conflitti. **Opzione sul tavolo dalla v0.4.5:** l'embedding in un processo separato (le soglie RAM di riposo del § 7 non sono state raggiunte: la memoria liberata resta residente con entrambi gli allocatori su macOS) | v0.5 | da fare |
 | v0.7 | `engramma serve`: API, autenticazione, molte celle | v0.6 | da fare |
 | v0.8 | Cluster: posizionamento Raft, router, replica multi-Raft, spostamento celle, backup su storage a oggetti | v0.7 | da fare |

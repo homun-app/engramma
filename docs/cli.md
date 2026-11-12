@@ -331,7 +331,9 @@ The human surface of the HTTP authorization flow (state in
   lowercase and without the dash. A label belongs to one **live**
   connection at a time: after `revoke` (or the 90-day expiry) the same
   label can be approved again for the reconnection.
-- `deny <XXXX-XXXX>` — refuse it.
+- `deny <XXXX-XXXX> | --all` — refuse it, or every pending request at
+  once (the flood answer: the waiting pages redirect each client away
+  with `access_denied`).
 - `grants` — label, client, cells, scopes, creation, last use, standing.
 - `revoke <label> | --all` — the tokens die at their next request (by
   label: the live grant under that label).

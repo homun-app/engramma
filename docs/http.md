@@ -83,7 +83,11 @@ nome che resti.
   «Connettori», la voce cambia col piano e con le politiche dello
   spazio di lavoro): URL `<public-url>/mcp`. Se usi la ricerca
   approfondita o le «conoscenze», avvia il server con
-  `--compat chatgpt` (gli strumenti `search`/`fetch` a schema fisso).
+  `--compat chatgpt`: gli strumenti `search`/`fetch` a schema fisso
+  esistono **solo per il collegamento di ChatGPT** (il cui documento
+  client è `chatgpt.com/oauth/client.json`). Claude e Codex non li
+  vedono nemmeno, e chiamarli per nome risponde come uno strumento
+  inesistente. Su stdio il flag non ha senso ed è un errore d'uso.
 - **claude.ai**: Impostazioni → Connettori → «Custom connector», URL
   `<public-url>/mcp`.
 - **Codex** (anche il lato «Work» dell'app ChatGPT): ha un elenco di
@@ -151,6 +155,14 @@ per esempio Cloudflare (`160.79.104.0/21` per Anthropic; le liste
 pubbliche di OpenAI). È una difesa in più, non un sostituto di OAuth.
 
 ## 6. Come funziona, in breve
+
+`/authorize` ha un tetto globale di 30 richieste al minuto (poi una
+pagina 429 con `Retry-After`) e un documento client rifiutato o
+irraggiungibile non si riscarica per cinque minuti. In attesa ci stanno
+al più **due richieste per client e dieci in tutto**: per svuotare la
+coda in un colpo, `engramma oauth deny --all`. La revoca di un refresh
+token (`/revoke`) porta con sé anche gli accessi della stessa
+famiglia; revocare un accesso tocca solo lui.
 
 Il server MCP è un *resource server* OAuth 2.1 (metadati RFC 9728) ed
 Engramma stesso è il *server di autorizzazione*: client pubblici con
