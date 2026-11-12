@@ -12,7 +12,8 @@ use std::path::Path;
 
 use engramma_core::cell::policy::Policy;
 use engramma_core::cell::proposals::{
-    ProposalInput, ProposalMode, ProposalState, ProposalStatus, ProposalsFilter, ProposeContext,
+    DecisionsFilter, ProposalInput, ProposalMode, ProposalState, ProposalStatus, ProposalsFilter,
+    ProposeContext,
 };
 use engramma_core::format::{At, Lang, Note, NoteType};
 use engramma_core::review::{PROMPT_VERSION, Reviewers};
@@ -391,6 +392,75 @@ fn the_breaker_stops_the_machine_after_the_cap() {
     assert!(
         matches!(third.status, ProposalStatus::Pending),
         "the breaker fired"
+    );
+}
+
+#[test]
+fn the_breaker_holds_under_parallel_proposes_in_one_process() {
+    // v0.5.2 (P0): over HTTP many proposes arrive CONCURRENTLY in the same
+    // process. The breaker's count and the decision it gates must share one
+    // critical section, or the ceiling is only advisory: ten reviews that
+    // all read "0 so far" would all decide. The reviewer is slow (300 ms)
+    // on purpose, so every review runs before any decision lands.
+    let (d, cell) = cell();
+    auto_policy(&cell, json!({ "max_auto_per_hour": 3 }));
+    let rev = reviewers_yaml(&command_yaml(
+        &script_reviewer(
+            d.path(),
+            "r",
+            "sleep 0.3; echo '{\"decision\":\"accept\",\"reason\":\"ok\",\"confidence\":0.95}'",
+        ),
+        10,
+    ));
+    let rev = std::sync::Arc::new(rev);
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let cell = cell.clone();
+        let rev = std::sync::Arc::clone(&rev);
+        handles.push(std::thread::spawn(move || {
+            propose(
+                &cell,
+                &format!("Fabio possiede il violino numero {i}."),
+                &rev,
+            )
+        }));
+    }
+    let mut accepted = 0;
+    let mut pending = 0;
+    let mut with_reason = 0;
+    for h in handles {
+        let out = h.join().unwrap(/* t */);
+        match out.status {
+            ProposalStatus::Accepted => accepted += 1,
+            ProposalStatus::Pending => {
+                pending += 1;
+                if out
+                    .decision_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("max_auto_per_hour"))
+                {
+                    with_reason += 1;
+                }
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+    assert_eq!(accepted, 3, "the ceiling is a ceiling, not a hint");
+    assert_eq!(pending, 7);
+    assert_eq!(with_reason, 7, "the blocked ones say why they wait");
+    let rows = cell
+        .proposals(&ProposalsFilter::default())
+        .unwrap(/* t */);
+    assert_eq!(
+        rows.iter().filter(|r| r.state.in_queue()).count(),
+        7,
+        "the others stay in the queue"
+    );
+    assert_eq!(
+        cell.decisions(&DecisionsFilter::default())
+            .unwrap(/* t */)
+            .len(),
+        3
     );
 }
 

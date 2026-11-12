@@ -710,31 +710,46 @@ impl Cell {
         }
         // A machine decision applies right after its proposal, as its own
         // operation (actor `reviewer:<name>`, with the review metadata).
+        // The breaker is re-read INSIDE the same critical section that
+        // writes: parallel proposes in one process cannot exceed it.
         if let Some((accept, reason, meta)) = machine {
             let reviewer_actor = format!("reviewer:{}", meta.reviewer);
-            let input = DecisionInput {
-                action: if accept {
-                    DecisionAction::Accept { edited: None }
-                } else {
-                    DecisionAction::Reject
-                },
-                reason: Some(reason.clone()),
-                review: Some(meta),
-            };
-            self.decide(&note.id, &input, &reviewer_actor)?;
+            let decided = self.decide_under_breaker(
+                &note.id,
+                accept,
+                &reason,
+                meta,
+                policy.max_auto_per_hour,
+            )?;
+            if decided {
+                return Ok(ProposalOutcome {
+                    status: if accept {
+                        ProposalStatus::Accepted
+                    } else {
+                        ProposalStatus::Rejected
+                    },
+                    // the queue's key is the NOTE, not the op: every caller
+                    // (CLI, review page, MCP) shows and accepts this one
+                    id: Some(note.id),
+                    existing: None,
+                    possible_duplicates: possible,
+                    decided_by: Some(reviewer_actor),
+                    decision_reason: Some(reason),
+                });
+            }
+            // the breaker tripped while our review was running: the
+            // proposal stays in the queue, and the caller learns why
             return Ok(ProposalOutcome {
-                status: if accept {
-                    ProposalStatus::Accepted
-                } else {
-                    ProposalStatus::Rejected
-                },
-                // the queue's key is the NOTE, not the op: every caller
-                // (CLI, review page, MCP) shows and accepts this one
+                status: ProposalStatus::Pending,
                 id: Some(note.id),
                 existing: None,
                 possible_duplicates: possible,
-                decided_by: Some(reviewer_actor),
-                decision_reason: Some(reason),
+                decided_by: None,
+                decision_reason: Some(format!(
+                    "interruptore: max_auto_per_hour ({}) raggiunto mentre la revisione \
+                     era in corso; decide un umano",
+                    policy.max_auto_per_hour
+                )),
             });
         }
         Ok(ProposalOutcome {
@@ -933,11 +948,22 @@ impl Cell {
     /// [`CellError::NoteNotFound`] for a missing supersede target;
     /// [`CellError::Db`] on SQL failures.
     pub fn decide(&self, id: &Ulid, input: &DecisionInput, actor: &str) -> Result<Ulid, CellError> {
-        let decided_at = self.now_at()?;
         let _guard = self
             .write_lock
             .lock()
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        self.decide_locked(id, input, actor)
+    }
+
+    /// [`Cell::decide`] for a caller that already holds the write lock (the
+    /// breaker's atomic apply, below).
+    fn decide_locked(
+        &self,
+        id: &Ulid,
+        input: &DecisionInput,
+        actor: &str,
+    ) -> Result<Ulid, CellError> {
+        let decided_at = self.now_at()?;
         let (target, target_before, target_closing, edited) = {
             let inner = self.lock()?;
             let meta = super::ops::proposal_meta(&inner.conn, id)?;
@@ -1012,6 +1038,46 @@ impl Cell {
         });
         let mut inner = self.lock()?;
         super::execute_op(&mut inner, OpKind::Decide, Some(*id), actor, payload)
+    }
+
+    /// Apply a MACHINE decision atomically with the breaker's count: the
+    /// re-read and the write share the write lock's critical section, so
+    /// concurrent proposes in one process (the HTTP surface, v0.5.2 P0)
+    /// cannot push past `max_auto_per_hour` however many reviews ran in
+    /// parallel outside the locks. Returns `false` — deciding nothing —
+    /// when the breaker stopped this decision.
+    fn decide_under_breaker(
+        &self,
+        id: &Ulid,
+        accept: bool,
+        reason: &str,
+        meta: ReviewMeta,
+        max_auto_per_hour: u32,
+    ) -> Result<bool, CellError> {
+        let reviewer_actor = format!("reviewer:{}", meta.reviewer);
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        // THE BREAKER, re-read where it bites: the count includes every
+        // decision another propose wrote while our review was running
+        if self.recent_auto_decisions(&reviewer_actor)? >= u64::from(max_auto_per_hour) {
+            return Ok(false);
+        }
+        self.decide_locked(
+            id,
+            &DecisionInput {
+                action: if accept {
+                    DecisionAction::Accept { edited: None }
+                } else {
+                    DecisionAction::Reject
+                },
+                reason: Some(reason.to_string()),
+                review: Some(meta),
+            },
+            &reviewer_actor,
+        )?;
+        Ok(true)
     }
 
     /// The `valid_from` of a stored note (creation-time read for the closing
@@ -1374,16 +1440,19 @@ impl Cell {
                         && machine_may_decide(&policy, &row.note, target_note.as_ref(), true)
                     {
                         let meta = ReviewMeta { confidence, ..meta };
-                        self.decide(
+                        // the breaker re-read and the write are one section
+                        // here too: a retry must not slip past the cap
+                        if self.decide_under_breaker(
                             &id,
-                            &DecisionInput {
-                                action: DecisionAction::Accept { edited: None },
-                                reason: Some(reason),
-                                review: Some(meta),
-                            },
-                            &actor,
-                        )?;
-                        decided += 1;
+                            true,
+                            &reason,
+                            meta,
+                            policy.max_auto_per_hour,
+                        )? {
+                            decided += 1;
+                        } else {
+                            break;
+                        }
                     }
                 }
                 crate::review::ReviewVerdict::Reject { reason, confidence } => {
@@ -1391,16 +1460,17 @@ impl Cell {
                         && machine_may_decide(&policy, &row.note, target_note.as_ref(), false)
                     {
                         let meta = ReviewMeta { confidence, ..meta };
-                        self.decide(
+                        if self.decide_under_breaker(
                             &id,
-                            &DecisionInput {
-                                action: DecisionAction::Reject,
-                                reason: Some(reason),
-                                review: Some(meta),
-                            },
-                            &actor,
-                        )?;
-                        decided += 1;
+                            false,
+                            &reason,
+                            meta,
+                            policy.max_auto_per_hour,
+                        )? {
+                            decided += 1;
+                        } else {
+                            break;
+                        }
                     }
                 }
                 crate::review::ReviewVerdict::Escalate { .. }
