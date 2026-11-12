@@ -26,7 +26,7 @@
 //! envelope inside)`) is kept for the v5 migration, which verifies the old
 //! chain before rewriting it.
 
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde_json::Value;
 use ulid::Ulid;
 
@@ -61,11 +61,23 @@ pub enum OpKind {
     /// Right to be forgotten (v0.3): remove the note and everything derived
     /// from it, and forget the payloads of its operations.
     Purge,
+    /// v0.5 (P1): an assistant proposes a fact — a note is born in
+    /// quarantine, in the proposals queue.
+    Propose,
+    /// v0.5 (P1): a decision on a proposal (accept, accept with edit,
+    /// reject), applied in the same operation that records it.
+    Decide,
+    /// v0.5 (P1): cancel a decision — the proposal returns to the queue,
+    /// the history is never rewritten.
+    RevertDecision,
+    /// v0.5 (P2): set the cell's policy. Introduced with the schema in P1;
+    /// the op belongs to the log so the history says who allowed what, when.
+    SetPolicy,
 }
 
 impl OpKind {
     /// Every kind, in declaration order (tests count coverage).
-    pub const ALL: [OpKind; 11] = [
+    pub const ALL: [OpKind; 15] = [
         OpKind::Init,
         OpKind::PutNote,
         OpKind::PatchNote,
@@ -77,6 +89,10 @@ impl OpKind {
         OpKind::Unlink,
         OpKind::Confirm,
         OpKind::Purge,
+        OpKind::Propose,
+        OpKind::Decide,
+        OpKind::RevertDecision,
+        OpKind::SetPolicy,
     ];
 
     /// Wire name.
@@ -93,6 +109,10 @@ impl OpKind {
             OpKind::Unlink => "unlink",
             OpKind::Confirm => "confirm",
             OpKind::Purge => "purge",
+            OpKind::Propose => "propose",
+            OpKind::Decide => "decide",
+            OpKind::RevertDecision => "revert_decision",
+            OpKind::SetPolicy => "set_policy",
         }
     }
 
@@ -113,6 +133,10 @@ impl OpKind {
             "unlink" => OpKind::Unlink,
             "confirm" => OpKind::Confirm,
             "purge" => OpKind::Purge,
+            "propose" => OpKind::Propose,
+            "decide" => OpKind::Decide,
+            "revert_decision" => OpKind::RevertDecision,
+            "set_policy" => OpKind::SetPolicy,
             other => return Err(CellError::Invalid(format!("unknown op kind `{other}`"))),
         })
     }
@@ -382,6 +406,10 @@ pub fn apply(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
             OpKind::Unlink => apply_unlink(tx, op)?,
             OpKind::Confirm => apply_confirm(tx, op)?,
             OpKind::Purge => apply_purge(tx, op)?,
+            OpKind::Propose => apply_propose(tx, op)?,
+            OpKind::Decide => apply_decide(tx, op)?,
+            OpKind::RevertDecision => apply_revert_decision(tx, op)?,
+            OpKind::SetPolicy => apply_set_policy(tx, op)?,
         }
     }
     // The cell HLC always advances to the op's HLC (ops apply in order).
@@ -1304,6 +1332,11 @@ pub(crate) fn purge_state(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellErr
     tx.execute("DELETE FROM notes WHERE id = ?1", [&id_str])?;
     tx.execute("DELETE FROM note_versions WHERE note_id = ?1", [&id_str])?;
     tx.execute("DELETE FROM note_tags WHERE note_id = ?1", [&id_str])?;
+    // v0.5 (P1): the queue row and the decisions about the proposal go with
+    // the note — the reason and the reviewer metadata are payload-body
+    // content, and the right to be forgotten must reach them
+    tx.execute("DELETE FROM proposals WHERE note_id = ?1", [&id_str])?;
+    tx.execute("DELETE FROM decisions WHERE proposal = ?1", [&id_str])?;
     // tags no note carries anymore (directly or through a descendant): the
     // redacted replay never creates them, so the live state must not keep
     // them either
@@ -1367,10 +1400,11 @@ pub(crate) fn purge_state(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellErr
 
 /// The log side of the purge on the LIVE cell: forget the payloads of the
 /// note's operations and **censor** the `supersede` ops where it was the NEW
-/// note (deterministic salt, recomputed chain tail).
+/// note, and the `decide` ops that closed another note over it (deterministic
+/// salt, recomputed chain tail).
 pub(crate) fn scrub_log(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
     forget_note_payloads(tx, id)?;
-    censor_supersedes(tx, id, &CensorFilter::Live)
+    censor_purged_ops(tx, id, &CensorFilter::Live)
 }
 
 /// The log side of the purge on a **compaction snapshot** (v0.3.1, P0.3):
@@ -1387,10 +1421,10 @@ pub(crate) fn scrub_log_snapshot(
     censorable: &std::collections::HashSet<String>,
 ) -> Result<(), CellError> {
     forget_note_payloads(tx, id)?;
-    censor_supersedes(tx, id, &CensorFilter::Snapshot(censorable))
+    censor_purged_ops(tx, id, &CensorFilter::Snapshot(censorable))
 }
 
-/// Which supersede payloads a censor may rewrite (see [`scrub_log_snapshot`]).
+/// Which censored payloads a censor may rewrite (see [`scrub_log_snapshot`]).
 enum CensorFilter<'a> {
     /// The live log: every match is censored.
     Live,
@@ -1408,23 +1442,28 @@ impl CensorFilter<'_> {
 }
 
 /// Forget the payloads of every op about the note (but never the `supersede`
-/// ops: they carry the OTHER note's content — forgetting them would erase
-/// the surviving note from every replay; they are censored instead).
+/// ops, nor the `decide` ops that closed another note over it: they carry
+/// the OTHER note's content — forgetting them would erase the surviving
+/// note from every replay; they are censored instead).
 fn forget_note_payloads(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
     let mut stmt = tx.prepare(
         "DELETE FROM op_payloads WHERE op_id IN (
              SELECT op_id FROM ops
-             WHERE note_id = ?1 AND kind NOT IN ('purge', 'supersede'))",
+             WHERE note_id = ?1 AND kind NOT IN ('purge', 'supersede', 'decide'))",
     )?;
     stmt.execute([id.to_string()])?;
     Ok(())
 }
 
-/// Censor the `supersede` payloads where the note was the NEW note: the
-/// content goes, the closing of the OLD note's validity stays replayable —
-/// forgetting the whole body would leave the old note un-superseded in a
-/// replay of the redacted log.
-fn censor_supersedes(
+/// Censor the payloads the purge must not merely forget:
+/// - `supersede` ops where the note was the NEW note: the content goes, the
+///   closing of the OLD note's validity stays replayable;
+/// - v0.5 (P1), `decide` ops that ACCEPTED a supersede proposal about this
+///   note: the proposal's content goes, the closing of the TARGET stays
+///   replayable (the target is another note's history). Every other `decide`
+///   op (rejects, plain accepts) carries nothing that outlives the proposal:
+///   its payload is simply deleted.
+fn censor_purged_ops(
     tx: &Transaction<'_>,
     id: &Ulid,
     filter: &CensorFilter<'_>,
@@ -1432,7 +1471,7 @@ fn censor_supersedes(
     let id_str = id.to_string();
     let mut stmt = tx.prepare(
         "SELECT o.op_id, p.body FROM ops o JOIN op_payloads p ON p.op_id = o.op_id
-         WHERE o.kind = 'supersede'",
+         WHERE o.kind IN ('supersede', 'decide')",
     )?;
     let rows: Vec<(String, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1443,28 +1482,85 @@ fn censor_supersedes(
     let mut plain_deleted: Vec<String> = Vec::new();
     for (op_id, body) in rows {
         let parsed = serde_json::from_str::<Value>(&body).ok();
-        let new_id = parsed
+        // what survives the purge, per kind — everything is derived from the
+        // ORIGINAL body alone, so the live censor and the in-snapshot censor
+        // build byte-identical replacements (a value read from the notes
+        // table would fork the two logs)
+        let kept: Option<serde_json::Map<String, Value>> = match parsed
             .as_ref()
-            .and_then(|b| b.get("note"))
-            .and_then(|n| n.get("id"))
+            .and_then(|b| b.get("proposal"))
             .and_then(Value::as_str)
-            .map(String::from);
-        if new_id.as_deref() != Some(id_str.as_str()) {
+        {
+            // a decide op about this note
+            Some(proposal) if proposal == id_str => {
+                let accept = parsed
+                    .as_ref()
+                    .and_then(|b| b.get("decision"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|d| d == "accept");
+                let target = parsed
+                    .as_ref()
+                    .and_then(|b| b.get("target"))
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                let target = match target {
+                    Some(t) if accept => Some(t),
+                    _ => None, // reject or plain accept: nothing survives
+                };
+                match target {
+                    Some(target) => {
+                        // the decide body recorded the closing it applied
+                        // (`target_closing`); the censor keeps it verbatim —
+                        // recomputing it could only diverge from what the
+                        // live state applied
+                        let mut kept = serde_json::Map::new();
+                        kept.insert("proposal".into(), Value::String(id_str.clone()));
+                        kept.insert("decision".into(), Value::String("accept".into()));
+                        kept.insert("censored".into(), Value::Bool(true));
+                        kept.insert("target".into(), Value::String(target));
+                        for k in ["target_closing", "decided_at"] {
+                            if let Some(v) = parsed.as_ref().and_then(|b| b.get(k)) {
+                                kept.insert(k.into(), v.clone());
+                            }
+                        }
+                        Some(kept)
+                    }
+                    None => {
+                        plain_deleted.push(op_id);
+                        continue;
+                    }
+                }
+            }
+            // a supersede op where the note was the new note (v0.3)
+            _ => {
+                let new_id = parsed
+                    .as_ref()
+                    .and_then(|b| b.get("note"))
+                    .and_then(|n| n.get("id"))
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                if new_id.as_deref() != Some(id_str.as_str()) {
+                    continue;
+                }
+                let mut kept = serde_json::Map::new();
+                for k in ["old_id", "valid_to", "old_updated_at"] {
+                    if let Some(v) = parsed.as_ref().and_then(|b| b.get(k)) {
+                        kept.insert(k.into(), v.clone());
+                    }
+                }
+                kept.insert("note".into(), Value::Null);
+                Some(kept)
+            }
+        };
+        let Some(kept) = kept else {
             continue;
-        }
+        };
         if !filter.may_censor(&op_id) {
             // the live log already forgot this payload (compaction cut): its
             // ops row keeps the original digest, so here the body only goes
             plain_deleted.push(op_id);
             continue;
         }
-        let mut kept = serde_json::Map::new();
-        for k in ["old_id", "valid_to", "old_updated_at"] {
-            if let Some(v) = parsed.as_ref().and_then(|b| b.get(k)) {
-                kept.insert(k.into(), v.clone());
-            }
-        }
-        kept.insert("note".into(), Value::Null);
         let seq: i64 = tx
             .query_row("SELECT seq FROM ops WHERE op_id = ?1", [&op_id], |r| {
                 r.get(0)
@@ -1582,6 +1678,419 @@ fn apply_confirm(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     note.updated_at = updated_at;
     write_note(tx, &note, true, true)?;
     reindex_note(tx, &id, Some(&old))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v0.5 (P1): proposals, decisions, revert
+// ---------------------------------------------------------------------------
+
+/// An assistant proposes a fact: the note is born quarantined — in the
+/// queue, invisible to the search — and the derived `proposals` row carries
+/// the queue metadata (proposer, declared client, motivation, mode).
+fn apply_propose(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
+    let note = note_from_body(op, "note")?;
+    if note.status != Status::Quarantined {
+        return Err(CellError::Invalid(format!(
+            "op {}: a proposal is born quarantined (`{}` given)",
+            op.op_id,
+            note.status.as_str()
+        )));
+    }
+    if read_note(tx, &note.id)?.is_some() {
+        return Err(CellError::Invalid(format!(
+            "op {}: the proposal note already exists",
+            op.op_id
+        )));
+    }
+    let mode = body_str(op, "mode")?;
+    let target = match mode.as_str() {
+        "new" => None,
+        "supersede" => Some(
+            Ulid::from_string(&body_str(op, "target")?)
+                .map_err(|_| CellError::Invalid(format!("op {}: bad target", op.op_id)))?,
+        ),
+        other => {
+            return Err(CellError::Invalid(format!(
+                "op {}: unknown proposal mode `{other}`",
+                op.op_id
+            )));
+        }
+    };
+    write_note(tx, &note, false, false)?;
+    reindex_note(tx, &note.id, None)?;
+    tx.execute(
+        "INSERT INTO proposals (note_id, mode, target, proposer, client, reason, state, proposed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+        rusqlite::params![
+            note.id.to_string(),
+            mode,
+            target.map(|t| t.to_string()),
+            op.actor,
+            op.body
+                .as_ref()
+                .and_then(|b| b.get("client"))
+                .and_then(Value::as_str),
+            op.body
+                .as_ref()
+                .and_then(|b| b.get("reason"))
+                .and_then(Value::as_str),
+            body_str(op, "proposed_at")?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// The proposal metadata the decide/revert applications read: `(mode,
+/// target, state)`. Works on a `Connection` (the creation-time reads) and on
+/// a `Transaction` (the applications, by deref).
+pub(crate) fn proposal_meta(
+    conn: &Connection,
+    id: &Ulid,
+) -> Result<Option<(String, Option<Ulid>, String)>, CellError> {
+    conn.query_row(
+        "SELECT mode, target, state FROM proposals WHERE note_id = ?1",
+        [id.to_string()],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(CellError::from)
+    .and_then(|row| {
+        row.map(|(mode, target, state)| {
+            let target = target
+                .map(|t| Ulid::from_string(&t))
+                .transpose()
+                .map_err(|_| CellError::Db(format!("bad proposal target for {id}")))?;
+            Ok((mode, target, state))
+        })
+        .transpose()
+    })
+}
+
+/// Whether a note row exists (any status) — creation-time checks.
+pub(crate) fn note_exists(conn: &Connection, id: &Ulid) -> Result<bool, CellError> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM notes WHERE id = ?1",
+        [id.to_string()],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// `(status, valid_to)` of a note row, when it exists — what a decision
+/// records about its supersede target and what a revert restores.
+pub(crate) fn read_note_status(
+    conn: &Connection,
+    id: &Ulid,
+) -> Result<Option<(Status, Option<Validity>)>, CellError> {
+    let row: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT status, valid_to FROM notes WHERE id = ?1",
+            [id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(status, valid_to)| {
+        let status = Status::parse(&status)
+            .map_err(|e| CellError::Db(format!("bad status for {id}: {e}")))?;
+        let valid_to = valid_to
+            .map(|v| Validity::parse(&v))
+            .transpose()
+            .map_err(|e| CellError::Db(format!("bad valid_to for {id}: {e}")))?;
+        Ok((status, valid_to))
+    })
+    .transpose()
+}
+
+/// A decision on a proposal, applied in the same operation that records it.
+/// `accept` activates the note (the decision IS the human confirmation: an
+/// `external` proposal may go active here, like `confirm`), closes the
+/// supersede target when the mode is `supersede`; `reject` tombstones the
+/// note — the text stays, so the decision can be reverted. A **censored**
+/// body (the proposal was purged later) replays only the closing of the
+/// target: everything about the proposal itself is gone on both sides.
+fn apply_decide(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
+    let id = Ulid::from_string(&body_str(op, "proposal")?)
+        .map_err(|_| CellError::Invalid(format!("op {}: bad proposal id", op.op_id)))?;
+    let decision = body_str(op, "decision")?;
+    let decided_at = crate::format::At::parse(&body_str(op, "decided_at")?)
+        .map_err(|e| CellError::Invalid(format!("bad `decided_at`: {e}")))?;
+    let body = op.body.as_ref().unwrap_or(&Value::Null);
+
+    if body.get("censored").and_then(Value::as_bool) == Some(true) {
+        // the purge of the proposal kept only what survives it: the closing
+        // of the supersede target (its content is another note's history)
+        if let (Some(target), true) = (
+            body.get("target")
+                .and_then(Value::as_str)
+                .and_then(|s| Ulid::from_string(s).ok()),
+            decision == "accept",
+        ) && let Some(trow) = read_note(tx, &target)?
+        {
+            let closing = body
+                .get("target_closing")
+                .and_then(Value::as_str)
+                .and_then(|s| Validity::parse(s).ok());
+            snapshot(tx, &target, trow.version, &op.op_id)?;
+            let mut t = trow.note.clone();
+            t.status = Status::Superseded;
+            t.valid_to = closing.or(t.valid_to);
+            t.updated_at = decided_at;
+            write_note(tx, &t, true, false)?;
+            reindex_note(tx, &target, Some(&trow))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO supersedes (new_id, old_id) VALUES (?1, ?2)",
+                rusqlite::params![id.to_string(), target.to_string()],
+            )?;
+        }
+        return Ok(());
+    }
+
+    let Some((mode, target, state)) = proposal_meta(tx, &id)? else {
+        return Err(CellError::Invalid(format!(
+            "op {}: note {id} is not a proposal",
+            op.op_id
+        )));
+    };
+    if state != "pending" && state != "reverted" {
+        return Err(CellError::Invalid(format!(
+            "op {}: the proposal is `{state}`; revert the decision before deciding again",
+            op.op_id
+        )));
+    }
+    let reason = body.get("reason").and_then(Value::as_str);
+    let review = body
+        .get("review")
+        .filter(|v| !v.is_null())
+        .map(|v| v.to_string());
+
+    match decision.as_str() {
+        "accept" => {
+            let Some(old) = read_note(tx, &id)? else {
+                return Err(CellError::NoteNotFound(id.to_string()));
+            };
+            // accept-with-edit: the human fixed the text while accepting
+            let mut note = match body.get("edited").filter(|v| !v.is_null()) {
+                Some(v) => {
+                    let n = Note::from_json(v).map_err(|e| {
+                        CellError::Invalid(format!("op {}: bad edited note: {e}", op.op_id))
+                    })?;
+                    if n.id != id {
+                        return Err(CellError::Invalid(format!(
+                            "op {}: the edited note changes the proposal's id",
+                            op.op_id
+                        )));
+                    }
+                    n
+                }
+                None => old.note.clone(),
+            };
+            if note.status == Status::Deleted {
+                return Err(CellError::Invalid(
+                    "an edited proposal cannot be a tombstone".into(),
+                ));
+            }
+            note.status = Status::Active;
+            note.updated_at = decided_at;
+            snapshot(tx, &id, old.version, &op.op_id)?;
+            write_note(tx, &note, true, true)?;
+            reindex_note(tx, &id, Some(&old))?;
+            // the supersede: close the target when it still exists (a purge
+            // may have taken it — then there is nothing to close and no
+            // supersedes row, exactly like the live state after that purge).
+            // The closing the creator recorded wins (`target_closing`): the
+            // purge's censor keeps that field verbatim, and the redacted
+            // replay must close exactly like the live state did.
+            if mode == "supersede"
+                && let Some(target) = target
+                && let Some(trow) = read_note(tx, &target)?
+            {
+                {
+                    let computed = note
+                        .valid_from
+                        .unwrap_or_else(|| Validity(decided_at.get().date(), None));
+                    let closing = body
+                        .get("target_closing")
+                        .and_then(Value::as_str)
+                        .and_then(|s| Validity::parse(s).ok())
+                        .unwrap_or(computed);
+                    snapshot(tx, &target, trow.version, &op.op_id)?;
+                    let mut t = trow.note.clone();
+                    t.status = Status::Superseded;
+                    t.valid_to = Some(closing);
+                    t.updated_at = decided_at;
+                    write_note(tx, &t, true, false)?;
+                    reindex_note(tx, &target, Some(&trow))?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO supersedes (new_id, old_id) VALUES (?1, ?2)",
+                        rusqlite::params![id.to_string(), target.to_string()],
+                    )?;
+                }
+            }
+        }
+        "reject" => {
+            let Some(old) = read_note(tx, &id)? else {
+                return Err(CellError::NoteNotFound(id.to_string()));
+            };
+            snapshot(tx, &id, old.version, &op.op_id)?;
+            let mut note = old.note.clone();
+            note.status = Status::Deleted; // the lapide: the text stays, the revert can undo
+            note.updated_at = decided_at;
+            write_note(tx, &note, true, false)?;
+            reindex_note(tx, &id, Some(&old))?;
+            super::vectors::delete_note_vectors(tx, &id)?;
+        }
+        other => {
+            return Err(CellError::Invalid(format!(
+                "op {}: unknown decision `{other}`",
+                op.op_id
+            )));
+        }
+    }
+    tx.execute(
+        "UPDATE proposals SET state = ?2, decision_op = ?3, decided_by = ?4, decided_at = ?5,
+                             decision_reason = ?6, review_json = ?7
+         WHERE note_id = ?1",
+        rusqlite::params![
+            id.to_string(),
+            if decision == "accept" {
+                "accepted"
+            } else {
+                "rejected"
+            },
+            op.op_id.to_string(),
+            op.actor,
+            decided_at.to_db_string(),
+            reason,
+            review,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO decisions (op_id, proposal, decision, actor, decided_at, reason, review_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            op.op_id.to_string(),
+            id.to_string(),
+            decision,
+            op.actor,
+            decided_at.to_db_string(),
+            reason,
+            review,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Cancel a decision: the proposal returns to the queue (quarantined again,
+/// invisible), a closed supersede target reopens exactly as it was, and the
+/// history gains an operation instead of losing one — the `git revert` of
+/// the log. A `purged` body (the content was purged after the decision)
+/// changes no state: the op row is the audit that the decision was
+/// cancelled, nothing more.
+fn apply_revert_decision(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
+    let decision_op = Ulid::from_string(&body_str(op, "decision")?)
+        .map_err(|_| CellError::Invalid(format!("op {}: bad decision id", op.op_id)))?;
+    let decided_at = crate::format::At::parse(&body_str(op, "decided_at")?)
+        .map_err(|e| CellError::Invalid(format!("bad `decided_at`: {e}")))?;
+    let body = op.body.as_ref().unwrap_or(&Value::Null);
+    if body.get("purged").and_then(Value::as_bool) == Some(true) {
+        return Ok(()); // nothing survives the purge: audit only
+    }
+    // cancel the decision — once
+    let n = tx.execute(
+        "UPDATE decisions SET reverted_by = ?2 WHERE op_id = ?1 AND reverted_by IS NULL",
+        rusqlite::params![decision_op.to_string(), op.op_id.to_string()],
+    )?;
+    if n == 0 {
+        return Err(CellError::Invalid(format!(
+            "op {}: decision {decision_op} is unknown or already reverted",
+            op.op_id
+        )));
+    }
+    let Some(id) = op.note_id else {
+        return Err(CellError::Invalid(format!(
+            "op {}: revert_decision needs `note_id`",
+            op.op_id
+        )));
+    };
+    let n = tx.execute(
+        "UPDATE proposals SET state = 'reverted', decision_op = NULL, decided_by = NULL,
+                              decided_at = NULL, decision_reason = NULL
+         WHERE note_id = ?1",
+        [id.to_string()],
+    )?;
+    if n == 0 {
+        return Err(CellError::Invalid(format!(
+            "op {}: note {id} is not a proposal",
+            op.op_id
+        )));
+    }
+    // the proposal note goes back to the queue
+    let Some(old) = read_note(tx, &id)? else {
+        return Err(CellError::Invalid(format!(
+            "op {}: the proposal note {id} is gone",
+            op.op_id
+        )));
+    };
+    snapshot(tx, &id, old.version, &op.op_id)?;
+    let mut note = old.note.clone();
+    note.status = Status::Quarantined;
+    note.updated_at = decided_at;
+    write_note(tx, &note, true, false)?;
+    reindex_note(tx, &id, Some(&old))?;
+    // a closed supersede target reopens exactly as it was (the restore
+    // values were recorded in the decide body when the decision was taken)
+    if let Some(v) = body.get("restore_target").filter(|v| !v.is_null()) {
+        let t_id = v
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|s| Ulid::from_string(s).ok())
+            .ok_or_else(|| CellError::Invalid(format!("op {}: bad restore_target", op.op_id)))?;
+        let status = Status::parse(v.get("status").and_then(Value::as_str).unwrap_or("active"))
+            .map_err(|e| CellError::Invalid(format!("op {}: bad restore status: {e}", op.op_id)))?;
+        let valid_to = v
+            .get("valid_to")
+            .and_then(Value::as_str)
+            .map(Validity::parse)
+            .transpose()
+            .map_err(|e| {
+                CellError::Invalid(format!("op {}: bad restore valid_to: {e}", op.op_id))
+            })?;
+        if let Some(trow) = read_note(tx, &t_id)? {
+            snapshot(tx, &t_id, trow.version, &op.op_id)?;
+            let mut t = trow.note.clone();
+            t.status = status;
+            t.valid_to = valid_to;
+            t.updated_at = decided_at;
+            write_note(tx, &t, true, false)?;
+            reindex_note(tx, &t_id, Some(&trow))?;
+        }
+        tx.execute(
+            "DELETE FROM supersedes WHERE new_id = ?1 AND old_id = ?2",
+            rusqlite::params![id.to_string(), t_id.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+/// The cell's policy, an operation of the log (P2 owns the semantics; P1
+/// introduces the op with the schema so the history can say who allowed
+/// what, and when). The body IS the policy document.
+fn apply_set_policy(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
+    let Some(body) = op.body.as_ref() else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('policy', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        [canonical_json(body)],
+    )?;
     Ok(())
 }
 

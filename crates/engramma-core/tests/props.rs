@@ -520,6 +520,8 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) -> std::collections::HashMap<O
     };
     let mut notes: Vec<Ulid> = Vec::new();
     let mut quarantined: Vec<Ulid> = Vec::new(); // non-external, via set_status
+    let mut proposals: Vec<Ulid> = Vec::new(); // queued, decidable (v0.5)
+    let mut decided: Vec<Ulid> = Vec::new(); // decide op ids, revertible (v0.5)
     let mut counts: std::collections::HashMap<OpKind, usize> = std::collections::HashMap::new();
     let draw = |pool: &[Ulid], rnd: u64| -> Option<Ulid> {
         if pool.is_empty() {
@@ -529,7 +531,7 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) -> std::collections::HashMap<O
         }
     };
     for i in 0..n {
-        let choice = next() % 12;
+        let choice = next() % 16;
         let fresh = any_note_of(next(), i);
         match choice {
             0..=2 => {
@@ -616,7 +618,94 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) -> std::collections::HashMap<O
                 {
                     notes.retain(|n| n != &id);
                     quarantined.retain(|n| n != &id);
+                    proposals.retain(|n| n != &id);
                     *counts.entry(OpKind::Purge).or_insert(0) += 1;
+                }
+            }
+            11 => {
+                // v0.5 (P1): propose a fact (or a correction) — a duplicate
+                // text is refused without an op, so the body carries a
+                // unique marker
+                let mode = match notes.last() {
+                    Some(target) if next() % 2 == 0 => {
+                        engramma_core::cell::proposals::ProposalMode::Supersede(*target)
+                    }
+                    _ => engramma_core::cell::proposals::ProposalMode::New,
+                };
+                let mut fresh = any_note_of(next(), i + 3000);
+                fresh.body = format!("{} unica{i}", fresh.body);
+                if let Ok(out) = cell.propose(
+                    &engramma_core::cell::proposals::ProposalInput {
+                        note: fresh,
+                        mode,
+                        client: Some("prop-test".into()),
+                        reason: Some("prop".into()),
+                    },
+                    "mcp:prop",
+                    None,
+                ) && let Some(id) = out.id
+                {
+                    // the row lands only when it is not a duplicate
+                    proposals.push(id);
+                    *counts.entry(OpKind::Propose).or_insert(0) += 1;
+                }
+            }
+            12 => {
+                // v0.5 (P1): decide a queued proposal
+                if let Some(id) = draw(&proposals, next()) {
+                    let accept = next() % 2 == 0;
+                    let action = if accept {
+                        engramma_core::cell::proposals::DecisionAction::Accept { edited: None }
+                    } else {
+                        engramma_core::cell::proposals::DecisionAction::Reject
+                    };
+                    if let Ok(op) = cell.decide(
+                        &id,
+                        &engramma_core::cell::proposals::DecisionInput {
+                            action,
+                            reason: Some("prop".into()),
+                            review: None,
+                        },
+                        "user@prop",
+                    ) {
+                        proposals.retain(|n| n != &id);
+                        if accept {
+                            notes.push(id);
+                        }
+                        decided.push(op);
+                        *counts.entry(OpKind::Decide).or_insert(0) += 1;
+                    }
+                }
+            }
+            13 => {
+                // v0.5 (P1): cancel a decision — a CONFLICT refuses (later
+                // human ops), a PURGED outcome still writes the audit op;
+                // only the Reverted one returns a proposal to the queue
+                if let Some(op) = draw(&decided, next()) {
+                    match cell.revert_decision(&op, "prop", "prop") {
+                        Ok(engramma_core::cell::proposals::RevertOutcome::Reverted {
+                            proposal,
+                            ..
+                        }) => {
+                            proposals.push(proposal);
+                            notes.retain(|n| n != &proposal);
+                            *counts.entry(OpKind::RevertDecision).or_insert(0) += 1;
+                        }
+                        Ok(engramma_core::cell::proposals::RevertOutcome::Purged { .. }) => {
+                            *counts.entry(OpKind::RevertDecision).or_insert(0) += 1;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            14 => {
+                // v0.5 (P2's op, introduced with the schema in P1): the
+                // policy must not rot either
+                if cell
+                    .set_policy(serde_json::json!({ "write": "propose" }), "prop")
+                    .is_ok()
+                {
+                    *counts.entry(OpKind::SetPolicy).or_insert(0) += 1;
                 }
             }
             9 => {

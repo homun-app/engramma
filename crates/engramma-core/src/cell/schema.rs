@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 12] = [
+pub const MIGRATIONS: [&str; 13] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -190,6 +190,45 @@ CREATE TABLE vault_conflicts_v12 (view_id TEXT NOT NULL,
                                   created_at TEXT NOT NULL,
                                   PRIMARY KEY (view_id, path));
 CREATE INDEX idx_vault_conflicts_note_v12 ON vault_conflicts_v12(note_id);
+"#,
+    r#"
+-- v13 (v0.5, P1): the proposals queue and the decisions registry. Both are
+-- DERIVED tables, maintained by `apply` of the new operations
+-- (propose/decide/revert_decision) and therefore rebuilt by every replay —
+-- the state digest covers them, so `verify` checks the new operations'
+-- derived state like any other table. The proposal NOTE lives in `notes`
+-- from birth, in quarantine; these rows carry the queue metadata. A purge
+-- deletes both rows with the note (the reason and the reviewer metadata are
+-- payload-body content: the right to be forgotten must reach them). No
+-- Rust-side backfill: no older binary knows these op kinds, so no existing
+-- cell can hold rows to rebuild. `state_digest` widened with these tables:
+-- compaction rows recorded under the old definition are adjusted once at
+-- open (see `upgrade_snapshot_digests` in cell/mod.rs).
+CREATE TABLE proposals (note_id TEXT PRIMARY KEY,   -- the proposed note
+                        mode TEXT NOT NULL,         -- new | supersede
+                        target TEXT,                -- superseded note, when mode = supersede
+                        proposer TEXT NOT NULL,     -- the propose op's actor
+                        client TEXT,                -- DECLARED clientInfo: registered, never an identity
+                        reason TEXT,                -- the assistant's stated motivation
+                        state TEXT NOT NULL,        -- pending | accepted | rejected | reverted
+                        proposed_at TEXT NOT NULL,
+                        decision_op TEXT,           -- the deciding op, when decided
+                        decided_by TEXT,
+                        decided_at TEXT,
+                        decision_reason TEXT,
+                        review_json TEXT,           -- reviewer name, model, prompt hash, confidence
+                        auto_failed INTEGER NOT NULL DEFAULT 0);  -- review ran and FAILED (P2)
+CREATE INDEX idx_proposals_state ON proposals(state);
+CREATE TABLE decisions (op_id TEXT PRIMARY KEY,     -- the decide op
+                        proposal TEXT NOT NULL,     -- the proposed note
+                        decision TEXT NOT NULL,     -- accept | reject
+                        actor TEXT NOT NULL,
+                        decided_at TEXT NOT NULL,
+                        reason TEXT,
+                        review_json TEXT,
+                        reverted_by TEXT);          -- the revert_decision op, when cancelled
+CREATE INDEX idx_decisions_proposal ON decisions(proposal);
+CREATE INDEX idx_decisions_actor ON decisions(actor);
 "#,
 ];
 

@@ -7,6 +7,7 @@
 //! (search, get) share the same connection in WAL mode.
 
 pub mod ops;
+pub mod proposals;
 pub mod schema;
 pub mod vectors;
 
@@ -543,6 +544,70 @@ fn per_cell_lock(path: &Path) -> Arc<Mutex<()>> {
         .unwrap_or_else(|_| Arc::new(Mutex::new(())))
 }
 
+/// v0.5 (P1): one-time adjustment of the compaction rows the schema-v13
+/// digest widening made stale — the recorded digests were computed WITHOUT
+/// the queue and the registry tables, so they can never match the new
+/// definition. A file snapshot is migrated in place (the empty tables land
+/// in it, as in the live cell) and re-digested under the new definition; a
+/// checkpoint (no file) has its digest redacted to NULL, exactly like a
+/// purge redaction: unverifiable, therefore not kept. Idempotent and
+/// crash-safe: a bookmark in `meta` marks the pass, and every step is a
+/// no-op the second time.
+fn upgrade_snapshot_digests(conn: &mut Connection, cell_path: &Path) -> Result<(), CellError> {
+    let done: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'dump_v13'", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if done.is_some() {
+        return Ok(());
+    }
+    let rows: Vec<(i64, Option<String>)> = {
+        let mut stmt = conn.prepare("SELECT seq, file FROM snapshots ORDER BY seq")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .flatten()
+            .collect()
+    };
+    for (seq, file) in rows {
+        let Some(file) = file else {
+            // a checkpoint: its digest described a state under the old
+            // definition — nothing to re-read, nothing to keep
+            conn.execute(
+                "UPDATE snapshots SET state_digest = NULL WHERE seq = ?1",
+                [seq],
+            )?;
+            continue;
+        };
+        let path = cell_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(&file);
+        if !path.exists() {
+            continue; // a ghost row: the purge owns its cleanup, an open must not fail
+        }
+        let mut snap = Connection::open(&path)?;
+        snap.busy_timeout(std::time::Duration::from_secs(10))?;
+        {
+            let tx = snap.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            schema::migrate(&tx)?;
+            tx.commit()?;
+        }
+        let digest = state_digest(&snap)?;
+        conn.execute(
+            "UPDATE snapshots SET state_digest = ?2 WHERE seq = ?1",
+            rusqlite::params![seq, digest],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('dump_v13', '1')
+         ON CONFLICT(key) DO UPDATE SET value = '1'",
+        [],
+    )?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    Ok(())
+}
+
 fn configure(conn: &Connection) -> Result<(), CellError> {
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -673,6 +738,17 @@ impl Cell {
                 }
             }
             tx.commit()?;
+        }
+        // v0.5 (P1): the state digest widened with the queue and the
+        // registry (schema v13). Compaction rows recorded under the OLD
+        // definition are adjusted once, here — before any verify can compare
+        // against them.
+        {
+            let cell_lock = per_cell_lock(path);
+            let _guard = cell_lock
+                .lock()
+                .map_err(|_| CellError::Db("cell lock registry poisoned".into()))?;
+            upgrade_snapshot_digests(&mut conn, path)?;
         }
         let mut clock = HlcClock::new(crate::id::node_id().to_string(), now_ms);
         {
@@ -957,7 +1033,7 @@ impl Cell {
         let censorable: std::collections::HashSet<String> = {
             let mut stmt = inner.conn.prepare(
                 "SELECT o.op_id FROM ops o JOIN op_payloads p ON p.op_id = o.op_id
-                 WHERE o.kind = 'supersede'",
+                 WHERE o.kind IN ('supersede', 'decide')",
             )?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
                 .flatten()
@@ -2747,12 +2823,29 @@ fn state_dump(conn: &Connection) -> Result<String, CellError> {
             "op_payloads",
             "SELECT op_id, salt, body FROM op_payloads ORDER BY op_id",
         ),
+        // v0.5 (P1): the queue and the registry are derived tables the ops
+        // themselves maintain — the digest covers them, so a diverging
+        // replay of a propose/decide/revert is a verification failure, not
+        // a silent drift
+        (
+            "proposals",
+            "SELECT note_id, mode, target, proposer, client, reason, state, proposed_at,
+                    decision_op, decided_by, decided_at, decision_reason, review_json,
+                    auto_failed
+             FROM proposals ORDER BY note_id",
+        ),
+        (
+            "decisions",
+            "SELECT op_id, proposal, decision, actor, decided_at, reason, review_json,
+                    reverted_by FROM decisions ORDER BY op_id",
+        ),
         // The migration bookmarks are not replayable state: no op writes
-        // them, so a from-zero rebuild never has them.
+        // them, so a from-zero rebuild never has them (`dump_v13` marks the
+        // v13 digest-widening pass over the compaction rows, v0.5 P1).
         (
             "meta",
             "SELECT key, value FROM meta
-             WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq') ORDER BY key",
+             WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13') ORDER BY key",
         ),
     ];
     let render = |v: rusqlite::types::Value| -> String {

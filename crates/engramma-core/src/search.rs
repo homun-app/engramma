@@ -1386,13 +1386,15 @@ impl Cell {
 // semantic search (v0.2 §4)
 // ---------------------------------------------------------------------------
 
-/// A vector candidate after filters: the best chunk of a note.
-struct VecCand {
-    id: String,
-    cosine: f64,
-    rank: usize,
-    note: Note,
-    chunk: usize,
+/// A vector candidate after filters: the best chunk of a note. `pub(crate)`
+/// for the proposals' semantic hints (v0.5, P1), which reuse the same
+/// exact-recall path the search uses.
+pub(crate) struct VecCand {
+    pub(crate) id: String,
+    pub(crate) cosine: f64,
+    pub(crate) rank: usize,
+    pub(crate) note: Note,
+    pub(crate) chunk: usize,
 }
 
 /// Build or reuse the in-memory index of the cell's `ready` model.
@@ -1827,7 +1829,7 @@ fn render_path(gi: &GraphIndex, pred: &HashMap<u32, (u32, u32, f64)>, node: u32)
 /// chunk per note → the same filters as BM25. Fewer than `k` survivors
 /// double `m`, up to the full scan.
 #[allow(clippy::too_many_arguments)]
-fn vector_candidates(
+pub(crate) fn vector_candidates(
     conn: &rusqlite::Connection,
     inner: &Inner,
     qv: &[f32],

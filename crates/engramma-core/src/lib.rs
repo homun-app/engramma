@@ -18,6 +18,12 @@ pub mod vector;
 
 pub use cell::{Cell, NotePatch, PurgeReport, VaultFile, VaultView, VerifyReport, snapshot_of};
 pub use cell::{EmbedPendingReport, ModelCoverage, ModelRow, ModelState};
+// v0.5 (P1): proposals, decisions, rollback.
+pub use cell::proposals::{
+    DecisionAction, DecisionInput, DecisionRow, DecisionState, DecisionsFilter, ProposalInput,
+    ProposalMode, ProposalOutcome, ProposalRow, ProposalState, ProposalStatus, ProposalsFilter,
+    RevertFilter, RevertOutcome, RevertReport, ReviewMeta,
+};
 pub use consolidation::{Candidate, CandidateKind, Consolidation};
 pub use embed::{Embedder, TextKind};
 pub use error::{CellError, EmbedError, FormatError, PortError, SearchError};

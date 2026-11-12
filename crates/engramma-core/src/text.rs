@@ -215,8 +215,58 @@ fn latin_ext_a(c: char) -> &'static str {
     }
 }
 
+/// v0.5 (P1): the duplicate test of a proposal. Deliberately dumber than
+/// [`normalize`]: no stemming (two facts that share every stem but differ in
+/// one word are NOT duplicates), only the three normalisations the spec
+/// names — case, whitespace runs, punctuation. Punctuation acts as a
+/// separator ("nero." == "nero", "Roma,5" == "Roma 5"), so a decimal comma
+/// and a space read the same: for a refusal test that over-merges is the
+/// safe direction (it asks the human, it never silently stores a twin).
+pub fn normalize_for_duplicate(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    let mut wrote_any = false;
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            if pending_space && wrote_any {
+                out.push(' ');
+            }
+            pending_space = false;
+            wrote_any = true;
+            for lc in c.to_lowercase() {
+                out.push(lc);
+            }
+        } else {
+            // whitespace AND punctuation: separators, collapsed
+            pending_space = true;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    /// v0.5 (P1): the duplicate normalisation, decided and pinned here.
+    #[test]
+    fn duplicate_normalisation() {
+        use super::normalize_for_duplicate as n;
+        // case, whitespace runs, punctuation
+        assert_eq!(n("Fabio lavora a Milano."), n("fabio lavora a milano"));
+        assert_eq!(n("FABIO   LAVORA A MILANO!"), n("Fabio lavora a Milano."));
+        assert_eq!(n("via Roma, 5"), n("via Roma 5"));
+        assert_eq!(n("caffè"), n("CAFFÈ"), "accents are letters, not noise");
+        // the trim: leading and trailing separators vanish
+        assert_eq!(n("  Fabio  "), n("Fabio"));
+        // and what must NOT merge: different facts stay different
+        assert_ne!(n("Fabio lavora a Milano."), n("Fabio lavora a Torino."));
+        assert_ne!(
+            n("Fabio parla inglese"),
+            n("Fabio parla inglese e francese")
+        );
+        // no stemming: two facts sharing every stem differ in one word
+        assert_ne!(n("il gatto nero corre"), n("il gatto nero correva"));
+    }
+
     use super::*;
 
     #[test]

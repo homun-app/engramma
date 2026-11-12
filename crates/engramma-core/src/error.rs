@@ -85,6 +85,11 @@ pub enum CellError {
         /// Highest schema version this binary understands.
         supported: i64,
     },
+    /// v0.5 (P1): the operation would land over a later correction — a
+    /// `revert_decision` whose note (or supersede target) was touched by a
+    /// later operation. The message names the operations in the way.
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 /// Errors returned by import/export.

@@ -831,14 +831,44 @@ fn a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint() {
              DROP TABLE vault_files;
              ALTER TABLE vault_files_v9 RENAME TO vault_files;
              CREATE UNIQUE INDEX idx_vault_files_note_v9 ON vault_files(note_id);
-             UPDATE meta SET value = '9' WHERE key = 'schema_version';",
+             DROP TABLE IF EXISTS proposals;
+             DROP TABLE IF EXISTS decisions;
+             UPDATE meta SET value = '9' WHERE key = 'schema_version';
+             DELETE FROM meta WHERE key = 'dump_v13';",
         )
         .unwrap(/* test-only */);
     };
     downgrade(&snap);
     let v9_digest = {
         let conn = rusqlite::Connection::open(&snap).unwrap(/* test-only */);
-        engramma_core::cell::state_digest(&conn).unwrap(/* test-only */)
+        // the v0.5 dump covers the queue tables: a v9 cell has none. The
+        // recorded digest stands for what a v0.3.1 binary wrote over ITS
+        // dump; the empty tables live in a throwaway in-memory COPY (adding
+        // them to the file itself would collide with the v13 migration the
+        // open is about to run). What matters to the fixture is that this
+        // value is STALE the moment a v0.5 binary opens the cell: the
+        // digest-widening pass re-digests the migrated file and its row.
+        let mut mem = rusqlite::Connection::open_in_memory().unwrap(/* test-only */);
+        let backup = rusqlite::backup::Backup::new(&conn, &mut mem).unwrap(/* test-only */);
+        backup
+            .run_to_completion(128, std::time::Duration::from_millis(0), None)
+            .unwrap(/* test-only */);
+        drop(backup);
+        mem.execute_batch(
+            "CREATE TABLE proposals (note_id TEXT PRIMARY KEY, mode TEXT NOT NULL,
+                                    target TEXT, proposer TEXT NOT NULL, client TEXT,
+                                    reason TEXT, state TEXT NOT NULL,
+                                    proposed_at TEXT NOT NULL, decision_op TEXT,
+                                    decided_by TEXT, decided_at TEXT, decision_reason TEXT,
+                                    review_json TEXT,
+                                    auto_failed INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE decisions (op_id TEXT PRIMARY KEY, proposal TEXT NOT NULL,
+                                     decision TEXT NOT NULL, actor TEXT NOT NULL,
+                                     decided_at TEXT NOT NULL, reason TEXT, review_json TEXT,
+                                     reverted_by TEXT);",
+        )
+        .unwrap(/* test-only */);
+        engramma_core::cell::state_digest(&mem).unwrap(/* test-only */)
     };
     downgrade(&path);
     {
