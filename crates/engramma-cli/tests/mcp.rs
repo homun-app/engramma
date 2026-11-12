@@ -907,3 +907,80 @@ fn confirm_with_the_2026_input_required_round() {
     let res = mcp.read_response(4);
     assert!(res.get("error").is_some(), "{res}");
 }
+
+/// v0.5.3 (P1.4): the indistinguishability control at the MCP surface. Two
+/// symmetric notes answer «gatto»; a quarantined note and a tombstone that
+/// match the question join the cell from another process (the server keeps
+/// running). The wire answer of `memory_search` must be EXACTLY what it was
+/// before — ids, order, scores, ranks — with no `2 and 3 without 1` and no
+/// displaced answer: over HTTP that would be an oracle on hidden notes.
+#[test]
+fn mcp_search_is_indistinguishable_with_hidden_notes() {
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let cells = cell_root(dir.path());
+    {
+        let cell = Cell::create(&cells.join("gatti.sqlite"), "gatti", "test").unwrap(/* t */);
+        for (title, body) in [
+            ("nero", "Il gatto nero dorme tutta la giornata sul divano."),
+            ("rosso", "Il gatto rosso gioca con la palla ogni sera."),
+            ("cena", "Stasera cuciniamo le melanzane alla parmigiana."),
+        ] {
+            cell.put_note(&plain_note(title, body), "test").unwrap(/* t */);
+        }
+    }
+    let mut mcp = spawn(dir.path(), "gatti");
+    mcp.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0.0"}}}"#);
+    let _ = mcp.read_response(1);
+    mcp.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    let search = |id: i64| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_search",
+                "arguments": {"cell": "gatti", "query": "gatto"}
+            }
+        })
+    };
+    mcp.send(&search(2).to_string());
+    let before = mcp.read_response(2);
+    let hits = before["result"]["content"][0]["text"].as_str().unwrap(/* t */);
+    let before_parsed: serde_json::Value = serde_json::from_str(hits).unwrap(/* t */);
+    let hits_before = before_parsed["hits"].as_array().unwrap(/* t */).clone();
+    assert_eq!(hits_before.len(), 2, "{hits_before:?}");
+    // the ranks are dense from 1: no hidden note above them
+    assert_eq!(
+        hits_before[0]["explain"]["bm25_rank"].as_i64(),
+        Some(1),
+        "{hits_before:?}"
+    );
+    assert_eq!(
+        hits_before[1]["explain"]["bm25_rank"].as_i64(),
+        Some(2),
+        "{hits_before:?}"
+    );
+
+    // from ANOTHER process (the server keeps its cell open): a quarantined
+    // note and a tombstone, both matching the question
+    {
+        let cell = Cell::open(&cells.join("gatti.sqlite")).unwrap(/* t */);
+        let mut hidden = plain_note("web", "Il gatto del web vince tutti i premi.");
+        hidden.confidence = Confidence::External;
+        hidden.status = Status::Quarantined;
+        hidden.source = "import:web".into();
+        cell.put_note(&hidden, "test").unwrap(/* t */);
+        let dead = plain_note("morto", "Il gatto di prova non c'è più.");
+        let id = dead.id;
+        cell.put_note(&dead, "test").unwrap(/* t */);
+        cell.delete_note(&id, "test").unwrap(/* t */);
+    }
+
+    mcp.send(&search(3).to_string());
+    let after = mcp.read_response(3);
+    let text_after = after["result"]["content"][0]["text"].as_str().unwrap(/* t */);
+    // the SAME bytes as before: field for field, hidden notes never moved
+    // anything (the two visible notes match the same stem symmetrically, so
+    // even SQLite's idf wobble cancels in the normalised answer)
+    assert_eq!(hits, text_after, "the wire answer changed");
+}

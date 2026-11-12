@@ -228,6 +228,13 @@ pub(crate) struct GraphIndex {
     node_map: HashMap<String, u32>,
     /// `Some(ulid)` for note nodes.
     node_note: Vec<Option<Ulid>>,
+    /// v0.5.3 (P1): the status of the note a node stands for (the same
+    /// tri-state the edges use; `Visible` for pure entity nodes). The push's
+    /// OUTPUT list carries visible notes only — a hidden note may receive
+    /// mass as an entity (other notes' walkable edges point at it) but it
+    /// never enters the list, so it can neither take a slot nor move the
+    /// max-normalisation of the visible entries.
+    note_vis: Vec<EdgeVisibility>,
     /// CSR offsets, `keys.len() + 1` entries.
     offsets: Vec<u32>,
     /// CSR adjacency (both directions of every edge).
@@ -272,6 +279,7 @@ impl GraphIndex {
             display: Vec::new(),
             node_map: HashMap::new(),
             node_note: Vec::new(),
+            note_vis: Vec::new(),
             offsets: Vec::new(),
             adj: Vec::new(),
             edges_of_note: HashMap::new(),
@@ -359,7 +367,63 @@ impl GraphIndex {
         gi.real_edges = raw.len();
         gi.place(all);
         gi.index_names(conn)?;
+        gi.refresh_note_vis(conn)?;
         Ok(gi)
+    }
+
+    /// v0.5.3 (P1): read the note statuses and file them under their nodes.
+    ///
+    /// # Errors
+    /// [`SearchError::Db`] on SQL failure.
+    fn refresh_note_vis(&mut self, conn: &Connection) -> Result<(), SearchError> {
+        let mut stmt = conn.prepare("SELECT id, status FROM notes")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut vis: HashMap<String, EdgeVisibility> = HashMap::new();
+        for row in rows {
+            let (id, status) = row?;
+            vis.insert(id, EdgeVisibility::from_status(&status));
+        }
+        drop(stmt);
+        for node in 0..self.node_note.len() {
+            if let Some(id) = self.node_note[node].as_ref() {
+                let v = vis
+                    .get(&id.to_string())
+                    .copied()
+                    .unwrap_or(EdgeVisibility::Visible);
+                self.note_vis[node] = v;
+            }
+        }
+        Ok(())
+    }
+
+    /// v0.5.3 (P1): may the note this node stands for appear in a walk's
+    /// OUTPUT? (Entity nodes — `node_note` None — always may: they are not
+    /// notes, and the walk through them is carried by other notes' edges.)
+    fn note_visible(&self, node: u32, include_quarantined: bool) -> bool {
+        if self.node_note.get(ix(node)).copied().flatten().is_none() {
+            return true;
+        }
+        self.note_vis
+            .get(ix(node))
+            .copied()
+            .unwrap_or(EdgeVisibility::Visible)
+            .walkable(include_quarantined)
+    }
+
+    /// v0.5.3 (P1): does this node have at least one WALKABLE edge — an
+    /// entity the visible graph actually speaks about? The question-entity
+    /// gate seeds only such entities: an entity only hidden notes ever
+    /// declared must not open the walk (its shares would dilute the real
+    /// seeds, and the walk itself would be an oracle).
+    pub(crate) fn has_walkable_step(
+        &self,
+        node: u32,
+        as_of: Option<OffsetDateTime>,
+        include_quarantined: bool,
+    ) -> bool {
+        self.steps(node, as_of, include_quarantined, &[], false)
+            .next()
+            .is_some()
     }
 
     /// Fill [`GraphIndex::names`] (v0.4, P1.4): every entity name, plus the
@@ -554,6 +618,9 @@ impl GraphIndex {
         self.display.push(key.clone());
         self.node_map.insert(key, n);
         self.node_note.push(ulid);
+        // corrected by the status pass at build/patch time; Visible is the
+        // fail-open default only for nodes the pass never sees
+        self.note_vis.push(EdgeVisibility::Visible);
         self.degree.push(0.0);
         // After a build the offsets are live: a new node extends them with an
         // empty range so traversal stays in bounds.
@@ -576,6 +643,7 @@ impl GraphIndex {
         self.display.push(display.to_string());
         self.node_map.insert(key, n);
         self.node_note.push(None);
+        self.note_vis.push(EdgeVisibility::Visible);
         self.degree.push(0.0);
         if !self.offsets.is_empty() {
             let last = self.offsets[self.offsets.len() - 1];
@@ -858,6 +926,23 @@ impl GraphIndex {
             self.bump_degree(p.dst, true);
             self.live_edges += 1;
         }
+        // v0.5.3 (P1): a rewrite may have changed the note's STATUS (a
+        // quarantine, a confirm): the output filter must see it
+        if let Some(note_status) = conn
+            .query_row(
+                "SELECT status FROM notes WHERE id = ?1",
+                [id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        {
+            let key = format!("note:{id}");
+            if let Some(&n) = self.node_map.get(&key) {
+                if let Some(v) = self.note_vis.get_mut(ix(n)) {
+                    *v = EdgeVisibility::from_status(&note_status);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -995,10 +1080,16 @@ impl GraphIndex {
                 }
             }
         }
-        // Notes only, seeds out; sorted by settled mass.
+        // Notes only, seeds out, VISIBLE ones only (v0.5.3, P1): a hidden
+        // note must not take a slot of the list nor move the max the scores
+        // normalise by; sorted by settled mass.
         let mut notes: Vec<(u32, f64)> = p
             .iter()
-            .filter(|(n, _)| !seed_set.contains(n) && self.node_note[ix(**n)].is_some())
+            .filter(|(n, _)| {
+                !seed_set.contains(n)
+                    && self.node_note[ix(**n)].is_some()
+                    && self.note_visible(**n, include_quarantined)
+            })
             .map(|(n, m)| (*n, *m))
             .collect();
         notes.sort_by(|a, b| {

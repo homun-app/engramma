@@ -611,26 +611,40 @@ fn match_expr_for(
     conn: &rusqlite::Connection,
     qt: &crate::text::QueryTerms,
 ) -> Result<String, SearchError> {
-    let total: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM notes WHERE status != 'deleted'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let df = doc_frequencies(conn, &qt.flat())?;
+    let total = visible_note_count(conn, false);
+    let df = doc_frequencies(conn, &qt.flat(), false)?;
     Ok(match_expr_with(qt, &df, total))
 }
 
-/// Document frequency of each form, from the index's own vocabulary.
+/// How many notes the DEFAULT view sees (v0.5.3, P1: the totals the
+/// frequent-term and support decisions divide by count the visible notes
+/// only — a hidden note must not bend them).
+pub(crate) fn visible_note_count(conn: &rusqlite::Connection, include_quarantined: bool) -> i64 {
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM notes WHERE status IN {}",
+            visible_statuses(include_quarantined)
+        ),
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Document frequency of each form among the notes the caller may see.
 /// SQLite 3.54's fts5vocab yields ONE row per term: (term, doc, cnt) where
 /// `doc` is the document frequency and `cnt` the total occurrences (probed
 /// by hand on the bundled 3.54.1; older fts5vocab emitted one row per
 /// term/document pair). An empty map means "unknown" — nothing is dropped,
-/// nothing is discounted.
+/// nothing is discounted. The vocabulary counts EVERY indexed row; with the
+/// default view (v0.5.3, P1) the quarantined documents are subtracted
+/// exactly — one rowid-probed MATCH count per term, the index's own
+/// tokenizer deciding — so a hidden note cannot inflate a term into
+/// "non-discriminative" and flip a support label.
 fn doc_frequencies(
     conn: &rusqlite::Connection,
     terms: &[String],
+    include_quarantined: bool,
 ) -> Result<HashMap<String, i64>, SearchError> {
     if terms.is_empty() {
         return Ok(HashMap::new());
@@ -651,6 +665,41 @@ fn doc_frequencies(
     for row in rows {
         let (term, doc_freq) = row?;
         df.insert(term, doc_freq);
+    }
+    drop(stmt);
+    if !include_quarantined && !df.is_empty() {
+        // subtract the quarantined documents, exactly: the CROSS JOIN pins
+        // the notes table first, so each term costs one rowid probe per
+        // quarantined note, not a posting-list scan
+        let hidden: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes WHERE status = 'quarantined'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if hidden > 0 {
+            let mut corrected = HashMap::with_capacity(df.len());
+            for (term, d) in df {
+                let hidden_hits: i64 = if d > 0 {
+                    // quoted like the MATCH alternatives: a term is never an
+                    // FTS expression here
+                    let needle = format!("\"{}\"", term.replace('"', ""));
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM notes n
+                         CROSS JOIN notes_fts ON notes_fts.rowid = n.rowid
+                         WHERE n.status = 'quarantined' AND notes_fts MATCH ?1",
+                        [&needle],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                corrected.insert(term, (d - hidden_hits).max(0));
+            }
+            df = corrected;
+        }
     }
     Ok(df)
 }
@@ -717,20 +766,41 @@ fn candidate_window(k: usize) -> u64 {
     u64::try_from(k.max(50)).unwrap_or(50)
 }
 
+/// The status set a read may see: the default view hides quarantined notes
+/// and tombstones; `include_quarantined` (the owner's own surfaces) lets
+/// the quarantined ones back in. THE ONE source of this truth — the FTS
+/// query, the candidate read and the vector list all speak it.
+pub(crate) fn visible_statuses(include_quarantined: bool) -> &'static str {
+    if include_quarantined {
+        "('active', 'superseded', 'quarantined')"
+    } else {
+        "('active', 'superseded')"
+    }
+}
+
 /// The BM25 candidate list for a MATCH expression: `(id, -bm25)` (FTS5's
 /// bm25() is negative, more negative = better), at most `limit`.
+/// v0.5.3 (P1): the visibility of state rides INSIDE the query — a
+/// quarantined note or a tombstone never enters the list, so the ranks the
+/// rerank and `explain` see are positions among the VISIBLE matches (the
+/// first visible result is rank 1, not 2), no hidden note displaces a
+/// visible one out of the window, and the max-normalisations downstream
+/// never see a hidden maximum.
 fn bm25_candidates(
     conn: &rusqlite::Connection,
     match_expr: &str,
     limit: u64,
+    include_quarantined: bool,
 ) -> Result<Vec<(String, f64)>, SearchError> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let mut stmt = conn.prepare(
+    let sql = format!(
         "SELECT n.id, bm25(notes_fts, 10.0, 3.0, 2.0) FROM notes_fts
          JOIN notes n ON n.rowid = notes_fts.rowid
-         WHERE notes_fts MATCH ?1
+         WHERE notes_fts MATCH ?1 AND n.status IN {}
          ORDER BY bm25(notes_fts, 10.0, 3.0, 2.0) LIMIT ?2",
-    )?;
+        visible_statuses(include_quarantined)
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![match_expr, limit], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
     })?;
@@ -918,7 +988,12 @@ impl Cell {
             return Err(SearchError::Invalid("query has no usable terms".into()));
         }
         let match_expr = match_expr_for(conn, &terms)?;
-        let text_hits = bm25_candidates(conn, &match_expr, candidate_window(q.k))?;
+        let text_hits = bm25_candidates(
+            conn,
+            &match_expr,
+            candidate_window(q.k),
+            q.filters.include_quarantined,
+        )?;
 
         // 2. Filters come BEFORE the graph expansion: only candidates that
         // pass them (status, quarantine, superseded, `as_of`) can seed the
@@ -1778,7 +1853,16 @@ fn graph_list(
         GraphSeeding::Question {
             seed_passage_weight,
         } => {
-            let entities = question_entities(gi, &q.text);
+            // v0.5.3 (P1): an entity the VISIBLE graph never speaks about
+            // (only hidden notes declared it) does not open the walk — its
+            // shares would dilute the real seeds and the open gate itself
+            // would be a fingerprint of the hidden note
+            let entities: Vec<(u32, f64)> = question_entities(gi, &q.text)
+                .into_iter()
+                .filter(|&(n, _)| {
+                    gi.has_walkable_step(n, q.filters.as_of, q.filters.include_quarantined)
+                })
+                .collect();
             if entities.is_empty() {
                 // the gate (P1.4): no entity named, no walk — the fused
                 // list stands on its own
@@ -1793,7 +1877,9 @@ fn graph_list(
                     },
                 ));
             }
-            let mut seeds = entities; // shares sum to 1
+            let share = 1.0 / entities.len() as f64;
+            let mut seeds: Vec<(u32, f64)> =
+                entities.into_iter().map(|(n, _)| (n, share)).collect();
             for (id, s) in fused_seeds {
                 if let Some(n) = gi.node_of_note(&Ulid::from_string(id).unwrap_or_default()) {
                     seeds.push((n, s * seed_passage_weight));
@@ -1997,7 +2083,11 @@ pub(crate) fn vector_candidates(
             }
         }
         // rank by exact cosine, then filter — notes read in chunks of 64
-        // (one batched query per chunk instead of two per candidate)
+        // (one batched query per chunk instead of two per candidate).
+        // v0.5.3 (P1): the rank is the position among the VISIBLE
+        // candidates (numbered as they are pushed), not the position in the
+        // raw list — the first visible result is rank 1 whatever sits
+        // hidden above it.
         let mut ranked: Vec<(String, f64, i64)> = best
             .into_iter()
             .map(|(id, (cos, chunk))| (id, cos, chunk))
@@ -2012,7 +2102,7 @@ pub(crate) fn vector_candidates(
                 .map(|(id, _, _)| id.clone())
                 .collect();
             let rows = read_candidates(conn, &ids, filters.include_quarantined, &filters.types)?;
-            for (i, (id, cos, chunk)) in ranked[base..end].iter().enumerate() {
+            for (id, cos, chunk) in ranked[base..end].iter() {
                 if out.len() >= 50 {
                     break 'ranked;
                 }
@@ -2025,7 +2115,7 @@ pub(crate) fn vector_candidates(
                 out.push(VecCand {
                     id: id.clone(),
                     cosine: *cos,
-                    rank: base + i + 1,
+                    rank: out.len() + 1,
                     note: row.note.clone(),
                     chunk: usize::try_from(*chunk).unwrap_or(0),
                 });
@@ -2248,21 +2338,22 @@ fn semantic_pipeline(
         text::query_terms(&q.text, q.lang, &cell_langs)
     };
     let mut text_hits: Vec<(String, f64)> = Vec::new();
-    let total_notes: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM notes WHERE status != 'deleted'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+    // v0.5.3 (P1): the totals and the frequencies see the visible notes
+    // only — a hidden match must not bend the support labels
+    let total_notes = visible_note_count(conn, q.filters.include_quarantined);
     // document frequencies once: the MATCH drops the ubiquitous terms and
     // the support labels discount text matches that rest on them alone
-    let df = doc_frequencies(conn, &terms.flat())?;
+    let df = doc_frequencies(conn, &terms.flat(), q.filters.include_quarantined)?;
     if !terms.is_empty() {
         let match_expr = match_expr_with(&terms, &df, total_notes);
         // v0.4.2 (P0.1): the window follows the asked `k`, floor 50 — no
         // silent cut above it (same rule as the text path above)
-        text_hits = bm25_candidates(conn, &match_expr, candidate_window(q.k))?;
+        text_hits = bm25_candidates(
+            conn,
+            &match_expr,
+            candidate_window(q.k),
+            q.filters.include_quarantined,
+        )?;
     }
     // one batched read for the candidates (P0.3): note + coverage columns
     let cand_rows = read_candidates(
@@ -2880,9 +2971,12 @@ mod tests {
                 .matched_terms
                 .contains(&"trasloc".to_string())
         );
-        // Ranks are positions in the BM25 candidate list *before* filters:
-        // the quarantined web note can rank first and then be filtered out.
-        assert_eq!(hits[0].explain.bm25_rank, Some(2));
+        // v0.5.3 (P1): the rank is the position among the VISIBLE matches —
+        // the quarantined web note never enters the BM25 list, so the first
+        // visible result is rank 1 (v0.1 pinned Some(2): the quarantined
+        // note ranked first and was filtered out afterwards, which over
+        // HTTP told every client a hidden note existed)
+        assert_eq!(hits[0].explain.bm25_rank, Some(1));
     }
 
     /// v0.5.3 (P0): the three-note cell of the phase, and the one-word
@@ -2924,6 +3018,45 @@ mod tests {
         )
         .unwrap(/* test-only */);
         (dir, cell)
+    }
+
+    /// v0.5.3 (P1.6): the status filter inside the BM25 query must not
+    /// change the plan into a full scan — the MATCH still drives through
+    /// the FTS index and the JOIN probes `notes` by rowid (the p95 budget
+    /// of the phase depends on it).
+    #[test]
+    fn the_bm25_status_filter_keeps_the_fts_plan() {
+        let (_d, cell) = setup();
+        let qt = text::query_terms("traslocato Milano", None, &[]);
+        let expr = or_match_expr(&qt.words);
+        let inner = cell.inner.lock().unwrap(/* test-only */);
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT n.id, bm25(notes_fts, 10.0, 3.0, 2.0) FROM notes_fts
+             JOIN notes n ON n.rowid = notes_fts.rowid
+             WHERE notes_fts MATCH '{expr}' AND n.status IN {}
+             ORDER BY bm25(notes_fts, 10.0, 3.0, 2.0) LIMIT 50",
+            visible_statuses(false)
+        );
+        let plan: Vec<String> = {
+            let mut stmt = inner.conn.prepare(&sql).unwrap(/* test-only */);
+            stmt.query_map([], |r| {
+                let detail: String = r.get(3)?;
+                Ok(detail)
+            })
+            .unwrap(/* test-only */)
+            .flatten()
+            .collect()
+        };
+        let joined = plan.join(" | ");
+        eprintln!("plan: {joined}");
+        assert!(
+            joined.contains("notes_fts VIRTUAL TABLE INDEX"),
+            "the MATCH must still drive the FTS index: {joined}"
+        );
+        assert!(
+            joined.contains("SEARCH n USING INTEGER PRIMARY KEY (rowid=?"),
+            "the JOIN must probe notes by rowid, not scan it: {joined}"
+        );
     }
 
     /// v0.5.3 (P0): the MATCH of an uncertain question carries every form of
