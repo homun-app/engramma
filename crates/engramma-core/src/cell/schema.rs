@@ -401,6 +401,18 @@ pub fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellE
         .flatten()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // v0.5 (P0): a cell a NEWER binary migrated must refuse to open here,
+    // before any migration or write. The old behavior — apply nothing (the
+    // list is exhausted) and keep going — silently wrote under tables the
+    // binary did not know; with derived tables maintained by `apply` the
+    // state would diverge from the log. Every surface opens through this
+    // function: CLI, MCP, Node, vault.
+    if current > SCHEMA_VERSION {
+        return Err(crate::error::CellError::SchemaTooNew {
+            found: current,
+            supported: SCHEMA_VERSION,
+        });
+    }
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         let v = (i + 1) as i64;
         if v > current {

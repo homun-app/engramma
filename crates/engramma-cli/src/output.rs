@@ -11,7 +11,8 @@ use engramma_core::{CellError, PortError, SearchError};
 #[derive(Debug)]
 pub struct CliError {
     /// Exit code: 2 usage, 3 note not found, 4 internal, 5 incomplete
-    /// forgetting (a purge left bytes in the WAL).
+    /// forgetting (a purge left bytes in the WAL), 6 the cell schema is
+    /// newer than this binary (v0.5, P0).
     pub code: i32,
     /// Human-readable message.
     pub message: String,
@@ -59,6 +60,15 @@ impl CliError {
             message: message.into(),
         }
     }
+
+    /// The cell schema is newer than this binary (v0.5, P0): the cell was
+    /// left untouched; upgrade Engramma before touching it again.
+    pub fn schema_too_new(message: impl Into<String>) -> Self {
+        Self {
+            code: 6,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<CellError> for CliError {
@@ -68,6 +78,11 @@ impl From<CellError> for CliError {
             CellError::VersionNotFound(id, v) => {
                 CliError::not_found(format!("version {v} of note {id} not found"))
             }
+            CellError::SchemaTooNew { found, supported } => CliError::schema_too_new(format!(
+                "the cell schema is newer than this binary (version {found}, \
+                 this binary supports up to {supported}): the cell was left untouched, \
+                 upgrade Engramma first"
+            )),
             other => CliError::internal(other.to_string()),
         }
     }

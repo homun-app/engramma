@@ -73,6 +73,8 @@ fn split_transport(err: &Error) -> (&'static str, String) {
                 "IO",
                 "MODEL_MISSING",
                 "COMPACTED",
+                // v0.5 (P0): the cell was migrated by a newer binary
+                "SCHEMA_TOO_NEW",
                 "CLOSED",
             ];
             let c: &str = code;
@@ -132,6 +134,16 @@ fn cell_error(e: CellError) -> Error {
         CellError::Compacted { snapshot_seq } => transport_err(
             "COMPACTED",
             format!("le operazioni sotto seq {snapshot_seq} sono compattate"),
+        ),
+        // v0.5 (P0): ONLY the new code, no new methods — an old Homun `.node`
+        // must be told the cell is newer, not left to write under tables it
+        // does not know (REPORT, «Per Homun»).
+        CellError::SchemaTooNew { found, supported } => transport_err(
+            "SCHEMA_TOO_NEW",
+            format!(
+                "lo schema della cella è più nuovo di questo binario \
+                 (versione {found}, supportata fino a {supported}): aggiorna il binding"
+            ),
         ),
         CellError::Invalid(m) if m.contains("can only be `quarantined`") => transport_err(
             "CONFLICT",

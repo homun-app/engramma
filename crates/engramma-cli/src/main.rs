@@ -23,7 +23,7 @@ use clap::{Parser, Subcommand};
 use engramma_core::format::{At, Lang, Note, NoteType};
 use engramma_core::port::{export, import_cell, import_obsidian};
 use engramma_core::search::Query;
-use engramma_core::{Cell, Confidence, NotePatch, Status, Validity};
+use engramma_core::{Cell, CellError, Confidence, NotePatch, Status, Validity};
 use output::{CliError, hit_human, hit_json, note_json};
 use ulid::Ulid;
 
@@ -338,6 +338,11 @@ fn cell_path(cli: &Cli, name: &str) -> Result<PathBuf, CliError> {
 fn open_cell(cli: &Cli) -> Result<Cell, CliError> {
     let path = cell_path(cli, &cli.cell)?;
     Cell::open(&path).map_err(|e| {
+        // v0.5 (P0): a newer schema keeps its own exit code and its own
+        // words — "run `engramma init` first?" would be exactly wrong.
+        if matches!(e, CellError::SchemaTooNew { .. }) {
+            return CliError::from(e);
+        }
         CliError::internal(format!(
             "cell `{}`: {e} (run `engramma init` first?)",
             cli.cell

@@ -71,6 +71,20 @@ pub enum CellError {
     /// payloads are gone, a replica restarts from the snapshot (DESIGN §4.3).
     #[error("ops below seq {snapshot_seq} were compacted: restart from the snapshot")]
     Compacted { snapshot_seq: i64 },
+    /// v0.5 (P0): the cell's schema is NEWER than this binary knows. An older
+    /// binary must refuse to open (let alone migrate) a cell a newer one
+    /// wrote: it would write under tables it does not know and the derived
+    /// state would diverge from the log. The cell is left untouched.
+    #[error(
+        "the cell schema is newer than this binary: schema version {found}, \
+             this binary supports up to {supported} — upgrade Engramma first"
+    )]
+    SchemaTooNew {
+        /// Schema version found in the cell.
+        found: i64,
+        /// Highest schema version this binary understands.
+        supported: i64,
+    },
 }
 
 /// Errors returned by import/export.
