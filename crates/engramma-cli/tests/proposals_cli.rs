@@ -193,7 +193,9 @@ fn accept_with_edit_runs_the_editor() {
     let editor = f.dir.path().join("editor.sh");
     std::fs::write(
         &editor,
-        "#!/bin/sh\nsed -i '' 's/Milano/Milano, Porta Romana/' \"$1\"\n",
+        // plain sh + sed without -i: the same script on macOS (BSD sed) and
+        // Linux (GNU sed) — `sed -i ''` is a BSD-ism the container rejects
+        "#!/bin/sh\nsed 's/Milano/Milano, Porta Romana/' \"$1\" > \"$1.new\" && mv \"$1.new\" \"$1\"\n",
     )
     .unwrap(/* t */);
     {

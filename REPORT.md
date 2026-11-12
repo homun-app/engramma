@@ -4846,9 +4846,43 @@ correzione resta una copia sola e il perdente riceve `duplicate`.
   (modulo, coda, `engramma review`), dove si annulla, che cosa non è
   sicurezza.
 
-## Disco
+## Chiusura
 
-- `du -sh target` all'inizio: **8,5G**.
-- Alla chiusura: **12G** (build di sviluppo, banco 10k, build Linux in
-  Docker e i tre artefatti di `npm run build`; `~/.cache/cargo-target`
+- **macOS:** `cargo fmt --check` verde; `cargo clippy --all-targets
+  --offline -- -D warnings` verde; `cargo test --offline --workspace`
+  **307 verdi, 0 falliti**; `cargo test -p engramma-bench --example
+  longmemeval` 3 verdi; `cargo deny check licenses bans` ok (un
+  «unmatched license allowance» Unicode-DFS-2016, la stessa nota delle
+  fasi precedenti: la voce è permessa e nessuna la usa più — lasciare
+  l'avviso, non il licenziatario, è il difetto).
+- **Banco a 10k** (`engramma-bench --notes 10000 --runs 1`, release):
+  le latenze di ricerca sono quelle della v0.4.6.1, letteralmente —
+  vettori p50 0,790 ms (0,790), ibrido caldo p50 **46,2 ms (46,2)** e
+  **66,7 ms (66,7)**, ibrido con embedding p50 **40,9 (40,9)** / **61,4
+  (61,4)**, p95 59,1 (59,1) / 79,6→79,7: dentro lo 0,2%, ben oltre il
+  tetto del 5% richiesto. Le tabelle nuove non toccano la ricerca. I
+  richiami si muovono di ±0,006 (0,838→0,839, 0,722→0,719: la varianza
+  tra giri documentata; nessuna tendenza). `bench/RESULTS.md` aggiornato.
+- **Linux** (`scripts/linux.sh`, container arm64, rete chiusa, sorgente
+  in sola lettura): **verde** — fmt, clippy e i 307 test. Il primo giro
+  aveva un test CLI rosso colpa mia: lo «editor» di `accept --edit` era
+  uno script `sed -i ''`, una sintassi BSD che GNU sed rifiuta —
+  riscritto in sh+sed portabile (`sed … > "$1.new" && mv`). Poi
+  `docker volume rm engramma-linux-target`: fatto.
+- **JS** (Node 24.22.1, Electron 24/45 via Homun): `test:electron`
+  **29/29 verdi**, `test:electron-main` ok — **senza cambiare le attese**
+  (il contratto JS è invariato; l'unica novità è il codice d'errore
+  `SCHEMA_TOO_NEW` di P0, che i test non toccano perché nessun test apre
+  celle con schema più nuovo).
+- **Build** (`npm run build`, rifatta dopo l'ultimo commit di codice):
+  `engramma.darwin-arm64.node`
+  `c302c3ea9778ea662c5c34452b6ac92ad378e69aa98107c2f68589044772d0f5`;
+  `index.js`
+  `25fd9cc1d50a1ec3f2d74bc004d904663ff07360102d27b938870329d9c832d4`;
+  `index.d.ts`
+  `bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a6488005bf69d9f8`.
+- **Disco:** `du -sh target` **8,5G** all'inizio, **16G** alla fine
+  (build di sviluppo + release del banco, build Linux del container nel
+  volume — rimosso — e i tre artefatti; `~/.cache/cargo-target` da 1,2G
   mai toccato).
+- **Tag:** `fase-v0.5` annotato; temporanei cancellati; nessun push.
