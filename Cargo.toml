@@ -39,7 +39,7 @@ time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-rmcp = { version = "3.8", features = ["server", "transport-io", "macros", "elicitation"] }
+rmcp = { version = "3.8", features = ["server", "transport-io", "macros", "elicitation", "transport-streamable-http-server"] }
 # v0.5: the local review page (`engramma review`, 127.0.0.1 only) — and,
 # later, the HTTP MCP transport and `engramma serve`, which mount on the
 # same stack (rmcp's HTTP server is a tower service).
