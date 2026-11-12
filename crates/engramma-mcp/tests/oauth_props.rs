@@ -109,6 +109,37 @@ proptest! {
     /// The port-ignoring exception applies ONLY to http + loopback: for
     /// https, or another host, a different port is a different redirect.
     #[test]
+    /// v0.5.3 (P3.5): 6to4 is judged by the IPv4 it embeds — a reserved v4
+    /// in a 6to4 coat is never public, a public one always is.
+    #[test]
+    fn sixto_four_is_the_ipv4_it_carries(a in any::<u8>(), b in any::<u8>(), c in any::<u8>(), d in any::<u8>()) {
+        let s = format!("2002:{a:02x}{b:02x}:{c:02x}{d:02x}::");
+        let v4 = format!("{a}.{b}.{c}.{d}");
+        prop_assert_eq!(
+            is_public_ip(s.parse().unwrap(/* strategy: valid ip */)),
+            is_public_ip(v4.parse().unwrap(/* strategy: valid ip */)),
+            "{} vs {}",
+            s,
+            v4
+        );
+    }
+
+    /// v0.5.3 (P3.5): local NAT64 (RFC 8215), Teredo and the deprecated
+    /// IPv4-compatible form are refused, whatever follows the prefix.
+    #[test]
+    fn nat64_teredo_and_ipv4_compatible_are_never_public(
+        a in any::<u8>(), b in any::<u8>(), c in any::<u8>(), d in any::<u8>(), e in any::<u8>()
+    ) {
+        for s in [
+            format!("64:ff9b:1:{a:x}:{b:x}:{c:x}:{d:x}:{e:x}"),
+            format!("2001:0:{a:x}:{b:x}:{c:x}:{d:x}:{e:x}:1"),
+            format!("::{a:x}.{b:x}.{c:x}.{d:x}"),
+        ] {
+            let Ok(addr) = s.parse() else { continue };
+            prop_assert!(!is_public_ip(addr), "{s} must not be public");
+        }
+    }
+
     fn ports_matter_except_on_loopback_http(
         scheme in prop_oneof![Just("http"), Just("https")],
         host in prop_oneof![Just("localhost"), Just("127.0.0.1"), Just("api.example.com")],

@@ -637,19 +637,23 @@ fn a_reused_code_revokes_what_it_had_minted() {
     // is proven by the store's own unit test; here the pair simply works
 }
 
+/// v0.5.2 pinned five GLOBAL waiting requests; v0.5.3 (P3.1) moved the
+/// ceilings to 2 per client and 10 in all (the dedicated test above covers
+/// both) — this one keeps checking that an over-ceiling /authorize answers
+/// with a PAGE, never a redirect.
 #[test]
-fn the_sixth_pending_request_is_refused_with_a_page() {
+fn the_third_pending_of_one_client_is_refused_with_a_page() {
     let (cimd_url, _cimd) = cimd_server();
     let s = Server::start(|cfg| {
         cfg.allow_loopback_cimd = true;
     });
     let (_v, challenge) = pkce();
-    for i in 0..5 {
+    for i in 0..2 {
         let q = authorize_query(&cimd_url, &challenge, &format!("&state=n{i}"));
         let r = s.get(&q);
         assert_eq!(r.status().as_u16(), 303, "request {i}");
     }
-    let q = authorize_query(&cimd_url, &challenge, "&state=sei");
+    let q = authorize_query(&cimd_url, &challenge, "&state=tre");
     let mut r = s.get(&q);
     assert_eq!(r.status().as_u16(), 200, "a page, not a redirect");
     let html = body(&mut r);
@@ -1700,36 +1704,70 @@ fn the_chatgpt_wrappers_exist_only_with_the_flag() {
         "{res}"
     );
 
-    // with it: search and fetch join, and nothing else changes
+    // with it: a NON-ChatGPT grant (this DCR client registers claude.ai's
+    // redirect) still sees the five tools — v0.5.3 (P2): the wrappers are
+    // the ChatGPT grant's alone, and the binary cannot fake that grant
+    // (its client_id is chatgpt.com's, which only ChatGPT's own CIMD can
+    // claim). The ChatGPT-grant list is covered by
+    // `compat_wrappers_belong_to_the_chatgpt_grant_alone` below.
     let s = start_bin(&["--allow-dcr", "--compat", "chatgpt"]);
     let token = bin_token(&s);
     let res = stateless_req(&s, &token, 2, "tools/list");
     assert_eq!(
         tool_names(&res),
         vec![
-            "fetch",
             "memory_get",
             "memory_neighbors",
             "memory_search",
             "memory_tags",
             "memory_timeline",
-            "search",
         ],
-        "Claude clients must not see doubles: {res}"
+        "no doubles for any client but ChatGPT: {res}"
     );
 }
 
+/// v0.5.2 (P6) + v0.5.3 (P2): the wrappers' function, exercised by the
+/// grant they belong to — a ChatGPT-shaped CIMD on loopback, the
+/// configured client id substituted (the REAL binary cannot host this
+/// grant: chatgpt.com's CIMD is the only one that can claim chatgpt.com's
+/// client_id).
 #[test]
 fn search_and_fetch_wrap_the_engine_over_http() {
-    let s = start_bin(&["--allow-dcr", "--compat", "chatgpt"]);
-    let token = bin_token(&s);
-    let meta = serde_json::json!({
-        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientCapabilities": {}
-    });
+    let (gpt_url, _g) = cimd_doc(CHATGPT_CIMD);
+    let keep = tempfile::tempdir().unwrap(/* t */);
+    let root = keep.path().join("root");
+    std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
+    {
+        let dir = tempfile::tempdir().unwrap(/* t */);
+        let c = engramma_core::Cell::create(&dir.path().join("x.sqlite"), "default", "t")
+            .unwrap(/* t */);
+        drop(c);
+        std::fs::copy(dir.path().join("x.sqlite"), root.join("cells/default.sqlite"))
+            .unwrap(/* t */);
+    }
+    let cfg = HttpConfig {
+        bind: "127.0.0.1:0".parse().unwrap(/* t */),
+        public_url: "https://memoria.example.net".into(),
+        cells: vec!["default".into()],
+        write: vec![],
+        allow_dcr: false,
+        compat_chatgpt: true,
+        chatgpt_client_id: gpt_url.clone(),
+        allow_insecure_public_url: false,
+        allow_loopback_cimd: true,
+    };
+    let state = Arc::new(HttpState::open_with_mcp(&root, cfg).unwrap(/* t */));
+    let addr = start_router(engramma_mcp::http::router(Arc::clone(&state)));
+    let token = compat_flow_token(
+        &state,
+        &addr,
+        &gpt_url,
+        "https://chatgpt.com/connector_platform_oauth_redirect",
+        "gpt",
+    );
     // a living note (and a quarantined one to stay honest)
     let t = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(/* t */);
-    let cell = engramma_core::Cell::open(&s.root.join("cells/default.sqlite")).unwrap(/* t */);
+    let cell = engramma_core::Cell::open(&root.join("cells/default.sqlite")).unwrap(/* t */);
     let make = |body: &str, status| {
         let note = engramma_core::Note {
             id: engramma_core::id::new_ulid().unwrap(/* t */),
@@ -1760,15 +1798,12 @@ fn search_and_fetch_wrap_the_engine_over_http() {
     );
 
     // search: id, title, EMPTY url
-    let res = stateless_call(
-        &s,
+    let res = mcp_rpc(
+        &addr,
         &token,
+        "tools/call",
+        &serde_json::json!({"name": "search", "arguments": { "query": "nuota" }}).to_string(),
         2,
-        serde_json::json!({
-            "name": "search",
-            "arguments": { "query": "nuota" },
-            "_meta": meta
-        }),
     );
     let structured = &res["result"]["structuredContent"];
     let results = structured["results"]
@@ -1781,15 +1816,12 @@ fn search_and_fetch_wrap_the_engine_over_http() {
     assert_eq!(id.len(), 26, "the FULL id, search-side too: {id}");
 
     // fetch: text and metadata, structured AND in content
-    let res = stateless_call(
-        &s,
+    let res = mcp_rpc(
+        &addr,
         &token,
+        "tools/call",
+        &serde_json::json!({"name": "fetch", "arguments": { "id": id }}).to_string(),
         3,
-        serde_json::json!({
-            "name": "fetch",
-            "arguments": { "id": id },
-            "_meta": meta
-        }),
     );
     let structured = &res["result"]["structuredContent"];
     assert_eq!(structured["id"], id.as_str());
@@ -1814,15 +1846,12 @@ fn search_and_fetch_wrap_the_engine_over_http() {
         hidden.to_string(),
         "01AROTONONEXISTE0000000000AA".to_string(),
     ] {
-        let res = stateless_call(
-            &s,
+        let res = mcp_rpc(
+            &addr,
             &token,
+            "tools/call",
+            &serde_json::json!({"name": "fetch", "arguments": { "id": probe }}).to_string(),
             4,
-            serde_json::json!({
-                "name": "fetch",
-                "arguments": { "id": probe },
-                "_meta": meta
-            }),
         );
         assert!(res.get("error").is_some(), "no oracle: {probe} — {res}");
     }
@@ -2266,7 +2295,7 @@ fn compat_flow_token(
         )
         .unwrap(/* t */)
         .expect("approved");
-    let mut r = still()
+    let r = still()
         .get(&format!("http://{addr}{attesa}", addr = addr))
         .header("Host", host)
         .call()
@@ -2476,4 +2505,283 @@ fn compat_wrappers_belong_to_the_chatgpt_grant_alone() {
             .is_some_and(|m| m == "tool not found"),
         "{via_wrapper:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// v0.5.3 (P3.1/3.2): the /authorize flood, the negative CIMD cache, the
+// caps, deny --all, and the session map's ceiling
+// ---------------------------------------------------------------------------
+
+/// A CIMD server that counts how many times it was fetched, serving the
+/// given content type.
+fn counting_cimd(
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    content_type: &'static str,
+) -> (String, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(/* t */);
+    let port = listener.local_addr().unwrap(/* t */).port();
+    let handle = std::thread::spawn(move || {
+        use std::io::Read as _;
+        use std::io::Write as _;
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let url = format!("http://127.0.0.1:{port}/client.json");
+            let body = format!(
+                r#"{{"client_id":"{url}","redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"],"client_name":"Contato"}}"#
+            );
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (format!("http://127.0.0.1:{port}/client.json"), handle)
+}
+
+/// v0.5.3 (P3.1): 30 /authorize a minute, then a page with Retry-After —
+/// whoever knows the URL can no longer hold the slots or the downloads.
+#[test]
+fn authorize_has_a_global_ceiling_of_30_per_minute() {
+    let s = Server::start(|cfg| {
+        cfg.allow_loopback_cimd = false;
+    });
+    // 30 cheap refusals fill the window (the ceiling comes first, before
+    // any client_id check: every request above counts)
+    for _ in 0..30 {
+        let mut r = s.get("/authorize");
+        assert_eq!(r.status().as_u16(), 200, "the error page is a page");
+        assert!(body(&mut r).contains("client_id"), "manca il client_id");
+    }
+    // the 31st within the minute: 429 with Retry-After, like /token
+    let mut r = s.get("/authorize");
+    assert_eq!(r.status().as_u16(), 429);
+    assert_eq!(r.headers().get("retry-after").unwrap(), "60");
+    assert!(body(&mut r).contains("Troppe richieste"));
+}
+
+/// v0.5.3 (P3.1): a document refused once is not fetched again for five
+/// minutes — the negative cache counts the exact URL, one event only.
+#[test]
+fn a_refused_cimd_is_not_refetched_for_five_minutes() {
+    let fetched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (url, _h) = counting_cimd(std::sync::Arc::clone(&fetched), "text/plain");
+    let s = Server::start(|cfg| {
+        cfg.allow_loopback_cimd = true;
+    });
+    let (v, c) = pkce();
+    let _ = v;
+    for round in 0..3 {
+        let q = authorize_query(&url, &c, &format!("&state=n{round}"));
+        let mut r = s.get(&q);
+        assert_eq!(r.status().as_u16(), 200, "the refusal is a page");
+        assert!(
+            body(&mut r).contains("client non è noto"),
+            "the generic refusal, no details"
+        );
+    }
+    assert_eq!(
+        fetched.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "ONE download for three attempts"
+    );
+    // and ONE event, carrying the cause
+    let rejected: Vec<String> = s
+        .state
+        .store
+        .events()
+        .unwrap(/* t */)
+        .into_iter()
+        .filter(|(at, kind, _)| *kind == "client_rejected" && *at > 0)
+        .map(|(_, _, detail)| detail)
+        .collect();
+    assert_eq!(rejected.len(), 1, "one event only: {rejected:?}");
+    assert!(
+        rejected[0].contains("document:") || rejected[0].contains("fetch:"),
+        "the event carries the local cause: {}",
+        rejected[0]
+    );
+}
+
+/// v0.5.3 (P3.1): two waiting requests per client, ten in all — one client
+/// alone can never fill the queue.
+#[test]
+fn authorize_waits_at_two_per_client_and_ten_in_all() {
+    let s = Server::start(|cfg| {
+        cfg.allow_loopback_cimd = true;
+    });
+    let (v, c) = pkce();
+    let _ = v;
+    // ONE client: the first two wait, the third is refused
+    let (url, _h) = cimd_server();
+    for i in 0..2 {
+        let r = s.get(&authorize_query(&url, &c, &format!("&state=a{i}")));
+        assert_eq!(r.status().as_u16(), 303, "to the waiting page");
+    }
+    let mut r = s.get(&authorize_query(&url, &c, "&state=a2"));
+    assert_eq!(r.status().as_u16(), 200);
+    let page = body(&mut r);
+    assert!(
+        page.contains("due collegamenti di questo client"),
+        "the per-client ceiling: {page}"
+    );
+    // FOUR more clients × 2 each: 2 + 8 = 10 waiting in all, the eleventh
+    // is refused regardless of its client
+    for k in 0..4 {
+        let (other, _h) = cimd_server();
+        for i in 0..2 {
+            let r = s.get(&authorize_query(&other, &c, &format!("&state=b{k}-{i}")));
+            assert_eq!(r.status().as_u16(), 303);
+        }
+    }
+    let (eleventh, _h) = cimd_server();
+    let mut r = s.get(&authorize_query(&eleventh, &c, "&state=c0"));
+    assert_eq!(r.status().as_u16(), 200);
+    let page = body(&mut r);
+    assert!(
+        page.contains("dieci collegamenti"),
+        "the global ceiling: {page}"
+    );
+}
+
+/// v0.5.3 (P3.1): `engramma oauth deny --all` refuses every pending
+/// request; the waiting pages redirect their browsers with access_denied.
+#[test]
+fn oauth_deny_all_refuses_every_waiting_request() {
+    let s = Server::start(|cfg| {
+        cfg.allow_loopback_cimd = true;
+    });
+    let (v, c) = pkce();
+    let _ = v;
+    let mut attese = Vec::new();
+    for k in 0..3 {
+        let (url, _h) = cimd_server();
+        let r = s.get(&authorize_query(&url, &c, &format!("&state=d{k}")));
+        assert_eq!(r.status().as_u16(), 303);
+        attese.push(location(&r).unwrap(/* t */));
+    }
+    // the REAL CLI, on the same root
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .arg("--root")
+        .arg(&s.root)
+        .args(["oauth", "deny", "--all"])
+        .output()
+        .unwrap(/* t */);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("rifiutate 3 richieste"), "{stdout}");
+    // nothing pending anymore
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    assert_eq!(s.state.store.pending_count(now).unwrap(/* t */), 0);
+    // every waiting page now redirects its browser away, denied
+    for attesa in attese {
+        let r = s.get(&attesa);
+        assert_eq!(r.status().as_u16(), 302);
+        let to = location(&r).unwrap(/* t */);
+        assert!(to.contains("error=access_denied"), "{to}");
+    }
+}
+
+/// v0.5.3 (P3.2): the legacy-session map is bounded (1000) and aged out;
+/// the evicted sessions answer 404 exactly like the unknown ones. The
+/// test opens 1100 sessions.
+#[test]
+fn the_session_map_is_bounded_and_the_evicted_answer_404() {
+    let (gpt_url, _g) = cimd_doc(CHATGPT_CIMD);
+    let keep = tempfile::tempdir().unwrap(/* t */);
+    let root = keep.path().join("root");
+    std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
+    {
+        let dir = tempfile::tempdir().unwrap(/* t */);
+        let c = engramma_core::Cell::create(&dir.path().join("x.sqlite"), "famiglia", "t")
+            .unwrap(/* t */);
+        drop(c);
+        std::fs::copy(
+            dir.path().join("x.sqlite"),
+            root.join("cells/famiglia.sqlite"),
+        )
+        .unwrap(/* t */);
+    }
+    let cfg = HttpConfig {
+        bind: "127.0.0.1:0".parse().unwrap(/* t */),
+        public_url: "https://memoria.example.net".into(),
+        cells: vec!["famiglia".into()],
+        write: vec![],
+        allow_dcr: false,
+        compat_chatgpt: false,
+        chatgpt_client_id: gpt_url.clone(),
+        allow_insecure_public_url: false,
+        allow_loopback_cimd: true,
+    };
+    let state = Arc::new(HttpState::open_with_mcp(&root, cfg).unwrap(/* t */));
+    let addr = start_router(engramma_mcp::http::router(Arc::clone(&state)));
+    let token = compat_flow_token(
+        &state,
+        &addr,
+        &gpt_url,
+        "https://chatgpt.com/connector_platform_oauth_redirect",
+        "sessioni",
+    );
+    let initialize = |addr: &SocketAddr, token: &str| -> Option<String> {
+        let mut r = still()
+            .post(&format!("http://{addr}/mcp", addr = addr))
+            .header("Host", "memoria.example.net")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-06-18")
+            .header("Authorization", format!("Bearer {token}"))
+            .send(&br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#[..])
+            .unwrap(/* t */);
+        assert_eq!(r.status().as_u16(), 200, "{}", body(&mut r));
+        r.headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let mut first_session = None;
+    let mut last_session = None;
+    for i in 0..1100 {
+        if let Some(sess) = initialize(&addr, &token) {
+            if first_session.is_none() {
+                first_session = Some(sess.clone());
+            }
+            last_session = Some(sess);
+        }
+        if i % 200 == 0 {
+            let n = state.sessions.lock().map(|m| m.len()).unwrap_or_default();
+            assert!(n <= 1000, "the map must never exceed 1000: {n}");
+        }
+    }
+    let n = state.sessions.lock().map(|m| m.len()).unwrap_or_default();
+    assert_eq!(n, 1000, "exactly the cap");
+    // the FIRST session (the oldest) was evicted: it answers 404 like an
+    // unknown one; the LAST still works
+    let call = |sess: &str| -> u16 {
+        let r = still()
+            .post(&format!("http://{addr}/mcp", addr = addr))
+            .header("Host", "memoria.example.net")
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2025-06-18")
+            .header("Mcp-Session-Id", sess)
+            .header("Authorization", format!("Bearer {token}"))
+            .send(&br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#[..])
+            .unwrap(/* t */);
+        r.status().as_u16()
+    };
+    assert_eq!(
+        call(first_session.as_deref().unwrap(/* t */)),
+        404,
+        "evicted = unknown"
+    );
+    assert_eq!(call(last_session.as_deref().unwrap(/* t */)), 200);
 }

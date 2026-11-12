@@ -374,8 +374,14 @@ enum OauthAction {
         #[arg(long)]
         yes: bool,
     },
-    /// Refuse one
-    Deny { code: String },
+    /// Refuse one (or, with --all, every pending request at once)
+    Deny {
+        /// The code the user's browser shows
+        code: Option<String>,
+        /// Refuse EVERY pending request (the flood answer)
+        #[arg(long)]
+        all: bool,
+    },
     /// The grants: label, client, cells, scopes, when, last use
     Grants,
     /// Revoke a grant (or all of them): its tokens die at the next request
@@ -2097,18 +2103,41 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
             }
             Ok(())
         }
-        OauthAction::Deny { code } => {
-            let code = &engramma_mcp::oauth::normalize_approval_code(code);
+        OauthAction::Deny { code, all } => {
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
-            let denied = store
-                .request_deny(code, now)
-                .map_err(|e| CliError::internal(format!("{e}")))?;
-            if denied {
-                report_ok(cli, "rifiutata", code);
-            } else {
-                return Err(CliError::not_found(format!(
-                    "nessuna richiesta in attesa con codice {code}"
-                )));
+            match (code, *all) {
+                (Some(typed), false) => {
+                    let code = &engramma_mcp::oauth::normalize_approval_code(typed);
+                    let denied = store
+                        .request_deny(code, now)
+                        .map_err(|e| CliError::internal(format!("{e}")))?;
+                    if denied {
+                        report_ok(cli, "rifiutata", code);
+                    } else {
+                        return Err(CliError::not_found(format!(
+                            "nessuna richiesta in attesa con codice {code}"
+                        )));
+                    }
+                }
+                (None, true) => {
+                    let n = store
+                        .request_deny_all(now)
+                        .map_err(|e| CliError::internal(format!("{e}")))?;
+                    if cli.json {
+                        print_json(&serde_json::json!({ "denied_all": n }));
+                    } else if n == 0 {
+                        println!("nessuna richiesta in attesa");
+                    } else {
+                        println!(
+                            "rifiutate {n} richieste: le pagine in attesa redirigono i client con access_denied"
+                        );
+                    }
+                }
+                _ => {
+                    return Err(CliError::usage(
+                        "serve un codice, o --all per rifiutarle tutte",
+                    ));
+                }
             }
             Ok(())
         }

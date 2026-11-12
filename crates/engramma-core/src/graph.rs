@@ -928,20 +928,14 @@ impl GraphIndex {
         }
         // v0.5.3 (P1): a rewrite may have changed the note's STATUS (a
         // quarantine, a confirm): the output filter must see it
-        if let Some(note_status) = conn
-            .query_row(
-                "SELECT status FROM notes WHERE id = ?1",
-                [id.to_string()],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
+        if let Ok(note_status) = conn.query_row(
+            "SELECT status FROM notes WHERE id = ?1",
+            [id.to_string()],
+            |r| r.get::<_, String>(0),
+        ) && let Some(&n) = self.node_map.get(&format!("note:{id}"))
+            && let Some(v) = self.note_vis.get_mut(ix(n))
         {
-            let key = format!("note:{id}");
-            if let Some(&n) = self.node_map.get(&key) {
-                if let Some(v) = self.note_vis.get_mut(ix(n)) {
-                    *v = EdgeVisibility::from_status(&note_status);
-                }
-            }
+            *v = EdgeVisibility::from_status(&note_status);
         }
         Ok(())
     }

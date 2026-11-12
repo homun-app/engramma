@@ -28,6 +28,11 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
             if o[..10].iter().all(|b| *b == 0) && o[10] == 0xff && o[11] == 0xff {
                 return is_public_v4([o[12], o[13], o[14], o[15]]);
             }
+            // 6to4 (2002::/16, v0.5.3 P3.5): the embedded IPv4 (bytes 2..6)
+            // is what the connection would reach — judge IT, like the mapped
+            if o[0] == 0x20 && o[1] == 0x02 {
+                return is_public_v4([o[2], o[3], o[4], o[5]]);
+            }
             // :: and ::1
             if o.iter().all(|b| *b == 0) {
                 return false;
@@ -50,6 +55,21 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
                 return false;
             }
             if o[..8] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0] {
+                return false;
+            }
+            // v0.5.3 (P3.5): 64:ff9b:1::/48 local NAT64 (RFC 8215 —
+            // site-specific, no embedded v4 to judge), 2001::/32 Teredo
+            // (the v4 hides in an obfuscated field), ::/96 IPv4-compatible
+            // (deprecated, no honest judgment possible): refused outright
+            if o[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01] {
+                return false;
+            }
+            if o[0] == 0x20 && o[1] == 0x01 && o[2] == 0 && o[3] == 0 {
+                return false;
+            }
+            // whatever is left of the all-zero prefix is ::/96 (:: and ::1
+            // left above): IPv4-compatible, deprecated — refused
+            if o[..12].iter().all(|b| *b == 0) {
                 return false;
             }
             true
@@ -226,9 +246,29 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
             "2001:db8::1",
+            // v0.5.3 (P3.5): local NAT64 (RFC 8215), Teredo, IPv4-compatible
+            "64:ff9b:1::1",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
+            "::0.0.0.9",
+            "::0.1.2.3",
         ] {
             assert!(!is_public_ip(ip(s)), "{s} must not be public");
         }
+    }
+
+    /// v0.5.3 (P3.5): a 6to4 address is judged by the IPv4 it carries,
+    /// exactly like an IPv4-mapped one.
+    #[test]
+    fn sixto_four_is_judged_by_the_embedded_ipv4() {
+        // 2002:0808:0808:: carries 8.8.8.8 — public
+        assert!(is_public_ip(ip("2002:0808:0808::")));
+        // 2002:0a00:0001 carries 10.0.0.1 — private, so NOT public
+        assert!(!is_public_ip(ip("2002:0a00:0001::")));
+        // 2002:7f00:0001 carries 127.0.0.1 — loopback in a 6to4 coat
+        assert!(!is_public_ip(ip("2002:7f00:0001::")));
+        // 2002:c0a8:0001 carries 192.168.0.1
+        assert!(!is_public_ip(ip("2002:c0a8:0001::")));
     }
 
     #[test]

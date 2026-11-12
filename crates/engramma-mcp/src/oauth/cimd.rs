@@ -53,6 +53,21 @@ impl std::fmt::Display for CimdError {
     }
 }
 
+impl CimdError {
+    /// v0.5.3 (P3.7): the LOCAL cause of a refusal — DNS, no public
+    /// address, timeout, HTTP status, TLS, or the document rule it broke.
+    /// [`Display`] stays generic (it is what the wire would say); this is
+    /// what the event log records.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            CimdError::NotAClientUrl => self.to_string(),
+            CimdError::Fetch(why) => format!("fetch: {why}"),
+            CimdError::BadDocument(why) => format!("document: {why}"),
+        }
+    }
+}
+
 /// The knobs of the fetch. `allow_loopback` is the TEST escape hatch —
 /// the library's integration tests run their CIMD server on 127.0.0.1 —
 /// and is never set by the CLI.
@@ -451,6 +466,94 @@ mod tests {
             fetch(&url, CimdFetch::default()),
             Err(CimdError::NotAClientUrl)
         ));
+    }
+
+    /// v0.5.3 (P3.6): the four borders of the cache window, owed by the
+    /// v0.5.2 REPORT ("nel codice, senza test").
+    #[test]
+    fn the_cache_control_window_clamps_at_both_borders() {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        // max-age=1 → the 5-minute floor
+        let (url, _h) = cimd_server(
+            200,
+            &[
+                ("content-type", "application/json"),
+                ("cache-control", "max-age=1"),
+            ],
+            r#"{"client_id":"{URL}","redirect_uris":["https://x.example/cb"]}"#,
+        );
+        let f = fetch(
+            &url,
+            CimdFetch {
+                allow_loopback: true,
+            },
+        )
+        .expect("ok");
+        assert!(
+            (f.cache_until - now - 300).abs() <= 5,
+            "floor: {}",
+            f.cache_until - now
+        );
+        // max-age=999999 → the 24-hour ceiling
+        let (url, _h) = cimd_server(
+            200,
+            &[
+                ("content-type", "application/json"),
+                ("cache-control", "max-age=999999"),
+            ],
+            r#"{"client_id":"{URL}","redirect_uris":["https://x.example/cb"]}"#,
+        );
+        let f = fetch(
+            &url,
+            CimdFetch {
+                allow_loopback: true,
+            },
+        )
+        .expect("ok");
+        assert!(
+            (f.cache_until - now - 86_400).abs() <= 5,
+            "ceiling: {}",
+            f.cache_until - now
+        );
+        // absent → one hour
+        let (url, _h) = cimd_server(
+            200,
+            &[("content-type", "application/json")],
+            r#"{"client_id":"{URL}","redirect_uris":["https://x.example/cb"]}"#,
+        );
+        let f = fetch(
+            &url,
+            CimdFetch {
+                allow_loopback: true,
+            },
+        )
+        .expect("ok");
+        assert!(
+            (f.cache_until - now - 3_600).abs() <= 5,
+            "default: {}",
+            f.cache_until - now
+        );
+        // non-numeric → one hour, not an error
+        let (url, _h) = cimd_server(
+            200,
+            &[
+                ("content-type", "application/json"),
+                ("cache-control", "max-age=presto"),
+            ],
+            r#"{"client_id":"{URL}","redirect_uris":["https://x.example/cb"]}"#,
+        );
+        let f = fetch(
+            &url,
+            CimdFetch {
+                allow_loopback: true,
+            },
+        )
+        .expect("ok");
+        assert!(
+            (f.cache_until - now - 3_600).abs() <= 5,
+            "garbage: {}",
+            f.cache_until - now
+        );
     }
 
     #[test]

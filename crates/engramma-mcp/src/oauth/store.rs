@@ -282,6 +282,17 @@ impl OAuthStore {
             .map_err(db)?;
             tx.commit().map_err(db)?;
         }
+        // v0.5.3 (P3.1): the negative CIMD cache — additive and idempotent,
+        // unversioned like the cells' fts5vocab view: existing roots gain it
+        // on their next open, no older binary is refused.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cimd_refused (
+               client_id TEXT PRIMARY KEY,
+               until     INTEGER NOT NULL,
+               reason    TEXT NOT NULL
+             );",
+        )
+        .map_err(db)?;
         let found: i64 = conn
             .query_row(
                 "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'schema_version'",
@@ -445,18 +456,44 @@ impl OAuthStore {
             return Ok(None);
         };
         let kind = if kind == "dcr" {
-            // an unused DCR client older than 24 h is gone
-            if conn
+            // v0.5.3 (P3.6), the lifecycle of a dynamic registration:
+            // - MAI usato (used_at NULL): scade dopo 24 h;
+            // - USATO: resta finché ha un grant vivo — la registrazione era
+            //   un mezzo per il collegamento, e con tutti i collegamenti
+            //   morti non c'è più niente da servire.
+            let state: Option<(bool, bool)> = conn
                 .query_row(
-                    "SELECT used_at IS NULL AND created_at < ?2 FROM clients WHERE client_id = ?1",
-                    rusqlite::params![client_id, now - 24 * 3600],
-                    |r| r.get::<_, bool>(0),
+                    "SELECT used_at IS NOT NULL,
+                            NOT EXISTS (SELECT 1 FROM grants
+                              WHERE client_id = ?1 AND revoked_at IS NULL AND absolute_expiry > ?2)
+                     FROM clients WHERE client_id = ?1",
+                    rusqlite::params![client_id, now],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()
-                .map_err(db)?
-                .unwrap_or(false)
-            {
-                return Ok(None);
+                .map_err(db)?;
+            match state {
+                // never used and older than a day: gone
+                Some((false, _)) => {
+                    let expired: bool = conn
+                        .query_row(
+                            "SELECT created_at < ?2 FROM clients WHERE client_id = ?1",
+                            rusqlite::params![client_id, now - 24 * 3600],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(true);
+                    if expired {
+                        let _ =
+                            conn.execute("DELETE FROM clients WHERE client_id = ?1", [client_id]);
+                        return Ok(None);
+                    }
+                }
+                // used, and every grant of its is dead: gone
+                Some((true, true)) => {
+                    let _ = conn.execute("DELETE FROM clients WHERE client_id = ?1", [client_id]);
+                    return Ok(None);
+                }
+                _ => {}
             }
             let _ = conn.execute(
                 "UPDATE clients SET used_at = ?2 WHERE client_id = ?1 AND used_at IS NULL",
@@ -475,6 +512,42 @@ impl OAuthStore {
             name,
             created_at,
         }))
+    }
+
+    /// v0.5.3 (P3.1): is this client_id in the negative CIMD cache (a
+    /// document that was refused or unreachable, for the next five
+    /// minutes)? The REASON comes back for the event log — the wire stays
+    /// generic.
+    /// # Errors
+    /// [`StoreError::Db`] on SQL failures.
+    pub fn cimd_refused_get(&self, client_id: &str, now: i64) -> Result<Option<String>> {
+        let conn = self.lock()?;
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT reason FROM cimd_refused WHERE client_id = ?1 AND until > ?2",
+                rusqlite::params![client_id, now],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db)?;
+        Ok(reason)
+    }
+
+    /// v0.5.3 (P3.1): park a refused/unreachable client_id for five
+    /// minutes: whoever knows the /authorize URL must not keep the process
+    /// downloading, one refusal per URL per window is enough.
+    /// # Errors
+    /// [`StoreError::Db`] on SQL failures.
+    pub fn cimd_refused_put(&self, client_id: &str, until: i64, reason: &str) -> Result<()> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO cimd_refused (client_id, until, reason)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(client_id) DO UPDATE SET until = ?2, reason = ?3",
+            rusqlite::params![client_id, until, reason],
+        )
+        .map_err(db)?;
+        Ok(())
     }
 
     // -- authorization requests --------------------------------------------
@@ -527,7 +600,8 @@ impl OAuthStore {
         self.requests_where("status = 'pending'", now)
     }
 
-    /// How many requests are waiting right now (the ceiling of 5).
+    /// How many requests are waiting right now (the global ceiling of 10,
+    /// v0.5.3 P3.1).
     /// # Errors
     /// [`StoreError::Db`] on SQL failures.
     pub fn pending_count(&self, now: i64) -> Result<usize> {
@@ -536,6 +610,24 @@ impl OAuthStore {
             .query_row(
                 "SELECT COUNT(*) FROM requests WHERE status = 'pending' AND expires_at > ?1",
                 [now],
+                |r| r.get(0),
+            )
+            .map_err(db)?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// v0.5.3 (P3.1): how many requests THIS client has waiting — the
+    /// per-client ceiling is 2, so one client alone can never fill the
+    /// queue (a spammer with many domains still can: declared in DESIGN).
+    /// # Errors
+    /// [`StoreError::Db`] on SQL failures.
+    pub fn pending_count_of(&self, client_id: &str, now: i64) -> Result<usize> {
+        let conn = self.lock()?;
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM requests
+                 WHERE status = 'pending' AND expires_at > ?1 AND client_id = ?2",
+                rusqlite::params![now, client_id],
                 |r| r.get(0),
             )
             .map_err(db)?;
@@ -808,6 +900,27 @@ impl OAuthStore {
             self.event(now, "request_denied", &format!("code={approval_code}"));
         }
         Ok(n > 0)
+    }
+
+    /// v0.5.3 (P3.1): refuse EVERY pending request (`engramma oauth deny
+    /// --all`) — the flood answer. Returns how many went. The waiting
+    /// pages redirect each browser back with `access_denied`.
+    /// # Errors
+    /// [`StoreError::Db`] on SQL failures.
+    pub fn request_deny_all(&self, now: i64) -> Result<usize> {
+        let n = {
+            let conn = self.lock()?;
+            conn.execute(
+                "UPDATE requests SET status = 'denied'
+                 WHERE status = 'pending' AND expires_at > ?1",
+                [now],
+            )
+            .map_err(db)?
+        };
+        if n > 0 {
+            self.event(now, "request_denied", &format!("--all: {n} richieste"));
+        }
+        Ok(n)
     }
 
     /// Mint the one-shot authorization code of an approved request, the
@@ -1170,17 +1283,47 @@ impl OAuthStore {
     }
 
     /// Revoke one token by its string (RFC 7009: unknown is not an error).
+    /// v0.5.3 (P3.4): revoking a REFRESH takes the whole family with it —
+    /// every access token born from the same authorization code (RFC 7009
+    /// § 2.1); revoking an ACCESS touches that token alone, and the client
+    /// keeps refreshing.
     /// # Errors
     /// [`StoreError::Db`] on SQL failures.
     pub fn token_revoke(&self, token: &str, now: i64) -> Result<()> {
         let hash = mint::hash_hex(token);
-        let conn = self.lock()?;
-        let _ = conn.execute(
-            "UPDATE tokens SET revoked = 1 WHERE token_hash = ?1",
-            [hash.as_str()],
-        );
-        drop(conn);
-        self.event(now, "token_revoked", "by /revoke");
+        let found: Option<(String, String)> = {
+            let conn = self.lock()?;
+            conn.query_row(
+                "SELECT kind, family FROM tokens WHERE token_hash = ?1",
+                [hash.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(db)?
+        };
+        if let Some((kind, family)) = found {
+            let n = if kind == "refresh" {
+                let conn = self.lock()?;
+                conn.execute(
+                    "UPDATE tokens SET revoked = 1 WHERE family = ?1",
+                    [family.as_str()],
+                )
+                .map_err(db)?
+            } else {
+                let conn = self.lock()?;
+                conn.execute(
+                    "UPDATE tokens SET revoked = 1 WHERE token_hash = ?1",
+                    [hash.as_str()],
+                )
+                .map_err(db)?
+            };
+            let what = if kind == "refresh" {
+                format!("by /revoke: refresh → family ({n} token)")
+            } else {
+                "by /revoke: access (solo lui)".to_string()
+            };
+            self.event(now, "token_revoked", &what);
+        }
         Ok(())
     }
 
@@ -1549,6 +1692,17 @@ mod tests {
         );
     }
 
+    fn seed_client_grant(s: &OAuthStore, client_id: &str, now: i64) {
+        let conn = s.conn.lock().unwrap(/* test-only */);
+        conn.execute(
+            "INSERT INTO grants (id, label, client_id, cells, scopes, created_at, absolute_expiry)
+             VALUES ('g-usato', 'usato', ?1, '[]', '[\"memory:read\"]', ?2, ?3)",
+            rusqlite::params![client_id, now, now + 90 * 24 * 3600],
+        )
+        .unwrap(/* test-only */);
+        drop(conn);
+    }
+
     fn seed_grant(s: &OAuthStore, id: &str, label: &str, now: i64) -> Grant {
         let grant = Grant {
             id: id.into(),
@@ -1686,6 +1840,135 @@ mod tests {
             s.code_already_minted("h1").unwrap(/* t */),
             "an expired code was still minted once"
         );
+    }
+
+    /// v0.5.3 (P3.4): revoking a REFRESH takes the whole family (every
+    /// access token of the same authorization, RFC 7009 § 2.1); revoking
+    /// an ACCESS touches it alone and the client keeps refreshing.
+    #[test]
+    fn revoke_of_a_refresh_kills_the_family_of_an_access_only_it() {
+        let (_d, s) = store();
+        let now = 1_000_i64;
+        let grant = seed_grant(&s, "g1", "prova", now);
+        let (at1, _) = s
+            .access_issue(&grant, &[SCOPE_READ.into()], "https://mem.example", "fam1", now)
+            .unwrap(/* t */);
+        let (at2, _) = s
+            .access_issue(&grant, &[SCOPE_READ.into()], "https://mem.example", "fam1", now)
+            .unwrap(/* t */);
+        let (rt, _) = s
+            .refresh_issue(&grant, &[SCOPE_READ.into()], "https://mem.example", "fam1", now)
+            .unwrap(/* t */);
+        // an access token alone: only it dies, the refresh still rotates
+        s.token_revoke(&at1, now).unwrap(/* t */);
+        assert_eq!(
+            s.access_check(&at1, "https://mem.example", now).unwrap(/* t */),
+            TokenCheck::Revoked
+        );
+        assert!(matches!(
+            s.access_check(&at2, "https://mem.example", now).unwrap(/* t */),
+            TokenCheck::Valid { .. }
+        ));
+        assert!(s.refresh_rotate(&rt, &[], "https://mem.example", now).unwrap(/* t */).is_ok());
+        // a refresh token: the whole family goes with it
+        s.token_revoke(&rt, now).unwrap(/* t */);
+        assert_eq!(
+            s.access_check(&at2, "https://mem.example", now).unwrap(/* t */),
+            TokenCheck::Revoked,
+            "the access of the same family is revoked with the refresh"
+        );
+        assert!(matches!(
+            s.refresh_rotate(&rt, &[], "https://mem.example", now).unwrap(/* t */),
+            Err(RefreshUse::Reused) | Err(RefreshUse::Unknown)
+        ));
+    }
+
+    /// v0.5.3 (P3.6): the DCR lifecycle, owed by the v0.5.2 REPORT — a
+    /// never-used registration dies at 24 h; a used one lives exactly as
+    /// long as a grant of its does. Clock injected (`now` is a parameter).
+    #[test]
+    fn the_dcr_client_lifecycle_is_24h_unused_and_alive_while_granted() {
+        use crate::oauth::store::ClientKind;
+        let (_d, s) = store();
+        let t0 = 1_000_i64;
+        let rec = |id: &str, created: i64| ClientRecord {
+            client_id: id.into(),
+            kind: ClientKind::Dcr,
+            redirect_uris: vec!["https://x.example/cb".into()],
+            name: Some("X".into()),
+            created_at: created,
+        };
+        s.dcr_put(&rec("nuovo", t0)).unwrap(/* t */);
+        s.dcr_put(&rec("vecchio", t0)).unwrap(/* t */);
+        // fresh and never used: alive, and the first use marks it
+        assert!(s.client_get("nuovo", t0 + 100).unwrap(/* t */).is_some());
+        // never used and older than a day: gone
+        assert!(s.client_get("vecchio", t0 + 24 * 3600 + 1).unwrap(/* t */).is_none());
+        // a used one WITH a live grant: alive until the grant dies
+        s.dcr_put(&rec("usato", t0)).unwrap(/* t */);
+        let _ = s.client_get("usato", t0 + 100).unwrap(/* t */).expect("first use");
+        seed_client_grant(&s, "usato", t0 + 200);
+        assert!(
+            s.client_get("usato", t0 + 3 * 24 * 3600).unwrap(/* t */).is_some(),
+            "a used client outlives the 24 h while its grant lives"
+        );
+        // the grant dies (revoked): the client goes with it
+        s.grant_revoke(Some("g-usato"), t0 + 4 * 24 * 3600).unwrap(/* t */);
+        assert!(
+            s.client_get("usato", t0 + 4 * 24 * 3600).unwrap(/* t */).is_none(),
+            "no live grant left: the registration is gone"
+        );
+    }
+
+    /// v0.5.3 (P3.1): the negative CIMD cache and the pending ceilings.
+    #[test]
+    fn the_negative_cimd_cache_and_the_pending_ceilings() {
+        let (_d, s) = store();
+        let t0 = 1_000_i64;
+        assert!(s.cimd_refused_get("https://x.example/c", t0).unwrap(/* t */).is_none());
+        s.cimd_refused_put("https://x.example/c", t0 + 300, "fetch: dns").unwrap(/* t */);
+        assert_eq!(
+            s.cimd_refused_get("https://x.example/c", t0 + 299).unwrap(/* t */).as_deref(),
+            Some("fetch: dns")
+        );
+        assert!(
+            s.cimd_refused_get("https://x.example/c", t0 + 301).unwrap(/* t */).is_none(),
+            "five minutes, then it may be tried again"
+        );
+        // the pending ceilings: 2 per client, 10 in all
+        for i in 0..12 {
+            let client = if i < 4 {
+                "https://a.example/c"
+            } else {
+                "https://b.example/c"
+            };
+            s.request_insert(&AuthRequest {
+                handle: format!("h{i}"),
+                approval_code: format!("AAAA-{i:04}"),
+                client_id: client.into(),
+                client_name: None,
+                redirect_uri: "https://x.example/cb".into(),
+                scopes: vec![SCOPE_READ.into()],
+                resource: None,
+                code_challenge: "c".into(),
+                state: None,
+                offered_cells: vec![],
+                offered_write: vec![],
+                status: RequestStatus::Pending,
+                grant_id: None,
+                created_at: t0,
+                expires_at: t0 + 600,
+            })
+            .unwrap(/* t */);
+        }
+        assert_eq!(
+            s.pending_count_of("https://a.example/c", t0).unwrap(/* t */),
+            4
+        );
+        assert_eq!(s.pending_count(t0).unwrap(/* t */), 12);
+        // deny --all clears every pending request
+        assert_eq!(s.request_deny_all(t0).unwrap(/* t */), 12);
+        assert_eq!(s.pending_count(t0).unwrap(/* t */), 0);
     }
 
     #[test]

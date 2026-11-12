@@ -106,7 +106,7 @@ impl Embedder for FakeEmbedder {
         Ok(texts
             .iter()
             .map(|t| {
-                let mut v = vec![0.0_f32; DIM];
+                let mut v = [0.0_f32; DIM];
                 for (i, b) in t.bytes().enumerate() {
                     v[(i + usize::from(b)) % DIM] += f32::from(b) / 255.0;
                 }
@@ -162,7 +162,7 @@ struct Snapshot {
 fn snapshot(hits: &[Hit]) -> Snapshot {
     Snapshot {
         ids: hits.iter().map(|h| h.note.id.to_string()).collect(),
-        scores: hits.iter().map(|h| h.score as f64).collect(),
+        scores: hits.iter().map(|h| h.score).collect(),
         fused: hits.iter().map(|h| h.explain.fused_score).collect(),
         bm25_ranks: hits.iter().map(|h| h.explain.bm25_rank).collect(),
         sem_ranks: hits.iter().map(|h| h.explain.semantic_rank).collect(),
@@ -282,12 +282,12 @@ fn diff(a: &Snapshot, b: &Snapshot, what: &str, wobble: &mut f64) -> Option<Stri
     }
     // the top of each list normalises to 1
     for (snap, name) in [(a, "A"), (b, "B")] {
-        if let Some(top) = snap.scores.first() {
-            if (*top - 1.0).abs() > SCORE_EPSILON {
-                return Some(format!(
-                    "{what}: {name} top score {top} — a hidden maximum?"
-                ));
-            }
+        if let Some(top) = snap.scores.first()
+            && (*top - 1.0).abs() > SCORE_EPSILON
+        {
+            return Some(format!(
+                "{what}: {name} top score {top} — a hidden maximum?"
+            ));
         }
     }
     let at = |snap: &Snapshot, id: &str| -> usize {

@@ -98,11 +98,54 @@ pub struct WriteSurface {
 
 /// One waiting MRTR confirmation: the proposal, its cell, and (over HTTP,
 /// v0.5.2 P4) the grant whose token opened the round — a retry with
-/// another grant's token finds nothing.
+/// another grant's token finds nothing. v0.5.3 (P3.3): the round EXPIRES
+/// (ten minutes — the client either comes back with the answer or the
+/// round is dead) and the map is bounded ([`MRTR_CAP`]).
 struct MrtrPending {
     cell: String,
     proposal: ulid::Ulid,
     grant: Option<String>,
+    /// When the round opened.
+    born: std::time::Instant,
+}
+
+/// v0.5.3 (P3.3): how long a round waits for its `inputResponses`.
+const MRTR_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// v0.5.3 (P3.3): the map of pending rounds never grows past this; the
+/// oldest leave first. The requestState was an 80-bit ULID (time plus
+/// randomness): it is bound to its grant and single-use, but the other
+/// secrets are 256 random bits — it is now too (`mint::opaque_token`).
+const MRTR_CAP: usize = 1000;
+
+/// v0.5.3 (P3.3): record a pending round, expiring the stale ones and
+/// keeping the map bounded.
+fn mrtr_insert(map: &mut HashMap<String, MrtrPending>, state: String, pending: MrtrPending) {
+    map.retain(|_, p| p.born.elapsed() < MRTR_TTL);
+    if map.len() >= MRTR_CAP {
+        let mut by_birth: Vec<(std::time::Instant, String)> =
+            map.iter().map(|(k, p)| (p.born, k.clone())).collect();
+        by_birth.sort();
+        let excess = map.len() + 1 - MRTR_CAP;
+        for (_, k) in by_birth.into_iter().take(excess) {
+            map.remove(&k);
+        }
+    }
+    map.insert(state, pending);
+}
+
+/// v0.5.3 (P3.3): take a round for its owner — `None` when unknown,
+/// expired (an expired state answers like an unknown one) or someone
+/// else's.
+fn mrtr_take(
+    map: &mut HashMap<String, MrtrPending>,
+    state: &str,
+    grant: Option<&str>,
+) -> Option<MrtrPending> {
+    let owned = map
+        .get(state)
+        .is_some_and(|p| p.grant.as_deref() == grant && p.born.elapsed() < MRTR_TTL);
+    if owned { map.remove(state) } else { None }
 }
 
 /// What a request's bearer token turned out to mean (v0.5.2, P4): the
@@ -1004,20 +1047,24 @@ impl MemoryServer {
                         .is_some_and(|v| v >= rmcp::model::ProtocolVersion::V_2026_07_28);
                     if modern {
                         // form 2 (2026-07-28): the tool answers
-                        // `input_required`; the retry brings the answer
-                        let state = engramma_core::id::new_ulid().map_err(err)?.to_string();
-                        self.write.as_ref().and_then(|w| {
-                            w.mrtr.lock().ok().map(|mut m| {
-                                m.insert(
-                                    state.clone(),
-                                    MrtrPending {
-                                        cell: cell_name.clone(),
-                                        proposal: outcome.id.unwrap_or_default(),
-                                        grant: grant.as_ref().map(|g| g.id.clone()),
-                                    },
-                                )
-                            })
-                        });
+                        // `input_required`; the retry brings the answer.
+                        // v0.5.3 (P3.3): the state is 256 random bits,
+                        // like every other secret, and the round expires
+                        let state = crate::oauth::mint::opaque_token("eng_rs_").map_err(err)?;
+                        if let Some(w) = self.write.as_ref()
+                            && let Ok(mut m) = w.mrtr.lock()
+                        {
+                            mrtr_insert(
+                                &mut m,
+                                state.clone(),
+                                MrtrPending {
+                                    cell: cell_name.clone(),
+                                    proposal: outcome.id.unwrap_or_default(),
+                                    grant: grant.as_ref().map(|g| g.id.clone()),
+                                    born: std::time::Instant::now(),
+                                },
+                            );
+                        }
                         let mut requests = std::collections::BTreeMap::new();
                         requests.insert(
                             "confirm".to_string(),
@@ -1201,10 +1248,7 @@ impl MemoryServer {
                 .mrtr
                 .lock()
                 .map_err(|_| McpError::internal_error("mrtr state poisoned".to_string(), None))?;
-            let owned = rounds
-                .get(state)
-                .is_some_and(|p| p.grant.as_deref() == grant.map(|g| g.id.as_str()));
-            if owned { rounds.remove(state) } else { None }
+            mrtr_take(&mut rounds, state, grant.map(|g| g.id.as_str()))
         };
         let Some(pending) = pending else {
             return Err(McpError::invalid_request(
@@ -1660,4 +1704,65 @@ pub fn run(
         let _quit_reason = running.waiting().await?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod mrtr_tests {
+    use super::*;
+
+    fn pending(grant: Option<&str>, born: std::time::Instant) -> MrtrPending {
+        MrtrPending {
+            cell: "c".into(),
+            proposal: ulid::Ulid::nil(),
+            grant: grant.map(str::to_string),
+            born,
+        }
+    }
+
+    /// v0.5.3 (P3.3): an expired round answers like an unknown one — the
+    /// state dies with its ten minutes.
+    #[test]
+    fn an_expired_request_state_answers_like_an_unknown_one() {
+        let mut m: HashMap<String, MrtrPending> = HashMap::new();
+        mrtr_insert(
+            &mut m,
+            "s-fresco".into(),
+            pending(Some("g1"), std::time::Instant::now()),
+        );
+        let old = std::time::Instant::now() - MRTR_TTL - std::time::Duration::from_secs(1);
+        mrtr_insert(&mut m, "s-vecchio".into(), pending(Some("g1"), old));
+        assert!(mrtr_take(&mut m, "s-fresco", Some("g1")).is_some());
+        assert!(
+            mrtr_take(&mut m, "s-vecchio", Some("g1")).is_none(),
+            "expired: unknown"
+        );
+        assert!(mrtr_take(&mut m, "s-mai-esistito", Some("g1")).is_none());
+        // and the owner rule stays: another grant finds nothing
+        mrtr_insert(
+            &mut m,
+            "s-altro".into(),
+            pending(Some("g1"), std::time::Instant::now()),
+        );
+        assert!(mrtr_take(&mut m, "s-altro", Some("g2")).is_none());
+        assert!(mrtr_take(&mut m, "s-altro", Some("g1")).is_some());
+    }
+
+    /// v0.5.3 (P3.3): the map is bounded — the oldest rounds leave first.
+    #[test]
+    fn the_pending_rounds_never_exceed_the_cap() {
+        let mut m: HashMap<String, MrtrPending> = HashMap::new();
+        for i in 0..MRTR_CAP + 50 {
+            mrtr_insert(
+                &mut m,
+                format!("s-{i}"),
+                pending(Some("g1"), std::time::Instant::now()),
+            );
+            // every insert also expires the stale: same instant, cap by count
+        }
+        assert_eq!(m.len(), MRTR_CAP, "the cap holds");
+        // the first fifty (the oldest, same birth — insertion order by
+        // stable sort) are gone; the last MRTR_CAP remain
+        assert!(m.contains_key(&format!("s-{}", 50 + MRTR_CAP - 1)));
+        assert!(!m.contains_key("s-0"));
+    }
 }

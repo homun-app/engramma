@@ -147,6 +147,29 @@ impl HttpConfig {
     }
 }
 
+/// One tracked legacy session (v0.5.3, P3.2): the grant that created it
+/// and when it was last used — the map prunes by both.
+#[derive(Debug, Clone)]
+pub struct SessionEntry {
+    /// The owning grant's id.
+    pub grant: String,
+    /// Unix seconds of the last request that carried this session id.
+    pub last_used: i64,
+    /// Insertion order — the tiebreaker when many sessions share a
+    /// `last_used` second (1100 initializes take less than one): the
+    /// oldest INSERT leaves first, deterministically.
+    pub seq: u64,
+}
+
+/// v0.5.3 (P3.2): the map of legacy sessions never grows past this; the
+/// oldest (by last use) leave first.
+const SESSION_CAP: usize = 1000;
+
+/// v0.5.3 (P3.2): a session nobody touched for this long is gone — rmcp
+/// 3.8 keeps sessions forever (no idle timeout of its own), so the map
+/// carries one: an hour, orders above any client's keep-alive.
+const SESSION_IDLE_SECS: i64 = 3600;
+
 /// The shared state of the HTTP server.
 pub struct HttpState {
     /// The validated configuration.
@@ -159,12 +182,71 @@ pub struct HttpState {
     /// Legacy-protocol MCP sessions (2026-07-28 has none): session id →
     /// the grant that created it. Another grant's token on someone
     /// else's session answers 404, exactly like an unknown session.
-    pub sessions: Mutex<HashMap<String, String>>,
+    /// v0.5.3 (P3.2): bounded ([`SESSION_CAP`]) and aged out
+    /// ([`SESSION_IDLE_SECS`]) — before, it only ever grew.
+    pub sessions: Mutex<HashMap<String, SessionEntry>>,
     /// The global `/token` limiter: (window start, count). Behind a tunnel
     /// every caller looks like 127.0.0.1, so the ceiling is global — 60 a
     /// minute, then 429 with Retry-After. Forwarded headers are not
     /// consulted: they are not trustworthy.
     token_window: Mutex<(i64, usize)>,
+    /// v0.5.3 (P3.1): the global `/authorize` limiter, same shape — 30 a
+    /// minute. Whoever knows the URL must not hold the five waiting slots
+    /// hostage nor keep the process downloading CIMD documents.
+    authorize_window: Mutex<(i64, usize)>,
+    /// v0.5.3 (P3.2): the session insertion counter (the eviction
+    /// tiebreaker).
+    session_seq: std::sync::atomic::AtomicU64,
+}
+
+impl HttpState {
+    /// v0.5.3 (P3.2): record a session, pruning by age and cap first.
+    fn session_insert(&self, sess: &str, grant: &str) {
+        let now = Self::now();
+        if let Ok(mut m) = self.sessions.lock() {
+            m.retain(|_, e| now - e.last_used < SESSION_IDLE_SECS);
+            if m.len() >= SESSION_CAP {
+                let mut by_use: Vec<(i64, u64, String)> = m
+                    .iter()
+                    .map(|(k, e)| (e.last_used, e.seq, k.clone()))
+                    .collect();
+                by_use.sort();
+                let excess = m.len() + 1 - SESSION_CAP;
+                for (_, _, k) in by_use.into_iter().take(excess) {
+                    m.remove(&k);
+                }
+            }
+            let seq = self
+                .session_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            m.insert(
+                sess.to_string(),
+                SessionEntry {
+                    grant: grant.to_string(),
+                    last_used: now,
+                    seq,
+                },
+            );
+        }
+    }
+
+    /// v0.5.3 (P3.2): the owner of a session, when it is still tracked;
+    /// touching it keeps it alive.
+    fn session_owner(&self, sess: &str) -> Option<String> {
+        let now = Self::now();
+        let mut m = self.sessions.lock().ok()?;
+        let e = m.get_mut(sess)?;
+        e.last_used = now;
+        Some(e.grant.clone())
+    }
+
+    /// v0.5.3 (P3.2): a session went away (the client's DELETE, or rmcp
+    /// closing it) — the map must not remember it.
+    fn session_remove(&self, sess: &str) {
+        if let Ok(mut m) = self.sessions.lock() {
+            m.remove(sess);
+        }
+    }
 }
 
 impl HttpState {
@@ -183,6 +265,8 @@ impl HttpState {
             mcp: None,
             sessions: Mutex::new(HashMap::new()),
             token_window: Mutex::new((0, 0)),
+            authorize_window: Mutex::new((0, 0)),
+            session_seq: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -214,15 +298,25 @@ impl HttpState {
     /// One tick of the global limiter: `false` when the window is full.
     fn token_rate_tick(&self) -> bool {
         const CAP: usize = 60;
+        self.rate_tick(&self.token_window, CAP)
+    }
+
+    /// v0.5.3 (P3.1): the `/authorize` limiter — 30 a minute, global.
+    fn authorize_rate_tick(&self) -> bool {
+        const CAP: usize = 30;
+        self.rate_tick(&self.authorize_window, CAP)
+    }
+
+    fn rate_tick(&self, window: &Mutex<(i64, usize)>, cap: usize) -> bool {
         let now = Self::now();
-        let Ok(mut w) = self.token_window.lock() else {
+        let Ok(mut w) = window.lock() else {
             return false; // a poisoned limiter closes the door
         };
         if now - w.0 >= 60 {
             w.0 = now;
             w.1 = 0;
         }
-        if w.1 >= CAP {
+        if w.1 >= cap {
             return false;
         }
         w.1 += 1;
@@ -232,6 +326,10 @@ impl HttpState {
     /// The client behind a `client_id`: the cache first, then a fresh CIMD
     /// fetch (the SSRF-fenced one), then nothing. Never DCR-fetches: a DCR
     /// client is only what `/register` minted.
+    /// v0.5.3 (P3.1): a document that was refused or unreachable is not
+    /// fetched again for five minutes — the negative cache counts the exact
+    /// URL, and the event is written ONCE (at the refusal that filled the
+    /// cache; the cache hits answer the same generic page in silence).
     async fn client_of(&self, client_id: &str) -> Option<ClientRecord> {
         let now = Self::now();
         if let Some(cached) = self.store.client_get(client_id, now).ok().flatten() {
@@ -242,6 +340,16 @@ impl HttpState {
         let looks_like_url = client_id.starts_with("https://")
             || (self.cfg.allow_loopback_cimd && client_id.starts_with("http://127.0.0.1"));
         if !looks_like_url {
+            return None;
+        }
+        // the negative cache: one refusal per URL per five minutes
+        if self
+            .store
+            .cimd_refused_get(client_id, now)
+            .ok()
+            .flatten()
+            .is_some()
+        {
             return None;
         }
         let mode = CimdFetch {
@@ -262,9 +370,20 @@ impl HttpState {
                 None
             }
             Ok(Err(e)) => {
-                // the refusal is generic on the wire; the reason is an event
-                self.store
-                    .event(Self::now(), "client_rejected", &format!("{client_id}: {e}"));
+                // v0.5.3 (P3.7): the refusal is generic on the wire, but
+                // the EVENT carries the cause — DNS, no public address,
+                // timeout, HTTP status, TLS — via the error's own detail
+                self.store.event(
+                    Self::now(),
+                    "client_rejected",
+                    &format!("{client_id}: {}", cimd::CimdError::detail(&e)),
+                );
+                // five minutes of peace for this URL
+                let _ = self.store.cimd_refused_put(
+                    client_id,
+                    Self::now() + 300,
+                    &cimd::CimdError::detail(&e),
+                );
                 None
             }
             Err(_) => None,
@@ -468,6 +587,21 @@ fn host_of_url(url: &str) -> &str {
 
 /// `GET /authorize`: the whole validation cascade of P3.
 async fn authorize(State(state): State<Arc<HttpState>>, Query(q): Query<Q>) -> Response {
+    // v0.5.3 (P3.1): the global ceiling comes FIRST — whoever knows the URL
+    // must not hold the waiting slots hostage nor keep the CIMD downloads
+    // busy. A page, with Retry-After, exactly like /token's 429.
+    if !state.authorize_rate_tick() {
+        let mut r = page(
+            "Troppe richieste",
+            "<h1>Troppe richieste</h1><p>aspetta un minuto e riprova.</p>",
+        );
+        *r.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        r.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_static("60"),
+        );
+        return r;
+    }
     let now = HttpState::now();
     // 1. BEFORE trusting the redirect_uri: the client must be known. A bad
     // client or a bad redirect answers with a PAGE, never a redirect —
@@ -556,15 +690,34 @@ async fn authorize(State(state): State<Arc<HttpState>>, Query(q): Query<Q>) -> R
         scopes.push(SCOPE_READ.to_string());
     }
 
-    // 3. the ceiling: at most 5 requests waiting, 10 minutes each
+    // 3. the ceilings (v0.5.3, P3.1): 2 waiting per client — one client
+    // alone can never fill the queue — and 10 in all. A spammer with many
+    // domains still can: declared in DESIGN §8.6.
+    match state.store.pending_count_of(&client_id, now) {
+        Ok(n) if n >= 2 => {
+            state
+                .store
+                .event(now, "authorize_flood", &format!("{client_id}: per-client"));
+            return page(
+                "Troppe richieste",
+                "<h1>Troppe richieste in attesa per questo client</h1>\
+                 <p>ci sono già due collegamenti di questo client da decidere: approvali o \
+                 rifiutali (`engramma oauth pending`) e riprova.</p>",
+            );
+        }
+        Ok(_) => {}
+        Err(_) => return error_page("oauth.db non è leggibile"),
+    }
     match state.store.pending_count(now) {
-        Ok(n) if n >= 5 => {
-            state.store.event(now, "authorize_flood", &client_id);
+        Ok(n) if n >= 10 => {
+            state
+                .store
+                .event(now, "authorize_flood", &format!("{client_id}: global"));
             return page(
                 "Troppe richieste",
                 "<h1>Troppe richieste in attesa</h1>\
-                 <p>ci sono già cinque collegamenti da decidere: approvale o rifiutale \
-                 (`engramma oauth pending`) e riprova.</p>",
+                 <p>ci sono già dieci collegamenti da decidere: approvali o rifiutali \
+                 (`engramma oauth pending`, oppure `engramma oauth deny --all`) e riprova.</p>",
             );
         }
         Ok(_) => {}
@@ -1270,25 +1423,25 @@ async fn mcp_gate(
     });
 
     // legacy sessions belong to the grant that created them: another
-    // grant's session id answers 404, like an unknown one
+    // grant's session id answers 404, like an unknown one (v0.5.3, P3.2:
+    // an aged-out or evicted session IS an unknown one)
+    let mut session_id: Option<String> = None;
     if let Some(sess) = req
         .headers()
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
     {
-        let bound = state
-            .sessions
-            .lock()
-            .ok()
-            .and_then(|m| m.get(&sess).cloned());
-        match bound {
+        match state.session_owner(&sess) {
             Some(owner) if owner != grant.id => {
                 return (StatusCode::NOT_FOUND, "session not found").into_response();
             }
-            Some(_) => {}
+            Some(_) => {
+                session_id = Some(sess);
+            }
             None => {
-                // a session the middleware never saw created: unknown
+                // a session the middleware never saw created (or one the
+                // map aged out): unknown
                 return (StatusCode::NOT_FOUND, "session not found").into_response();
             }
         }
@@ -1297,6 +1450,7 @@ async fn mcp_gate(
     // the access log needs the MCP method and tool: read the (bounded)
     // body, then put it back — same head, same extensions
     let (parts, body) = req.into_parts();
+    let is_delete = parts.method == axum::http::Method::DELETE;
     let mut method_desc: Option<(Option<String>, Option<String>)> = None;
     let req = if parts.method == axum::http::Method::POST {
         match axum::body::to_bytes(body, 1024 * 1024 + 1).await {
@@ -1327,9 +1481,17 @@ async fn mcp_gate(
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
-        && let Ok(mut m) = state.sessions.lock()
     {
-        m.insert(sess, grant.id.clone());
+        state.session_insert(&sess, &grant.id);
+        session_id = Some(sess);
+    }
+    // v0.5.3 (P3.2): a DELETE the transport accepted closes the session —
+    // the map must not remember it (nor count it towards the cap)
+    if is_delete
+        && let Some(sess) = session_id
+        && response.status().is_success()
+    {
+        state.session_remove(&sess);
     }
     access_log(
         Some(&grant.id),
