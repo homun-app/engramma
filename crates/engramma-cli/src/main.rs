@@ -4,6 +4,7 @@
 //! `<root>/cells/<name>.sqlite` (default root: `~/.engramma`).
 
 mod output;
+mod review;
 
 // v0.4.4 (P1) → v0.4.5 (P2): the executable picks the allocator, and it
 // picks it PER PLATFORM: mimalloc on macOS (the system allocator keeps
@@ -253,6 +254,16 @@ enum Command {
     Policy {
         #[command(subcommand)]
         action: PolicyAction,
+    },
+    /// The local review page: the queue, the decisions, the notes
+    /// (127.0.0.1 only, Ctrl-C to stop) (v0.5)
+    Review {
+        /// Port (default: any free one)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Open the browser at the printed address
+        #[arg(long)]
+        open: bool,
     },
     /// Restore a version
     Restore { id: String, version: i64 },
@@ -1378,6 +1389,15 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             yes,
         } => run_revert(cli, decision, by, since, until, *dry_run, *yes),
         Command::Policy { action } => run_policy(cli, action),
+        Command::Review { port, open } => {
+            let cell = open_cell(cli)?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| CliError::internal(format!("tokio: {e}")))?;
+            rt.block_on(review::run(cell, *port, *open))
+                .map_err(|e| CliError::internal(format!("review: {e}")))
+        }
         Command::Vault { action } => run_vault(cli, action),
         Command::Mcp {
             cells,

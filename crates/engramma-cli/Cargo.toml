@@ -21,6 +21,11 @@ time.workspace = true
 ulid.workspace = true
 tokio.workspace = true
 axum.workspace = true
+# v0.5 (P5): the review page — the session/CSRF tokens (blake3, ring: both
+# already in the lock) and the form decoding (serde)
+blake3.workspace = true
+ring.workspace = true
+serde.workspace = true
 
 # v0.4.4 (P1) → v0.4.5 (P2): the executable chooses the allocator, per
 # platform (see the workspace entry): mimalloc on macOS only — on Linux
@@ -30,3 +35,5 @@ mimalloc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# v0.5 (P5): the review-page tests speak HTTP; ureq is already in the lock
+ureq.workspace = true

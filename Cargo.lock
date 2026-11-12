@@ -722,17 +722,21 @@ version = "0.1.0-dev"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "clap",
  "engramma-core",
  "engramma-embed",
  "engramma-mcp",
  "engramma-vault",
  "mimalloc",
+ "ring",
+ "serde",
  "serde_json",
  "tempfile",
  "time",
  "tokio",
  "ulid",
+ "ureq",
 ]
 
 [[package]]
