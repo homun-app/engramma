@@ -315,6 +315,12 @@ enum Command {
         #[command(subcommand)]
         action: VaultAction,
     },
+    /// The OAuth grants of `mcp --http`: what waits for you, what you
+    /// approved, and how to cut it off (v0.5.2)
+    Oauth {
+        #[command(subcommand)]
+        action: OauthAction,
+    },
     /// Start the MCP server (stdio)
     Mcp {
         /// Exposed cells (comma-separated; without this flag no cell is exposed)
@@ -328,6 +334,44 @@ enum Command {
         #[arg(long)]
         actor: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum OauthAction {
+    /// The authorization requests waiting for your decision
+    Pending,
+    /// Approve one: the code is the one the user's browser shows
+    Approve {
+        /// The approval code shown in the browser (`XXXX-XXXX`)
+        code: String,
+        /// How this connection's proposals sign: `mcp:<label>`
+        /// ([a-z0-9-]{1,32})
+        #[arg(long)]
+        label: String,
+        /// Keep only these cells of what the server offers (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        cells: Vec<String>,
+        /// Keep only these scopes (memory:read, memory:propose)
+        #[arg(long, value_delimiter = ',')]
+        scope: Vec<String>,
+        /// Skip the interactive confirmation (for scripts)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Refuse one
+    Deny { code: String },
+    /// The grants: label, client, cells, scopes, when, last use
+    Grants,
+    /// Revoke a grant (or all of them): its tokens die at the next request
+    Revoke {
+        /// The grant's label
+        grant: Option<String>,
+        /// Every grant
+        #[arg(long)]
+        all: bool,
+    },
+    /// The event log: approvals, refusals, revocations, alarms
+    Log,
 }
 
 #[derive(Subcommand)]
@@ -1398,6 +1442,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             rt.block_on(review::run(cell, *port, *open))
                 .map_err(|e| CliError::internal(format!("review: {e}")))
         }
+        Command::Oauth { action } => run_oauth(cli, action),
         Command::Vault { action } => run_vault(cli, action),
         Command::Mcp {
             cells,
@@ -1826,6 +1871,274 @@ fn embed_after_write(cli: &Cli, cell: &Cell) -> Result<Option<(usize, usize)>, C
         .embed_pending(embedder.as_ref(), 512)
         .map_err(CliError::from)?;
     Ok(Some((report.done, report.remaining)))
+}
+
+// ---------------------------------------------------------------------------
+// v0.5.2 (P3): `engramma oauth` — the human surface of the authorization
+// ---------------------------------------------------------------------------
+
+/// The host of a client_id or redirect URL, for the approval's own display.
+fn oauth_host(url: &str) -> &str {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', ':', '?'])
+        .next()
+        .unwrap_or(url)
+}
+
+fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
+    use engramma_mcp::oauth::store::{OAuthStore, RequestStatus, SCOPE_PROPOSE, SCOPE_READ};
+    let store = OAuthStore::open(&root(cli).join("oauth.db"))
+        .map_err(|e| CliError::internal(format!("{e}")))?;
+    match action {
+        OauthAction::Pending => {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let pending = store
+                .requests_pending(now)
+                .map_err(|e| CliError::internal(format!("{e}")))?;
+            if cli.json {
+                let arr: Vec<serde_json::Value> = pending
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "code": r.approval_code,
+                            "client": r.client_name,
+                            "client_id_host": oauth_host(&r.client_id),
+                            "redirect_host": oauth_host(&r.redirect_uri),
+                            "scopes": r.scopes,
+                            "age_secs": now - r.created_at,
+                        })
+                    })
+                    .collect();
+                print_json(&serde_json::json!({ "pending": arr }));
+            } else {
+                if pending.is_empty() {
+                    println!("nessuna richiesta in attesa");
+                }
+                for r in &pending {
+                    println!(
+                        "{}  {} (client {}) → {} — {} — {} s",
+                        r.approval_code,
+                        r.client_name.as_deref().unwrap_or("client senza nome"),
+                        oauth_host(&r.client_id),
+                        oauth_host(&r.redirect_uri),
+                        r.scopes.join(" "),
+                        now - r.created_at
+                    );
+                }
+            }
+            Ok(())
+        }
+        OauthAction::Approve {
+            code,
+            label,
+            cells,
+            scope,
+            yes,
+        } => {
+            if !label
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                || label.is_empty()
+                || label.len() > 32
+            {
+                return Err(CliError::usage(format!(
+                    "`--label {label}` non va: servono 1-32 caratteri fra a-z, 0-9 e -"
+                )));
+            }
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let Some(req) = store
+                .request_by_code(code)
+                .map_err(|e| CliError::internal(format!("{e}")))?
+            else {
+                return Err(CliError::not_found(format!(
+                    "nessuna richiesta con codice {code}"
+                )));
+            };
+            if req.status != RequestStatus::Pending || req.expires_at <= now {
+                return Err(CliError::usage(format!(
+                    "la richiesta {code} non è più decidibile (scaduta o già decisa)"
+                )));
+            }
+            // the phishing fence: SHOW whose client and whose redirect,
+            // then let the human say yes
+            println!(
+                "client: {} ({})",
+                req.client_name.as_deref().unwrap_or("senza nome"),
+                oauth_host(&req.client_id)
+            );
+            println!("redirect: {}", oauth_host(&req.redirect_uri));
+            println!("ambiti chiesti: {}", req.scopes.join(" "));
+            if !*yes {
+                use std::io::Write as _;
+                print!("approvo {code} con etichetta `{label}`? [s/N] ");
+                std::io::stdout().flush().ok();
+                let mut answer = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut answer)
+                    .map_err(|e| CliError::internal(format!("stdin: {e}")))?;
+                if !answer.trim().eq_ignore_ascii_case("s") {
+                    println!("annullato");
+                    return Ok(());
+                }
+            }
+            // the grant can only RESTRICT what the server offered
+            let cells: Vec<String> = req
+                .offered_cells
+                .iter()
+                .filter(|c| cells.is_empty() || cells.contains(c))
+                .cloned()
+                .collect();
+            let mut scopes: Vec<String> = req
+                .scopes
+                .iter()
+                .filter(|sc| scope.is_empty() || scope.contains(sc))
+                .cloned()
+                .collect();
+            // propose survives only where the server can write AND the
+            // grant kept a writable cell
+            if !req.offered_write.iter().any(|w| cells.contains(w)) {
+                scopes.retain(|sc| sc != SCOPE_PROPOSE);
+            }
+            if !scopes.iter().any(|sc| sc == SCOPE_READ) {
+                scopes.push(SCOPE_READ.to_string());
+            }
+            store
+                .request_approve(code, label, &cells, &scopes, now)
+                .map_err(|e| CliError::internal(format!("{e}")))?
+                .ok_or_else(|| CliError::usage("l'approvazione non è andata: riprova"))?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "approved": code,
+                    "label": label,
+                    "cells": cells,
+                    "scopes": scopes,
+                }));
+            } else {
+                println!(
+                    "approvato: {label} (celle: {}, ambiti: {})",
+                    cells.join(", "),
+                    scopes.join(" ")
+                );
+            }
+            Ok(())
+        }
+        OauthAction::Deny { code } => {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let denied = store
+                .request_deny(code, now)
+                .map_err(|e| CliError::internal(format!("{e}")))?;
+            if denied {
+                report_ok(cli, "rifiutata", code);
+            } else {
+                return Err(CliError::not_found(format!(
+                    "nessuna richiesta in attesa con codice {code}"
+                )));
+            }
+            Ok(())
+        }
+        OauthAction::Grants => {
+            let grants = store
+                .grants()
+                .map_err(|e| CliError::internal(format!("{e}")))?;
+            if cli.json {
+                let arr: Vec<serde_json::Value> = grants
+                    .iter()
+                    .map(|g| {
+                        serde_json::json!({
+                            "id": g.id,
+                            "label": g.label,
+                            "client": oauth_host(&g.client_id),
+                            "cells": g.cells,
+                            "scopes": g.scopes,
+                            "created_at": g.created_at,
+                            "last_used_at": g.last_used_at,
+                            "revoked_at": g.revoked_at,
+                        })
+                    })
+                    .collect();
+                print_json(&serde_json::json!({ "grants": arr }));
+            } else {
+                if grants.is_empty() {
+                    println!("nessun grant");
+                }
+                for g in &grants {
+                    println!(
+                        "{}  {}  celle: {}  ambiti: {}  creato {}  {}",
+                        g.label,
+                        oauth_host(&g.client_id),
+                        g.cells.join(","),
+                        g.scopes.join(" "),
+                        g.created_at,
+                        if g.revoked_at.is_some() {
+                            "REVOCATO"
+                        } else {
+                            "vivo"
+                        }
+                    );
+                }
+            }
+            Ok(())
+        }
+        OauthAction::Revoke { grant, all } => {
+            let (id, label) = match (grant, *all) {
+                (Some(label), false) => {
+                    let grants = store
+                        .grants()
+                        .map_err(|e| CliError::internal(format!("{e}")))?;
+                    match grants.iter().find(|g| &g.label == label) {
+                        Some(g) => (Some(g.id.clone()), label.clone()),
+                        None => {
+                            return Err(CliError::not_found(format!(
+                                "nessun grant con etichetta `{label}`"
+                            )));
+                        }
+                    }
+                }
+                (None, true) => (None, "*".to_string()),
+                _ => {
+                    return Err(CliError::usage(
+                        "serve un'etichetta, o --all per revocare tutto",
+                    ));
+                }
+            };
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let n = store
+                .grant_revoke(id.as_deref(), now)
+                .map_err(|e| CliError::internal(format!("{e}")))?;
+            if cli.json {
+                print_json(&serde_json::json!({ "revoked": label, "grants": n }));
+            } else {
+                println!(
+                    "revocati {n} grant ({label}): i loro token muoiono alla prossima richiesta"
+                );
+            }
+            Ok(())
+        }
+        OauthAction::Log => {
+            let events = store
+                .events()
+                .map_err(|e| CliError::internal(format!("{e}")))?;
+            if cli.json {
+                let arr: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|(at, kind, detail)| {
+                        serde_json::json!({ "at": at, "kind": kind, "detail": detail })
+                    })
+                    .collect();
+                print_json(&serde_json::json!({ "events": arr }));
+            } else {
+                if events.is_empty() {
+                    println!("nessun evento");
+                }
+                for (at, kind, detail) in &events {
+                    println!("{at}  {kind}  {detail}");
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// `engramma model list|pull|use`.

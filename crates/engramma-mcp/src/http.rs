@@ -17,16 +17,23 @@
 //! loopback, and there is no anonymous mode — even `initialize` wants a
 //! token, because read-only tools are personal data too.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 
-use crate::oauth::store::{OAuthStore, SCOPE_PROPOSE, SCOPE_READ};
+use crate::oauth::cimd::{self, CimdFetch};
+use crate::oauth::mint;
+use crate::oauth::net::{parse_redirect_uri, redirect_matches, redirect_uri_ok};
+use crate::oauth::store::{
+    AuthRequest, ClientRecord, CodeUse, OAuthStore, RefreshUse, RequestStatus, SCOPE_PROPOSE,
+    SCOPE_READ,
+};
 
 /// The configuration of the HTTP surface. The CLI builds one with both
 /// test hatches off; the library's own tests may turn them on. The hatches
@@ -141,6 +148,11 @@ pub struct HttpState {
     pub cfg: HttpConfig,
     /// oauth.db.
     pub store: OAuthStore,
+    /// The global `/token` limiter: (window start, count). Behind a tunnel
+    /// every caller looks like 127.0.0.1, so the ceiling is global — 60 a
+    /// minute, then 429 with Retry-After. Forwarded headers are not
+    /// consulted: they are not trustworthy.
+    token_window: Mutex<(i64, usize)>,
 }
 
 impl HttpState {
@@ -153,14 +165,80 @@ impl HttpState {
     pub fn open(root: &std::path::Path, cfg: HttpConfig) -> Result<Self, crate::oauth::StoreError> {
         cfg.validate().map_err(crate::oauth::StoreError::Db)?;
         let store = OAuthStore::open(&root.join("oauth.db"))?;
-        Ok(Self { cfg, store })
+        Ok(Self {
+            cfg,
+            store,
+            token_window: Mutex::new((0, 0)),
+        })
+    }
+
+    fn now() -> i64 {
+        time::OffsetDateTime::now_utc().unix_timestamp()
+    }
+
+    /// One tick of the global limiter: `false` when the window is full.
+    fn token_rate_tick(&self) -> bool {
+        const CAP: usize = 60;
+        let now = Self::now();
+        let Ok(mut w) = self.token_window.lock() else {
+            return false; // a poisoned limiter closes the door
+        };
+        if now - w.0 >= 60 {
+            w.0 = now;
+            w.1 = 0;
+        }
+        if w.1 >= CAP {
+            return false;
+        }
+        w.1 += 1;
+        true
+    }
+
+    /// The client behind a `client_id`: the cache first, then a fresh CIMD
+    /// fetch (the SSRF-fenced one), then nothing. Never DCR-fetches: a DCR
+    /// client is only what `/register` minted.
+    async fn client_of(&self, client_id: &str) -> Option<ClientRecord> {
+        let now = Self::now();
+        if let Some(cached) = self.store.client_get(client_id, now).ok().flatten() {
+            return Some(cached);
+        }
+        // a CIMD URL is https:// (the loopback http escape is the library
+        // test hatch only)
+        let looks_like_url = client_id.starts_with("https://")
+            || (self.cfg.allow_loopback_cimd && client_id.starts_with("http://127.0.0.1"));
+        if !looks_like_url {
+            return None;
+        }
+        let mode = CimdFetch {
+            allow_loopback: self.cfg.allow_loopback_cimd,
+        };
+        let url = client_id.to_string();
+        let fetched = tokio::task::spawn_blocking(move || cimd::fetch(&url, mode)).await;
+        match fetched {
+            Ok(Ok(f)) => {
+                let cache_until = f.cache_until;
+                if self
+                    .store
+                    .cimd_put(client_id, &f.record, cache_until)
+                    .is_ok()
+                {
+                    return Some(f.record);
+                }
+                None
+            }
+            Ok(Err(e)) => {
+                // the refusal is generic on the wire; the reason is an event
+                self.store
+                    .event(Self::now(), "client_rejected", &format!("{client_id}: {e}"));
+                None
+            }
+            Err(_) => None,
+        }
     }
 }
 
 /// HTML-escape everything that will land in a page: client names come
 /// from the outside world and their text is hostile.
-// used by the /authorize pages from P3 on
-#[expect(dead_code, reason = "the OAuth pages arrive with P3")]
 pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -238,7 +316,645 @@ async fn not_found() -> Response {
         .into_response()
 }
 
-/// The whole HTTP router. `/mcp` joins in P1; the OAuth flow in P3.
+// ---------------------------------------------------------------------------
+// P3: the authorization flow
+// ---------------------------------------------------------------------------
+
+/// One query string.
+type Q = HashMap<String, String>;
+
+/// The waiting page: hard headers on every page this phase serves.
+fn page(title: &str, body: &str) -> Response {
+    let mut r = Html(format!(
+        "<!doctype html>\n<html lang=\"it\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>{}</title></head><body><main>{body}</main></body></html>",
+        esc(title)
+    ))
+    .into_response();
+    let headers = r.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        axum::http::header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    r
+}
+
+/// The ERROR page (not a redirect): used when the client_id or the
+/// redirect_uri did not pass — answering with a redirect would BE the
+/// open-redirect bug.
+fn error_page(why: &str) -> Response {
+    page(
+        "Non riesco",
+        &format!(
+            "<h1>Non posso avviare il collegamento</h1><p>{}</p>\
+             <p>Torna all'app da cui hai cliccato e riprova; se continua, \
+             il client non è compatibile con questo server.</p>",
+            esc(why)
+        ),
+    )
+}
+
+/// Percent-encode one query value.
+fn urlenc(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// Append parameters to a redirect URI (it may already carry a query).
+fn redirect_with(redirect: &str, params: &[(&str, String)]) -> String {
+    let sep = if redirect.contains('?') { '&' } else { '?' };
+    let joined = params
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlenc(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{redirect}{sep}{joined}")
+}
+
+/// A 302 Found redirect (what OAuth flows speak).
+fn found(to: &str) -> Response {
+    let mut r = StatusCode::FOUND.into_response();
+    if let Ok(v) = HeaderValue::from_str(to) {
+        r.headers_mut().insert(axum::http::header::LOCATION, v);
+    }
+    r
+}
+
+/// The error redirect: always carries `iss` (RFC 9207), errors included,
+/// and the client's `state` when it sent one.
+fn error_redirect(
+    redirect: &str,
+    error: &str,
+    description: &str,
+    state: &Option<String>,
+    issuer: &str,
+) -> Response {
+    let mut params = vec![
+        ("error", error.to_string()),
+        ("error_description", description.to_string()),
+    ];
+    if let Some(st) = state {
+        params.push(("state", st.clone()));
+    }
+    params.push(("iss", issuer.to_string()));
+    found(&redirect_with(redirect, &params))
+}
+
+/// The host of a URL, for the pages (and only for them).
+fn host_of_url(url: &str) -> &str {
+    url.split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', ':', '?'])
+        .next()
+        .unwrap_or(url)
+}
+
+/// `GET /authorize`: the whole validation cascade of P3.
+async fn authorize(State(state): State<Arc<HttpState>>, Query(q): Query<Q>) -> Response {
+    let now = HttpState::now();
+    // 1. BEFORE trusting the redirect_uri: the client must be known. A bad
+    // client or a bad redirect answers with a PAGE, never a redirect —
+    // that is the open-redirect defense.
+    let Some(client_id) = q.get("client_id").cloned() else {
+        return error_page("manca il client_id");
+    };
+    let Some(client) = state.client_of(&client_id).await else {
+        return error_page(
+            "il client non è noto a questo server (documento client irraggiungibile o non valido)",
+        );
+    };
+    let Some(redirect) = q.get("redirect_uri").cloned() else {
+        return error_page("manca il redirect_uri");
+    };
+    let registered = client
+        .redirect_uris
+        .iter()
+        .any(|r| redirect_matches(r, &redirect));
+    if !registered {
+        state.store.event(
+            now,
+            "client_rejected",
+            &format!("{client_id}: redirect_uri not registered"),
+        );
+        return error_page("il redirect_uri non è registrato da questo client");
+    }
+
+    // 2. everything else answers at the redirect, with `iss` and `state`
+    let issuer = state.cfg.issuer();
+    let client_state = q.get("state").cloned();
+    let err = |error: &str, d: &str| error_redirect(&redirect, error, d, &client_state, &issuer);
+
+    if q.get("response_type").map(String::as_str) != Some("code") {
+        return err("unsupported_response_type", "only `code` is spoken here");
+    }
+    let Some(challenge) = q.get("code_challenge").cloned() else {
+        return err(
+            "invalid_request",
+            "PKCE is required: bring a code_challenge (S256)",
+        );
+    };
+    match q.get("code_challenge_method").map(String::as_str) {
+        Some("S256") => {}
+        _ => {
+            return err(
+                "invalid_request",
+                "code_challenge_method must be S256 (`plain` is not accepted)",
+            );
+        }
+    }
+    let resource = match q.get("resource") {
+        Some(r) if r == &state.cfg.resource() => Some(r.clone()),
+        Some(_) => {
+            return err(
+                "invalid_target",
+                "the resource must be this server's canonical one",
+            );
+        }
+        None => {
+            // RFC 8707 asks for it; we bind OUR resource and say so
+            state
+                .store
+                .event(now, "authorize_without_resource", &client_id);
+            Some(state.cfg.resource())
+        }
+    };
+    // the scopes: known ones kept, everything else ignored (ChatGPT asks
+    // for `openid email profile`; we do not speak OIDC and do not refuse)
+    let offered = state.cfg.scopes();
+    let mut scopes: Vec<String> = q
+        .get("scope")
+        .map(|s| {
+            s.split(' ')
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| offered.contains(&s.as_str()))
+        .collect();
+    // `memory:read` is the floor: the read tools are the point of the
+    // connection, and the token answer says what was really granted
+    if !scopes.iter().any(|s| s == SCOPE_READ) {
+        scopes.push(SCOPE_READ.to_string());
+    }
+
+    // 3. the ceiling: at most 5 requests waiting, 10 minutes each
+    match state.store.pending_count(now) {
+        Ok(n) if n >= 5 => {
+            state.store.event(now, "authorize_flood", &client_id);
+            return page(
+                "Troppe richieste",
+                "<h1>Troppe richieste in attesa</h1>\
+                 <p>ci sono già cinque collegamenti da decidere: approvale o rifiutale \
+                 (`engramma oauth pending`) e riprova.</p>",
+            );
+        }
+        Ok(_) => {}
+        Err(_) => return error_page("oauth.db non è leggibile"),
+    }
+
+    // 4. record and send the browser to the waiting page
+    let handle = mint::handle().unwrap_or_default();
+    let code = mint::approval_code().unwrap_or_default();
+    if handle.is_empty() || code.is_empty() {
+        return error_page("il generatore casuale non risponde");
+    }
+    let req = AuthRequest {
+        handle: handle.clone(),
+        approval_code: code.clone(),
+        client_id: client_id.clone(),
+        client_name: client.name.clone(),
+        redirect_uri: redirect.clone(),
+        scopes,
+        resource,
+        code_challenge: challenge,
+        state: client_state,
+        offered_cells: state.cfg.cells.clone(),
+        offered_write: state.cfg.write.clone(),
+        status: RequestStatus::Pending,
+        grant_id: None,
+        created_at: now,
+        expires_at: now + 600,
+    };
+    if state.store.request_insert(&req).is_err() {
+        return error_page("oauth.db non è scrivibile");
+    }
+    state.store.event(
+        now,
+        "request_created",
+        &format!("code={code} client={client_id}"),
+    );
+    axum::response::Redirect::to(&format!("/attesa/{handle}")).into_response()
+}
+
+/// `GET /attesa/<handle>`: the page the browser refreshes until the human
+/// decides on the computer where engramma runs.
+async fn attesa(State(state): State<Arc<HttpState>>, Path(handle): Path<String>) -> Response {
+    let now = HttpState::now();
+    let Ok(Some(req)) = state.store.request_by_handle(&handle) else {
+        return page("Sconosciuto", "<h1>Richiesta sconosciuta</h1>");
+    };
+    let issuer = state.cfg.issuer();
+    match req.status {
+        RequestStatus::Pending if req.expires_at > now => {
+            let client_host = host_of_url(&req.client_id);
+            let redirect_host = host_of_url(&req.redirect_uri);
+            let loopback_note = if parse_redirect_uri(&req.redirect_uri).is_some_and(|u| {
+                u.scheme == "http" && (u.host == "127.0.0.1" || u.host == "localhost")
+            }) {
+                "<p class=\"avviso\">Attenzione: il client riceverà la risposta su un \
+                 indirizzo locale del TUO computer (redirect http su loopback).</p>"
+            } else {
+                ""
+            };
+            let body = format!(
+                "<meta http-equiv=\"refresh\" content=\"3\">\
+<h1>Collegamento in attesa</h1>\
+<p><strong>{}</strong> chiede di leggere la tua memoria.</p>\
+<table>\
+<tr><th>client</th><td><code>{}</code></td></tr>\
+<tr><th>riceverà la risposta su</th><td><code>{}</code></td></tr>\
+<tr><th>ambiti</th><td>{}</td></tr>\
+</table>\
+{loopback_note}\
+<p>Se i nomi sopra sono quelli che ti aspetti, approva sul computer dove \
+ gira Engramma:</p>\
+<pre>engramma oauth approve {}</pre>\
+<p class=\"meta\">Questa pagina si aggiorna da sola; il codice scade con la \
+ richiesta (10 minuti).</p>",
+                esc(req.client_name.as_deref().unwrap_or("Un client")),
+                esc(client_host),
+                esc(redirect_host),
+                esc(&req.scopes.join(" ")),
+                esc(&req.approval_code),
+            );
+            page("In attesa", &body)
+        }
+        RequestStatus::Pending => error_redirect(
+            &req.redirect_uri,
+            "access_denied",
+            "la richiesta è scaduta",
+            &req.state,
+            &issuer,
+        ),
+        RequestStatus::Denied => error_redirect(
+            &req.redirect_uri,
+            "access_denied",
+            "rifiutata sul computer dove gira engramma",
+            &req.state,
+            &issuer,
+        ),
+        RequestStatus::Approved => {
+            // the code is minted HERE, the first time the page sees the
+            // approval: its 60 s window starts when the client can
+            // actually pick it up
+            if state.store.code_already_minted(&handle).unwrap_or(false) {
+                return page(
+                    "Completato",
+                    "<h1>Collegamento già completato</h1>\
+                     <p>il codice d'autorizzazione è già stato emesso: torna all'app.</p>",
+                );
+            }
+            match state.store.code_mint(&handle, &state.cfg.resource(), now) {
+                Ok(Some((code, _record, _expires))) => {
+                    let mut params = vec![("code", code)];
+                    if let Some(st) = &req.state {
+                        params.push(("state", st.clone()));
+                    }
+                    params.push(("iss", issuer));
+                    found(&redirect_with(&req.redirect_uri, &params))
+                }
+                _ => error_redirect(
+                    &req.redirect_uri,
+                    "access_denied",
+                    "la richiesta non è più valida",
+                    &req.state,
+                    &issuer,
+                ),
+            }
+        }
+    }
+}
+
+/// A token-endpoint JSON answer (always `Cache-Control: no-store`).
+fn token_json(v: serde_json::Value) -> Response {
+    let mut r = (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&v).unwrap_or_else(|_| "{}".into()),
+    )
+        .into_response();
+    r.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    r
+}
+
+/// A token-endpoint error (RFC 6749 §5.2: 400 + `error`).
+fn token_error(error: &str, description: &str) -> Response {
+    let mut r = token_json(serde_json::json!({ "error": error, "error_description": description }));
+    *r.status_mut() = StatusCode::BAD_REQUEST;
+    r
+}
+
+/// `POST /token`: authorization_code (with PKCE) and refresh_token.
+async fn token(State(state): State<Arc<HttpState>>, Form(f): Form<Q>) -> Response {
+    if !state.token_rate_tick() {
+        let mut r = token_error("slow_down", "troppo: riprova tra poco");
+        *r.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        r.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_static("60"),
+        );
+        return r;
+    }
+    let now = HttpState::now();
+    match f.get("grant_type").map(String::as_str) {
+        Some("authorization_code") => token_code(&state, &f, now).await,
+        Some("refresh_token") => token_refresh(&state, &f, now),
+        Some(_) => token_error(
+            "unsupported_grant_type",
+            "authorization_code o refresh_token",
+        ),
+        None => token_error("invalid_request", "manca grant_type"),
+    }
+}
+
+async fn token_code(state: &HttpState, f: &Q, now: i64) -> Response {
+    let Some(code) = f.get("code") else {
+        return token_error("invalid_request", "manca code");
+    };
+    let Some(verifier) = f.get("code_verifier") else {
+        return token_error("invalid_request", "manca code_verifier (PKCE)");
+    };
+    let Some(client_id) = f.get("client_id") else {
+        return token_error("invalid_request", "manca client_id");
+    };
+    let Some(redirect) = f.get("redirect_uri") else {
+        return token_error("invalid_request", "manca redirect_uri");
+    };
+    match state.store.code_consume(code, now) {
+        Err(_) => token_error("oauth.db", "non leggibile"),
+        Ok(Err(CodeUse::Unknown)) => token_error("invalid_grant", "codice sconosciuto"),
+        Ok(Err(CodeUse::Expired)) => token_error("invalid_grant", "codice scaduto"),
+        Ok(Err(CodeUse::Reused { family })) => {
+            // a code answers twice: assume theft, kill the whole chain
+            let _ = state.store.revoke_family(&family, now);
+            state
+                .store
+                .event(now, "code_reused", &format!("family={family}"));
+            token_error(
+                "invalid_grant",
+                "il codice era già stato usato: tutto ciò che ne era nato è revocato",
+            )
+        }
+        Ok(Ok(rec)) => {
+            if rec.client_id != *client_id {
+                token_error("invalid_grant", "il codice è di un altro client");
+            }
+            if !redirect_matches(&rec.redirect_uri, redirect) {
+                token_error("invalid_grant", "redirect_uri non corrispondente");
+            }
+            if let Some(want) = f.get("resource")
+                && Some(want.as_str()) != rec.resource.as_deref()
+            {
+                return token_error("invalid_target", "resource non corrispondente");
+            }
+            if !mint::pkce_verify(&rec.code_challenge, verifier) {
+                return token_error("invalid_grant", "PKCE non verificato");
+            }
+            let Some(grant) = state.store.grant(&rec.grant_id, now).ok().flatten() else {
+                return token_error("invalid_grant", "il grant non vive più");
+            };
+            // the grant can only NARROW what the code asked
+            let scopes: Vec<String> = rec
+                .scopes
+                .iter()
+                .filter(|s| grant.scopes.contains(s))
+                .cloned()
+                .collect();
+            let audience = state.cfg.resource();
+            let (access, access_exp) =
+                match state
+                    .store
+                    .access_issue(&grant, &scopes, &audience, &rec.family, now)
+                {
+                    Ok(v) => v,
+                    Err(_) => return token_error("server_error", "oauth.db"),
+                };
+            let (refresh, _refresh_exp) =
+                match state
+                    .store
+                    .refresh_issue(&grant, &scopes, &audience, &rec.family, now)
+                {
+                    Ok(v) => v,
+                    Err(_) => return token_error("server_error", "oauth.db"),
+                };
+            state.store.event(
+                now,
+                "token_issued",
+                &format!(
+                    "grant={} client={}",
+                    grant.id,
+                    host_of_url(&grant.client_id)
+                ),
+            );
+            token_json(serde_json::json!({
+                "access_token": access,
+                "token_type": "Bearer",
+                "expires_in": access_exp - now,
+                "refresh_token": refresh,
+                "scope": scopes.join(" "),
+            }))
+        }
+    }
+}
+
+fn token_refresh(state: &HttpState, f: &Q, now: i64) -> Response {
+    let Some(refresh) = f.get("refresh_token") else {
+        return token_error("invalid_request", "manca refresh_token");
+    };
+    let audience = state.cfg.resource();
+    let wanted: Vec<String> = f
+        .get("scope")
+        .map(|s| {
+            s.split(' ')
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    match state.store.refresh_rotate(refresh, &wanted, &audience, now) {
+        Err(_) => token_error("server_error", "oauth.db"),
+        Ok(Err(RefreshUse::Reused)) => token_error(
+            "invalid_grant",
+            "il refresh era già stato ruotato: il grant è revocato, ricollega il client",
+        ),
+        Ok(Err(RefreshUse::Unknown)) => token_error("invalid_grant", "refresh sconosciuto"),
+        Ok(Err(RefreshUse::Expired)) => {
+            token_error("invalid_grant", "refresh scaduto: ricollega il client")
+        }
+        Ok(Ok(rot)) => token_json(serde_json::json!({
+            "access_token": rot.access,
+            "token_type": "Bearer",
+            "expires_in": rot.access_exp - now,
+            "refresh_token": rot.refresh,
+            "scope": rot.scopes.join(" "),
+        })),
+    }
+}
+
+/// `POST /revoke` (RFC 7009): 200 even for an unknown token.
+async fn revoke(State(state): State<Arc<HttpState>>, Form(f): Form<Q>) -> Response {
+    if let Some(token) = f.get("token") {
+        let _ = state.store.token_revoke(token, HttpState::now());
+    }
+    let mut r = StatusCode::OK.into_response();
+    r.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    r
+}
+
+/// `POST /register` (RFC 7591) — only with `--allow-dcr`.
+async fn register(
+    State(state): State<Arc<HttpState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !state.cfg.allow_dcr {
+        return (
+            StatusCode::NOT_FOUND,
+            "il server non accetta registrazioni dinamiche",
+        )
+            .into_response();
+    }
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if !ct.starts_with("application/json") {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "registration wants application/json",
+        )
+            .into_response();
+    }
+    if body.len() > 16 * 1024 {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "too large").into_response();
+    }
+    let doc: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_REQUEST, "unreadable JSON").into_response(),
+    };
+    match doc
+        .get("token_endpoint_auth_method")
+        .and_then(|v| v.as_str())
+    {
+        None | Some("none") => {}
+        Some(_other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("token_endpoint_auth_method `{_other}` is not supported: only `none` (public client with PKCE)"),
+            )
+                .into_response();
+        }
+    }
+    let uris: Vec<String> = doc
+        .get("redirect_uris")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if uris.is_empty() || uris.iter().any(|u| !redirect_uri_ok(u)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "redirect_uris: https anywhere, or http on a loopback host",
+        )
+            .into_response();
+    }
+    let now = HttpState::now();
+    // the flood cap: 20 registered-and-never-used clients
+    match state.store.dcr_unused_count() {
+        Ok(n) if n >= 20 => {
+            let mut r = (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many unused registrations",
+            )
+                .into_response();
+            r.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("3600"),
+            );
+            return r;
+        }
+        Ok(_) => {}
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "oauth.db").into_response(),
+    }
+    let client_id = mint::opaque_token("eng_client_").unwrap_or_default();
+    let rec = ClientRecord {
+        client_id: client_id.clone(),
+        kind: crate::oauth::store::ClientKind::Dcr,
+        redirect_uris: uris.clone(),
+        name: doc
+            .get("client_name")
+            .and_then(|v| v.as_str())
+            .map(|n| n.chars().take(80).collect::<String>()),
+        created_at: now,
+    };
+    if state.store.dcr_put(&rec).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "oauth.db").into_response();
+    }
+    state
+        .store
+        .event(now, "client_registered", &format!("{client_id} (dcr)"));
+    let mut r = (
+        StatusCode::CREATED,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&serde_json::json!({
+            "client_id": client_id,
+            "client_id_issued_at": now,
+            "redirect_uris": uris,
+            "token_endpoint_auth_method": "none",
+        }))
+        .unwrap_or_default(),
+    )
+        .into_response();
+    r.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    r
+}
+
+/// The whole HTTP router. `/mcp` joins in P1.
 pub fn router(state: Arc<HttpState>) -> Router {
     // RFC 9728 puts the metadata at /.well-known/oauth-protected-resource
     // (+ /mcp); several clients also try the bare path — same document
@@ -260,6 +976,11 @@ pub fn router(state: Arc<HttpState>) -> Router {
             "/.well-known/oauth-authorization-server",
             get(authorization_server),
         )
+        .route("/authorize", get(authorize))
+        .route("/attesa/{handle}", get(attesa))
+        .route("/token", post(token))
+        .route("/revoke", post(revoke))
+        .route("/register", post(register))
         .fallback(not_found);
     // RFC 8414 path insertion, when the issuer carries a path
     if let Some((_, path)) = issuer_path.split_once('/') {

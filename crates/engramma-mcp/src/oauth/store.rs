@@ -62,18 +62,21 @@ fn db(e: impl std::fmt::Display) -> StoreError {
 type ClientRaw = (String, Option<String>, i64, Option<i64>, String);
 /// One raw `requests` row, before parsing.
 type RequestRaw = (
-    String,
-    String,
-    Option<String>,
-    String,
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-    i64,
-    i64,
+    String,         // handle
+    String,         // approval_code
+    String,         // client_id
+    Option<String>, // client_name
+    String,         // redirect_uri
+    String,         // scope
+    Option<String>, // resource
+    String,         // code_challenge
+    Option<String>, // state
+    String,         // offered_cells
+    String,         // offered_write
+    String,         // status
+    Option<String>, // grant_id
+    i64,            // created_at
+    i64,            // expires_at
 );
 /// One raw `codes` row, before parsing.
 type CodeRaw = (
@@ -144,6 +147,11 @@ pub struct AuthRequest {
     pub code_challenge: String,
     /// The client's `state`, echoed back on every redirect.
     pub state: Option<String>,
+    /// What the SERVER process offers (its `--cells`): the grant can only
+    /// restrict this, and the approval happens in another process.
+    pub offered_cells: Vec<String>,
+    /// The server process's `--write` cells (the propose ceiling).
+    pub offered_write: Vec<String>,
     pub status: RequestStatus,
     pub grant_id: Option<String>,
     pub created_at: i64,
@@ -481,8 +489,9 @@ impl OAuthStore {
         conn.execute(
             "INSERT INTO requests
                (handle, approval_code, client_id, client_name, redirect_uri, scope,
-                resource, code_challenge, state, status, grant_id, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                resource, code_challenge, state, offered_cells, offered_write,
+                status, grant_id, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 req.handle,
                 req.approval_code,
@@ -493,6 +502,8 @@ impl OAuthStore {
                 req.resource,
                 req.code_challenge,
                 req.state,
+                serde_json::to_string(&req.offered_cells).unwrap_or_default(),
+                serde_json::to_string(&req.offered_write).unwrap_or_default(),
                 req.status.as_str(),
                 req.grant_id,
                 req.created_at,
@@ -536,7 +547,8 @@ impl OAuthStore {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT handle, approval_code, client_id, client_name, redirect_uri, scope,
-                        resource, code_challenge, state, status, grant_id, created_at, expires_at
+                        resource, code_challenge, state, offered_cells, offered_write,
+                        status, grant_id, created_at, expires_at
                  FROM requests WHERE {cond} ORDER BY created_at"
             ))
             .map_err(db)?;
@@ -553,16 +565,18 @@ impl OAuthStore {
                     r.get::<_, String>(7)?,
                     r.get::<_, Option<String>>(8)?,
                     r.get::<_, String>(9)?,
-                    r.get::<_, Option<String>>(10)?,
-                    r.get::<_, i64>(11)?,
-                    r.get::<_, i64>(12)?,
+                    r.get::<_, String>(10)?,
+                    r.get::<_, String>(11)?,
+                    r.get::<_, Option<String>>(12)?,
+                    r.get::<_, i64>(13)?,
+                    r.get::<_, i64>(14)?,
                 ))
             })
             .map_err(db)?
             .flatten()
             .collect::<Vec<_>>()
             .into_iter()
-            .filter(|r| r.12 > now || r.9 != "pending")
+            .filter(|r| r.13 > now || r.11 != "pending")
             .collect::<Vec<_>>();
         drop(stmt);
         let mut out = Vec::new();
@@ -577,6 +591,8 @@ impl OAuthStore {
                 resource,
                 challenge,
                 state,
+                offered_cells,
+                offered_write,
                 status,
                 grant_id,
                 created_at,
@@ -592,6 +608,8 @@ impl OAuthStore {
                 resource,
                 code_challenge: challenge,
                 state,
+                offered_cells: serde_json::from_str(&offered_cells).unwrap_or_default(),
+                offered_write: serde_json::from_str(&offered_write).unwrap_or_default(),
                 status: RequestStatus::parse(&status)?,
                 grant_id,
                 created_at,
@@ -628,8 +646,9 @@ impl OAuthStore {
         let conn = self.lock()?;
         let row: Option<RequestRaw> = conn
             .query_row(
-                "SELECT approval_code, client_id, client_name, redirect_uri, scope, resource,
-                        code_challenge, state, status, grant_id, created_at, expires_at
+                "SELECT handle, approval_code, client_id, client_name, redirect_uri, scope,
+                        resource, code_challenge, state, offered_cells, offered_write,
+                        status, grant_id, created_at, expires_at
                  FROM requests WHERE handle = ?1",
                 [handle],
                 |r| {
@@ -646,6 +665,9 @@ impl OAuthStore {
                         r.get(9)?,
                         r.get(10)?,
                         r.get(11)?,
+                        r.get(12)?,
+                        r.get(13)?,
+                        r.get(14)?,
                     ))
                 },
             )
@@ -653,6 +675,7 @@ impl OAuthStore {
             .map_err(db)?;
         drop(conn);
         let Some((
+            handle2,
             code,
             client_id,
             client_name,
@@ -661,6 +684,8 @@ impl OAuthStore {
             resource,
             challenge,
             state,
+            offered_cells,
+            offered_write,
             status,
             grant_id,
             created_at,
@@ -670,7 +695,7 @@ impl OAuthStore {
             return Ok(None);
         };
         Ok(Some(AuthRequest {
-            handle: handle.to_string(),
+            handle: handle2,
             approval_code: code,
             client_id,
             client_name,
@@ -679,6 +704,8 @@ impl OAuthStore {
             resource,
             code_challenge: challenge,
             state,
+            offered_cells: serde_json::from_str(&offered_cells).unwrap_or_default(),
+            offered_write: serde_json::from_str(&offered_write).unwrap_or_default(),
             status: RequestStatus::parse(&status)?,
             grant_id,
             created_at,
@@ -754,13 +781,14 @@ impl OAuthStore {
     /// # Errors
     /// [`StoreError::Db`] on SQL failures.
     pub fn request_deny(&self, approval_code: &str, now: i64) -> Result<bool> {
-        let conn = self.lock()?;
-        let n = conn
-            .execute(
+        let n = {
+            let conn = self.lock()?;
+            conn.execute(
                 "UPDATE requests SET status = 'denied' WHERE approval_code = ?1 AND status = 'pending'",
                 [approval_code],
             )
-            .map_err(db)?;
+            .map_err(db)?
+        };
         if n > 0 {
             self.event(now, "request_denied", &format!("code={approval_code}"));
         }
@@ -1357,6 +1385,8 @@ CREATE TABLE requests (
   resource      TEXT,
   code_challenge TEXT NOT NULL,
   state         TEXT,
+  offered_cells TEXT NOT NULL,
+  offered_write TEXT NOT NULL,
   status        TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied')),
   grant_id      TEXT,
   created_at    INTEGER NOT NULL,
@@ -1464,6 +1494,8 @@ mod tests {
             resource: None,
             code_challenge: "challenge".into(),
             state: Some("st".into()),
+            offered_cells: vec!["default".into()],
+            offered_write: vec![],
             status: RequestStatus::Pending,
             grant_id: None,
             created_at: now,
