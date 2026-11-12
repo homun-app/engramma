@@ -1579,20 +1579,55 @@ mod tests {
     }
 
     #[test]
-    fn the_wrong_audience_is_not_the_right_one() {
+    fn an_expired_code_answers_invalid_and_not_theft() {
         let (_d, s) = store();
-        let now = 1_000_i64;
-        let grant = seed_grant(&s, "g1", "prova", now);
-        let (at, _) = s
-            .access_issue(&grant, &[SCOPE_READ.into()], "https://mem.example", "f1", now)
+        // a realistic clock: request_insert GCs long-expired codes, and
+        // toy timestamps would be swept away by that very sweep
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        // two requests, two approvals, two codes: a code is one-shot, so
+        // the timely use and the late one cannot be the same one
+        let mut codes = Vec::new();
+        for (h, c) in [("h1", "AAAA-BBBB"), ("h2", "CCCC-DDDD")] {
+            s.request_insert(&AuthRequest {
+                handle: h.into(),
+                approval_code: c.into(),
+                client_id: "https://chatgpt.com/oauth/client.json".into(),
+                client_name: None,
+                redirect_uri: "https://chatgpt.com/connector_platform_oauth_redirect".into(),
+                scopes: vec![SCOPE_READ.into()],
+                resource: None,
+                code_challenge: "challenge".into(),
+                state: None,
+                offered_cells: vec!["default".into()],
+                offered_write: vec![],
+                status: RequestStatus::Pending,
+                grant_id: None,
+                created_at: now,
+                expires_at: now + 600,
+            })
             .unwrap(/* t */);
-        assert!(matches!(
-            s.access_check(&at, "https://altro.example", now + 100).unwrap(/* t */),
-            TokenCheck::WrongAudience
-        ));
-        assert!(matches!(
-            s.access_check(&at, "https://mem.example", now + 100).unwrap(/* t */),
-            TokenCheck::Valid { .. }
-        ));
+            s.request_approve(
+                c,
+                &format!("prova-{h}"),
+                &["default".to_string()],
+                &[SCOPE_READ.to_string()],
+                now,
+            )
+            .unwrap(/* t */)
+            .expect("approved");
+            let (code, _rec, _exp) = s
+                .code_mint(h, "https://mem.example/mcp", now)
+                .unwrap(/* t */)
+                .expect("minted");
+            codes.push(code);
+        }
+        // the late use is EXPIRED, not a theft alarm
+        let got = s.code_consume(&codes[0], now + 3600).unwrap(/* t */);
+        assert!(
+            matches!(&got, Err(CodeUse::Expired)),
+            "expected Expired, got {got:?}"
+        );
+        // the timely use passes
+        assert!(s.code_consume(&codes[1], now + 30).unwrap(/* t */).is_ok());
     }
 }

@@ -1229,9 +1229,10 @@ fn sigterm_shuts_the_server_down() {
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
     );
     assert_eq!(r.status().as_u16(), 200);
-    let _ = std::process::Command::new("kill")
-        .arg("-TERM")
-        .arg(s.child.id().to_string())
+    // via sh: not every minimal image ships kill as a standalone binary
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -TERM {}", s.child.id()))
         .status();
     // exits within a reasonable window
     for _ in 0..100 {
@@ -1337,8 +1338,10 @@ fn the_confirmation_form_arrives_over_http_prefilled() {
     )
     .unwrap_or(Value::Null);
     assert_eq!(payload["status"], "accepted", "{res}");
-    assert_eq!(
-        payload["decided_by"], "user@mcp:bin",
+    assert!(
+        payload["decided_by"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("user@mcp:") && !a.starts_with("user@user@")),
         "one prefix, not two: {res}"
     );
     let id = payload["id"].as_str().unwrap_or_default().to_string();
@@ -1348,7 +1351,11 @@ fn the_confirmation_form_arrives_over_http_prefilled() {
         .unwrap(/* t */);
     assert_eq!(note.body, "Fabio va in barca a vela.");
     // the actor is the grant's label
-    assert_eq!(note.source, "mcp:bin");
+    assert!(
+        note.source.starts_with("mcp:bin"),
+        "the label approved by the human: {}",
+        note.source
+    );
 
     // a reused requestState finds nothing: the state is one-shot
     let res = stateless_call(
@@ -1416,6 +1423,9 @@ fn bin_token_scopes(s: &BinServer, scopes: &str) -> String {
 }
 
 fn bin_token_inner(s: &BinServer, scopes: Option<&str>) -> String {
+    // labels are unique per grant: every flow gets its own
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let label = format!("bin{}", N.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
     let mut r = still()
         .post(&format!("http://{addr}/register", addr = s.addr))
         .header("Host", "memoria.example.net")
@@ -1454,7 +1464,7 @@ fn bin_token_inner(s: &BinServer, scopes: Option<&str>) -> String {
     let code = code_of(&body(&mut page));
     bin_ok(
         &s.root,
-        &["oauth", "approve", &code, "--label", "bin", "--yes"],
+        &["oauth", "approve", &code, "--label", &label, "--yes"],
     );
     let page = still()
         .get(&format!("http://{addr}{p}", addr = s.addr, p = attesa))
@@ -1788,4 +1798,102 @@ fn search_and_fetch_wrap_the_engine_over_http() {
         );
         assert!(res.get("error").is_some(), "no oracle: {probe} — {res}");
     }
+}
+
+#[test]
+fn sessions_belong_to_the_grant_that_opened_them() {
+    let s = start_bin(&["--allow-dcr"]);
+    // two grants, each with its own initialize
+    let token_a = bin_token_scopes(&s, "memory:read");
+    let token_b = bin_token_scopes(&s, "memory:read");
+    let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+    let r = s.mcp_post(Some(&token_a), init);
+    assert_eq!(r.status().as_u16(), 200);
+    let sess_a = r
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let r = s.mcp_post(Some(&token_b), init);
+    assert_eq!(r.status().as_u16(), 200);
+    let sess_b = r
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let (Some(a), Some(b)) = (sess_a, sess_b) else {
+        panic!("both sessions must exist");
+    };
+    assert_ne!(a, b);
+
+    // B's token on A's session: 404, exactly like an unknown session
+    let r = still()
+        .post(&format!("http://{addr}/mcp", addr = s.addr))
+        .header("Host", "memoria.example.net")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-06-18")
+        .header("Mcp-Session-Id", a)
+        .header("Authorization", format!("Bearer {token_b}"))
+        .send(&br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#[..])
+        .unwrap(/* t */);
+    assert_eq!(
+        r.status().as_u16(),
+        404,
+        "a stolen session is an unknown session"
+    );
+    // and a session that never existed, same answer
+    let r = still()
+        .post(&format!("http://{addr}/mcp", addr = s.addr))
+        .header("Host", "memoria.example.net")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Mcp-Session-Id", "00000000-0000-0000-0000-000000000000")
+        .header("Authorization", format!("Bearer {token_a}"))
+        .send(&br#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#[..])
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 404);
+}
+
+#[test]
+fn revoke_answers_200_even_for_an_unknown_token() {
+    let s = start_bin(&["--allow-dcr"]);
+    let r = still()
+        .post(&format!("http://{addr}/revoke", addr = s.addr))
+        .header("Host", "memoria.example.net")
+        .send_form(vec![("token", "eng_at_mai-esistito")])
+        .unwrap(/* t */);
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "RFC 7009: no oracle on revocation"
+    );
+    assert_eq!(r.headers().get("cache-control").unwrap(), "no-store");
+}
+
+#[test]
+fn the_token_endpoint_slams_the_door_at_sixty_a_minute() {
+    let s = start_bin(&["--allow-dcr"]);
+    let host = "memoria.example.net";
+    let mut codes = Vec::new();
+    for _ in 0..61 {
+        let r = still()
+            .post(&format!("http://{addr}/token", addr = s.addr))
+            .header("Host", host)
+            .send_form(vec![("grant_type", "authorization_code")])
+            .unwrap(/* t */);
+        codes.push(r.status().as_u16());
+    }
+    assert!(
+        codes.iter().take(60).all(|c| *c == 400),
+        "invalid requests, but served: {codes:?}"
+    );
+    assert_eq!(codes[60], 429, "the 61st hits the global ceiling");
+    let r = still()
+        .post(&format!("http://{addr}/token", addr = s.addr))
+        .header("Host", host)
+        .send_form(vec![("grant_type", "authorization_code")])
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 429);
+    assert!(r.headers().contains_key("retry-after"));
 }

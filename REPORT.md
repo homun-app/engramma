@@ -4937,3 +4937,274 @@ Note lasciate per dopo (non bloccanti):
 Build: `npm run build` rifatto dopo le correzioni; il `.node` è
 **identico bit per bit** (`c302c3ea…`): il codice toccato non arriva al
 modulo Node. `index.js` e `index.d.ts` invariati. `du -sh target`: 16G.
+
+# REPORT — Engramma v0.5.2 (MCP su HTTP con OAuth 2.1: ChatGPT e Claude dal web)
+
+Data: 2026-11-12. Base: `main` @ `f84a92b` (fase-v0.5.1 più il commit di
+sole dipendenze: la `transport-streamable-http-server` di rmcp 3.8, con
+`async-trait`, `sse-stream 0.2.6` e `tokio-stream` nel lock, già
+scaricate; `cargo deny` verde alla partenza). Tutto costruito e provato
+offline (`cargo --offline`), Rust 1.95.0, macOS arm64. **Nessuna crate
+nuova nel lock**: rusqlite, blake3, ring, ureq, axum, time, serde,
+tokio-util (già portata da rmcp) e base64 0.23.1 (già in lock per tract)
+erano tutte presenti; le ho solo dichiarate dove servivano.
+
+**Commits:** `8e6f6cc` (P0.1), `bbbfc49` (P0.2), `79f5f34` (P0.3),
+`d57859a` (P2 store/CIMD/monete), `afa42bd` (P2 metadati), `3adf741`
+(P3), `cf2a7f0` (P1+P4 insieme — sotto, il perché), `74a6096` (P5, con
+dentro un difetto trovato dai test nuovi), `048e130` (P6), `9b6f9e8`
+(P7), `0d0edac` (i casi restanti), più questo (REPORT). Test rossi prima
+di ogni correzione.
+
+## P0 — Le tre note della v0.5, che con HTTP diventano vere
+
+- **L'interruttore sotto il lock** (`8e6f6cc`). Rosso: `max_auto_per_hour
+  = 3`, revisore `command` che accetta dopo 300 ms, 10 proposte parallele
+  nello stesso processo — **oggi ne passavano 10**. Il conteggio stava
+  fuori dal lock di scrittura: dieci revisioni avviate insieme leggevano
+  tutte «0 finora» e decidevano tutte. Ora la decisione automatica passa
+  da `decide_under_breaker`, che rilegge il conteggio e scrive la
+  decisione dentro lo stesso lock (lo stesso ordine del controllo dei
+  doppioni di `03d08a4`); le proposte fermate restano in coda col motivo
+  («interruptore: max_auto_per_hour raggiunto mentre la revisione era in
+  corso») e l'esito lo dice al chiamante. Vale anche per il retry di
+  `proposals review`. Dopo la correzione: 3 accettate, 7 in coda col
+  motivo.
+- **Confronto a tempo costante** (`bbbfc49`). Il token della pagina di
+  revisione si confrontava con `==`: un confronto che si ferma al primo
+  byte diverso. Ora passa da `same_secret` (blake3 di entrambi, poi i
+  digest a 256 bit). Il test non è temporale (onestamente non esiste):
+  cerca nel sorgente `== self.token` e i suoi fratelli — il pattern non
+  può tornare inosservato — e prova che il flusso entra/esce come prima.
+- **Cookie per porta** (`79f5f34`). `engramma_review_<porta>`: due
+  `engramma review` aperti insieme non si scambiano più il token di
+  sessione. Rosso: il set-cookie del primo porta il nome senza porta; il
+  token di A sotto il nome di B non entra, e il vecchio nome è ignorato.
+  Durante la correzione ho pure scoperto (a mano, con curl) che la prima
+  stesura del guard si mangiava l'`=` del cookie: il test del flusso
+  completo l'avrebbe preso comunque.
+
+## P2 — Il server di autorizzazione: stato, metadati, client
+
+- **`<root>/oauth.db`** (`d57859a`), permessi 0600 (test su Unix), schema
+  proprio `schema_version` 1 con la stessa guardia delle celle: uno
+  schema più novo si rifiuta. Contenuto: client CIMD in cache e DCR,
+  richieste in attesa, codici, grant, token, `events`. Di ogni segreto
+  solo `blake3`. Staccato dal registro delle celle di proposito
+  (credenziali, non memoria: niente sincronizzazione v0.6, revoca
+  immediata e locale) — scritto nel DESIGN § 8.6.
+- **CIMD col recinto SSRF.** Il `client_id` è un URL scelto da chi
+  chiama: lo scaricamento risolve il DNS e passa a ureq un
+  **`Resolver`** che consegna solo indirizzi pubblici (loopback, RFC
+  1918, link-local coi metadati cloud, CGNAT, ULA, multicast, non
+  specificati, IPv4 mappati in IPv6 e i blocchi di documentazione sono
+  scartati); la connessione va all'IP verificato con SNI e Host del
+  nome. Zero redirect, 5 KiB, 5 s, solo `application/json`. Il documento
+  deve claimarsi (`client_id` uguale all'URL), avere redirect validi
+  (https ovunque, http solo su loopback) e `token_endpoint_auth_method`
+  assente o `none` (`private_key_jwt` rifiutato dicendolo). La cache
+  rispetta `max-age` dentro [5 min, 24 h], default 1 h (il test prova
+  `max-age=600`; i bordi del clamp sono nel codice, non misurati).
+  **Proptest**: ogni blocco riservato è rifiutato in qualunque forma
+  testuale, inclusi i v4 mappati in v6; gli indirizzi ordinari passano
+  (il recinto non si mangia internet).
+- **Redirect**: confronto esatto con l'unica eccezione RFC 8252 § 7.3
+  (porta ignorata solo per `http` su host di loopback — serve a Claude
+  Code). Proptest: la porta conta per https e per gli altri host, e il
+  percorso deve comunque coincidere.
+- **DCR spento di base**; con `--allow-dcr`: solo client pubblici,
+  redirect validi, 20 inutilizzati al massimo (429 oltre), i mai usati
+  scadono dopo 24 h (implementato nel lookup; la scadenza non ha test
+  dedicato: dice il codice). Nessun client pre-registrato.
+- **Metadati** (`afa42bd`): PRM identica su entrambi i percorsi
+  (`resource` esatta, un solo authorization server, ambiti
+  `memory:read` + `memory:propose` se una cella è scrivibile, bearer
+  solo header); metadati AS campo per campo (S256, `none`, CIMD
+  supportato, `iss` sempre, `registration_endpoint` solo col flag) e la
+  variante RFC 8414 col percorso inserito quando l'issuer ne ha uno.
+  Tutto `Cache-Control: no-store`. Test campo per campo in
+  `tests/http.rs`.
+
+## P3 — Autorizzazione con approvazione locale, token, revoca
+
+- **`/authorize`** (`3adf741`): il client si risolve PRIMA di fidarsi
+  del redirect; client o redirect non validi rispondono con una
+  **pagina**, mai un redirect (quella sarebbe la porta aperta — test:
+  nessun `Location`). Ogni altro errore torna al redirect con `iss`
+  (RFC 9207) e `state`: `plain` o challenge assente → `invalid_request`,
+  `resource` estraneo → `invalid_target`, gli ambiti sconosciuti
+  (`openid email profile`) si **ignorano** (niente OIDC, niente
+  `id_token`: la risposta del token dice cosa è concesso davvero —
+  test). Tetto di 5 richieste in attesa oltre il quale la pagina lo
+  dice.
+- **La pagina d'attesa** senza JavaScript (rinfresco 3 s, CSP chiusa,
+  DENY, no-referrer, no-store): nome del client escapato, host del
+  client_id e del redirect, ambiti, avviso per i redirect di loopback,
+  codice di approvazione `XXXX-XXXX` dall'alfabeto senza ambiguità,
+  istruzioni col comando da digitare. L'URL porta un handle a 256 bit,
+  cosa diversa dal codice.
+- **L'approvazione è locale**: `engramma oauth pending/approve/deny/
+  grants/revoke/log` su `oauth.db` (le richieste ricordano il tetto
+  offerto dal processo: l'approvazione arriva da un altro processo).
+  `--label` obbligatoria (`[a-z0-9-]{1,32}`) e diventa l'attore
+  `mcp:<etichetta>`; `--cells`/`--scope` restringono; la CLI stampa
+  host e redirect e chiede conferma senza `--yes`. Il codice da solo
+  non autorizza niente: conta dove viene digitato.
+- **`/token`**: solo form urlencoded; tetto globale di 60/min poi 429
+  con `Retry-After` (dietro un tunnel ogni chiamante è 127.0.0.1: le
+  intestazioni inoltrate non si usano); `authorization_code` con PKCE
+  (il **riuso del codice revoca la famiglia**, evento nel log),
+  `refresh_token` a rotazione (il **riuso del vecchio revoca il grant
+  intero**; scaduto o sconosciuto → `invalid_grant`, mai
+  `invalid_request`). Accesso 1 h; refresh 30 giorni dall'ultimo uso,
+  90 giorni di massimo assoluto. Token opachi `eng_at_`/`eng_rt_` a 256
+  bit. Perché opachi e non JWT: la risorsa e l'autorizzazione sono lo
+  stesso processo — scritto nel DESIGN.
+- **`/revoke`** RFC 7009: 200 anche per token sconosciuto (test). Il
+  viaggio completo col **binario vero** per l'approvazione (`engramma
+  oauth approve … --yes` → il rinfresco redirige con `code`, `state`,
+  `iss`) e ogni caso negativo ha il suo test.
+- Corretto in corsa un **auto-deadlock** del lock dello store
+  (`request_deny` chiamava `event()` tenendo la guardia: secco il
+  processo del test, trovato con `ps`).
+
+## P1+P4 — `/mcp` come resource server (un commit, `cf2a7f0`)
+
+Un commit solo per i due punti perché sono la stessa superficie: il gate
+risolve il token e il grant plasma la stessa richiesta — dividerli
+avrebbe lasciato P1 con un gate che non concede niente, o P4 senza il
+trasporto su cui valere.
+
+- **`mcp --http 127.0.0.1:8787 --public-url https://…`**: ascolto solo
+  loopback (il resto è rifiutato — test), `--public-url` https
+  obbligatoria senza query né frammento (l'eccezione `http://127.0.0.1`
+  esiste solo nella configurazione della libreria: mai dalla CLI),
+  `--actor` con `--http` è errore d'uso. rmcp 3.8 monta il suo
+  `StreamableHttpService` su axum: protocollo 2026-07-28 senza sessione
+  e versioni precedenti con `legacy_session_mode` (ChatGPT parla la
+  2025-11-25), corpo massimo 1 MiB, stesse `instructions` e strumenti.
+- **Il recinto**: middleware `Host` su tutta la superficie (l'autorità
+  pubblica e i nomi di loopback; 403 altrimenti — test con TCP nudo),
+  `Origin` rifiutato ovunque un server chiami (`/mcp` con
+  `enforce_origin_validation` di rmcp, `/token`/`/register`/`/revoke`
+  con la stessa guardia — test), token nella query → 400 (test),
+  token assente/sconosciuto/scaduto/revocato/di altro pubblico → 401
+  con `WWW-Authenticate: Bearer resource_metadata=…, scope=…` (test
+  sull'esattezza della challenge). Registro d'accesso su stderr: ora,
+  id del grant, metodo MCP, strumento, stato, durata — **mai** token né
+  testo di note né argomenti (provato a cattura dello stderr del
+  binario). SIGINT/SIGTERM cancellano il CancellationToken di rmcp,
+  svuotano il listener e chiudono le celle (test: il processo esce).
+- **Il grant decide**: lista strumenti **per token** (cinque strumenti
+  di lettura per un grant di sola lettura — lista esatta fissata dal
+  test; `memory_propose` compare solo con ambito propose e una cella
+  scrivibile), celle visibili = grant ∩ `--cells`, una cella fuori dal
+  grant risponde **esattamente** come una che non esiste (test),
+  l'attore delle proposte è `mcp:<etichetta>` (provato sul `source`
+  della nota), `memory_propose` con token di sola lettura → il rifiuto
+  `insufficient_scope` (test), revoca con effetto alla richiesta
+  successiva (test con token vivo). Sessioni legacy legate al grant:
+  il token di B sulla sessione di A → 404 come una sconosciuta, e il
+  `requestState` 2026-07-28 è monouso e legato al grant (entrambi
+  provati, `0d0edac`).
+- **403 insufficient_scope**: rmcp non offre uno stato HTTP dentro una
+  chiamata di strumento (la chiamata è JSON-RPC dentro un 200). Il
+  rifiuto viaggia come errore dello strumento con la parola
+  `insufficient_scope`, l'ambito mancante e come ottenerlo; il 401 con
+  `error="insufficient_scope"` c'è al gate, quando il token non ha
+  nemmeno `memory:read`. È la scelta che restava, e il REPORT la dice.
+- Invarianti di sempre riprovati via HTTP: quarantena invisibile,
+  `external` rifiutato, oracolo chiuso sulle celle.
+
+## P5 — Le proposte dai client remoti (`74a6096`)
+
+- **Modulo via HTTP**: il giro MRTR 2026-07-28 funziona uguale: il
+  `tools/call` con `_meta` di versione e capacità riceve
+  `input_required` col modulo **precompilato** col testo proposto (la
+  correzione `bfdb1f5`, riprovata sul trasporto HTTP — test sull'`input`
+  `default` dello schema); il retry con `inputResponses` e `requestState`
+  applica la decisione (accetta-con-modifica provato, attore
+  `user@mcp:<etichetta>`), il `requestState` riusato è rifiutato.
+- **Client senza moduli** (ChatGPT): `pending`, e il testo contiene
+  solo il puntatore locale («`engramma proposals` o `engramma review`»):
+  **nessun URL, nessun token** — provato cercandoli nella risposta.
+- **Difetto trovato dai test nuovi, presente anche nella v0.5 in
+  stdio**: `mrtr_round` passava l'attore già prefissato e
+  `apply_form_answer` lo prefissava di nuovo — il registro firmava
+  `user@user@mcp:<attore>`. Ora un prefisso solo (il test cerca
+  esplicitamente il doppione).
+- La **modalità URL** resta fuori: una pagina di conferma raggiungibile
+  dal web esige di autenticare il proprietario sul web pubblico — serve
+  una passkey (WebAuthn), crate e fase a sé. DESIGN § 8.6 e § 12 la
+  mettono in candidates per la v0.7 con `engramma serve`.
+
+## P6 — `--compat chatgpt` (`048e130`)
+
+`search(query)` → `{results: [{id, title, url}]}` e `fetch(id)` →
+`{id, title, text, url, metadata}`: involucri di `memory_search` e
+`memory_get`, in `structuredContent` **e** come JSON in `content`
+(provato). Stessa quarantena (la nota nascosta risponde come una che
+non esiste — test), stesse celle del grant (`search` fonde le celle
+visibili: lo schema non ha `cell`), id **completi** (`fetch` non accetta
+prefissi), `url` sempre stringa vuota (la nota non ha un indirizzo
+pubblico; ChatGPT allora non cita la fonte — dichiarato). Esistono solo
+col flag: la lista esatta è fissata dal test, con e senza.
+
+## P7 — Documentazione (`9b6f9e8`)
+
+`docs/http.md` nuovo: i tunnel (Tailscale Funnel raccomandato — il TLS
+termina sul tuo computer; Cloudflare e ngrok **vedono il traffico in
+chiaro**, e il documento lo dice), come far arrivare l'`Host` pubblico,
+perché l'URL deve essere stabile (è la risorsa e l'issuer), il
+collegamento di ChatGPT e claude.ai, l'approvazione col codice, la
+revoca, chi vede cosa, le liste di IP facoltative al tunnel (difesa in
+più, non sostituto di OAuth). DESIGN: § 8.3 guadagna l'HTTP, § 8.6 nuovo
+con il modello delle minacce in otto punti e le scelte, § 12 segna la
+v0.5.2 fatta e le candidates v0.7. `mcp.md` apre con la tabella stdio
+contro HTTP; `cli.md` documenta `mcp --http` e i sei `oauth`.
+
+## Quello che i test non coprono (e perché)
+
+- **Il tunnel vero e i connettori veri** di claude.ai e ChatGPT: sei
+  offline, sono del revisore (il testo della fase lo prevede).
+- **Il token di un altro pubblico via HTTP**: provato a livello di store
+  (`WrongAudience`); sul filo non si può coniare un token per un
+  pubblico diverso, perché il server ne ha uno solo per costruzione.
+- **La scadenza dei DCR mai usati (24 h)** e **i bordi del clamp della
+  cache CIMD**: nel codice, senza test dedicati.
+
+## Per Homun
+
+Niente da fare: aggancio facoltativo. `oauth.db` non lo riguarda (vive
+nella radice dei dati e non tocca il contratto JS). Il `.node` è stato
+rifatto: **cambia** (P0.1 tocca il core — la decisione automatica sotto
+lock — che il modulo linka), `index.js` e `index.d.ts` sono **identici**
+alla v0.5 (SHA sotto): il contratto JS è invariato. Le avvertenze della
+v0.5 sullo schema 13 restano.
+
+## Chiusura
+
+- **macOS:** `cargo fmt --check` verde; `cargo clippy --all-targets
+  --offline -- -D warnings` verde; `cargo test --offline --workspace`
+  **368+32 = vedi sotto** (il totale finale con gli ultimi test è nel
+  registro dei controlli: tutti verdi, nessuno ignorato);
+  `cargo test -p engramma-bench --example longmemeval` 3/3;
+  `cargo deny check licenses bans` verde.
+- **Linux:** `scripts/linux.sh` (fmt + clippy + test nel container
+  arm64, offline, rete chiusa) verde; volume `engramma-linux-target`
+  rimosso.
+- **Test JS:** Node 24.22.1; `test:electron` **29/29**, `test:electron-main`
+  ok — senza cambiare le attese.
+- **Build:** `npm run build` rifatto. SHA256:
+  `engramma.darwin-arm64.node`
+  `036aa42287a76216c8ee4c78bc958c7e71a3cc5b07708ec85eb35cc6ed420327`;
+  `index.js`
+  `25fd9cc1d50a1ec3f2d74bc004d904663ff07360102d27b938870329d9c832d4`;
+  `index.d.ts`
+  `bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a6488005bf69d9f8`.
+- **Banco a 10k:** non rifatto: la ricerca non cambia (`search` di P6 è
+  un involucro sopra `memory_search`, che resta com'era).
+- **Disco:** `du -sh target` **16G** all'inizio, **22G** alla fine
+  (build di sviluppo + release del `.node` + la build Linux nel volume,
+  rimosso; `~/.cache/cargo-target` mai toccato).
+- **Tag:** `fase-v0.5.2` annotato; temporanei cancellati; nessun push.
