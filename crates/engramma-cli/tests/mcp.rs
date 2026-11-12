@@ -450,3 +450,449 @@ fn mcp_without_cells_refuses() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--cells"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// v0.5 (P3): the write surface (`--write <cell> --actor <name>`)
+// ---------------------------------------------------------------------------
+
+fn spawn_writing(root: &std::path::Path, cells: &str, write: &str, actor: &str) -> Mcp {
+    let child = Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .args(["mcp", "--root"])
+        .arg(root)
+        .args(["--cells", cells])
+        .args(["--write", write])
+        .args(["--actor", actor])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap(/* test-only */);
+    Mcp { child }
+}
+
+impl Mcp {
+    /// Answer a server-initiated elicitation with `(action, text)`.
+    fn answer_elicitation(&mut self, action: &str, text: &str, shows: &str) {
+        // read lines until the server asks; the request has a `method` and
+        // an `id` but no `result`
+        let stdout = self.child.stdout.as_mut().expect(/* test-only */ "stdout");
+        let mut reader = BufReader::new(stdout);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the elicitation request"
+            );
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).unwrap(/* test-only */);
+            assert!(n > 0, "server closed stdout");
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = serde_json::from_str(trimmed).unwrap(/* t */);
+            if v.get("method").and_then(|m| m.as_str()) == Some("elicitation/create") {
+                let id = v.get("id").cloned().unwrap_or(serde_json::json!(1));
+                let params = &v["params"];
+                assert!(
+                    params["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains(shows)),
+                    "the form shows the proposal: {params}"
+                );
+                assert!(
+                    params["requestedSchema"]["properties"]["text"].is_object(),
+                    "the editable text field: {params}"
+                );
+                let answer = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "action": action,
+                        "content": { "text": text }
+                    }
+                });
+                self.send(&answer.to_string());
+                return;
+            }
+        }
+    }
+}
+
+fn open_with_policy(cells_dir: &std::path::Path, name: &str, policy: serde_json::Value) {
+    let cell = Cell::open(&cells_dir.join(format!("{name}.sqlite"))).unwrap(/* t */);
+    cell.set_policy(policy, "test").unwrap(/* t */);
+}
+
+fn init(mcp: &mut Mcp, id: i64, protocol: &str, elicitation: bool) -> serde_json::Value {
+    let capabilities = if elicitation {
+        serde_json::json!({ "elicitation": {} })
+    } else {
+        serde_json::json!({})
+    };
+    mcp.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "initialize",
+            "params": {
+                "protocolVersion": protocol,
+                "capabilities": capabilities,
+                "clientInfo": { "name": "test-client", "version": "9.9" }
+            }
+        })
+        .to_string(),
+    );
+    let init = mcp.read_response(id);
+    mcp.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    init
+}
+
+fn propose_call(id: i64, cell: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": "memory_propose", "arguments": { "cell": cell, "text": text } }
+    })
+}
+
+fn tool_payload(res: &serde_json::Value) -> serde_json::Value {
+    let text = res["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    serde_json::from_str(text).unwrap_or(serde_json::Value::Null)
+}
+
+#[test]
+fn the_tool_list_is_exact_with_and_without_write() {
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let cells = cell_root(dir.path());
+    make_cell(&cells, "scrivibile", "Fabio nuota in piscina.");
+
+    // without --write: the five read tools, annotated read-only
+    let mut mcp = spawn(dir.path(), "scrivibile");
+    init(&mut mcp, 1, "2025-06-18", false);
+    mcp.send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
+    let list = mcp.read_response(2);
+    let mut tools: Vec<String> = list["result"]["tools"]
+        .as_array()
+        .unwrap(/* t */)
+        .iter()
+        .map(|t| t["name"].as_str().unwrap(/* t */).to_string())
+        .collect();
+    tools.sort();
+    assert_eq!(
+        tools,
+        vec![
+            "memory_get",
+            "memory_neighbors",
+            "memory_search",
+            "memory_tags",
+            "memory_timeline"
+        ]
+    );
+    for t in list["result"]["tools"].as_array().unwrap(/* t */) {
+        assert_eq!(t["annotations"]["readOnlyHint"], true, "{t}");
+    }
+
+    // with --write: memory_propose joins, and only it writes
+    let mut mcp = spawn_writing(dir.path(), "scrivibile", "scrivibile", "claude-desktop");
+    init(&mut mcp, 1, "2025-06-18", false);
+    mcp.send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
+    let list = mcp.read_response(2);
+    let mut tools: Vec<String> = list["result"]["tools"]
+        .as_array()
+        .unwrap(/* t */)
+        .iter()
+        .map(|t| t["name"].as_str().unwrap(/* t */).to_string())
+        .collect();
+    tools.sort();
+    assert_eq!(
+        tools,
+        vec![
+            "memory_get",
+            "memory_neighbors",
+            "memory_propose",
+            "memory_search",
+            "memory_tags",
+            "memory_timeline"
+        ]
+    );
+    for t in list["result"]["tools"].as_array().unwrap(/* t */) {
+        let expected = t["name"] == serde_json::json!("memory_propose");
+        assert_eq!(t["annotations"]["readOnlyHint"], !expected, "{t}");
+        if expected {
+            assert_eq!(t["annotations"]["destructiveHint"], false, "{t}");
+            assert_eq!(t["annotations"]["openWorldHint"], false, "{t}");
+        }
+    }
+    // the instructions tell the assistant the courtesy protocol
+    let _ = init; // (the instructions are on initialize; checked below)
+}
+
+#[test]
+fn a_proposal_lands_in_the_queue_and_a_duplicate_is_refused() {
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let cells = cell_root(dir.path());
+    make_cell(&cells, "mem", "Fabio nuota in piscina.");
+    open_with_policy(&cells, "mem", serde_json::json!({ "write": "propose" }));
+
+    let mut mcp = spawn_writing(dir.path(), "mem", "mem", "claude-desktop");
+    let info = init(&mut mcp, 1, "2025-06-18", false);
+    // the instructions carry the proposing etiquette
+    let instructions = info["result"]["instructions"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        instructions.contains("ASK the user first"),
+        "{instructions}"
+    );
+    assert!(instructions.contains("NEVER propose"), "{instructions}");
+    assert!(
+        instructions.contains("mcp:claude-desktop"),
+        "{instructions}"
+    );
+
+    mcp.send(&propose_call(2, "mem", "Fabio corre la mattina.").to_string());
+    let res = mcp.read_response(2);
+    let payload = tool_payload(&res);
+    assert_eq!(payload["status"], "pending", "{payload}");
+    assert!(payload["id"].as_str().is_some(), "{payload}");
+
+    // it is in the queue, quarantined, signed by the actor
+    let cell = Cell::open(&cells.join("mem.sqlite")).unwrap(/* t */);
+    let queue = engramma_core::cell::proposals::ProposalsFilter::default();
+    let rows = cell.proposals(&queue).unwrap(/* t */);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].proposer, "mcp:claude-desktop");
+    assert_eq!(rows[0].client.as_deref(), Some("test-client 9.9"));
+    assert_eq!(rows[0].note.status, Status::Quarantined);
+
+    // the same text again: a duplicate, and nothing new queued
+    mcp.send(&propose_call(3, "mem", "Fabio  corre la mattina!").to_string());
+    let res = mcp.read_response(3);
+    let payload = tool_payload(&res);
+    assert_eq!(payload["status"], "duplicate", "{payload}");
+    assert_eq!(
+        cell.proposals(&queue).unwrap(/* t */).len(),
+        1,
+        "the duplicate wrote nothing"
+    );
+
+    // a closed cell refuses: the policy is the first word
+    open_with_policy(&cells, "mem", serde_json::json!({ "write": "off" }));
+    mcp.send(&propose_call(4, "mem", "Fabio mangia sushi.").to_string());
+    let res = mcp.read_response(4);
+    assert!(
+        res.get("error").is_some_and(|e| {
+            e["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("does not accept proposals"))
+        }),
+        "{res}"
+    );
+}
+
+#[test]
+fn a_cell_outside_the_write_list_refuses_without_revealing_more() {
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let cells = cell_root(dir.path());
+    make_cell(&cells, "aperta", "Fabio nuota in piscina.");
+    make_cell(&cells, "sola_lettura", "Nota su [[Torino]].");
+    make_cell(&cells, "segreta", "Nota riservata.");
+    for name in ["aperta", "sola_lettura"] {
+        open_with_policy(&cells, name, serde_json::json!({ "write": "propose" }));
+    }
+
+    let mut mcp = spawn_writing(dir.path(), "aperta,sola_lettura", "aperta", "claude");
+    init(&mut mcp, 1, "2025-06-18", false);
+    // exposed but not writable: the answer names only the writable set
+    mcp.send(&propose_call(2, "sola_lettura", "Fabio corre.").to_string());
+    let res = mcp.read_response(2);
+    assert!(
+        res.get("error").is_some_and(|e| {
+            e["message"].as_str().is_some_and(|m| {
+                m.contains("does not accept proposals through this server")
+                    && m.contains("writable cells: aperta")
+            })
+        }),
+        "{res}"
+    );
+    // not exposed at all: the same answer the read tools give, nothing more
+    mcp.send(&propose_call(3, "segreta", "Fabio corre.").to_string());
+    let res = mcp.read_response(3);
+    assert!(
+        res.get("error").is_some_and(|e| e["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not exposed"))),
+        "{res}"
+    );
+}
+
+#[test]
+fn confirm_without_elicitation_capability_stays_pending_with_a_pointer() {
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let cells = cell_root(dir.path());
+    make_cell(&cells, "mem", "Fabio nuota in piscina.");
+    open_with_policy(&cells, "mem", serde_json::json!({ "write": "confirm" }));
+
+    let mut mcp = spawn_writing(dir.path(), "mem", "mem", "claude");
+    init(&mut mcp, 1, "2025-06-18", false); // NO elicitation capability
+    mcp.send(&propose_call(2, "mem", "Fabio sciaga.").to_string());
+    let res = mcp.read_response(2);
+    let payload = tool_payload(&res);
+    assert_eq!(payload["status"], "pending", "{payload}");
+    assert!(
+        payload["note"]
+            .as_str()
+            .is_some_and(|n| n.contains("engramma proposals")),
+        "the answer says where to confirm: {payload}"
+    );
+}
+
+#[test]
+fn confirm_with_the_server_requested_form_accepts_rejects_and_cancels() {
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let cells = cell_root(dir.path());
+    make_cell(&cells, "mem", "Fabio nuota in piscina.");
+    open_with_policy(&cells, "mem", serde_json::json!({ "write": "confirm" }));
+
+    let mut mcp = spawn_writing(dir.path(), "mem", "mem", "claude");
+    init(&mut mcp, 1, "2025-06-18", true);
+
+    // accept with the text EDITED by the human
+    mcp.send(&propose_call(2, "mem", "Fabio sciaga.").to_string());
+    mcp.answer_elicitation("accept", "Fabio sciaga in Dolomiti.", "sciaga");
+    let res = mcp.read_response(2);
+    let payload = tool_payload(&res);
+    assert_eq!(payload["status"], "accepted", "{payload}");
+    assert_eq!(payload["decided_by"], "user@mcp:claude", "{payload}");
+    let id = payload["id"].as_str().unwrap(/* t */).to_string();
+    let cell = Cell::open(&cells.join("mem.sqlite")).unwrap(/* t */);
+    let note = cell
+        .get(&ulid::Ulid::from_string(&id).unwrap(/* t */))
+        .unwrap(/* t */);
+    assert_eq!(note.status, Status::Active);
+    assert_eq!(note.body, "Fabio sciaga in Dolomiti.", "the edit landed");
+
+    // a plain accept keeps the proposed text
+    mcp.send(&propose_call(3, "mem", "Fabio gioca a scacchi.").to_string());
+    mcp.answer_elicitation("accept", "Fabio gioca a scacchi.", "scacchi");
+    let res = mcp.read_response(3);
+    assert_eq!(tool_payload(&res)["status"], "accepted");
+
+    // the RIFIUTA button rejects: the lapide keeps the text
+    mcp.send(&propose_call(4, "mem", "Fabio vende la casa.").to_string());
+    mcp.answer_elicitation("decline", "Fabio vende la casa.", "casa");
+    let res = mcp.read_response(4);
+    let payload = tool_payload(&res);
+    assert_eq!(payload["status"], "rejected", "{payload}");
+    let id = payload["id"].as_str().unwrap(/* t */).to_string();
+    let note = cell
+        .get(&ulid::Ulid::from_string(&id).unwrap(/* t */))
+        .unwrap(/* t */);
+    assert_eq!(note.status, Status::Deleted);
+    assert_eq!(note.body, "Fabio vende la casa.");
+
+    // ANNULLA leaves it pending, in the queue
+    mcp.send(&propose_call(5, "mem", "Fabio cucina il pesce.").to_string());
+    mcp.answer_elicitation("cancel", "", "pesce");
+    let res = mcp.read_response(5);
+    let payload = tool_payload(&res);
+    assert_eq!(payload["status"], "pending", "{payload}");
+}
+
+#[test]
+fn confirm_with_the_2026_input_required_round() {
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let cells = cell_root(dir.path());
+    make_cell(&cells, "mem", "Fabio nuota in piscina.");
+    open_with_policy(&cells, "mem", serde_json::json!({ "write": "confirm" }));
+
+    let mut mcp = spawn_writing(dir.path(), "mem", "mem", "claude");
+    // 2026-07-28 speaks the discover flow: no initialize handshake — every
+    // request carries its own `_meta` (version + capabilities)
+    let meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+    });
+
+    // the first round answers input_required, with the form inside
+    mcp.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "memory_propose",
+                "arguments": { "cell": "mem", "text": "Fabio va in barca." },
+                "_meta": meta
+            }
+        })
+        .to_string(),
+    );
+    let res = mcp.read_response(2);
+    assert_eq!(res["result"]["resultType"], "input_required", "{res}");
+    let request = &res["result"]["inputRequests"]["confirm"];
+    assert!(request.is_object(), "{res}");
+    assert!(
+        request["params"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("barca")),
+        "{res}"
+    );
+    let state = res["result"]["requestState"]
+        .as_str()
+        .unwrap(/* t */)
+        .to_string();
+
+    // the proposal is ALREADY queued: a client that never retries loses
+    // nothing
+    let cell = Cell::open(&cells.join("mem.sqlite")).unwrap(/* t */);
+    assert_eq!(
+        cell.proposals(&engramma_core::cell::proposals::ProposalsFilter::default())
+            .unwrap(/* t */)
+            .len(),
+        1
+    );
+
+    // the retry: the same call with the answers and the echoed state
+    mcp.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "memory_propose",
+                "arguments": { "cell": "mem", "text": "Fabio va in barca." },
+                "_meta": meta,
+                "inputResponses": {
+                    "confirm": { "action": "accept", "content": { "text": "Fabio va in barca a vela." } }
+                },
+                "requestState": state
+            }
+        })
+        .to_string(),
+    );
+    let res = mcp.read_response(3);
+    let payload = tool_payload(&res);
+    assert_eq!(payload["status"], "accepted", "{res}");
+    let id = payload["id"].as_str().unwrap(/* t */).to_string();
+    let note = cell
+        .get(&ulid::Ulid::from_string(&id).unwrap(/* t */))
+        .unwrap(/* t */);
+    assert_eq!(note.body, "Fabio va in barca a vela.", "the edit landed");
+
+    // an unknown requestState is refused: the state is one-shot
+    mcp.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {
+                "name": "memory_propose",
+                "arguments": { "cell": "mem", "text": "Fabio dorme." },
+                "_meta": meta,
+                "inputResponses": {
+                    "confirm": { "action": "accept", "content": { "text": "Fabio dorme." } }
+                },
+                "requestState": state
+            }
+        })
+        .to_string(),
+    );
+    let res = mcp.read_response(4);
+    assert!(res.get("error").is_some(), "{res}");
+}

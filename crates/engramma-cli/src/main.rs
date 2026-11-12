@@ -248,11 +248,18 @@ enum Command {
         #[command(subcommand)]
         action: VaultAction,
     },
-    /// Start the MCP server (stdio, read-only)
+    /// Start the MCP server (stdio)
     Mcp {
         /// Exposed cells (comma-separated; without this flag no cell is exposed)
         #[arg(long, value_delimiter = ',')]
         cells: Vec<String>,
+        /// Cells that also accept PROPOSALS through `memory_propose`
+        /// (comma-separated; a subset of --cells)
+        #[arg(long, value_delimiter = ',')]
+        write: Vec<String>,
+        /// Who signs the proposals (`mcp:<actor>`); required with --write
+        #[arg(long)]
+        actor: Option<String>,
     },
 }
 
@@ -1291,14 +1298,31 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             Ok(())
         }
         Command::Vault { action } => run_vault(cli, action),
-        Command::Mcp { cells } => {
+        Command::Mcp {
+            cells,
+            write,
+            actor,
+        } => {
             if cells.is_empty() {
                 return Err(CliError::usage(
                     "`engramma mcp` needs --cells <a,b>: without it no cell would be exposed",
                 ));
             }
+            if !write.is_empty() && actor.is_none() {
+                return Err(CliError::usage(
+                    "`--write` needs `--actor <name>`: proposals must be attributable",
+                ));
+            }
+            for w in write {
+                if !cells.contains(w) {
+                    return Err(CliError::usage(format!(
+                        "`--write {w}` names a cell that is not in `--cells`"
+                    )));
+                }
+            }
             let names: Vec<String> = cells.clone();
-            engramma_mcp::run(root(cli), &names)
+            let writable: Vec<String> = write.clone();
+            engramma_mcp::run(root(cli), &names, &writable, actor.as_deref())
                 .map_err(|e| CliError::internal(format!("mcp: {e}")))
         }
     }
