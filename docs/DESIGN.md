@@ -156,6 +156,18 @@ Indici: `edges(src)`, `edges(dst)`, `edges(rel)`, `notes(status, valid_to)`, `no
 ### 4.5 Lo strato di accesso ai dati
 Il trait `CellStore` isola SQL, FTS e vettori: un'implementazione SQLite oggi, Turso o altro domani. Il resto del motore non contiene SQL.
 
+### 4.3.1 La convergenza del registro (v0.6)
+
+Lo stato di una copia è funzione dell'**insieme** delle operazioni che possiede, mai dell'ordine di arrivo (§ 4). Le regole:
+
+- **L'identità in rete.** `content_hash` = blake3 del contenuto canonico `{op_id, hlc, actor, kind, note_id, base, payload_digest}` (più `base` quando vive). La stessa operazione ha la stessa identità su ogni copia; `prev_hash`/`hash` restano la **catena locale d'arrivo** di quel disco. Il payload digest già impegna corpo e sale: l'identità è stabile sotto redazione.
+- **L'ordine totale.** `(hlc.physical_ms, hlc.counter, hlc.node, op_id)`. I node id sono a larghezza fissa (12 esadecimali): `ORDER BY hlc, op_id` in SQL percorre lo stesso ordine.
+- **La materializzazione per oggetto.** Un'operazione che nell'ordine totale cade **prima** dell'ultima già applicata al suo oggetto lo fa **rimaterializzare**: le righe di stato vanno, lo stato al taglio di compattazione torna dall'istantaneo di versione del primo arrivo sopra il taglio, e tutte le operazioni dell'oggetto si rigiocano in ordine totale, ciascuna nella metà che lo riguarda (un `supersede` vale per la nota nuova e per la vecchia; una `decide` per la proposta e per il bersaglio; la riga `supersedes` la scrivono entrambe le metà, `INSERT OR IGNORE`). Chi arriva ultimo applica diretto: il caso comune non costa di più. Un'operazione su un oggetto che non c'è ancora si **conserva** in attesa (`pending_objects`, tavola locale) e materializza quando arriva la put.
+- **`base`: chi ha visto cosa.** Ogni operazione che modifica una nota esistente porta `base`, il `content_hash` dell'ultima operazione di quella nota che l'autore aveva applicato. Due operazioni con la stessa `base` sono **concorrenti**. Prima della v0.6 non c'è: sequenziali per dichiarazione.
+- **Le regole dei conflitti.** Intestazione (titolo, tag, validità, tipo, confidenza, stato): l'ultima scrittura per campo nell'ordine totale. Corpo con modifiche concorrenti: vince l'ultima nell'ordine totale; la perdente diventa una **copia di conflitto** — nota attiva con id deterministico `blake3("engramma/conflict/v1" ‖ content_hash del perdente)` in forma ULID con la parte temporale dell'HLC del perdente, tag `conflitto`, arco verso l'originale — **stato derivato**: ogni copia la produce identica senza un'operazione; le correzioni dell'utente su di lei sono operazioni normali sul suo id. `decide` concorrenti sulla stessa proposta: vale la **prima** nell'ordine totale; le altre restano nel registro come «decisione superata» (`decisions`), senza effetto; `revert_decision` segue le stesse regole. `delete` contro modifica concorrente: vince la lapide se è l'ultima nell'ordine; una modifica successiva alla lapide la riapre **solo se la sua `base` è la lapide stessa** (chi modifica l'aveva vista — la lapide o chi dopo di lei la lasciò chiusa). **La `purge` domina sempre**: quando l'insieme contiene una purge della nota X, ogni operazione di X si conserva **redatta**, X non materializza, e le sue copie di conflitto vanno con lei; anche gli archi che la nominano come estremo.
+- **La frontiera stabile e la compattazione.** In una cella condivisa si compatta solo sotto la **frontiera stabile** — la testa più profonda che **tutti** i dispositivi vivi hanno confermato (`device_acks`, una riga per sessione); sopra la frontiera i payload restano. Un dispositivo nuovo parte da un'**istantanea logica** alla frontiera, poi riceve le operazioni sopra.
+- **`adopt`.** Le operazioni scritte prima della v0.6 non hanno firma. Chi condivide firma un'operazione `adopt` con la radice di Merkle dei `content_hash` di tutto ciò che esiste: un'operazione senza firma è accettata solo coperta da un `adopt` valido.
+
 ## 5. Affidabilità, quarantena, fonte
 
 - **Ogni scrittura richiede `source` e `confidence`**, altrimenti viene rifiutata.
@@ -166,7 +178,7 @@ Il trait `CellStore` isola SQL, FTS e vettori: un'implementazione SQLite oggi, T
 - **«Perché lo so?»:** ogni risultato porta la sua `source`. L'applicazione la trasforma in un collegamento, per esempio la conversazione di Homun.
 - **Fatti che cambiano.** Una nota che sostituisce un'altra (`supersedes`) le mette `valid_to` e la marca `superseded`. Restano nello storico e rispondono alle domande «com'era prima».
 - **Le proposte (v0.5).** Accanto alla quarantena dei contenuti `external` c'è la **coda delle proposte**: una nota che un assistente propone nasce in quarantena — la ricerca non la vede, il grafo non la semina — con i suoi metadati (chi propone, client dichiarato, modo `new`/`supersede`, motivazione). Le due cose sono distinte: `external` è quarantena di *contenuto* (terze parti), la coda è quarantena di *autore* (un modello). Se ne decide in § 8.5: politica per cella, revisore automatico, decisioni applicate nell'operazione che le registra, annullamento che non riscrive mai la storia.
-- **L'invariante d'indistinguibilità (v0.5.3).** La visibilità di stato entra **dentro** ogni lista, prima di ranghi e normalizzazioni: la query BM25 porta il filtro di stato nel JOIN (gli stessi stati della lettura), i ranghi vettoriali si numerano dopo il filtro, il grafo espelle le note nascoste dall'uscita del push prima della finestra e della normalizzazione, e le frequenze/totali contano i soli visibili. Ne segue la proprietà che il codice mantiene come invariante (proptest dedicato, tre modalità): **la stessa domanda dà gli stessi risultati — stessi id, ranghi densi da 1, massimo normalizzato a 1, stessi coseni, supporti e percorsi — con o senza note in quarantena e lapidi che corrispondono alla domanda**. L'eccezione dichiarata: i *valori* dei punteggi portano l'ε dell'IDF di FTS5, che SQLite calcola sull'indice intero (le righe in quarantena devono restarci: `include_quarantined` è contratto); l'ε è misurata nel banco (≈0,8% a tre note con match puliti, fino a ~0,8 su corpus minimi patologici, trascurabile a dimensioni reali) e non è leggibile da nessun controfattuale. Su HTTP, `explain` non è più un oracolo sulle note nascoste: i ranghi non partono da 2, il `fused_score` del primo è 1, nessun visibile è spinto fuori dalla finestra.
+- **L'invariante d'indistinguibilità (v0.5.3).** La visibilità di stato entra **dentro** ogni lista, prima di ranghi e normalizzazioni: la query BM25 porta il filtro di stato nel JOIN (gli stessi stati della lettura), i ranghi vettoriali si numerano dopo il filtro, il grafo espelle le note nascoste dall'uscita del push prima della finestra e della normalizzazione, e le frequenze/totali contano i soli visibili. Ne segue la proprietà che il codice mantiene come invariante (proptest dedicato, tre modalità): **la stessa domanda dà gli stessi risultati — stessi id, ranghi densi da 1, massimo normalizzato a 1, stessi coseni, supporti e percorsi — con o senza note in quarantena e lapidi che corrispondono alla domanda**. **(v0.6, P0) La proprietà è ora esatta, bit per bit:** le note in quarantena vivono in un indice FTS **separato** (`notes_fts_hidden`), quindi l'IDF, le frequenze dei documenti, i ranghi e le normalizzazioni della vista predefinita non le vedono affatto — l'eccezione dell'ε dell'IDF è sparita, e il proptest la chiede uguale anche nei punteggi (stesso `score`, `raw_score`, `fused_score`, coseni), con il caso «Zebedeo tonno» del revisore come test a sé. La vista del proprietario (`include_quarantined`) interroga entrambi gli indici e li fonde **per rango** (RRF con k=60 nel ramo testo, pari merito spezzato per id): i due bm25 sono numeri incommensurabili, e l'alternativa — un indice unico — è esattamente ciò che questa fase ha tolto. Sopra la stessa impronta non è un segreto: la proprietà riguarda il controfattuale remoto, non la vista del proprietario. Su HTTP, `explain` non è più un oracolo sulle note nascoste: i ranghi non partono da 2, il `fused_score` del primo è 1, nessun visibile è spinto fuori dalla finestra.
 
 ## 6. La ricerca mista
 
@@ -472,137 +484,16 @@ segreti client, mai token nella query string.
 
 ## 10. Cifratura e condivisione
 
-- **Sul disco:**
-  - in locale ci si affida alla cifratura del sistema (FileVault, BitLocker);
-  - più avanti, opzionale, la cifratura della cella. **Da decidere:** SQLCipher, licenza BSD, che è C ma si incorpora bene, oppure cifratura a livello di pagina.
-- **Condivisione Homun ↔ Homun (v0.5):**
-  - **Identità:** una coppia di chiavi per installazione (Ed25519/X25519).
-  - **Abbinamento** con un codice o un QR e verifica dell'impronta.
-  - **Le operazioni del registro** di una cella condivisa viaggiano **cifrate da un capo all'altro**:
-    - la cella ha una sua chiave (XChaCha20-Poly1305), distribuita ai partecipanti cifrata con le loro chiavi;
-    - in seguito, per i gruppi, **MLS (RFC 9420)**, che rinnova le chiavi quando qualcuno entra o esce.
-  - **Un nodo che inoltra soltanto** conserva e passa operazioni cifrate e **non può cercare**: la ricerca la fa ogni partecipante sulla sua copia.
+### 10.1 I dispositivi del proprietario (v0.6)
 
-  È una scelta consapevole: oggi la ricerca su dati cifrati è lenta e limitata.
-  - **Permessi per cella:** lettura, proposta (che finisce in quarantena), scrittura. Sono revocabili, e la revoca ruota la chiave.
-- **Agenti di altri sistemi:** sopra il canale cifrato si possono scambiare messaggi A2A, ma il canale e i permessi restano i nostri. A2A di per sé non è cifrato da un capo all'altro.
+- **Sul disco:** in locale ci si affida alla cifrazione del sistema (FileVault, BitLocker); più avanti, opzionale, la cifratura della cella (**da decidere:** SQLCipher, BSD, o cifratura a livello di pagina).
+- **L'identità del dispositivo.** `<root>/device.key`: un seme da 32 byte, permessi 0600, mai lasciato dal disco. HKDF-SHA256 con etichette distinte ne deriva la chiave di **trasporto** iroh (Ed25519), quella di **firma** delle operazioni (Ed25519) e quella **HPKE** (X25519) — mai la stessa chiave per due usi. L'id del dispositivo **è** la chiave pubblica di firma: ogni firma nomina il suo autore per costruzione. Il portachiavi del sistema è un seguito.
+- **L'elenco dei dispositivi** (`devices.db`): un piccolo registro firmato per radice dei dati — `create` (il primo, da sé), `add` (un membro garantisce), `remove` (un membro revoca, con la radice di Merkle e il conto delle operazioni del revocato che chi rimuoveva aveva accettato). **La revoca domina:** chi è stato rimosso non rientra; l'ultimo dispositivo non si rimuove; un non-membro vivo non firma nulla. L'elenco si riconcilia **prima** delle celle, a ogni sessione.
+- **La firma delle operazioni.** Ed25519 sul `content_hash` (§ 4.3.1), colonne `device` e `sig`. Una firma che non torna, o un autore assente o rimosso, non entra. `actor` resta quello di sempre (`user`, `mcp:<etichetta>`…); l'autore crittografico è il dispositivo, e `revert --by device:<nome>` lo usa.
+- **L'abbinamento.** Due modi, un esito: il **biglietto** (indirizzo iroh di chi invita più un segreto a 128 bit, base32 con prefisso di versione, dieci minuti e un uso; chi entra autentica chi invita dal MAC del segreto sul transcript — il segreto in chiaro non attraversa mai) e il **codice breve** (`7-tigre-lago`: canale più due parole da una lista fissa di 2048 parole italiane nel repo; SPAKE2 — RFC 9382, gruppo Ed25519 — col codice come password; **un tentativo per canale**: un attaccante attivo ha una possibilità su 2048². *La crate `spake2` non ha audit indipendente: l'uso è confinato a questo percorso*). In entrambi i casi entrambi gli schermi stampano le stesse **sei cifre** (SAS: blake3 del segreto condiviso e del transcript) e l'umano conferma — solo dopo firma la `add`.
+- **Le buste.** Una chiave di cella per **epoca** (32 byte; l'epoca 0 da chi condivide, k+1 da chi rimuove), avvolta per ciascun dispositivo con **HPKE** (RFC 9180, modo base, X25519 HKDF-SHA256 ChaCha20-Poly1305, `info = etichetta ‖ cell_sync_id ‖ epoca`). L'operazione viaggia in **XChaCha20-Poly1305** (chiave `HKDF(chiave d'epoca, "engramma/op/v1")`, nonce casuale di 24 byte, AAD = `cell_sync_id ‖ epoca ‖ id opaco`). Sul filo fra dispositivi la busta sta comunque dentro QUIC: il sigillo serve al relay e al nodo cieco.
+- **Gli id opachi.** `cell_sync_id` = HMAC della chiave d'epoca 0; l'id opaco di un'operazione = HMAC(chiave di mac stabile, `content_hash`): le operazioni si riconoscono attraverso le epoche, e il nodo cieco non vede né `op_id` né HLC.
+- **Il nodo cieco** (`engramma/mailbox/1`): conserva e consegna buste sigillate per elenco e `cell_sync_id`, indicizzate per id opaco e null'altro; **non ha chiavi di cella**. Accetta solo dalle chiavi di trasporto dei dispositivi vivi; i nomi nell'elenco viaggiano cifrati per i soli dispositivi (lui vede chiavi). La `purge` arriva **firmata** e i byte delle buste nominate se ne vanno davvero (DELETE e VACUUM). Ritenzione: 180 giorni di base.
+- **Il modello delle minacce e i suoi limiti.** Il relay di n0 e il nodo cieco vedono chiavi, indirizzi, orari e dimensioni; non vedono testo, nomi, titoli, tag, autori, né `op_id` in chiaro. Possono trattenere o scartare messaggi (disponibilità), non falsificarli né riordinarli: le operazioni sono firmate e lo stato è indipendente dall'ordine (§ 4.3.1). Un orologio oltre ora+5 minuti è rifiutato all'arrivo. **Cosa questa fase non promette:** né sicurezza dopo compromissione (PCS) né segretezza in avanti (FS) per messaggio — una chiave d'epoca rubata apre tutta l'epoca; la rotazione alla rimozione è il compromesso giusto per i dispositivi di una sola persona. **MLS (RFC 9420)** presuppone un servizio di consegna che ordina (OpenMLS 0.9); **BeeKEM/Keyhive** e **DCGKA** sono ancora pre-alpha: è la scelta da rivedere per la condivisione con altre persone (v0.6.x). Fonti: RFC 9180 (HPKE), RFC 9382 (SPAKE2), RFC 9420 (MLS), il [paper Keyhive](https://dstaley.com/thesis.pdf) (2025) e [DCGKA](https://eprint.iacr.org/2024/1665) (2024).
+- **Quello che resta locale e non viaggia mai:** `device.key`, `oauth.db`, la configurazione; i legami della vista markdown; i vettori e il registro dei modelli (ogni dispositivo li ricalcola); le istantanee, la riga `hlc` di `meta`.
 
-## 11. Come si misura
-
-- **Benchmark nostro**, in italiano e inglese: storie sintetiche di una persona nell'arco di mesi (traslochi, lavori, persone, preferenze che cambiano), con domande:
-  - fattuali, temporali («dove abitava a marzo?»);
-  - di aggiornamento;
-  - multi-salto («chi lavora con il partner di…»);
-  - di astensione (la risposta non c'è).
-
-  Si misurano il richiamo@k e il MRR sulla parte del motore: **non** serve un giudice LLM, perché si giudica se la nota giusta è tra le prime k.
-- **Confronto esterno — LongMemEval** (v0.4.4, `bench/examples/longmemeval.rs`; metriche e divisione rifatte in v0.4.5): LongMemEval-S *cleaned*, 470 domande (le 30 di astensione escluse), una cella per domanda, nota = round, **metriche ufficiali** di `eval_utils.py` (`recall_any/all@k` e `ndcg@k` a livello turno e sessione — l'ndcg di sessione dal v0.4.5 è ESATTAMENTE quello ufficiale: lista non deduplicata, taglio `k_eff` al primo prefisso con k sessioni distinte, ideale che conta i round del corpus nelle sessioni giuste; ndcg = 0 se l'ideale è 0), k = 5 e 10, modalità testo (BM25, `graph_hops = 0`) e ibrida, `question_date` come «adesso» per la recenza. Lo studio di α (v0.4.5) divide le domande una volta per tutte: **dev** = le 150 del sottoinsieme fisso della v0.4.4, **test** = le altre 320 (sha256 della lista nel REPORT), e la scelta del predefinito avviene su dev + banco italiano, con il test guardato UNA volta, dopo. **Il numero di partenza (v0.4.5, su tutte le 470, α=0,5):** testo → sessione `any@5` 0,9702, `ndcg@5` 0,6607, turno `ndcg@5` 0,6829; ibrida → sessione `any@5` **0,9809**, `all@5` **0,8723**, `ndcg@5` **0,7536**, turno `any@5` **0,9106**, turno `ndcg@5` **0,6970** (corsa rifatta in verifica: la riga originale del REPORT era ad α=0,7). Su questo dataset ripulito BM25 è quasi saturo in cima, ma con α=0,5 la fusione lo batte su tutte le metriche, sessione e turno. I lavori pubblicati (dataset originale, indici diversi) riportano 0,8–0,97: il confronto resta un ordine di grandezza. LoCoMo solo con cautela: il suo giudice e le sue risposte di riferimento sono stati contestati nel 2026.
-- **Prestazioni**, su un Mac M-series, cella da 100 000 note — **misurate** (v0.4.3, verifiche; confermate dal banco in v0.4.4 entro il rumore):
-  - inserimento ~1 900–2 500 note/s senza embedding;
-  - ricerca testo + grafo p95 **12,3 ms**;
-  - ricerca mista calda (embedding della domanda già calcolato) p50 **10,5 ms**, p95 **13,9 ms**;
-  - ricerca ibrida con embedding della domanda p95 ~24 ms;
-  - apertura di una cella ~1 ms;
-  - embedding ~135–148 note/s (Granite 97M, 10 filoni).
-
-  Gli obiettivi della bozza (≥ 2 000/s, p95 ≤ 30 e ≤ 50 ms) sono dunque raggiunti con margine.
-- **Correttezza:**
-  - test di proprietà (giro del formato senza perdite; registro rigiocato = stesso stato; esportazione → importazione = stesso stato);
-  - `engramma verify`: ricostruisce gli indici e li confronta.
-
-## 12. Tabella di marcia
-
-| Versione | Contenuto | Dipende da | Stato |
-|---|---|---|---|
-| **v0.1** | Formato e parser; cella SQLite; registro con HLC e hash; versioni e lapidi; FTS con radici italiano/inglese; entità, relazioni e tag; validità e quarantena; ricerca testo + grafo + tempo con spiegazioni; import/export della cartella; CLI; MCP stdio in sola lettura; benchmark e test di proprietà | — | **fatta** (`fase-v0.1`, `fase-v0.1.1`) |
-| v0.2 | Embedder (ONNX incorporato via tract, Ollama, HTTP); vettori derivati con indice `FlatI8`; ricerca mista (RRF o convessa, scelta misurando); scelta misurata del modello; cambio di modello blu/verde | v0.1 | **fatta** (`fase-v0.2`, `fase-v0.2.1`) |
-| v0.3 | Grafo in memoria con PPR come terza lista (costo e multi-salto); registro v2 con payload dimenticabili; `purge`; compattazione con istantanee; vista markdown bidirezionale (riconciliazione per scansione, `notify` come innesco); candidati al consolidamento | v0.2 | **fatta** (`fase-v0.3`, `fase-v0.3.1`, `fase-v0.3.2`) |
-| v0.4 | Collegamento Node (napi-rs); **integrazione in Homun**: migrazione, strumenti, `search_history`, sezione Memoria, quarantena dai turni contaminati, audit MCP con ambiti | v0.3 | **fatta** (`fase-v0.4` … `fase-v0.4.4`). **Slittati fuori dalla v0.4:** il **grafo adattivo** (non ha raggiunto le soglie: multi-salto 0,458 a 100k col predefinito, contro il testo+grafo che già lo serve) e l'**audit MCP con ambiti** (MCP resta stdio in sola lettura con `--cells`); la chiusura v0.4.3–v0.4.4 ha consolidato disco, RAM, Linux e LongMemEval (§ 7 e § 11) |
-| v0.4.4 | Consolidamento: profili di build (`line-tables-only`), mimalloc nei due artefatti (§ 7), Linux arm64 provato in Docker (`scripts/linux.sh`), LongMemEval come numero esterno (§ 11), DESIGN alla verità | v0.4.3 | **fatta** (`fase-v0.4.4`) |
-| v0.4.5 | Il peso della fusione e il picco della RAM: metriche LongMemEval ufficiali (ndcg di sessione), α ritarato su due banchi e confermato su domande tenute da parte (0,5, § 6.3), lotti di embedding con tetto di token + ordinamento per lunghezza + pool fisso (§ 7), allocatore per piattaforma, cache NNEF provata e scartata | v0.4.4 | **fatta** (`fase-v0.4.5`) |
-| v0.4.6 | I lotti di embedding, davvero: il riempimento BatchLongest del tokenizer tolto (la v0.4.5 lo riempiva al più lungo: l'ordinamento era morto e una nota corta pagava la più lunga), offset dei lotti a somma prefissa, predefiniti budget 4096 × 1 lavoratore seguendo la regola della v0.4.5, griglia e banco rimisurati (§ 7); **v0.4.6.1** (correzione di verifica): budget predefinito 512 — picco 878 MB, 100 note/s a 10k | v0.4.5 | **fatta** (`fase-v0.4.6`, `fase-v0.4.6.1`) |
-| v0.5 | Scrivere da altri assistenti: proposte in quarantena con decisioni e rollback, politiche per cella e revisore automatico (§ 8.5), MCP in scrittura con elicitation (§ 8.3), CLI della coda, pagina locale di revisione, guardia sugli schemi più nuovi | v0.4.6 | **fatta** (`fase-v0.5`) |
-| v0.5.2 | MCP su HTTP con OAuth 2.1 (§ 8.6): resource server + server di autorizzazione con approvazione locale, CIMD col recinto SSRF, token opachi a rotazione, grant per token; `--compat chatgpt` | v0.5 | **fatta** (`fase-v0.5.2`) |
-| v0.5.3 | La lingua delle domande corte (§ 6.1: domanda incerta, espansione sulle lingue della cella; banco delle domande corte); l'indistinguibilità delle note nascoste (§ 5: visibilità dentro le liste, prima di ranghi e normalizzazioni); `search`/`fetch` solo al grant ChatGPT; le rifiniture HTTP di § 8.6 (tetti di `/authorize`, cache negativa del CIMD, `deny --all`, sessioni e turni MRTR con tetto e TTL, revoca per famiglia, recinto SSRF esteso, eventi con la causa) | v0.5.2 | **fatta** (`fase-v0.5.3`) |
-| v0.6 | Identità, abbinamento, sincronizzazione cifrata del registro tra pari, permessi per cella, conflitti. **Opzione sul tavolo dalla v0.4.5:** l'embedding in un processo separato (le soglie RAM di riposo del § 7 non sono state raggiunte: la memoria liberata resta residente con entrambi gli allocatori su macOS) | v0.5 | da fare |
-| v0.7 | `engramma serve`: API, autenticazione, molte celle | v0.6 | da fare |
-| v0.8 | Cluster: posizionamento Raft, router, replica multi-Raft, spostamento celle, backup su storage a oggetti | v0.7 | da fare |
-| poi | Python, Swift, Kotlin, WASM; MLS per i gruppi; messaggi A2A sul canale | — | — |
-
-**Candidati per la v0.7 (da decidere con l'utente, nessuna data):** la **modalità URL** dell'elicitation — una pagina di conferma raggiungibile dal web esige di autenticare il proprietario sul web pubblico: una **passkey** (WebAuthn), crate e fase a sé — e `engramma serve` (§ 9). L'approvazione OAuth potrebbe salire sulla pagina di revisione, se le celle e i grant si riconciliano.
-
-## 13. v0.1 nel dettaglio (sarà il primo prompt per GLM)
-
-**Repository nuovo** (`~/Projects/Bot/engramma`, nome da confermare), licenza **Apache-2.0**, Rust stabile, workspace come al § 8.1, con solo `engramma-core`, `engramma-cli` e `engramma-mcp`.
-
-1. **Formato** (§ 3):
-   - parser e serializzatore;
-   - validazione con errori leggibili;
-   - `spec/format-v0.md` con esempi validi e non validi usati come test;
-   - collegamenti, relazioni tipizzate e tag dal corpo.
-2. **Cella** (§ 4):
-   - schema e migrazioni versionate;
-   - ogni scrittura come operazione nella stessa transazione;
-   - HLC, ULID, hash concatenato;
-   - `note_versions`, lapidi, `supersedes` che chiude la validità.
-3. **Testo** (§ 6.1): `body_norm` con le radici (`rust-stemmers`) e rilevamento della lingua (`whatlang`).
-4. **Ricerca v0.1:**
-   - BM25 + allargamento nel grafo + filtri (tipo, tag con figli, `as_of`, affidabilità, quarantena, sostituite) + riordino per affidabilità e recenza;
-   - spiegazioni;
-   - `neighbors`, `path`, `tags`, `entities`, `timeline`, `history`, `changes_since`.
-5. **Import/export:**
-   - cartella markdown ↔ cella, senza perdite;
-   - import di una cartella Obsidian qualsiasi (le note senza intestazione ricevono `id`, `type: note` e `source: import:obsidian`).
-6. **CLI `engramma`:** tutti i comandi del § 8.1 tranne `serve`, con uscita leggibile e `--json`.
-7. **`engramma mcp`:** stdio, in sola lettura, `--cells`, i 5 strumenti del § 8.3, con descrizioni chiare per i modelli.
-8. **Test:**
-   - unitari;
-   - **di proprietà** (`proptest`): giro del formato, registro rigiocato = stesso stato, export → import = stesso stato;
-   - **dorati**, su una cartella di esempio in italiano: «Fabio, Giulia, trasloco a Milano, lavoro, preferenze che cambiano», circa 60 note;
-   - `engramma verify`.
-9. **Benchmark** in `bench/`:
-   - generatore sintetico da 10 000 e 100 000 note;
-   - domande con la nota attesa;
-   - richiamo@5 / MRR e latenze p50 e p95, stampate in un rapporto.
-10. **Integrazione continua:**
-    - compilazione e test su macOS (arm64, x86_64), Linux e Windows;
-    - `cargo deny` per le licenze: solo licenze permissive;
-    - `cargo clippy -D warnings`;
-    - nessuna rete nei test.
-
-**Criteri di chiusura:**
-- tutti i test verdi sulle tre piattaforme;
-- benchmark eseguito, con i numeri nel rapporto;
-- un utente può fare `engramma init`, `import` di una cartella Obsidian, `search` e `mcp`, e collegarlo a Claude Desktop per leggere la sua memoria.
-
-## 14. Decisioni aperte
-
-Chiuse lungo la strada:
-
-1. ~~Il nome~~ → **Engramma** (deciso 2026-11-05; il pacchetto npm sarà `@engramma/core`).
-2. ~~**Campi in inglese** nel formato~~ → adottati dalla v0.1, confermati.
-3. ~~**Il modello di embedding predefinito**~~ → **Granite R2 97M** (v0.2, misurato; § 7). Il 311M resta un'opzione. Runtime (tract) deciso 2026-11-05.
-4. ~~**Indice vettoriale**~~ → `FlatI8` in Rust: **sqlite-vec scartato** (un'estensione caricata a runtime, da tenere in passo con SQLite e da firmare diversamente in Electron; la scansione int8 nostra basta fino a ~1M vettori, § 11).
-5. ~~**L'istantanea di compattazione**~~ → facoltativa (`--keep-snapshot`): la compattazione base è un punto di controllo senza seconda copia; l'istantanea serve a chi vuole un file coerente da portare via (v0.3.2).
-6. ~~**L'allocatore degli artefatti finali**~~ → mimalloc nel `.node` e nel binario CLI, librerie neutre (v0.4.4, § 7); **per piattaforma** dalla v0.4.5 (macOS sì, Linux no: glibc trattiene meno a riposo — § 7).
-7. ~~**α della fusione convessa**~~ → **0,5** (v0.4.5: due banchi + conferma su domande tenute da parte, § 6.3 e § 11; la storia 0,6 → 0,7 → 0,5 sta nel commento di `Fusion::default`).
-
-Ancora aperte:
-
-8. **Dove vive:** repository privato o pubblico su GitHub?
-9. **SQLCipher sì o no** per la cifratura della cella (v0.5).
-10. **Windows:** non provato (v0.4.4: macOS arm64 provato, Linux arm64 provato in Docker, x86_64 e Windows no; i punti sensibili — file aperti, nomi riservati, separatori — sono nel REPORT v0.4.4).
-11. **Il rapporto con Homun:** il motore resta un progetto separato, con le sue versioni. Homun fissa una versione precisa (oggi quella col lock degli hash del registro).
-
-## Fonti (verificate il 2026-11-05)
-- Licenza SurrealDB: https://surrealdb.com/license
-- Kùzu archiviato: https://biggo.com/news/202510130126_KuzuDB-embedded-graph-database-archived · CozoDB fermo: https://github.com/cozodb/cozo/discussions/299
-- Turso (stato beta): https://www.theregister.com/databases/2026/07/29/after-rewriting-sqlite-in-rust-turso-turns-its-sights-on-postgres/5279835 · https://explainx.ai/blog/turso-database-sqlite-rust-rewrite-guide-2026
-- Benchmark della memoria e i loro limiti: https://mem0.ai/library/agent-memory/ai-memory-benchmarks-in-2026
-- Fonte e avvelenamento della memoria: https://arxiv.org/pdf/2605.30771 · https://arxiv.org/pdf/2606.22030
-- Memoria temporale: https://arxiv.org/pdf/2601.07468
-- A2A e i suoi limiti di sicurezza: https://arxiv.org/pdf/2609.10871 · https://arxiv.org/pdf/2606.31498
-- EmbeddingGemma: https://developers.googleblog.com/en/introducing-embeddinggemma/ · Granite Embedding R2 (ONNX, terza parte): https://huggingface.co/Hisham480/multilingual-r2-ONNX
-- Memoria portabile: https://github.com/MacPaw/portable-memory · https://portable-ai-memory.org/spec/v1.0/
-- (2026-11-05, v0.2) Rilasci di sqlite-vec (0.1.9 stabile, DiskANN/IVF solo in 0.1.10-alpha): https://github.com/asg017/sqlite-vec/releases · Granite Embedding Multilingual R2: https://huggingface.co/blog/ibm-granite/granite-embedding-multilingual-r2 · Fusione convessa contro RRF (ACM TOIS 2023): https://dl.acm.org/doi/10.1145/3596512 · Le misure di tract, sqlite-vec e scansione int8 sono nostre (prototipi nel commit 90a106e e nel prompt v0.2).
-- (2026-11-06, v0.3) HippoRAG 2 e PPR per la memoria: https://github.com/osu-nlp-group/hipporag · Hub nei grafi di memoria (GAAMA): https://arxiv.org/pdf/2603.27910 · MemGraphRAG: https://arxiv.org/pdf/2606.00610 · Payload dimenticabili e crypto-shredding: https://verraes.net/2019/05/eventsourcing-patterns-forgettable-payloads/ · https://verraes.net/2019/05/eventsourcing-patterns-throw-away-the-key/ · Digest salati (SD-JWT, RFC 9901): https://rfc-editor.org/rfc/rfc9901 · Il prototipo PPR e le misure di latenza a 100k sono nostri (prompt v0.3, allegato `ppr`).

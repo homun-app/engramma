@@ -339,3 +339,30 @@ The human surface of the HTTP authorization flow (state in
   label: the live grant under that label).
 - `log` — the event history: approvals, refusals, revocations, reuse
   alarms, rejected clients. No secrets, no note text.
+
+
+## `engramma devices` (v0.6)
+
+- `init` — crea `device.key` (o mostra l'esistente) e il primo dispositivo dell'elenco
+- `invite` — stampa un biglietto d'invito (10 minuti, un uso)
+- `code` — stampa un codice breve (`7-tigre-lago`)
+- `join <biglietto-o-codice> --name <nome>` — abbinamento; le sei cifre si confermano su entrambi
+- `list` — nome, id corto, chiave di trasporto
+- `remove <nome>` — con il riassunto: rotazione delle chiavi, ciò che il rimosso aveva lo tiene
+- `log` — il registro dell'elenco, con le firme
+
+## `engramma sync` (v0.6)
+
+- `share <cella>` — `adopt` + epoca 0; dopo la conferma la cella viaggia verso tutti i dispositivi
+- `unshare <cella>` — smette da qui; le copie altrove restano (e lo dice)
+- `run` — una passata con tutti i dispositivi e il nodo cieco raggiungibili, poi esce (JSON)
+- `serve` — in ascolto: sincronizza a ogni scrittura locale e ogni 5 minuti; convive con un altro processo che scrive
+- `status` — per cella: dispositivi, ultima sessione, operazioni in attesa, frontiera stabile, epoca
+- `conflicts` — le copie di conflitto che questa copia tiene
+
+## `engramma mailbox` (v0.6)
+
+- `serve --root <dir>` — il nodo cieco (ALPN `engramma/mailbox/1`, ritenzione 180 giorni)
+- `add <biglietto del nodo>` / `remove` / `status`
+
+Ogni comando accetta `--json`. Gli errori non contengono testo di note.
