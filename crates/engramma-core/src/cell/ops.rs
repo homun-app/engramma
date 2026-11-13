@@ -1387,32 +1387,26 @@ fn apply_put(tx: &Transaction<'_>, op: &Op, note: &Note) -> Result<(), CellError
         // v0.6 (P1): a rewrite whose author had SEEN the lapide reopens the
         // note (their base is the tombstone); one that did not see it is
         // held back by the materializer, and the lapide wins.
-        let was_deleted = row.note.status == Status::Deleted;
-        if was_deleted {
-            reopen_tombstone(tx, &note.id)?;
-            note.status = if note.confidence == crate::format::Confidence::External {
-                Status::Quarantined
-            } else {
-                Status::Active
-            };
+        // v0.4.1 (P0.1): a rewrite PRESERVES the note's state — and a
+        // tombstone is not resurrected (restore it first). The reopen rule
+        // of v0.6 (P1) lives in the materializer, for the arriving write
+        // whose `base` is the lapide.
+        let preserved = if row.note.status == Status::Active
+            && note.confidence == crate::format::Confidence::External
+        {
+            Status::Quarantined
         } else {
-            let preserved = if row.note.status == Status::Active
-                && note.confidence == crate::format::Confidence::External
-            {
-                Status::Quarantined
-            } else {
-                row.note.status
-            };
-            if note.status != preserved {
-                return Err(CellError::Invalid(format!(
-                    "a rewrite preserves the note's state (`{}` requested, `{}` is \
-                     the state): use `setStatus`, `confirm` or `delete` to change it",
-                    note.status.as_str(),
-                    preserved.as_str(),
-                )));
-            }
-            note.status = preserved;
+            row.note.status
+        };
+        if note.status != preserved {
+            return Err(CellError::Invalid(format!(
+                "a rewrite preserves the note's state (`{}` requested, `{}` is \
+                 the state): use `setStatus`, `confirm` or `delete` to change it",
+                note.status.as_str(),
+                preserved.as_str(),
+            )));
         }
+        note.status = preserved;
         // a superseded note must keep a closed validity, and the rewrite of
         // one does not carry it: keep the closing the old version had
         if row.note.status == Status::Superseded && note.valid_to.is_none() {
@@ -1440,12 +1434,14 @@ fn apply_patch(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     let Some(old) = read_note(tx, &id)? else {
         return Err(CellError::NoteNotFound(id.to_string()));
     };
-    // v0.6 (P1): a patch whose author had SEEN the lapide reopens the note —
-    // and a local author always has (their base is the tombstone). A patch
-    // that did not see it never reaches this line: the materializer's
-    // tombstone rule holds it back, and the lapide wins. A tombstone has no
-    // FTS row (that is the index's discipline), so the reindex below must
-    // not try to delete one: the note re-enters the index as if new.
+    // v0.6 (P1): a PATCH whose author had SEEN the lapide reopens the
+    // note — and a local author always has (their base is the tombstone).
+    // A patch that did not see it never reaches this line on the arrival
+    // path: the materializer's tombstone rule holds it back, and the lapide
+    // wins. A tombstone has no FTS row (the index's discipline), so the
+    // reindex below must not try to delete one: the note re-enters the
+    // index as if new. A full REWRITE (`put`) of a tombstone stays a usage
+    // error — `restore` is the tool for that, and the JS contract says so.
     let mut reopened = false;
     let old = if old.note.status == Status::Deleted {
         reopened = true;
@@ -2574,27 +2570,27 @@ fn apply_decide(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), CellE
                 // supersede's: whichever half a copy rematerializes, the
                 // row lands the same — materializing the proposal alone
                 // must not lose it
-                if scope.wants(&target) {
-                    if let Some(trow) = &trow {
-                        // the closing the creator recorded wins; the fallback
-                        // is a function of the op content alone (the decision
-                        // date), never of another note's CURRENT state — a
-                        // copy that materializes this half alone must close
-                        // exactly like one that ran the whole operation
-                        let computed = crate::format::Validity(decided_at.get().date(), None);
-                        let closing = body
-                            .get("target_closing")
-                            .and_then(Value::as_str)
-                            .and_then(|s| Validity::parse(s).ok())
-                            .unwrap_or(computed);
-                        snapshot(tx, &target, trow.version, &op.op_id)?;
-                        let mut t = trow.note.clone();
-                        t.status = Status::Superseded;
-                        t.valid_to = Some(closing);
-                        t.updated_at = decided_at;
-                        write_note(tx, &t, true, false)?;
-                        reindex_note(tx, &target, Some(trow))?;
-                    }
+                if scope.wants(&target)
+                    && let Some(trow) = &trow
+                {
+                    // the closing the creator recorded wins; the fallback
+                    // is a function of the op content alone (the decision
+                    // date), never of another note's CURRENT state — a
+                    // copy that materializes this half alone must close
+                    // exactly like one that ran the whole operation
+                    let computed = crate::format::Validity(decided_at.get().date(), None);
+                    let closing = body
+                        .get("target_closing")
+                        .and_then(Value::as_str)
+                        .and_then(|s| Validity::parse(s).ok())
+                        .unwrap_or(computed);
+                    snapshot(tx, &target, trow.version, &op.op_id)?;
+                    let mut t = trow.note.clone();
+                    t.status = Status::Superseded;
+                    t.valid_to = Some(closing);
+                    t.updated_at = decided_at;
+                    write_note(tx, &t, true, false)?;
+                    reindex_note(tx, &target, Some(trow))?;
                 }
                 if scope.wants(&id) || scope.wants(&target) {
                     tx.execute(

@@ -457,7 +457,6 @@ fn materialize_note(
     // had applied
     let mut pending_since: Option<String> = None;
     let mut events: Vec<ReplayEvent> = Vec::new();
-    let mut losers: Vec<LoserRecord> = Vec::new();
     let purged = note_purged_in_set(tx, id)?;
     for op in &all {
         // a purge always applies, on an empty object too: its scrub IS the
@@ -471,6 +470,7 @@ fn materialize_note(
             events.push(ReplayEvent {
                 hash: op.content_hash.clone(),
                 body: None,
+                base: op.base.clone(),
                 op_id: op.op_id,
                 hlc_ms: op.hlc.physical_ms,
             });
@@ -483,6 +483,7 @@ fn materialize_note(
                     events.push(ReplayEvent {
                         hash: op.content_hash.clone(),
                         body: None,
+                        base: op.base.clone(),
                         op_id: op.op_id,
                         hlc_ms: op.hlc.physical_ms,
                     });
@@ -490,22 +491,6 @@ fn materialize_note(
                 }
                 TombstoneOutcome::Reopens => ops::reopen_tombstone(tx, id)?,
                 TombstoneOutcome::NoTombstone => {}
-            }
-            // concurrency: every body write AFTER the one this operation
-            // leaned on is a write it did not see — each survives as a copy
-            if let Some(base) = op.base.as_deref()
-                && let Some(pos) = events.iter().position(|e| e.hash == base)
-            {
-                for e in &events[pos + 1..] {
-                    if let Some((state, _)) = &e.body {
-                        losers.push(LoserRecord {
-                            op_id: e.op_id,
-                            hlc_ms: e.hlc_ms,
-                            content_hash: e.hash.clone(),
-                            state: state.clone(),
-                        });
-                    }
-                }
             }
             match ops::apply_scoped(tx, op, Scope::Note(*id)) {
                 Ok(()) => {}
@@ -518,6 +503,7 @@ fn materialize_note(
                 events.push(ReplayEvent {
                     hash: op.content_hash.clone(),
                     body: Some((row.note, row.version)),
+                    base: op.base.clone(),
                     op_id: op.op_id,
                     hlc_ms: op.hlc.physical_ms,
                 });
@@ -548,6 +534,7 @@ fn materialize_note(
             events.push(ReplayEvent {
                 hash: op.content_hash.clone(),
                 body: None,
+                base: op.base.clone(),
                 op_id: op.op_id,
                 hlc_ms: op.hlc.physical_ms,
             });
@@ -558,9 +545,50 @@ fn materialize_note(
     } else {
         clear_pending(tx, object)?;
     }
+    // THE CONFLICT SET, derived once from the FINAL winner: the last body
+    // write in total order wins (the replay applied it last), and the
+    // losers are exactly the body writes it did not see — those after its
+    // `base`. Derived from the whole set at the end of the replay, the
+    // set is a function of the SET by construction: every copy replays
+    // the same total order, computes the same winner and the same losers
+    // — however the operations arrived.
+    let losers = final_losers(&events);
     reconcile_conflict_copies(tx, id, &losers)?;
     restore_hlc_watermark(tx, watermark, None)?;
     Ok(())
+}
+
+/// The losers of the whole replay: the body writes after the WINNER's
+/// `base`, the winner being the LAST body write in total order.
+fn final_losers(events: &[ReplayEvent]) -> Vec<LoserRecord> {
+    let Some(winner_pos) = events.iter().rposition(|e| e.body.is_some()) else {
+        return Vec::new();
+    };
+    let winner_base = events[winner_pos].base.clone();
+    // A base that is NOT among the events means "written before the sync
+    // era, or censored by a purge" — sequential by declaration, never a
+    // concurrent past: no losers. (Starting from 0 here manufactured
+    // phantom conflict copies: a purge's censor REWRITES a supersede's
+    // content_hash, so a patch written before the censor points at a hash
+    // that no longer exists — the phantom's tell.)
+    let start = match &winner_base {
+        Some(b) => events
+            .iter()
+            .position(|e| &e.hash == b)
+            .map_or(winner_pos, |p| (p + 1).min(winner_pos)),
+        None => 0,
+    };
+    events[start..winner_pos]
+        .iter()
+        .filter_map(|e| {
+            e.body.as_ref().map(|(state, _)| LoserRecord {
+                op_id: e.op_id,
+                hlc_ms: e.hlc_ms,
+                content_hash: e.hash.clone(),
+                state: state.clone(),
+            })
+        })
+        .collect()
 }
 
 /// One applied operation of the replay, with what the conflict rules need:
@@ -569,6 +597,7 @@ fn materialize_note(
 struct ReplayEvent {
     hash: String,
     body: Option<(crate::format::Note, i64)>,
+    base: Option<String>,
     op_id: Ulid,
     hlc_ms: u64,
 }

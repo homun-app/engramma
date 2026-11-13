@@ -160,12 +160,12 @@ fn external_rewrite_quarantines_and_patch_preserves() {
     assert_eq!(cell.get(&b.id).unwrap(/* t */).status, Status::Quarantined);
 }
 
-/// v0.6 (P1): a rewrite by a writer who had SEEN the lapide reopens the
-/// note — their base IS the tombstone. (A rewrite that did not see it never
-/// reaches `apply`: the materializer's tombstone rule holds it back, and
-/// the lapide wins — the convergence tests own that half.)
+/// v0.4.1 (P0.1): a full REWRITE does not resurrect a tombstone (restore
+/// it first). v0.6 (P1): a PATCH by a writer who had the lapide in front
+/// of them reopens it — their base IS the tombstone (the conflict rules of
+/// the DESIGN; the convergence tests own the arriving half).
 #[test]
-fn a_tombstone_reopens_for_a_writer_who_saw_it() {
+fn a_rewrite_does_not_resurrect_a_tombstone_but_a_patch_reopens_it() {
     let (_d, cell) = cell();
     let n = note(
         4,
@@ -176,7 +176,20 @@ fn a_tombstone_reopens_for_a_writer_who_saw_it() {
     cell.put_note(&n, "t").unwrap(/* test-only */);
     cell.delete_note(&n.id, "t").unwrap(/* test-only */);
 
-    // a local patch: the writer had the tombstone in front of them
+    let mut same_id = note(
+        4,
+        "tentativo di resurrezione",
+        Confidence::Stated,
+        Status::Active,
+    );
+    same_id.created_at = At(time::OffsetDateTime::now_utc());
+    let err = cell.put_note(&same_id, "t").unwrap_err(/* test-only */);
+    assert!(
+        matches!(err, CellError::Invalid(ref m) if m.contains("preserves the note's state")),
+        "{err}"
+    );
+
+    // the patch reopens: the writer saw the lapide
     cell.patch_note(
         &n.id,
         &NotePatch {
@@ -187,22 +200,8 @@ fn a_tombstone_reopens_for_a_writer_who_saw_it() {
     )
     .unwrap(/* test-only */);
     let back = cell.get(&n.id).unwrap(/* test-only */);
-    assert_eq!(back.status, Status::Active, "the note reopens");
+    assert_eq!(back.status, Status::Active, "the patch reopens the note");
     assert!(back.body.contains("dopo la lapide"));
-
-    // and a full rewrite reopens it too, preserving the birth date
-    cell.delete_note(&n.id, "t").unwrap(/* test-only */);
-    let mut same_id = note(
-        4,
-        "tentativo di resurrezione",
-        Confidence::Stated,
-        Status::Active,
-    );
-    same_id.created_at = At(time::OffsetDateTime::now_utc());
-    cell.put_note(&same_id, "t").unwrap(/* test-only */);
-    let back = cell.get(&n.id).unwrap(/* test-only */);
-    assert_eq!(back.status, Status::Active, "the rewrite reopens");
-    assert_eq!(back.created_at, n.created_at, "the birth date stays");
     let vr = cell.verify().unwrap(/* test-only */);
     assert!(vr.ok(), "{vr:?}");
 }
