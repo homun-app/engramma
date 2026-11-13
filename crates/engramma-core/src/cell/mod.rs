@@ -1037,7 +1037,35 @@ impl Cell {
         let mut arrival = op.clone();
         arrival.seq = prev_seq + 1;
         arrival.seal(&prev_hash);
+        // v0.6 (P1): the purge dominates — an operation of a note this copy
+        // knows is purged never rests here in the clear, and a purge that
+        // arrives scrubs what earlier arrivals left. Both run inside THIS
+        // transaction, wrapped in secure deletion: the freed pages are
+        // zeroed as they free, and the plaintext never reaches the WAL.
+        let purge_arrival = op.kind == OpKind::Purge;
+        let mut scrubbed_notes: Vec<Ulid> = Vec::new();
+        if !purge_arrival {
+            for object in ops::objects_of(&arrival) {
+                if let Some(nid) = object.strip_prefix("note:")
+                    && let Ok(purged) = Ulid::from_string(nid)
+                    && material::note_purged_in_set(&tx, &purged)?
+                {
+                    scrubbed_notes.push(purged);
+                }
+            }
+        }
+        let scrubbing = purge_arrival || !scrubbed_notes.is_empty();
+        let secure_before: Option<i64> = if scrubbing {
+            let before: i64 = tx.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+            tx.pragma_update(None, "secure_delete", "ON")?;
+            Some(before)
+        } else {
+            None
+        };
         material::arrive(&tx, &arrival)?;
+        for purged in &scrubbed_notes {
+            ops::scrub_log(&tx, purged)?;
+        }
         if let Some(s) = logged
             && let Ok(prev) = Hlc::parse(&s)
             && prev > arrival.hlc
@@ -1050,6 +1078,24 @@ impl Cell {
         }
         tx.commit()?;
         inner.clock.observe(&arrival.hlc);
+        // a purge that ARRIVED carries the disk hygiene of a local one: the
+        // bodies it scrubs may sit in earlier WAL frames and freed pages of
+        // this copy, and the right to be forgotten reaches them (secure
+        // deletion around the scrub, an FTS optimize, a VACUUM, a
+        // checkpoint — the same dance, the same guarantees)
+        if scrubbing && let Some(before) = secure_before {
+            inner.conn.pragma_update(None, "secure_delete", before)?;
+        }
+        if purge_arrival {
+            inner.conn.execute_batch(
+                "INSERT INTO notes_fts(notes_fts) VALUES('optimize');
+                 INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
+            )?;
+            inner.conn.execute_batch("VACUUM;")?;
+            if !wal_checkpoint(&inner.conn).unwrap_or(false) {
+                inner.pending_scrub = vec!["wal"];
+            }
+        }
         // the derived indexes follow, as for a local write
         inner.lang_hist_dirty = true;
         match arrival.kind {

@@ -1723,6 +1723,9 @@ fn apply_purge(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     };
     purge_state(tx, &id)?;
     scrub_log(tx, &id)?;
+    // v0.6 (P1): the purge dominates the note's whole derivation — its
+    // conflict copies go with it
+    super::material::purge_conflict_copies(tx, &id)?;
     Ok(())
 }
 

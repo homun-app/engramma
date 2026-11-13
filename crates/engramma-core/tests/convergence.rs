@@ -420,3 +420,108 @@ fn a_tombstone_wins_over_an_unseen_modification() {
     );
     assert!(reopened.body.contains("dopo la lapide"));
 }
+
+/// The purge dominates everything, whichever side of the partition it lands
+/// on: the note does not materialize, every operation of the note is stored
+/// REDACTED when it arrives after the purge (its body never touches the
+/// disk of this copy), its conflict copies are purged too, and two copies
+/// that received the same set in opposite orders converge.
+#[test]
+fn the_purge_dominates_whatever_the_arrival_order() {
+    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let a = Cell::create(&dir_a.path().join("a.sqlite"), "conv", "device-a")
+        .unwrap(/* test-only */);
+    let note = base_note(11, "il segreto da dimenticare");
+    let id = note.id;
+    a.put_note(&note, "device-a").unwrap(/* test-only */);
+    let first: Vec<Op> = a.ops().unwrap(/* test-only */);
+    let b = copy_of("b", &first);
+
+    // A purges; concurrently B patches — and B's patch must never be stored
+    // in the clear anywhere the purge has already arrived
+    a.purge(&id, "oblio", "device-a").unwrap(/* test-only */);
+    b.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("il segreto riscritto da B".into()),
+            ..Default::default()
+        },
+        "device-b",
+    )
+    .unwrap(/* test-only */);
+
+    let union = union_logs(
+        &a.ops().unwrap(/* test-only */),
+        &b.ops().unwrap(/* test-only */),
+    );
+    let mut by_total: Vec<Op> = union.values().cloned().collect();
+    by_total.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
+    // one copy receives the purge FIRST, the other the patch first
+    let purge_pos = by_total
+        .iter()
+        .position(|o| o.kind.as_str() == "purge")
+        .unwrap(/* test-only */);
+    let patch_pos = by_total
+        .iter()
+        .position(|o| o.kind.as_str() == "patch_note")
+        .unwrap(/* test-only */);
+    // one copy receives the total order, the other the two swapped
+    let order_x = by_total.clone(); // total order (purge before or after the patch by hlc)
+    let mut order_y = by_total.clone(); // the opposite delivery of the two
+    order_y.swap(purge_pos, patch_pos);
+    let x = copy_of("x", &order_x);
+    let y = copy_of("y", &order_y);
+
+    // the note is GONE on both copies, whatever the arrival order
+    for cell in [&x, &y] {
+        assert!(
+            matches!(
+                cell.get(&id),
+                Err(engramma_core::CellError::NoteNotFound(_))
+            ),
+            "the purged note does not materialize"
+        );
+        // the body of the note is nowhere in the copy's files — the main
+        // database AND the WAL (recent arrivals live there)
+        let mut text = String::new();
+        for suffix in ["-wal", ""] {
+            let mut p = dir_of(cell);
+            p.as_mut_os_string().push(suffix);
+            if let Ok(bytes) = std::fs::read(&p) {
+                text.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        assert!(
+            !text.contains("il segreto"),
+            "the purged text must not survive in the copy's files"
+        );
+        // every op of the purged note that arrived after the purge is
+        // stored REDACTED: its body never touched this copy's disk
+        let rows = cell
+            .debug_column(&format!(
+                "SELECT kind || ' ' || (p.body IS NULL) FROM ops o
+                 LEFT JOIN op_payloads p ON p.op_id = o.op_id
+                 WHERE o.op_id IN (SELECT op_id FROM op_objects WHERE object = 'note:{id}')
+                 ORDER BY o.seq"
+            ))
+            .unwrap(/* test-only */);
+        assert!(
+            rows.iter()
+                .all(|r| r.ends_with(" 1") || r.starts_with("purge")),
+            "the ops of the purged note are skeletons: {rows:?}"
+        );
+    }
+    assert_eq!(
+        x.replicated_digest().unwrap(/* test-only */),
+        y.replicated_digest().unwrap(/* test-only */),
+        "the purge dominates on every copy of the same set"
+    );
+}
+
+/// Where this cell's file lives (the test's copy_of leaks its tempdir on
+/// purpose; the file sits next to the cell name).
+fn dir_of(cell: &Cell) -> std::path::PathBuf {
+    let mut p = cell.file_path().to_path_buf();
+    p.set_extension("sqlite");
+    p
+}

@@ -395,9 +395,16 @@ fn materialize_note(
     let mut pending_since: Option<String> = None;
     let mut events: Vec<ReplayEvent> = Vec::new();
     let mut losers: Vec<LoserRecord> = Vec::new();
+    let purged = note_purged_in_set(tx, id)?;
     for op in &all {
-        if !note_exists(tx, id)? && !op_creates_note(op, id) {
-            pending_since = Some(op.op_id.to_string());
+        // a purge always applies, on an empty object too: its scrub IS the
+        // state it carries (the bodies it must forget arrived before it)
+        if !note_exists(tx, id)? && !op_creates_note(op, id) && op.kind != OpKind::Purge {
+            if !purged {
+                pending_since = Some(op.op_id.to_string());
+            }
+            // a purged note's ops lean on a note that will never
+            // materialize: recorded, redacted, not waiting
             events.push(ReplayEvent {
                 hash: op.content_hash.clone(),
                 body: None,
@@ -804,6 +811,47 @@ fn delete_note_state(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<(), Ce
     tx.execute("DELETE FROM supersedes WHERE new_id = ?1", [&id_str])?;
     tx.execute("DELETE FROM proposals WHERE note_id = ?1", [&id_str])?;
     tx.execute("DELETE FROM decisions WHERE proposal = ?1", [&id_str])?;
+    Ok(())
+}
+
+/// Does the SET hold a purge of this note? The purge dominates: the note
+/// does not materialize, its operations arrive redacted, its conflict
+/// copies go with it.
+pub(crate) fn note_purged_in_set(
+    tx: &rusqlite::Transaction<'_>,
+    id: &Ulid,
+) -> Result<bool, CellError> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM ops o
+         JOIN op_objects oo ON oo.op_id = o.op_id
+         WHERE oo.object = ?1 AND o.kind = 'purge'",
+        [format!("note:{id}")],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// The purge of a note takes its CONFLICT COPIES with it: they are the
+/// note's own derivation, and the right to be forgotten reaches everything
+/// the note's content produced.
+pub(crate) fn purge_conflict_copies(
+    tx: &rusqlite::Transaction<'_>,
+    original: &Ulid,
+) -> Result<(), CellError> {
+    let copies: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT copy_id FROM conflict_copies WHERE original_id = ?1")?;
+        let rows = stmt.query_map([original.to_string()], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for copy_id in copies {
+        let Ok(cid) = Ulid::from_string(&copy_id) else {
+            continue;
+        };
+        delete_note_state(tx, &cid)?;
+        super::vectors::delete_note_vectors(tx, &cid)?;
+        tx.execute("DELETE FROM conflict_copies WHERE copy_id = ?1", [copy_id])?;
+        clear_pending(tx, &format!("note:{cid}"))?;
+    }
     Ok(())
 }
 
