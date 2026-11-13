@@ -704,6 +704,18 @@ impl Cell {
         Ok(cell)
     }
 
+    /// Open (or create) the file of a COPY without a history of its own
+    /// (v0.6, P1): the schema is applied and the cell waits for its first
+    /// INGESTED operation — the shared `init` of the cell it is about to
+    /// become a copy of. This is how a device joins a shared cell: no
+    /// second `init`, no identity of its own to reconcile.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL or I/O failure.
+    pub fn open_bare(path: &Path) -> Result<Cell, CellError> {
+        Self::open_raw(path, false)
+    }
+
     /// Open an existing cell (runs pending migrations, restores the HLC).
     ///
     /// # Errors
@@ -933,6 +945,121 @@ impl Cell {
         let mut inner = self.lock()?;
         execute_op(&mut inner, kind, note_id, actor, payload)?;
         Ok(())
+    }
+
+    /// An operation arriving from another copy of this cell (v0.6, P1).
+    /// Idempotent by `op_id`: an operation already held changes nothing and
+    /// answers `false`. The operation keeps the identity it was created
+    /// with (`content_hash`, `base`) — the receiver recomputes both from
+    /// the content and refuses a row that claims to be what it is not — and
+    /// is sealed into THIS copy's local chain of arrival (`prev_hash`,
+    /// `hash`, `seq`), which stays what it always was: the audit trail of
+    /// one disk. A physical time too far in the future is refused at the
+    /// door (the threat model's 5-minute drift cap: no device can write
+    /// itself "into the future" and win every conflict).
+    ///
+    /// # Errors
+    /// [`CellError::Invalid`] on a forged identity, a body that does not
+    /// digest to its salted digest, or a clock beyond the drift cap.
+    pub fn ingest_op(&self, op: &Op) -> Result<bool, CellError> {
+        const DRIFT_CAP_MS: u64 = 5 * 60 * 1000;
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let mut inner = self.lock()?;
+        let wall_ms = inner.clock.wall_ms();
+        let tx = inner
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seen: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM ops WHERE op_id = ?1",
+            [op.op_id.to_string()],
+            |r| r.get(0),
+        )?;
+        if seen > 0 {
+            // idempotent: nothing to store, nothing to apply
+            tx.rollback()?;
+            return Ok(false);
+        }
+        let expect = ops::content_hash(
+            &op.op_id,
+            &op.hlc,
+            &op.actor,
+            op.kind,
+            op.note_id,
+            op.base.as_deref(),
+            &op.payload_digest,
+        );
+        if expect != op.content_hash {
+            return Err(CellError::Invalid(format!(
+                "op {}: content_hash disagrees with its content",
+                op.op_id
+            )));
+        }
+        match (&op.salt, &op.body) {
+            (Some(salt), Some(body)) => {
+                if ops::payload_digest(salt, body) != op.payload_digest {
+                    return Err(CellError::Invalid(format!(
+                        "op {}: the body does not digest to its salted digest",
+                        op.op_id
+                    )));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(CellError::Invalid(format!(
+                    "op {}: body and salt disagree (one forgotten, one present)",
+                    op.op_id
+                )));
+            }
+        }
+        if op.hlc.physical_ms > wall_ms.saturating_add(DRIFT_CAP_MS) {
+            return Err(CellError::Invalid(format!(
+                "op {}: physical time {} ms is beyond the +5 min drift cap",
+                op.op_id, op.hlc.physical_ms
+            )));
+        }
+        // the local chain of arrival takes the op as it comes
+        let (prev_seq, prev_hash): (i64, String) = tx
+            .query_row(
+                "SELECT seq, hash FROM ops ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or((0, ops::GENESIS_HASH.to_string()));
+        // `apply` writes the op's own HLC into `meta`; the cell clock must
+        // hold the MAXIMUM ever seen, never go backwards
+        let logged: Option<String> = tx
+            .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
+            .optional()?;
+        let mut arrival = op.clone();
+        arrival.seq = prev_seq + 1;
+        arrival.seal(&prev_hash);
+        ops::apply(&tx, &arrival)?;
+        if let Some(s) = logged
+            && let Ok(prev) = Hlc::parse(&s)
+            && prev > arrival.hlc
+        {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES ('hlc', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = ?1",
+                [s],
+            )?;
+        }
+        tx.commit()?;
+        inner.clock.observe(&arrival.hlc);
+        // the derived indexes follow, as for a local write
+        inner.lang_hist_dirty = true;
+        match arrival.kind {
+            OpKind::Link | OpKind::Unlink | OpKind::Purge => inner.graph_dirt.global = true,
+            _ => {
+                if let Some(id) = arrival.note_id {
+                    inner.graph_dirt.notes.push(id);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Scrub one compaction snapshot file in place (v0.3.1, P0.3): the same
@@ -1580,6 +1707,17 @@ impl Cell {
     pub fn state_digest(&self) -> Result<String, CellError> {
         let inner = self.lock()?;
         state_digest(&inner.conn)
+    }
+
+    /// The [`replicated_digest`] of this cell (v0.6, P1): what copies of
+    /// one cell compare — the state the operations determine, without the
+    /// local tables.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn replicated_digest(&self) -> Result<String, CellError> {
+        let inner = self.lock()?;
+        replicated_digest(&inner.conn)
     }
 
     /// The markdown view's reconciliation state: one view's rows (last
@@ -2381,8 +2519,8 @@ impl Cell {
         }
         let inner = self.lock()?;
         let mut stmt = inner.conn.prepare(
-            "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.payload_digest,
-                    p.salt, p.body, o.prev_hash, o.hash
+            "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.base, o.content_hash,
+                    o.payload_digest, p.salt, p.body, o.prev_hash, o.hash
              FROM ops o LEFT JOIN op_payloads p ON p.op_id = o.op_id
              WHERE o.seq > ?1 ORDER BY o.seq",
         )?;
@@ -2394,11 +2532,13 @@ impl Cell {
                 actor: &r.get::<_, String>(3)?,
                 kind: &r.get::<_, String>(4)?,
                 note_id: r.get::<_, Option<String>>(5)?.as_deref(),
-                payload_digest: &r.get::<_, String>(6)?,
-                salt: r.get::<_, Option<Vec<u8>>>(7)?.as_deref(),
-                body_json: r.get::<_, Option<String>>(8)?.as_deref(),
-                prev_hash: &r.get::<_, String>(9)?,
-                hash: &r.get::<_, String>(10)?,
+                base: r.get::<_, Option<String>>(6)?.as_deref(),
+                content_hash: &r.get::<_, String>(7)?,
+                payload_digest: &r.get::<_, String>(8)?,
+                salt: r.get::<_, Option<Vec<u8>>>(9)?.as_deref(),
+                body_json: r.get::<_, Option<String>>(10)?.as_deref(),
+                prev_hash: &r.get::<_, String>(11)?,
+                hash: &r.get::<_, String>(12)?,
             }))
         })?;
         let mut out = Vec::new();
@@ -2749,10 +2889,36 @@ fn execute_op(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap_or((0, ops::GENESIS_HASH.to_string()));
+    // v0.6 (P1): an operation that modifies a note carries `base` — the
+    // wire identity of the last operation of that note this author had
+    // applied (the local log holds exactly what was applied, in total
+    // order). Two operations with the same base are concurrent.
+    let base = if let Some(id) = note_id {
+        tx.query_row(
+            "SELECT o.content_hash FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = ?1
+             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
+            [format!("note:{id}")],
+            |r| r.get(0),
+        )
+        .optional()?
+    } else {
+        None
+    };
     // The salt is minted at creation, like the op id and the HLC: `apply`
     // stays deterministic and the digest can be recomputed forever.
     let salt = crate::id::random_salt()?;
-    let mut op = ops::make_op(op_id, hlc, actor, kind, note_id, payload, salt.to_vec())?;
+    let mut op = ops::make_op(ops::OpParts {
+        op_id,
+        hlc,
+        actor: actor.to_string(),
+        kind,
+        note_id,
+        base,
+        body: payload,
+        salt: salt.to_vec(),
+    })?;
     op.seq = prev_seq + 1;
     op.seal(&prev_hash);
     ops::apply(&tx, &op)?;
@@ -2825,7 +2991,63 @@ pub(crate) fn get_note_tx(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<N
 /// The canonical dump of the logical tables, row by row (the comparison
 /// basis of [`compare_states`] and the content of [`state_digest`]).
 fn state_dump(conn: &Connection) -> Result<String, CellError> {
-    let tables = [
+    dump_tables(conn, &state_dump_tables(false))
+}
+
+/// The tables of the REPLICATED dump (v0.6, P1): the logical state the
+/// operations determine — no arrival chain (`ops`, `op_payloads`: each copy
+/// has its own), no local bookkeeping (`meta.hlc` rides with the arrivals).
+/// Copies that hold the same SET of operations produce the same digest;
+/// this is the comparison the convergence property (and, later, the sync
+/// session) speaks.
+fn replicated_dump_tables() -> Vec<(&'static str, &'static str)> {
+    let mut tables = state_dump_tables(true);
+    tables.retain(|(name, _)| !matches!(*name, "ops" | "op_payloads"));
+    tables
+}
+
+fn dump_tables(conn: &Connection, tables: &[(&str, &str)]) -> Result<String, CellError> {
+    let render = |v: rusqlite::types::Value| -> String {
+        use rusqlite::types::Value as V;
+        match v {
+            V::Null => "\u{0}".into(),
+            V::Integer(i) => i.to_string(),
+            V::Real(f) => f.to_string(),
+            V::Text(t) => t,
+            V::Blob(b) => format!("{b:x?}"),
+        }
+    };
+    let mut out = String::new();
+    for (name, sql) in tables {
+        out.push_str(name);
+        out.push('\n');
+        let mut stmt = conn.prepare(sql)?;
+        let ncols = stmt.column_count();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next().map_err(CellError::from)? {
+            for i in 0..ncols {
+                let v: rusqlite::types::Value = row.get(i)?;
+                out.push_str(&render(v));
+                out.push('\u{1}');
+            }
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+/// The table list of a logical dump. `replicated` drops the keys of `meta`
+/// that ride with the arrivals (`hlc`) — everything else a copy must agree
+/// on, `cell_id` and the policy included.
+fn state_dump_tables(replicated: bool) -> Vec<(&'static str, &'static str)> {
+    let meta_sql = if replicated {
+        "SELECT key, value FROM meta
+         WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13', 'hlc') ORDER BY key"
+    } else {
+        "SELECT key, value FROM meta
+         WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13') ORDER BY key"
+    };
+    vec![
         (
             "notes",
             "SELECT id, type, title, body, frontmatter_json, scope, source, confidence, status, valid_from, valid_to, created_at, updated_at, version, body_norm, tags_text FROM notes ORDER BY id",
@@ -2890,39 +3112,8 @@ fn state_dump(conn: &Connection) -> Result<String, CellError> {
         // The migration bookmarks are not replayable state: no op writes
         // them, so a from-zero rebuild never has them (`dump_v13` marks the
         // v13 digest-widening pass over the compaction rows, v0.5 P1).
-        (
-            "meta",
-            "SELECT key, value FROM meta
-             WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13') ORDER BY key",
-        ),
-    ];
-    let render = |v: rusqlite::types::Value| -> String {
-        use rusqlite::types::Value as V;
-        match v {
-            V::Null => "\u{0}".into(),
-            V::Integer(i) => i.to_string(),
-            V::Real(f) => f.to_string(),
-            V::Text(t) => t,
-            V::Blob(b) => format!("{b:x?}"),
-        }
-    };
-    let mut out = String::new();
-    for (name, sql) in tables {
-        out.push_str(name);
-        out.push('\n');
-        let mut stmt = conn.prepare(sql)?;
-        let ncols = stmt.column_count();
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next().map_err(CellError::from)? {
-            for i in 0..ncols {
-                let v: rusqlite::types::Value = row.get(i)?;
-                out.push_str(&render(v));
-                out.push('\u{1}');
-            }
-            out.push('\n');
-        }
-    }
-    Ok(out)
+        ("meta", meta_sql),
+    ]
 }
 
 /// blake3 of the canonical dump of the logical tables — the digest a
@@ -2934,6 +3125,20 @@ pub fn state_digest(conn: &Connection) -> Result<String, CellError> {
     Ok(blake3::hash(state_dump(conn)?.as_bytes())
         .to_hex()
         .to_string())
+}
+
+/// blake3 of the canonical dump of the REPLICATED tables (v0.6, P1): the
+/// digest copies compare — the same set of operations must produce the
+/// same value on every copy, arrival order notwithstanding.
+///
+/// # Errors
+/// [`CellError::Db`] on SQL failure.
+pub fn replicated_digest(conn: &Connection) -> Result<String, CellError> {
+    Ok(
+        blake3::hash(dump_tables(conn, &replicated_dump_tables())?.as_bytes())
+            .to_hex()
+            .to_string(),
+    )
 }
 
 /// Row-by-row comparison of two cell states.
@@ -3840,7 +4045,8 @@ mod tests {
             Some(&serde_json::Value::Null),
             "the new note's content must be censored out"
         );
-        assert!(cell.verify().unwrap(/* test-only */).ok());
+        let vr = cell.verify().unwrap(/* test-only */);
+        assert!(vr.ok(), "{vr:?}");
         // the old note stays closed: the censored supersede still replays it
         let back = cell.get(&old.id).unwrap(/* test-only */);
         assert_eq!(back.status, Status::Superseded);

@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 14] = [
+pub const MIGRATIONS: [&str; 15] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -253,6 +253,28 @@ INSERT INTO notes_fts(rowid, title, body_norm, tags_text)
      SELECT rowid, COALESCE(title, ''), COALESCE(body_norm, ''), COALESCE(tags_text, '')
      FROM notes WHERE status IN ('active', 'superseded');
 "#,
+    r#"
+-- v15 (v0.6, P1): an operation's identity and causality travel with it.
+-- `content_hash` is blake3 over the canonical CONTENT {op_id, hlc, actor,
+-- kind, note_id, base, payload_digest}: the same operation carries the same
+-- identity on every copy, whatever each copy's local arrival chain is (the
+-- `prev_hash`/`hash` pair stays what it always was — the local chain of
+-- arrival, for the audit of one disk). `base` is the content_hash of the
+-- last operation of the same note the AUTHOR had applied; two operations
+-- with the same base are concurrent. NULL before v0.6: those operations
+-- are sequential by declaration. `op_objects` maps every operation to the
+-- semantic objects it touches ("note:<ulid>", "edge:<id>", "policy"):
+-- written at apply time from the payload, it survives redaction (it holds
+-- ids only) and answers "which operations concern this object" without
+-- reading a single body — the index the per-object materialization of P1
+-- and the frontier of P1.6 walk.
+ALTER TABLE ops ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';
+ALTER TABLE ops ADD COLUMN base TEXT;
+CREATE TABLE op_objects (op_id TEXT NOT NULL,
+                         object TEXT NOT NULL,
+                         PRIMARY KEY (op_id, object));
+CREATE INDEX idx_op_objects_object ON op_objects(object);
+"#,
 ];
 
 /// Rust-side migration steps, run right after the SQL of version `v`.
@@ -284,6 +306,125 @@ fn migrate_rust(tx: &rusqlite::Transaction<'_>, v: i64) -> Result<(), crate::err
     }
     if v == 12 {
         migrate_views_v12(tx)?;
+    }
+    if v == 15 {
+        migrate_log_v15(tx)?;
+    }
+    Ok(())
+}
+
+/// The Rust side of migration v15 (v0.6, P1): give every existing operation
+/// its wire identity and its object index. `base` stays NULL — pre-v0.6
+/// operations are sequential by declaration. The object set comes from the
+/// columns first (the note), then the payload when it still lives (a
+/// supersede names its new note, a link its edge), then the derived tables
+/// (`supersedes`) for the redacted supersedes; a redacted link/unlink under
+/// a compaction cut has no recoverable edge id and is left unindexed — no
+/// v0.6 copy has written it, and `sync share` starts the epoch with
+/// `adopt` (P1.6).
+fn migrate_log_v15(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
+    use crate::error::CellError;
+    struct Row {
+        op_id: String,
+        hlc: String,
+        actor: String,
+        kind: String,
+        note_id: Option<String>,
+        payload_digest: String,
+    }
+    let rows: Vec<Row> = {
+        let mut stmt = tx.prepare(
+            "SELECT op_id, hlc, actor, kind, note_id, payload_digest FROM ops ORDER BY seq",
+        )?;
+        let mapped = stmt.query_map([], |r| {
+            Ok(Row {
+                op_id: r.get(0)?,
+                hlc: r.get(1)?,
+                actor: r.get(2)?,
+                kind: r.get(3)?,
+                note_id: r.get(4)?,
+                payload_digest: r.get(5)?,
+            })
+        })?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+    for r in &rows {
+        let op_id = ulid::Ulid::from_string(&r.op_id)
+            .map_err(|_| CellError::Invalid(format!("bad op_id `{}`", r.op_id)))?;
+        let hlc = crate::hlc::Hlc::parse(&r.hlc)?;
+        let kind = super::ops::OpKind::parse(&r.kind)?;
+        let note_id = r
+            .note_id
+            .as_deref()
+            .map(ulid::Ulid::from_string)
+            .transpose()
+            .map_err(|_| CellError::Invalid(format!("bad note_id in op {}", r.op_id)))?;
+        let ch = super::ops::content_hash(
+            &op_id,
+            &hlc,
+            &r.actor,
+            kind,
+            note_id,
+            None,
+            &r.payload_digest,
+        );
+        tx.execute(
+            "UPDATE ops SET content_hash = ?2 WHERE op_id = ?1",
+            rusqlite::params![r.op_id, ch],
+        )?;
+        // the object set: the note column, the new-note side of a supersede,
+        // the edge id of a link/unlink — payload first, derived tables as
+        // the fallback for the redacted ones
+        let mut objects: Vec<String> = Vec::new();
+        if let Some(n) = &r.note_id {
+            objects.push(format!("note:{n}"));
+        }
+        let body: Option<serde_json::Value> = tx
+            .query_row(
+                "SELECT p.body FROM op_payloads p WHERE p.op_id = ?1",
+                [&r.op_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .and_then(|b: String| serde_json::from_str(&b).ok());
+        if kind == super::ops::OpKind::Supersede {
+            let new_id = body
+                .as_ref()
+                .and_then(|b| b.get("note"))
+                .and_then(|n| n.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let fallback: Vec<String> = {
+                let mut stmt =
+                    tx.prepare("SELECT new_id FROM supersedes WHERE old_id = ?1 ORDER BY new_id")?;
+                let mapped = stmt.query_map([&r.note_id], |row| row.get(0))?;
+                mapped.collect::<Result<Vec<_>, _>>()?
+            };
+            if let Some(new) = new_id {
+                objects.push(format!("note:{new}"));
+            } else {
+                for new in fallback {
+                    objects.push(format!("note:{new}"));
+                }
+            }
+        }
+        if matches!(kind, super::ops::OpKind::Link | super::ops::OpKind::Unlink)
+            && let Some(id) = body
+                .as_ref()
+                .and_then(|b| b.get("edge"))
+                .and_then(|e| e.get("id"))
+                .or_else(|| body.as_ref().and_then(|b| b.get("id")))
+                .and_then(serde_json::Value::as_str)
+        {
+            objects.push(format!("edge:{id}"));
+        }
+        for object in objects {
+            tx.execute(
+                "INSERT INTO op_objects (op_id, object) VALUES (?1, ?2)
+                 ON CONFLICT(op_id, object) DO NOTHING",
+                rusqlite::params![r.op_id, object],
+            )?;
+        }
     }
     Ok(())
 }
