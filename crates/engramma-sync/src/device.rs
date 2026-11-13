@@ -29,6 +29,9 @@ const LABEL_HPKE: &[u8] = b"engramma/device/hpke/v1";
 pub struct DeviceKey {
     transport: SigningKey,
     signing: SigningKey,
+    // the DERIVED X25519 private key (DHKEM's DeriveKeyPair over the
+    // HKDF-derived secret) — NOT the raw derived secret, which is only
+    // the intermediate input
     hpke_secret: [u8; 32],
 }
 
@@ -100,16 +103,18 @@ impl DeviceKey {
         self.signing.verifying_key().to_bytes()
     }
 
+    /// The HPKE (X25519) SECRET key, as 32 raw bytes (the holder opens
+    /// its wraps with this; it never leaves the device).
+    #[must_use]
+    pub fn hpke_secret(&self) -> [u8; 32] {
+        self.hpke_secret
+    }
+
     /// The HPKE (X25519) public key, as 32 raw bytes.
     #[must_use]
     pub fn hpke_public(&self) -> [u8; 32] {
-        use hpke::kem::X25519HkdfSha256;
-        use hpke::{Kem, Serializable};
-        let (_secret, public) = X25519HkdfSha256::derive_keypair(&self.hpke_secret);
-        let bytes = public.to_bytes();
-        let mut out = [0_u8; 32];
-        out.copy_from_slice(&bytes);
-        out
+        let sk = x25519_dalek::StaticSecret::from(self.hpke_secret);
+        x25519_dalek::PublicKey::from(&sk).to_bytes()
     }
 
     /// Sign a message with the operation signing key.

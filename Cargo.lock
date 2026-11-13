@@ -1413,6 +1413,7 @@ dependencies = [
  "time",
  "tokio",
  "ulid",
+ "x25519-dalek",
 ]
 
 [[package]]
