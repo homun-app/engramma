@@ -27,6 +27,7 @@ const LABEL_HPKE: &[u8] = b"engramma/device/hpke/v1";
 
 /// One device's keys, all derived from the one seed.
 pub struct DeviceKey {
+    seed: [u8; 32],
     transport: SigningKey,
     signing: SigningKey,
     // the DERIVED X25519 private key (DHKEM's DeriveKeyPair over the
@@ -78,10 +79,15 @@ impl DeviceKey {
             );
             okm
         };
+        let mut hpke_secret = derive(LABEL_HPKE);
+        hpke_secret[0] &= 248;
+        hpke_secret[31] &= 127;
+        hpke_secret[31] |= 64;
         Self {
+            seed,
             transport: SigningKey::from_bytes(&derive(LABEL_TRANSPORT)),
             signing: SigningKey::from_bytes(&derive(LABEL_SIGNING)),
-            hpke_secret: derive(LABEL_HPKE),
+            hpke_secret,
         }
     }
 
@@ -89,6 +95,22 @@ impl DeviceKey {
     #[must_use]
     pub fn device_id(&self) -> String {
         hex(&self.signing.verifying_key().to_bytes())
+    }
+
+    /// The device's seed (tests and the server task re-derive the keys
+    /// in their own thread; the seed never leaves the process).
+    #[must_use]
+    pub fn clone_seed(&self) -> [u8; 32] {
+        self.seed
+    }
+
+    /// The transport key's SEED (iroh's SecretKey is an Ed25519 seed):
+    /// only the device itself holds it; peers know the public key.
+    #[must_use]
+    pub fn transport_seed(&self) -> [u8; 32] {
+        self.transport.to_bytes()[..32].try_into().expect(
+            /* signing key is 64 bytes: seed‖public */ "seed is 32 bytes",
+        )
     }
 
     /// The public iroh transport key (Ed25519), as 32 raw bytes.
@@ -140,7 +162,7 @@ impl DeviceKey {
     }
 }
 
-pub(crate) fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -148,5 +170,5 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 /// own small log, not a cell).
 #[must_use]
 pub fn registry_node() -> &'static str {
-    "engramma-registry"
+    "engrammaregistry"
 }

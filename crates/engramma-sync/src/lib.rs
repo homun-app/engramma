@@ -7,7 +7,9 @@
 
 pub mod crypto;
 pub mod device;
+pub mod keystore;
 pub mod pairing;
+pub mod protocol;
 pub mod registry;
 pub mod words;
 

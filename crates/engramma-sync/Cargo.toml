@@ -18,9 +18,10 @@ ed25519-dalek.workspace = true
 x25519-dalek = "3"
 getrandom = "0.4"
 time.workspace = true
+base64ct = "1"
 hkdf.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -33,3 +34,4 @@ rusqlite.workspace = true
 iroh = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 proptest.workspace = true
+

@@ -88,6 +88,67 @@ pub struct DeviceRegistry {
 }
 
 impl DeviceRegistry {
+    /// The underlying connection (the keystore shares it).
+    #[must_use]
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Every registry row as JSON, for the session's first exchange: each
+    /// row carries the signature it was born with, so the peer validates
+    /// on arrival, not on trust.
+    ///
+    /// # Errors
+    /// [`Error::Db`] on SQL failure.
+    pub fn rows_json(&self) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        if let Ok(rows) = self
+            .conn
+            .prepare("SELECT op_id, hlc, kind, payload_json, sig FROM registry ORDER BY seq")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| {
+                    let payload: String = r.get(3)?;
+                    let sig: Vec<u8> = r.get(4)?;
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        payload,
+                        sig,
+                    ))
+                })
+                .map(|rows| rows.collect::<Vec<_>>())
+            })
+        {
+            for row in rows.into_iter().flatten() {
+                let (op_id, hlc, kind, payload, sig) = row;
+                out.push(serde_json::json!({
+                    "op_id": op_id,
+                    "hlc": hlc,
+                    "kind": kind,
+                    "payload": serde_json::from_str::<serde_json::Value>(&payload)
+                        .unwrap_or(serde_json::Value::Null),
+                    "sig": base64_url(&sig),
+                }));
+            }
+        }
+        out
+    }
+
+    /// Apply the rows a session brought: each is decoded, verified and
+    /// applied through [`DeviceRegistry::arrive`] — signature first,
+    /// rules second.
+    ///
+    /// # Errors
+    /// Whatever `arrive` rejects with; a bad row aborts the exchange.
+    pub fn arrive_rows(&self, rows: &[serde_json::Value]) -> Result<()> {
+        for row in rows {
+            let op = decode_row(row)?;
+            self.arrive(&op)?;
+        }
+        Ok(())
+    }
+
     /// Open (or create) the registry of a data-root.
     ///
     /// # Errors
@@ -104,7 +165,14 @@ impl DeviceRegistry {
                 device TEXT PRIMARY KEY, name TEXT NOT NULL, transport TEXT NOT NULL,
                 hpke TEXT NOT NULL, added_by TEXT NOT NULL, added_at TEXT NOT NULL,
                 removed_at TEXT, removed_by TEXT);
-             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
+             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE IF NOT EXISTS cell_keys (
+                sync_id BLOB NOT NULL, epoch INTEGER NOT NULL,
+                key BLOB NOT NULL,        -- the raw epoch key, for holders
+                wrapped_for TEXT,         -- device id when this row is a wrap
+                wrapped BLOB,             -- the HPKE wrap (when wrapped_for)
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (sync_id, epoch, wrapped_for));",
         )?;
         Ok(Self { conn, path })
     }
@@ -545,6 +613,53 @@ impl DeviceRegistry {
             v.get("accepted_count").and_then(Value::as_u64).unwrap_or(0),
         )))
     }
+}
+
+fn decode_row(row: &serde_json::Value) -> Result<RegistryOp> {
+    use base64ct::{Base64UrlUnpadded as B64, Encoding};
+    let op_id = ulid::Ulid::from_string(
+        row.get("op_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    )
+    .map_err(|e| Error::Malformed(format!("bad op_id: {e}")))?;
+    let hlc = engramma_core::hlc::Hlc::parse(
+        row.get("hlc")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    )
+    .map_err(|e| Error::Malformed(format!("bad hlc: {e}")))?;
+    let kind = match row
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+    {
+        "create" => RegistryKind::Create,
+        "add" => RegistryKind::Add,
+        "remove" => RegistryKind::Remove,
+        other => return Err(Error::Malformed(format!("unknown registry kind `{other}`"))),
+    };
+    let sig = B64::decode_vec(
+        row.get("sig")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    )
+    .map_err(|e| Error::Malformed(format!("bad signature: {e}")))?;
+    Ok(RegistryOp {
+        op_id,
+        hlc,
+        kind,
+        payload: row
+            .get("payload")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        sig,
+    })
+}
+
+fn base64_url(data: &[u8]) -> String {
+    use base64ct::{Base64UrlUnpadded as B64, Encoding};
+    B64::encode_string(data)
 }
 
 fn hex_decode(hex: &str, out: &mut [u8; 32]) -> bool {

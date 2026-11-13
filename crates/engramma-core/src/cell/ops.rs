@@ -302,21 +302,58 @@ fn content_json(
     base: Option<&str>,
     payload_digest: &str,
 ) -> Value {
-    let note_id = note_id
-        .map(|u| Value::String(u.to_string()))
-        .unwrap_or(Value::Null);
-    let mut content = serde_json::json!({
-        "actor": actor,
-        "hlc": hlc.to_string(),
-        "kind": kind.as_str(),
-        "note_id": note_id,
-        "op_id": op_id.to_string(),
-        "payload_digest": payload_digest,
-    });
+    // the canonical form, hand-serialized: every local write pays this,
+    // and the serde Value + to_string round trip was measurable at 10k.
+    // Only `actor` is free-form input: it goes through the escaper; every
+    // other field is ULID, hex or a fixed word. The golden vector (and the
+    // whole suite) pins the bytes.
+    let mut out = String::with_capacity(200);
+    out.push_str("{\"actor\":");
+    json_escape_into(&mut out, actor);
+    // the canonical order is the map's sorted-key order: base, when it
+    // lives, comes second
     if let Some(base) = base {
-        content["base"] = Value::String(base.to_string());
+        out.push_str(",\"base\":");
+        json_escape_into(&mut out, base);
     }
-    content
+    out.push_str(",\"hlc\":");
+    json_escape_into(&mut out, &hlc.to_string());
+    out.push_str(",\"kind\":");
+    json_escape_into(&mut out, kind.as_str());
+    out.push_str(",\"note_id\":");
+    match note_id {
+        Some(n) => json_escape_into(&mut out, &n.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"op_id\":");
+    json_escape_into(&mut out, &op_id.to_string());
+    out.push_str(",\"payload_digest\":");
+    json_escape_into(&mut out, payload_digest);
+    out.push('}');
+    Value::String(out)
+}
+
+/// Append `s` to `out` as a JSON string literal (quotes included),
+/// escaping exactly as serde_json does: quote, backslash, and the control
+/// range below 0x20 as `\u00xx`.
+fn json_escape_into(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 /// The identity of an operation on the wire (v0.6, P1): blake3 over the
@@ -331,12 +368,17 @@ pub fn content_hash(
     base: Option<&str>,
     payload_digest: &str,
 ) -> String {
+    let content = content_json(op_id, hlc, actor, kind, note_id, base, payload_digest);
+    let fallback;
+    let bytes: &[u8] = match &content {
+        Value::String(s) => s.as_bytes(),
+        other => {
+            fallback = other.to_string();
+            fallback.as_bytes()
+        }
+    };
     let mut hasher = blake3::Hasher::new();
-    hasher.update(
-        content_json(op_id, hlc, actor, kind, note_id, base, payload_digest)
-            .to_string()
-            .as_bytes(),
-    );
+    hasher.update(bytes);
     hasher.finalize().to_hex().to_string()
 }
 
@@ -2919,6 +2961,52 @@ mod tests {
             op_hash_v1(GENESIS_HASH, &canonical),
             "a217239290ba91e17196ab1812bd01a1e3d05e71f6048387017212636c555d46"
         );
+    }
+
+    /// The hand-rolled canonical content must be byte-identical to the
+    /// serde form for ANY actor string — including control characters and
+    /// quotes — because a content_hash that moves would break every old
+    /// row's verification.
+    #[test]
+    fn hand_rolled_content_matches_serde_bytes() {
+        let cases = [
+            "user@cli",
+            "mcp:claude-desktop",
+            "a\"quote",
+            "back\\slash",
+            "line\nbreak",
+            "tab\there",
+            "ctrl\u{1}x",
+            "unicode àèìòù",
+            "",
+        ];
+        for actor in cases {
+            let op_id = Ulid::from_string("01F7ZQ6VTSATW2BQ5Z9R0P1S8T").unwrap(/* t */);
+            let hlc = crate::hlc::Hlc::parse("01a17720ca0000000007.0123456789ab").unwrap(/* t */);
+            let note = Ulid::from_string("01F7ZQ6VTSATW2BQ5Z9R0P1S8T").unwrap(/* t */);
+            for (nid, base) in [(Some(note), None), (None, Some("deadbeef"))] {
+                let hand = content_json(&op_id, &hlc, actor, OpKind::PutNote, nid, base, "digest");
+                let hand = match &hand {
+                    Value::String(s) => s.clone(),
+                    v => v.to_string(),
+                };
+                let note_json = nid
+                    .map(|u| Value::String(u.to_string()))
+                    .unwrap_or(Value::Null);
+                let mut serde_form = serde_json::json!({
+                    "actor": actor,
+                    "hlc": hlc.to_string(),
+                    "kind": "put_note",
+                    "note_id": note_json,
+                    "op_id": op_id.to_string(),
+                    "payload_digest": "digest",
+                });
+                if let Some(b) = base {
+                    serde_form["base"] = Value::String(b.into());
+                }
+                assert_eq!(hand, serde_form.to_string(), "actor {actor:?}");
+            }
+        }
     }
 
     #[test]
