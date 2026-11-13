@@ -616,9 +616,10 @@ fn or_match_expr(words: &[crate::text::QueryWord]) -> String {
 fn match_expr_for(
     conn: &rusqlite::Connection,
     qt: &crate::text::QueryTerms,
+    include_quarantined: bool,
 ) -> Result<String, SearchError> {
-    let total = visible_note_count(conn, false);
-    let df = doc_frequencies(conn, &qt.flat(), &qt.fragments(), false)?;
+    let total = visible_note_count(conn, include_quarantined);
+    let df = doc_frequencies(conn, &qt.flat(), &qt.fragments(), include_quarantined)?;
     Ok(match_expr_with(qt, &df, total))
 }
 
@@ -753,7 +754,7 @@ fn match_expr_with(qt: &crate::text::QueryTerms, df: &HashMap<String, i64>, tota
             .unwrap_or(0)
     };
     let matching = qt.words.iter().filter(|w| df_of(w) > 0).count();
-    let kept: Vec<crate::text::QueryWord> = if matching >= 2 {
+    let mut kept: Vec<crate::text::QueryWord> = if matching >= 2 {
         let kept: Vec<crate::text::QueryWord> = qt
             .words
             .iter()
@@ -768,6 +769,23 @@ fn match_expr_with(qt: &crate::text::QueryTerms, df: &HashMap<String, i64>, tota
     } else {
         qt.words.clone()
     };
+    // v0.5.3 (P0, chiusura): an uncertain question's forms that the index
+    // does not hold (df = 0) leave the singles — they cannot match a
+    // document, and carrying them had cost half a millisecond per query
+    // (measured at 10k: p50 of the text search 1.2 → 1.7 ms). The last
+    // form of a word stays (a MATCH that finds nothing is honest), and so
+    // does the canonical form (the pairs are built on it).
+    for w in &mut kept {
+        if w.forms.len() > 1 {
+            let primary = w.primary.clone();
+            w.forms
+                .retain(|f| df.get(f.as_str()).copied().unwrap_or(0) > 0 || *f == primary);
+            if w.forms.is_empty() {
+                // every form was absent: keep the primary alone
+                w.forms.push(primary);
+            }
+        }
+    }
     or_match_expr(&kept)
 }
 
@@ -999,7 +1017,7 @@ impl Cell {
         if terms.is_empty() {
             return Err(SearchError::Invalid("query has no usable terms".into()));
         }
-        let match_expr = match_expr_for(conn, &terms)?;
+        let match_expr = match_expr_for(conn, &terms, q.filters.include_quarantined)?;
         let text_hits = bm25_candidates(
             conn,
             &match_expr,
@@ -3688,7 +3706,7 @@ mod tests {
                 .collect();
             eprintln!("dfs {stems:?} -> {dfs:?}");
             // "lavora" (above the fraction AND the 1000-document floor) leaves
-            let expr = match_expr_for(&inner.conn, &terms).unwrap(/* test-only */);
+            let expr = match_expr_for(&inner.conn, &terms, false).unwrap(/* test-only */);
             assert!(
                 !expr.contains(&format!("\"{}\"", stems[1])),
                 "the ubiquitous term must leave the MATCH: {expr}"
@@ -3704,7 +3722,7 @@ mod tests {
             let both = text::query_terms("lavora squadra", Some(crate::format::Lang::It), &[]);
             let both_flat = both.flat();
             assert_eq!(both_flat.len(), 2, "{both_flat:?}");
-            let expr2 = match_expr_for(&inner.conn, &both).unwrap(/* test-only */);
+            let expr2 = match_expr_for(&inner.conn, &both, false).unwrap(/* test-only */);
             assert!(
                 expr2.contains(both_flat[0].as_str()) && expr2.contains(both_flat[1].as_str()),
                 "no term may be dropped when every matching term is frequent: {expr2}"
