@@ -1016,3 +1016,45 @@ fn the_watermark_keeps_the_maximum_across_out_of_order_arrivals() {
     assert_eq!(got, max, "the watermark must hold the maximum ever seen");
     assert!(z.verify().unwrap(/* test-only */).ok());
 }
+
+/// The P1 measure: what does ONE rematerialization cost on a note with a
+/// hundred versions? The number belongs in the REPORT; the assertion is a
+/// generous ceiling, a regression tripwire rather than a promise.
+#[test]
+fn rematerializing_a_hundred_version_note_stays_cheap() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let a = Cell::create(&dir.path().join("m.sqlite"), "conv", "device-a")
+        .unwrap(/* test-only */);
+    let note = base_note(31, "la nota dalle cento versioni");
+    let id = note.id;
+    a.put_note(&note, "device-a").unwrap(/* test-only */);
+    for i in 1..=100 {
+        a.patch_note(
+            &id,
+            &NotePatch {
+                body: Some(format!("versione {i}")), ..Default::default()
+            },
+            "device-a",
+        )
+        .unwrap(/* test-only */);
+    }
+    // a copy that receives everything in REVERSE order rematerializes the
+    // note at every arrival: the worst case
+    let ops = a.ops().unwrap(/* test-only */);
+    let mut rev: Vec<Op> = ops.clone();
+    rev.reverse();
+    let started = std::time::Instant::now();
+    let z = copy_of("m", &rev);
+    let elapsed = started.elapsed();
+    assert_eq!(
+        z.get(&id).unwrap(/* test-only */).body,
+        "versione 100",
+        "the winner is the last write in total order"
+    );
+    assert!(z.verify().unwrap(/* test-only */).ok());
+    eprintln!("misure P1: 100 versioni consegnate alla rovescia (la peggiore): {elapsed:?}");
+    assert!(
+        elapsed.as_secs() < 30,
+        "a hundred-version rematerialization storm took {elapsed:?}"
+    );
+}
