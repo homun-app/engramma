@@ -389,3 +389,21 @@ picco di `into_typed`/`into_optimized` che il malloc di macOS non
 restituisce al sistema, ma riusa — 1000 `embedPending` e 2000 ricerche
 ibride sopra non spostano la misura, REPORT §v0.4.2) — e l'interfaccia
 chiede tutto al demone via RPC.
+
+## La sincronizzazione accanto al demone (v0.6)
+
+In questa fase **il contratto JS non cambia**: Homun sincronizza le sue
+celle facendo girare accanto `engramma sync serve --root <radice di
+Homun>`. I due processi convivono: il demone scrive, `sync serve`
+sincronizza a ogni scrittura (la rileva con `PRAGMA data_version`) e ogni
+5 minuti. La convivenza è provata nel banco end-to-end di `engramma-sync`.
+
+**Lo schema delle celle sale alla versione 19** (v15: `content_hash`,
+`base`, `op_objects`; v16: `pending_objects`; v17: `conflict_copies`;
+v18: `device_acks`; v19: `device`, `sig`): le celle migrate **non tornano
+indietro** a un binario più vecchio (il `SCHEMA_TOO_NEW` della v0.5 le
+rifiuta). Migrazione all'apertura, irrovocabile, con `verify` verde dopo.
+
+**L'API JS della sincronizzazione** (stato, abbinamento col QR del
+biglietto, elenco dei dispositivi) è la v0.6.x, con l'interfaccia di
+Homun: questa fase ha consegnato il demone `sync serve` e la CLI.
