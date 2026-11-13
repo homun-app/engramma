@@ -833,6 +833,7 @@ fn a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint() {
              CREATE UNIQUE INDEX idx_vault_files_note_v9 ON vault_files(note_id);
              DROP TABLE IF EXISTS proposals;
              DROP TABLE IF EXISTS decisions;
+             DROP TABLE IF EXISTS notes_fts_hidden;  -- v14: a real v9 cell has one index
              UPDATE meta SET value = '9' WHERE key = 'schema_version';
              DELETE FROM meta WHERE key = 'dump_v13';",
         )

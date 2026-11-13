@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 13] = [
+pub const MIGRATIONS: [&str; 14] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -229,6 +229,29 @@ CREATE TABLE decisions (op_id TEXT PRIMARY KEY,     -- the decide op
                         reverted_by TEXT);          -- the revert_decision op, when cancelled
 CREATE INDEX idx_decisions_proposal ON decisions(proposal);
 CREATE INDEX idx_decisions_actor ON decisions(actor);
+"#,
+    r#"
+-- v14 (v0.6, P0): the quarantined notes leave the ONE text index. FTS5
+-- computes bm25's IDF over the whole index it answers from: with the hidden
+-- rows inside, a quarantined note matching a question moved the IDF of its
+-- terms and with it every visible score (measured by the reviewer: a second
+-- result from 1e-06 to 0.4156 — a fingerprint of a hidden note, readable by
+-- any client repeating the question). From here: `notes_fts` holds exactly
+-- the visible notes (`active`, `superseded`), `notes_fts_hidden` exactly the
+-- quarantined ones, tombstones neither. The owner's `include_quarantined`
+-- (JS contract of v0.4) queries both and fuses by rank; the default view
+-- answers from `notes_fts` alone, whose statistics no hidden row can bend.
+-- The migration self-heals the base index too (delete-all + selective
+-- insert: the discipline `reindex_note` keeps, applied once by hand).
+CREATE VIRTUAL TABLE notes_fts_hidden USING fts5(title, body_norm, tags_text, content='notes', content_rowid='rowid',
+                                                 tokenize='unicode61 remove_diacritics 2');
+INSERT INTO notes_fts_hidden(rowid, title, body_norm, tags_text)
+     SELECT rowid, COALESCE(title, ''), COALESCE(body_norm, ''), COALESCE(tags_text, '')
+     FROM notes WHERE status = 'quarantined';
+INSERT INTO notes_fts(notes_fts) VALUES('delete-all');
+INSERT INTO notes_fts(rowid, title, body_norm, tags_text)
+     SELECT rowid, COALESCE(title, ''), COALESCE(body_norm, ''), COALESCE(tags_text, '')
+     FROM notes WHERE status IN ('active', 'superseded');
 "#,
 ];
 
@@ -469,9 +492,11 @@ pub fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellE
     // over `notes_fts` (never part of `ops`, the replay comparison or the
     // export); created unversioned like `meta` — idempotent and additive, so
     // existing cells gain it on their next open. It must follow the
-    // migrations: on a fresh cell `notes_fts` only exists after v1.
+    // migrations: on a fresh cell `notes_fts` only exists after v1. The
+    // hidden twin (v0.6, P0) serves the same read on `notes_fts_hidden`.
     tx.execute_batch(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts_vocab USING fts5vocab(notes_fts, 'row');",
+        "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts_vocab USING fts5vocab(notes_fts, 'row');
+         CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts_hidden_vocab USING fts5vocab(notes_fts_hidden, 'row');",
     )?;
     Ok(())
 }

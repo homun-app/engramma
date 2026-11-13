@@ -619,7 +619,7 @@ fn match_expr_for(
     include_quarantined: bool,
 ) -> Result<String, SearchError> {
     let total = visible_note_count(conn, include_quarantined);
-    let df = doc_frequencies(conn, &qt.flat(), &qt.fragments(), include_quarantined)?;
+    let df = doc_frequencies(conn, &qt.flat(), include_quarantined)?;
     Ok(match_expr_with(qt, &df, total))
 }
 
@@ -643,27 +643,39 @@ pub(crate) fn visible_note_count(conn: &rusqlite::Connection, include_quarantine
 /// `doc` is the document frequency and `cnt` the total occurrences (probed
 /// by hand on the bundled 3.54.1; older fts5vocab emitted one row per
 /// term/document pair). An empty map means "unknown" — nothing is dropped,
-/// nothing is discounted. The vocabulary counts EVERY indexed row; with the
-/// default view (v0.5.3, P1) the quarantined documents are subtracted
-/// exactly — one rowid-probed MATCH count per term, the index's own
-/// tokenizer deciding — so a hidden note cannot inflate a term into
-/// "non-discriminative" and flip a support label.
+/// nothing is discounted. The base vocabulary counts the visible notes only
+/// (v0.6, P0: the quarantined rows live in their own index, so nothing is
+/// subtracted anymore); the owner's `include_quarantined` view sums the
+/// hidden vocabulary in.
 fn doc_frequencies(
     conn: &rusqlite::Connection,
     terms: &[String],
-    fragments: &[(String, String)],
     include_quarantined: bool,
 ) -> Result<HashMap<String, i64>, SearchError> {
     if terms.is_empty() {
         return Ok(HashMap::new());
     }
     let placeholders = vec!["?"; terms.len()].join(", ");
-    let sql = format!("SELECT term, doc FROM notes_fts_vocab WHERE term IN ({placeholders})");
+    let sql = if include_quarantined {
+        // the two vocabularies in one pass: same terms, summed docs
+        format!(
+            "SELECT term, SUM(doc) FROM (
+                 SELECT term, doc FROM notes_fts_vocab WHERE term IN ({placeholders})
+                 UNION ALL
+                 SELECT term, doc FROM notes_fts_hidden_vocab WHERE term IN ({placeholders})
+             ) GROUP BY term"
+        )
+    } else {
+        format!("SELECT term, doc FROM notes_fts_vocab WHERE term IN ({placeholders})")
+    };
     let Ok(mut stmt) = conn.prepare(&sql) else {
         // no vocabulary view (should not happen: the schema creates it)
         return Ok(HashMap::new());
     };
-    let params: Vec<String> = terms.to_vec();
+    let mut params: Vec<String> = terms.to_vec();
+    if include_quarantined {
+        params.extend(terms.iter().cloned());
+    }
     let rows = stmt
         .query_map(rusqlite::params_from_iter(params), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -673,46 +685,6 @@ fn doc_frequencies(
     for row in rows {
         let (term, doc_freq) = row?;
         df.insert(term, doc_freq);
-    }
-    drop(stmt);
-    if !include_quarantined && !df.is_empty() {
-        // subtract the quarantined documents, exactly: the CROSS JOIN pins
-        // the notes table first, so each term costs one rowid probe per
-        // quarantined note, not a posting-list scan
-        let hidden: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM notes WHERE status = 'quarantined'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if hidden > 0 {
-            let mut corrected = HashMap::with_capacity(df.len());
-            for (term, d) in df {
-                let hidden_hits: i64 = if d > 0 {
-                    // the SAME fragment the MATCH would use (a raw form
-                    // carries its column filter; a term is never an FTS
-                    // expression here)
-                    let needle = fragments
-                        .iter()
-                        .find(|(t, _)| t == &term)
-                        .map(|(_, frag)| frag.clone())
-                        .unwrap_or_else(|| format!("\"{}\"", term.replace('"', "")));
-                    conn.query_row(
-                        "SELECT COUNT(*) FROM notes n
-                         CROSS JOIN notes_fts ON notes_fts.rowid = n.rowid
-                         WHERE n.status = 'quarantined' AND notes_fts MATCH ?1",
-                        [&needle],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0)
-                } else {
-                    0
-                };
-                corrected.insert(term, (d - hidden_hits).max(0));
-            }
-            df = corrected;
-        }
     }
     Ok(df)
 }
@@ -808,27 +780,25 @@ pub(crate) fn visible_statuses(include_quarantined: bool) -> &'static str {
     }
 }
 
-/// The BM25 candidate list for a MATCH expression: `(id, -bm25)` (FTS5's
-/// bm25() is negative, more negative = better), at most `limit`.
-/// v0.5.3 (P1): the visibility of state rides INSIDE the query — a
-/// quarantined note or a tombstone never enters the list, so the ranks the
-/// rerank and `explain` see are positions among the VISIBLE matches (the
-/// first visible result is rank 1, not 2), no hidden note displaces a
-/// visible one out of the window, and the max-normalisations downstream
-/// never see a hidden maximum.
-fn bm25_candidates(
+/// One BM25 list from ONE index: `(id, -bm25)` (FTS5's bm25() is negative,
+/// more negative = better), at most `limit`. The visibility of state rides
+/// INSIDE the query (v0.5.3, P1) — a row the statuses exclude never enters
+/// the list, so the ranks the rerank and `explain` see are positions among
+/// the matches that count, no hidden note displaces a visible one out of
+/// the window, and the max-normalisations downstream never see a hidden
+/// maximum.
+fn bm25_from(
     conn: &rusqlite::Connection,
+    table: &str,
     match_expr: &str,
-    limit: u64,
-    include_quarantined: bool,
+    limit: i64,
+    statuses: &str,
 ) -> Result<Vec<(String, f64)>, SearchError> {
-    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let sql = format!(
-        "SELECT n.id, bm25(notes_fts, 10.0, 3.0, 2.0) FROM notes_fts
-         JOIN notes n ON n.rowid = notes_fts.rowid
-         WHERE notes_fts MATCH ?1 AND n.status IN {}
-         ORDER BY bm25(notes_fts, 10.0, 3.0, 2.0) LIMIT ?2",
-        visible_statuses(include_quarantined)
+        "SELECT n.id, bm25({table}, 10.0, 3.0, 2.0) FROM {table}
+         JOIN notes n ON n.rowid = {table}.rowid
+         WHERE {table} MATCH ?1 AND n.status IN {statuses}
+         ORDER BY bm25({table}, 10.0, 3.0, 2.0) LIMIT ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![match_expr, limit], |r| {
@@ -839,6 +809,58 @@ fn bm25_candidates(
         let (id, bm25) = row?;
         out.push((id, -bm25));
     }
+    Ok(out)
+}
+
+/// The BM25 candidate list for a MATCH expression. The default view answers
+/// from `notes_fts` alone — and since v0.6 (P0) that index holds the
+/// visible notes ONLY, so its IDF cannot be moved by a hidden row and the
+/// visible scores are bit-stable no matter what the quarantine holds. The
+/// owner's `include_quarantined` view queries BOTH indices; their bm25 are
+/// two incommensurable numbers (each IDF lives in its own index), so the
+/// choice is to fuse BY RANK inside the text branch — RRF with k = 60, the
+/// same fusion the hybrid search offers — a choice of DESIGN §5, written
+/// here: an alternative (recomputing bm25 over the union) would need one
+/// index holding everything, which is exactly what this phase removed.
+fn bm25_candidates(
+    conn: &rusqlite::Connection,
+    match_expr: &str,
+    limit: u64,
+    include_quarantined: bool,
+) -> Result<Vec<(String, f64)>, SearchError> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let base = bm25_from(
+        conn,
+        "notes_fts",
+        match_expr,
+        limit,
+        "('active', 'superseded')",
+    )?;
+    if !include_quarantined {
+        return Ok(base);
+    }
+    let hidden = bm25_from(
+        conn,
+        "notes_fts_hidden",
+        match_expr,
+        limit,
+        "('quarantined')",
+    )?;
+    // RRF over the two lists (a note lives in exactly one of them), ties
+    // broken by id: every copy of a cell must fuse to the same order.
+    const K: u64 = 60;
+    let mut fused: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for list in [&base, &hidden] {
+        for (rank, (id, _)) in list.iter().enumerate() {
+            *fused.entry(id.clone()).or_default() += 1.0 / (K as f64 + (rank + 1) as f64);
+        }
+    }
+    let mut out: Vec<(String, f64)> = fused.into_iter().collect();
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     Ok(out)
 }
 
@@ -2373,12 +2395,7 @@ fn semantic_pipeline(
     let total_notes = visible_note_count(conn, q.filters.include_quarantined);
     // document frequencies once: the MATCH drops the ubiquitous terms and
     // the support labels discount text matches that rest on them alone
-    let df = doc_frequencies(
-        conn,
-        &terms.flat(),
-        &terms.fragments(),
-        q.filters.include_quarantined,
-    )?;
+    let df = doc_frequencies(conn, &terms.flat(), q.filters.include_quarantined)?;
     if !terms.is_empty() {
         let match_expr = match_expr_with(&terms, &df, total_notes);
         // v0.4.2 (P0.1): the window follows the asked `k`, floor 50 — no

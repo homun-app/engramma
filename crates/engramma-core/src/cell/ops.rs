@@ -522,17 +522,52 @@ fn fts_tags_value(tags: &[String]) -> String {
     sorted.join(" ")
 }
 
-/// Remove a note from the FTS index (values must match the insert exactly).
+/// Which of the two text indices a note lives in (v0.6, P0): the base one
+/// answers the default view — its IDF never sees a hidden row, so a
+/// quarantined note cannot bend a visible score — and the hidden one holds
+/// the quarantined notes for the owner's `include_quarantined`. Tombstones
+/// live in neither.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FtsIndex {
+    /// `active` and `superseded` notes.
+    Base,
+    /// `quarantined` notes.
+    Hidden,
+}
+
+impl FtsIndex {
+    fn table(self) -> &'static str {
+        match self {
+            Self::Base => "notes_fts",
+            Self::Hidden => "notes_fts_hidden",
+        }
+    }
+}
+
+/// The index a note's status routes it to, if any (`deleted` → none).
+pub(crate) fn index_for(status: Status) -> Option<FtsIndex> {
+    match status {
+        Status::Active | Status::Superseded => Some(FtsIndex::Base),
+        Status::Quarantined => Some(FtsIndex::Hidden),
+        Status::Deleted => None,
+    }
+}
+
+/// Remove a note from one FTS index (values must match the insert exactly).
 fn fts_delete(
     tx: &Transaction<'_>,
+    idx: FtsIndex,
     rowid: i64,
     title: &str,
     body_norm: &str,
     tags_text: &str,
 ) -> Result<(), CellError> {
+    let table = idx.table();
     tx.execute(
-        "INSERT INTO notes_fts(notes_fts, rowid, title, body_norm, tags_text)
-         VALUES ('delete', ?1, ?2, ?3, ?4)",
+        &format!(
+            "INSERT INTO {table}({table}, rowid, title, body_norm, tags_text)
+             VALUES ('delete', ?1, ?2, ?3, ?4)"
+        ),
         rusqlite::params![rowid, title, body_norm, tags_text],
     )?;
     Ok(())
@@ -540,13 +575,15 @@ fn fts_delete(
 
 fn fts_insert(
     tx: &Transaction<'_>,
+    idx: FtsIndex,
     rowid: i64,
     title: &str,
     body_norm: &str,
     tags_text: &str,
 ) -> Result<(), CellError> {
+    let table = idx.table();
     tx.execute(
-        "INSERT INTO notes_fts(rowid, title, body_norm, tags_text) VALUES (?1, ?2, ?3, ?4)",
+        &format!("INSERT INTO {table}(rowid, title, body_norm, tags_text) VALUES (?1, ?2, ?3, ?4)"),
         rusqlite::params![rowid, title, body_norm, tags_text],
     )?;
     Ok(())
@@ -681,16 +718,17 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
         .map_err(|e| CellError::Invalid(format!("note {id} body: {e}")))?;
 
     // --- FTS: drop the old row first (values as inserted), then rebuild.
-    // The index holds exactly the non-tombstoned notes: a delete for a
-    // rowid that is not there corrupts FTS5's internal accounting (the
-    // "database disk image is malformed" error it raises is not a no-op —
-    // one delete later the row refuses to leave the index), so tombstones
-    // never issue one and the error is no longer swallowed.
+    // Each index holds exactly the notes its side of the status split owns:
+    // a delete for a rowid that is not there corrupts FTS5's internal
+    // accounting (the "database disk image is malformed" error it raises is
+    // not a no-op — one delete later the row refuses to leave the index), so
+    // tombstones never issue one and the error is no longer swallowed.
     if let Some(old) = old
-        && old.note.status != Status::Deleted
+        && let Some(idx) = index_for(old.note.status)
     {
         fts_delete(
             tx,
+            idx,
             old.rowid,
             old.note.title.as_deref().unwrap_or(""),
             &old.body_norm,
@@ -736,9 +774,10 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
         "UPDATE notes SET tags_text = ?2 WHERE id = ?1",
         rusqlite::params![id.to_string(), tags_text],
     )?;
-    if row.note.status != Status::Deleted {
+    if let Some(idx) = index_for(row.note.status) {
         fts_insert(
             tx,
+            idx,
             row.rowid,
             row.note.title.as_deref().unwrap_or(""),
             &row.body_norm,
@@ -1308,20 +1347,23 @@ pub(crate) fn purge_state(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellErr
     let id_str = id.to_string();
     // everything the note touched, when it is still there
     if let Some(row) = read_note(tx, id)?
-        && row.note.status != Status::Deleted
+        && let Some(idx) = index_for(row.note.status)
     {
-        // The FTS row is removed only when the index really holds it: a
-        // compaction snapshot's index is empty by construction (P0.4:
-        // `delete-all` at compact, rebuilt at verify), and a `delete` for a
-        // rowid that is not there corrupts FTS5's accounting.
+        // The FTS row is removed only when an index really holds it (v0.6,
+        // P0: either of the two): a compaction snapshot's indices are empty
+        // by construction (P0.4: `delete-all` at compact, rebuilt at
+        // verify), and a `delete` for a rowid that is not there corrupts
+        // FTS5's accounting.
         let in_index: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM notes_fts_docsize WHERE id = ?1",
+            "SELECT (SELECT COUNT(*) FROM notes_fts_docsize WHERE id = ?1)
+                  + (SELECT COUNT(*) FROM notes_fts_hidden_docsize WHERE id = ?1)",
             [row.rowid],
             |r| r.get(0),
         )?;
         if in_index > 0 {
             fts_delete(
                 tx,
+                idx,
                 row.rowid,
                 row.note.title.as_deref().unwrap_or(""),
                 &row.body_norm,

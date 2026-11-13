@@ -254,6 +254,7 @@ fn v032_cell_migrates_roots_to_views_and_the_first_sync_adopts() {
              -- digest-widening bookmark
              DROP TABLE IF EXISTS proposals;
              DROP TABLE IF EXISTS decisions;
+             DROP TABLE IF EXISTS notes_fts_hidden;  -- v14: a v11 cell has one index
              DELETE FROM meta WHERE key = 'dump_v13';",
         )
         .unwrap(/* test-only */);

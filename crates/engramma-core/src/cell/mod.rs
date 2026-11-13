@@ -416,28 +416,37 @@ fn verify_checkpoint_coherence(
     }
 }
 
-/// Run the FTS5 integrity-check: the index must match what its content table
-/// implies (every FTS column has a twin in `notes` since schema v3).
+/// Run the FTS5 integrity-check on both text indices (v0.6, P0): each must
+/// match what its side of the status split in the content table implies
+/// (every FTS column has a twin in `notes` since schema v3).
 fn fts_integrity_check(conn: &Connection) -> Result<(), CellError> {
-    conn.execute(
-        "INSERT INTO notes_fts(notes_fts) VALUES('integrity-check')",
-        [],
+    conn.execute_batch(
+        "INSERT INTO notes_fts(notes_fts) VALUES('integrity-check');
+         INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('integrity-check');",
     )?;
     // SQLite 3.54's integrity-check verifies the index structure but does
     // NOT compare an external-content index with its content table (checked
-    // by hand), so compare the indexed rowid set ourselves: it must be
-    // exactly the non-tombstoned notes.
+    // by hand), so compare the indexed rowid sets ourselves: the base index
+    // holds exactly the visible notes, the hidden one exactly the
+    // quarantined notes, tombstones neither.
     let diverged: i64 = conn.query_row(
-        "SELECT (SELECT COUNT(*) FROM (SELECT rowid AS id FROM notes WHERE status != 'deleted'
-                                       EXCEPT SELECT id FROM notes_fts_docsize))
+        "SELECT (SELECT COUNT(*) FROM (SELECT rowid AS id FROM notes
+                                        WHERE status IN ('active', 'superseded')
+                                        EXCEPT SELECT id FROM notes_fts_docsize))
              + (SELECT COUNT(*) FROM (SELECT id FROM notes_fts_docsize
-                                      EXCEPT SELECT rowid FROM notes WHERE status != 'deleted'))",
+                                      EXCEPT SELECT rowid FROM notes
+                                      WHERE status IN ('active', 'superseded')))
+             + (SELECT COUNT(*) FROM (SELECT rowid AS id FROM notes WHERE status = 'quarantined'
+                                      EXCEPT SELECT id FROM notes_fts_hidden_docsize))
+             + (SELECT COUNT(*) FROM (SELECT id FROM notes_fts_hidden_docsize
+                                      EXCEPT SELECT rowid FROM notes
+                                      WHERE status = 'quarantined'))",
         [],
         |r| r.get(0),
     )?;
     if diverged > 0 {
         return Err(CellError::Db(format!(
-            "the index holds {diverged} rowid(s) more or fewer than the living notes"
+            "the text indices hold {diverged} rowid(s) more or fewer than the notes their status routes them to"
         )));
     }
     Ok(())
@@ -949,7 +958,10 @@ impl Cell {
             ops::scrub_log_snapshot(&tx, id, censorable)?;
             tx.commit()?;
         }
-        conn.execute("INSERT INTO notes_fts(notes_fts) VALUES('optimize')", [])?;
+        conn.execute_batch(
+            "INSERT INTO notes_fts(notes_fts) VALUES('optimize');
+             INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
+        )?;
         conn.pragma_update(None, "secure_delete", secure_before)?;
         conn.execute_batch("VACUUM;")?;
         state_digest(&conn)
@@ -1018,9 +1030,10 @@ impl Cell {
         // the purged body leave the index too (O(index): measured on the 100k
         // bench, REPORT §v0.3.1). It runs inside the `secure_delete` window:
         // the pages the merge frees are zeroed.
-        inner
-            .conn
-            .execute("INSERT INTO notes_fts(notes_fts) VALUES('optimize')", [])?;
+        inner.conn.execute_batch(
+            "INSERT INTO notes_fts(notes_fts) VALUES('optimize');
+             INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
+        )?;
         // the in-memory vector index drops the note with its vectors
         if let Some(st) = &mut inner.index {
             st.idx.remove(&id.to_string());
@@ -2121,10 +2134,14 @@ impl Cell {
                     tx.execute("DELETE FROM vault_views", [])?;
                     tx.execute("DELETE FROM vault_conflicts", [])?;
                     tx.execute("DELETE FROM snapshots", [])?;
-                    // external-content FTS5: `delete-all` empties the index
-                    // (its segments carry the stems); verify rebuilds it
-                    // from the content table before the tail replay
-                    tx.execute("INSERT INTO notes_fts(notes_fts) VALUES('delete-all')", [])?;
+                    // external-content FTS5: `delete-all` empties both
+                    // indices (their segments carry the stems); verify
+                    // rebuilds them from the content table before the tail
+                    // replay
+                    tx.execute_batch(
+                        "INSERT INTO notes_fts(notes_fts) VALUES('delete-all');
+                         INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('delete-all');",
+                    )?;
                     tx.commit()?;
                 }
                 snap_conn.pragma_update(None, "secure_delete", secure_before)?;
@@ -2550,21 +2567,26 @@ impl Cell {
                             }
                             // v0.3.1 (P0.4): the snapshot carries no FTS
                             // content (stripped at compact — it is derived,
-                            // and its segments hold the stems). Rebuild it
-                            // from the content table BEFORE the tail replay:
-                            // the tail's FTS deletes must find their rows.
-                            // Not the `rebuild` command: it indexes every
-                            // content row, tombstones included, while the
-                            // live index holds exactly the non-deleted notes
-                            // — so the same discipline: empty, then insert
-                            // the living rows only.
+                            // and its segments hold the stems). Rebuild both
+                            // indices from the content table BEFORE the tail
+                            // replay: the tail's FTS deletes must find their
+                            // rows. Not the `rebuild` command: it indexes
+                            // every content row, tombstones included, while
+                            // each live index holds exactly the notes its
+                            // side of the status split owns (v0.6, P0) — so
+                            // the same discipline: empty, then insert each
+                            // side's rows only.
                             {
                                 let tx = rebuild_conn.transaction()?;
                                 tx.execute_batch(
                                     "INSERT INTO notes_fts(notes_fts) VALUES('delete-all');
                                      INSERT INTO notes_fts(rowid, title, body_norm, tags_text)
                                      SELECT rowid, COALESCE(title, ''), body_norm, tags_text
-                                     FROM notes WHERE status != 'deleted';",
+                                     FROM notes WHERE status IN ('active', 'superseded');
+                                     INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('delete-all');
+                                     INSERT INTO notes_fts_hidden(rowid, title, body_norm, tags_text)
+                                     SELECT rowid, COALESCE(title, ''), body_norm, tags_text
+                                     FROM notes WHERE status = 'quarantined';",
                                 )?;
                                 tx.commit()?;
                             }
