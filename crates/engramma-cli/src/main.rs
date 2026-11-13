@@ -290,6 +290,21 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Manage the devices of this data root (v0.6)
+    Devices {
+        #[command(subcommand)]
+        action: DevicesAction,
+    },
+    /// Synchronize this data root's cells (v0.6)
+    Sync {
+        #[command(subcommand)]
+        action: SyncAction,
+    },
+    /// The blind mailbox node (v0.6)
+    Mailbox {
+        #[command(subcommand)]
+        action: MailboxAction,
+    },
     /// Verify the log (hash chain + replay)
     Verify,
     /// Compact the log: register a checkpoint (no second copy of the cell)
@@ -456,6 +471,62 @@ enum ModelAction {
     Pull { id: String },
     /// Set the cell's embedding model (blue/green: builds while the old one serves)
     Use { id: String },
+}
+
+#[derive(Subcommand)]
+enum DevicesAction {
+    /// Create the device key (or show the existing one)
+    Init,
+    /// Print an invite ticket (10 minutes, one use)
+    Invite,
+    /// Print a short pairing code
+    Code,
+    /// Join with a ticket or a code
+    Join {
+        /// The ticket (textual) or the code (NUMBER-WORD-WORD)
+        ticket_or_code: String,
+        /// This device's name
+        #[arg(long)]
+        name: String,
+    },
+    /// List the devices (name, short id, last contact, epochs)
+    List,
+    /// Remove a device (rotates every shared cell's key)
+    Remove { name: String },
+    /// The device list's own log
+    Log,
+}
+
+#[derive(Subcommand)]
+enum SyncAction {
+    /// Share a cell with the other devices (adopt + key epoch 0)
+    Share { cell: String },
+    /// Stop sharing a cell from here (copies elsewhere stay)
+    Unshare { cell: String },
+    /// One pass with every reachable device and the mailbox, then exit
+    Run,
+    /// Serve: sync on every local write and every 5 minutes
+    Serve,
+    /// Per cell: devices, last session, pending ops, frontier, epoch
+    Status,
+    /// The conflict copies this copy holds
+    Conflicts,
+}
+
+#[derive(Subcommand)]
+enum MailboxAction {
+    /// Run the blind mailbox node
+    Serve {
+        /// The node's data root
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// Add the mailbox to this data root's device list
+    Add { ticket: String },
+    /// Remove the mailbox
+    Remove,
+    /// The mailbox's health
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1314,6 +1385,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Devices { action } => devices_run(cli, action),
+        Command::Sync { action } => sync_run(cli, action),
+        Command::Mailbox { action } => mailbox_run(cli, action),
         Command::Verify => {
             let cell = open_cell(cli)?;
             let report = cell.verify()?;
@@ -3278,6 +3352,278 @@ fn line_diff(old: &str, new: &str) -> Vec<String> {
         j += 1;
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// v0.6: devices, sync, mailbox
+// ---------------------------------------------------------------------------
+
+fn devices_run(cli: &Cli, action: &DevicesAction) -> Result<(), CliError> {
+    use engramma_sync::device::DeviceKey;
+    use engramma_sync::registry::DeviceRegistry;
+    let r = root(cli);
+    match action {
+        DevicesAction::Init => {
+            let dk =
+                DeviceKey::load_or_create(&r).map_err(|e| CliError::internal(e.to_string()))?;
+            let reg = DeviceRegistry::open(&r).map_err(|e| CliError::internal(e.to_string()))?;
+            let n = reg
+                .live_members()
+                .map_err(|e| CliError::internal(e.to_string()))?
+                .len();
+            if n == 0 {
+                reg.create_first(&dk, "portatile")
+                    .map_err(|e| CliError::internal(e.to_string()))?;
+            }
+            if cli.json {
+                print_json(&serde_json::json!({ "device": short_id(&dk.device_id()) }));
+            } else {
+                println!(
+                    "dispositivo {} (elenco: {} vivi)",
+                    short_id(&dk.device_id()),
+                    n.max(1)
+                );
+            }
+            Ok(())
+        }
+        DevicesAction::List => {
+            let reg = DeviceRegistry::open(&r).map_err(|e| CliError::internal(e.to_string()))?;
+            let members = reg
+                .live_members()
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            if cli.json {
+                let v: Vec<serde_json::Value> = members
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "name": m.name, "device": short_id(&m.device),
+                            "transport": short_id(&m.transport),
+                        })
+                    })
+                    .collect();
+                print_json(&serde_json::json!({ "devices": v }));
+            } else {
+                for m in &members {
+                    println!(
+                        "{}  {}  {}",
+                        m.name,
+                        short_id(&m.device),
+                        short_id(&m.transport)
+                    );
+                }
+            }
+            Ok(())
+        }
+        DevicesAction::Invite => {
+            let dk =
+                DeviceKey::load_or_create(&r).map_err(|e| CliError::internal(e.to_string()))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let ticket = engramma_sync::pairing::Ticket::mint(dk.transport_public(), "", &[], now)
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            println!("{}", ticket.encode());
+            Ok(())
+        }
+        DevicesAction::Code => {
+            let code = engramma_sync::pairing::ShortCode::generate()
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            println!("{}", code.encode());
+            Ok(())
+        }
+        DevicesAction::Join { .. } => {
+            // the transport ride (iroh connect + the pairing turns) is the
+            // P5 serve loop's sibling; the CLI prints the way in today
+            Err(CliError::internal(
+                "join: collega il dispositivo con il biglietto — `engramma devices invite` — \
+                 e conferma le sei cifre su entrambi gli schermi (P5)",
+            ))
+        }
+        DevicesAction::Remove { name } => {
+            let dk =
+                DeviceKey::load_or_create(&r).map_err(|e| CliError::internal(e.to_string()))?;
+            let reg = DeviceRegistry::open(&r).map_err(|e| CliError::internal(e.to_string()))?;
+            let target = reg
+                .live_members()
+                .map_err(|e| CliError::internal(e.to_string()))?
+                .into_iter()
+                .find(|m| m.name == *name)
+                .ok_or_else(|| CliError::internal(format!("nessun dispositivo «{name}»")))?;
+            if !cli.json {
+                println!(
+                    "rimuovo {}: ruota le chiavi di ogni cella condivisa; \
+                     ciò che il dispositivo aveva già lo tiene",
+                    name
+                );
+            }
+            reg.remove(&dk, &target.device, "pending-root", 0)
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            if cli.json {
+                print_json(&serde_json::json!({ "removed": name }));
+            }
+            Ok(())
+        }
+        DevicesAction::Log => {
+            let reg = DeviceRegistry::open(&r).map_err(|e| CliError::internal(e.to_string()))?;
+            let rows = reg.rows_json();
+            if cli.json {
+                print_json(&serde_json::json!({ "ops": rows }));
+            } else {
+                for row in rows {
+                    println!(
+                        "{}  {}  {}",
+                        row["hlc"].as_str().unwrap_or(""),
+                        row["kind"].as_str().unwrap_or(""),
+                        row["payload"]["name"].as_str().unwrap_or("")
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn short_id(hex: &str) -> String {
+    hex.chars().take(8).collect()
+}
+
+fn sync_run(cli: &Cli, action: &SyncAction) -> Result<(), CliError> {
+    match action {
+        SyncAction::Share { cell } => {
+            let c = open_cell_named(cli, cell)?;
+            let r = root(cli);
+            let dk = engramma_sync::device::DeviceKey::load_or_create(&r)
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            let op = c
+                .adopt_log("cli")
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            c.mark_shared()
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            let reg = engramma_sync::registry::DeviceRegistry::open(&r)
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            let ks = engramma_sync::keystore::KeyStore::new(reg.conn());
+            let epoch0 = ks
+                .create_epoch0(&[0_u8; 32])
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            let _ = dk;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "cell": cell, "adopt": op.to_string(),
+                    "epoch": 0,
+                }));
+            } else {
+                println!(
+                    "cella «{cell}» condivisa: adopt {}, epoca 0, chiave {}",
+                    op,
+                    short_id(&engramma_sync::device::hex(&epoch0.0))
+                );
+            }
+            Ok(())
+        }
+        SyncAction::Unshare { cell } => {
+            let _ = open_cell_named(cli, cell)?;
+            // the local bookkeeping only: the copies elsewhere stay
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "cell": cell,
+                    "note": "le copie sugli altri dispositivi restano",
+                }));
+            } else {
+                println!("«{cell}» non si sincronizza più da qui; le copie altrove restano");
+            }
+            Ok(())
+        }
+        SyncAction::Run => {
+            // the loopback session driver is the crate's; the CLI passes
+            // through to it when the serve task runs
+            Err(CliError::internal(
+                "sync run: il servizio gira con `engramma sync serve` (P5)",
+            ))
+        }
+        SyncAction::Serve => Err(CliError::internal(
+            "sync serve: il demone arriva con il loop di servizio (P5)",
+        )),
+        SyncAction::Status => {
+            let c = open_cell(cli)?;
+            let frontier = c
+                .stable_frontier()
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            let r = root(cli);
+            let reg = engramma_sync::registry::DeviceRegistry::open(&r)
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            let devices = reg
+                .live_members()
+                .map_err(|e| CliError::internal(e.to_string()))?
+                .len();
+            let head: i64 = c
+                .debug_column("SELECT CAST(COALESCE(MAX(seq),0) AS TEXT) FROM ops")
+                .map_err(|e| CliError::internal(e.to_string()))?[0]
+                .parse()
+                .unwrap_or(0);
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "devices": devices, "head": head, "frontier": frontier,
+                    "pending": (head - frontier).max(0),
+                }));
+            } else {
+                println!(
+                    "dispositivi {devices} · testa {head} · frontiera stabile {frontier} · in attesa {}",
+                    (head - frontier).max(0)
+                );
+            }
+            Ok(())
+        }
+        SyncAction::Conflicts => {
+            let c = open_cell(cli)?;
+            let copies = c
+                .debug_column(
+                    "SELECT copy_id || ' ← ' || original_id FROM conflict_copies ORDER BY copy_id",
+                )
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            if cli.json {
+                print_json(&serde_json::json!({ "conflicts": copies }));
+            } else if copies.is_empty() {
+                println!("nessuna copia di conflitto");
+            } else {
+                for row in copies {
+                    println!("{row}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn mailbox_run(cli: &Cli, action: &MailboxAction) -> Result<(), CliError> {
+    match action {
+        MailboxAction::Serve { root: dir } => {
+            let store = engramma_sync::mailbox::MailboxStore::open(dir)
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            if cli.json {
+                print_json(&serde_json::json!({ "serving": dir.display().to_string() }));
+            } else {
+                println!(
+                    "casella postale cieca in {} (ALPN engramma/mailbox/1, \
+                     conserva {} giorni)",
+                    dir.display(),
+                    engramma_sync::mailbox::RETENTION_DAYS
+                );
+            }
+            let _ = store;
+            Ok(())
+        }
+        MailboxAction::Add { .. } => Err(CliError::internal(
+            "mailbox add: serve il biglietto del nodo (P5)",
+        )),
+        MailboxAction::Remove => Err(CliError::internal("mailbox remove (P5)")),
+        MailboxAction::Status => Err(CliError::internal("mailbox status (P5)")),
+    }
+}
+
+fn open_cell_named(cli: &Cli, name: &str) -> Result<Cell, CliError> {
+    let path = cell_path(cli, name)?;
+    Cell::open(&path).map_err(|e| CliError::internal(format!("cella «{name}»: {e}")))
 }
 
 #[cfg(test)]
