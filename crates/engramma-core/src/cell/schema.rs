@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 18] = [
+pub const MIGRATIONS: [&str; 19] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -311,6 +311,18 @@ CREATE INDEX idx_conflict_copies_original ON conflict_copies(original_id);
 CREATE TABLE device_acks (device TEXT PRIMARY KEY,
                           ack_seq INTEGER NOT NULL,
                           at TEXT NOT NULL);
+"#,
+    r#"
+-- v19 (v0.6, P2): who SIGNED an operation. `device` is the device id (the
+-- signing public key, hex) and `sig` its Ed25519 signature over the
+-- operation's content_hash — the cryptographic author, distinct from the
+-- human-facing `actor`. NULL for everything written before the sync era
+-- and outside it: those operations are covered by the `adopt` root (P1.6)
+-- or never leave this machine. The chain's envelope does not cover these
+-- columns: the signature IS its own proof, verified against the device
+-- list, not against the local chain of arrival.
+ALTER TABLE ops ADD COLUMN device TEXT;
+ALTER TABLE ops ADD COLUMN sig TEXT;
 "#,
 ];
 

@@ -42,7 +42,7 @@ pub(crate) fn ops_concerning(
     let cut = cut_seq(tx)?;
     let mut stmt = tx.prepare(
         "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.base, o.content_hash,
-                o.payload_digest, p.salt, p.body, o.prev_hash, o.hash
+                o.payload_digest, p.salt, p.body, o.prev_hash, o.hash, o.device, o.sig
          FROM ops o
          JOIN op_objects oo ON oo.op_id = o.op_id
          LEFT JOIN op_payloads p ON p.op_id = o.op_id
@@ -65,6 +65,8 @@ pub(crate) fn ops_concerning(
                 body_json: r.get::<_, Option<String>>(10)?.as_deref(),
                 prev_hash: &r.get::<_, String>(11)?,
                 hash: &r.get::<_, String>(12)?,
+                device: r.get::<_, Option<String>>(13)?.as_deref(),
+                sig: r.get::<_, Option<String>>(14)?.as_deref(),
             }))
         })?
         .collect::<Result<Result<Vec<_>, _>, _>>()??;

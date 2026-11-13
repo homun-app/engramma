@@ -501,6 +501,9 @@ pub(crate) struct GraphDirt {
 pub(crate) struct Inner {
     pub(crate) conn: Connection,
     clock: HlcClock,
+    /// The sync era's signer (v0.6, P2): signs every LOCAL operation with
+    /// the device key. `None` outside the sync era.
+    pub(crate) signer: Option<std::sync::Arc<dyn ops::Signer>>,
     /// Lazily built on the first semantic search (opening a cell stays ≤ 50 ms).
     pub(crate) index: Option<IndexState>,
     /// Lazily built on the first graph walk (same reason).
@@ -809,6 +812,7 @@ impl Cell {
             inner: Arc::new(Mutex::new(Inner {
                 conn,
                 clock,
+                signer: None,
                 index: None,
                 graph: None,
                 graph_dirt: GraphDirt::default(),
@@ -919,6 +923,17 @@ impl Cell {
         self.inner
             .lock()
             .map_err(|_| CellError::Db("cell mutex poisoned".into()))
+    }
+
+    /// Arm the sync era's signer (v0.6, P2): every LOCAL operation from
+    /// here on is signed with the device key and carries the device id.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] when the cell lock is poisoned.
+    pub fn set_signer(&self, signer: std::sync::Arc<dyn ops::Signer>) -> Result<(), CellError> {
+        let mut inner = self.lock()?;
+        inner.signer = Some(signer);
+        Ok(())
     }
 
     /// Replace the HLC clock — tests inject skewed wall clocks to play
@@ -2696,7 +2711,7 @@ impl Cell {
         let inner = self.lock()?;
         let mut stmt = inner.conn.prepare(
             "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.base, o.content_hash,
-                    o.payload_digest, p.salt, p.body, o.prev_hash, o.hash
+                    o.payload_digest, p.salt, p.body, o.prev_hash, o.hash, o.device, o.sig
              FROM ops o LEFT JOIN op_payloads p ON p.op_id = o.op_id
              WHERE o.seq > ?1 ORDER BY o.seq",
         )?;
@@ -2715,6 +2730,8 @@ impl Cell {
                 body_json: r.get::<_, Option<String>>(10)?.as_deref(),
                 prev_hash: &r.get::<_, String>(11)?,
                 hash: &r.get::<_, String>(12)?,
+                device: r.get::<_, Option<String>>(13)?.as_deref(),
+                sig: r.get::<_, Option<String>>(14)?.as_deref(),
             }))
         })?;
         let mut out = Vec::new();
@@ -3094,7 +3111,12 @@ fn execute_op(
         base,
         body: payload,
         salt: salt.to_vec(),
+        device: inner.signer.as_ref().map(|s| s.device_id()),
+        sig: None,
     })?;
+    if let Some(signer) = &inner.signer {
+        op.sig = Some(signer.sign(op.content_hash.as_bytes()));
+    }
     op.seq = prev_seq + 1;
     op.seal(&prev_hash);
     ops::apply(&tx, &op)?;

@@ -186,6 +186,11 @@ pub struct Op {
     pub prev_hash: String,
     /// This op hash.
     pub hash: String,
+    /// The cryptographic author (v0.6, P2): the signing device's id, when
+    /// the sync era signed this operation.
+    pub device: Option<String>,
+    /// Its Ed25519 signature over the `content_hash`, base64.
+    pub sig: Option<String>,
 }
 
 impl Op {
@@ -268,6 +273,21 @@ pub fn op_hash(prev_hash: &str, envelope_json: &str) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// The sync era's signer (v0.6, P2): the cell asks it to sign every
+/// LOCAL operation over its `content_hash` and to name the device. The
+/// implementation lives in the sync crate (the device key never enters
+/// the core).
+pub trait Signer: Send + Sync {
+    /// The device id (its signing public key, hex).
+    fn device_id(&self) -> String;
+    /// Sign the content hash, base64.
+    fn sign(&self, msg: &[u8]) -> String;
+    /// Verify a signature: `(device id, message, signature base64)` → ok?
+    fn verify(device: &str, msg: &[u8], sig: &str) -> bool
+    where
+        Self: Sized;
+}
+
 /// The canonical CONTENT of an operation — what its wire identity covers:
 /// `{op_id, hlc, actor, kind, note_id, base, payload_digest}`. The payload
 /// digest already commits to the body and its salt, so the identity is
@@ -342,6 +362,9 @@ pub struct OpParts {
     pub base: Option<String>,
     pub body: Value,
     pub salt: Vec<u8>,
+    /// The signing device and its signature, when the sync era signs.
+    pub device: Option<String>,
+    pub sig: Option<String>,
 }
 
 /// Build an operation from its parts.
@@ -359,6 +382,8 @@ pub fn make_op(parts: OpParts) -> Result<Op, CellError> {
         base,
         body,
         salt,
+        device,
+        sig,
     } = parts;
     let Value::Object(fields) = &body else {
         return Err(CellError::Invalid(
@@ -399,6 +424,8 @@ pub fn make_op(parts: OpParts) -> Result<Op, CellError> {
         content_hash: ch,
         prev_hash: String::new(),
         hash: String::new(),
+        device,
+        sig,
     })
 }
 
@@ -496,6 +523,8 @@ pub struct OpRow<'a> {
     pub body_json: Option<&'a str>,
     pub prev_hash: &'a str,
     pub hash: &'a str,
+    pub device: Option<&'a str>,
+    pub sig: Option<&'a str>,
 }
 
 /// Rebuild an [`Op`] from a stored row.
@@ -557,6 +586,8 @@ pub fn op_from_row(r: OpRow<'_>) -> Result<Op, CellError> {
         content_hash: r.content_hash.to_string(),
         prev_hash: r.prev_hash.to_string(),
         hash: r.hash.to_string(),
+        device: r.device.map(str::to_string),
+        sig: r.sig.map(str::to_string),
     })
 }
 
@@ -596,8 +627,8 @@ impl Scope {
 pub fn store_op(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     tx.execute(
         "INSERT INTO ops (seq, op_id, hlc, actor, kind, note_id, base, content_hash,
-                          payload_digest, prev_hash, hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                          payload_digest, prev_hash, hash, device, sig)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             op.seq,
             op.op_id.to_string(),
@@ -610,6 +641,8 @@ pub fn store_op(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
             op.payload_digest,
             op.prev_hash,
             op.hash,
+            op.device,
+            op.sig,
         ],
     )?;
     if let (Some(salt), Some(body)) = (&op.salt, &op.body) {
@@ -2793,7 +2826,7 @@ fn apply_set_policy(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
 pub fn read_ops(conn: &Connection) -> Result<Vec<Op>, CellError> {
     let mut stmt = conn.prepare(
         "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.base, o.content_hash,
-                o.payload_digest, p.salt, p.body, o.prev_hash, o.hash
+                o.payload_digest, p.salt, p.body, o.prev_hash, o.hash, o.device, o.sig
          FROM ops o LEFT JOIN op_payloads p ON p.op_id = o.op_id
          ORDER BY o.seq",
     )?;
@@ -2813,6 +2846,8 @@ pub fn read_ops(conn: &Connection) -> Result<Vec<Op>, CellError> {
                 body_json: r.get::<_, Option<String>>(10)?.as_deref(),
                 prev_hash: &r.get::<_, String>(11)?,
                 hash: &r.get::<_, String>(12)?,
+                device: r.get::<_, Option<String>>(13)?.as_deref(),
+                sig: r.get::<_, Option<String>>(14)?.as_deref(),
             }))
         })?
         .collect::<Result<Result<Vec<_>, _>, _>>()??;
@@ -2845,6 +2880,8 @@ mod tests {
             base: None,
             body,
             salt: salt.to_vec(),
+            device: None,
+            sig: None,
         })
         .unwrap(/* test-only */);
         op.seal(GENESIS_HASH);
@@ -2896,6 +2933,8 @@ mod tests {
             base: None,
             body,
             salt: vec![0; 16],
+            device: None,
+            sig: None,
         };
         assert!(make_op(parts(serde_json::json!({ "kind": "confirm" }))).is_err());
         assert!(make_op(parts(serde_json::json!([]))).is_err());
