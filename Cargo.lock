@@ -1297,6 +1297,7 @@ dependencies = [
  "engramma-core",
  "engramma-embed",
  "engramma-mcp",
+ "engramma-sync",
  "engramma-vault",
  "mimalloc",
  "ring",

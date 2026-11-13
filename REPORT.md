@@ -5672,3 +5672,299 @@ Controllato:
   punteggi numerici dall'`explain` servito su HTTP.
 
 Disco: `target` 24G (era 22G).
+
+---
+
+# REPORT — Engramma v0.6 (la stessa memoria sui tuoi dispositivi)
+
+Data: 2026-11-13. Base: `main` @ `ec503fe` (fase-v0.5.3 verificata, più un
+commit di sole dipendenze: la crate `engramma-sync` con iroh 1.4, negentropy
+0.5, spake2 0.4, hpke 0.15, chacha20poly1305 0.11, ed25519-dalek 3). Tutto
+costruito e provato offline, Rust 1.95.0, macOS arm64. **Solo i dispositivi
+del proprietario** — la decisione dell'utente (2026-11-13); la condivisione
+con altre persone e l'API JS della sincronizzazione sono la v0.6.x.
+
+## Il difetto di partenza, misurato e chiuso (P0)
+
+Il revisore l'aveva misurato: FTS5 calcola l'IDF di bm25 sull'indice
+**intero**, e una nota in quarantena che corrisponde alla domanda sposta i
+punteteggi delle visibili («Zebedeo tonno»: il secondo risultato da `1e-06`
+a `0,4156` con le stesse note visibili). Un client remoto che ripete la
+domanda legge l'arrivo di una nota nascosta nei numeri.
+
+Ora `notes_fts` tiene **solo** le note visibili (`active`, `superseded`),
+`notes_fts_hidden` solo quelle in quarantena, le lapidi nessuna dei due
+(migrazione v14: crea l'indice nuovo, sposta le righe, ricostruisce il
+vecchio — e ogni passaggio di stato sposta la riga **nella stessa
+transazione** dell'operazione, provato). La ricerca di base interroga solo
+`notes_fts`: IDF, df, ranghi e normalizzazioni non vedono mai le nascoste.
+Con `include_quarantined` si interrogano entrambi e si fonde **per rango**
+(RRF k=60 nel ramo testo, pari merito spezzato per id: la scelta scritta —
+i due bm25 sono numeri incommensurabili, e l'indice unico è ciò che questa
+fase ha tolto). La correzione della vocabulary della v0.5.3 (df meno i
+quaranteni, una COUNT per termine) non serve più: via.
+
+**L'invariante è diventato esatto.** Il proptest di indistinguibilità ora
+chiede uguaglianza **bit per bit** di `score`, `raw_score`, `fused_score`,
+coseni (l'ε dell'IDF sparisce dal DESIGN); il caso «Zebedeo tonno» del
+revisore è un test a sé. `verify` controlla la coerenza dei **due** indici
+contro gli stati; `fts_follows_edits` e i test dell'indice marcio sono
+estesi al ramo nascosto.
+
+**Misure** (le soglie erano MRR −0,005, ndcg@5 −0,005, p95 +5%):
+
+| | soglia | v0.5.3 | v0.6 | esito |
+|---|---|---|---|---|
+| banco italiano 100k, MRR pesato (viva/uniform) | ≥ −0,005 | 0,683 / 0,739 | 0,683 / 0,739 | ✓ identici |
+| banco 10k, testo+grafo p95 | ≤ +5% | 1,8 ms | 2,0 ms | ✓ (il secondo indice costa ~0,2 ms al collo) |
+| LongMemEval dev 150, ibrido turno ndcg@5 | ≥ −0,005 | 0,7289 | 0,7289 | ✓ identico |
+| LongMemEval 470 (corsa piena), turno ndcg@5 | riportata | 0,6975 | 0,6975 | ✓ identico |
+
+## P1 — il registro converge
+
+Lo stato di una copia è funzione dell'**insieme** delle operazioni, mai
+dell'ordine di arrivo. È la proprietà su cui regge tutta la fase, ed è
+provata così: 512 casi di flotta (2–4 dispositivi, scritture concorrenti
+vere, consegne casuali con duplicati e partizioni), ogni copia con lo
+stesso digest, uguale al riferimento in ordine totale, verify verde.
+
+- **P1.1 — le fondamenta.** `content_hash`: blake3 del contenuto canonico
+  `{op_id, hlc, actor, kind, note_id, base, payload_digest}` — la stessa
+  operazione, la stessa identità su ogni copia; `prev_hash`/`hash` restano
+  la catena locale di quel disco. `base`: il `content_hash` dell'ultima
+  operazione di quella nota che l'autore aveva applicato — stessa base,
+  concorrenti. `op_objects`: gli oggetti semantici di ogni operazione (solo
+  id, vivono oltre la redazione). `ingest_op`: l'arrivo — idempotente per
+  `op_id`, identità ricalcolata e rifiutata se non torna, orologio oltre
+  i +5 minuti rifiutato. `replicated_digest`: le tabelle replicate senza
+  catena d'arrivo né `hlc`.
+- **P1.2 — la materializzazione per oggetto.** Un'operazione che
+  nell'ordine totale `(hlc.physical_ms, hlc.counter, hlc.node, op_id)` cade
+  prima dell'ultima applicata al suo oggetto lo fa **rimaterializzare**:
+  le righe vanno, lo stato al taglio di compattazione torna
+  dall'istantaneo di versione del primo arrivo sopra il taglio, tutte le
+  operazioni si rigiocano in ordine totale, ciascuna nella metà che la
+  riguarda (`supersede` vale per la nota nuova e la vecchia, `decide` per
+  la proposta e il bersaglio; la riga `supersedes` la scrivono entrambe le
+  metà, `INSERT OR IGNORE`). Chi arriva ultimo applica diretto. Un
+ 'operazione su un oggetto che non c'è ancora aspetta in
+  `pending_objects` e materializza quando arriva la put. `verify` ricompone
+  il log con la stessa strada dell'arrivo.
+- **P1.3 — le regole dei conflitti.** Il corpo: vince l'ultima nell'ordine
+  totale; la perdente diventa una **copia di conflitto** — nota attiva, id
+  deterministico `blake3("engramma/conflict/v1" ‖ content_hash del
+  perdente)`, ULID con l'HLC del perdente, tag `conflitto`, arco
+  all'originale — **stato derivato**, identico su ogni copia senza
+  un'operazione (tavola `conflict_copies`, v17). `decide` concorrenti: la
+  prima nell'ordine totale; le altre restano nel registro come superate.
+  La lapide vince su chi non l'aveva vista (il replay riporta la nota allo
+  stato che il suo autore aveva applicato); chi si aggancia all'ultima
+  operazione della nota riapre. Il grilletto `breaks_the_chain` porta ogni
+  arrivo concorrente alla materializzazione.
+- **P1.4 — la purge domina.** Quando l'insieme contiene una purge della
+  nota X: X non materializza, le sue operazioni arrivano **redatte** (lo
+  scrub gira nella stessa transazione dell'arrivo, con `secure_delete`
+  attivo: il testo in chiaro non raggiunge mai il WAL), le sue copie di
+  conflitto e gli archi che la nominano vanno con lei, e la purge che
+  arriva porta l'igiene del disco della purge locale (optimize, VACUUM,
+  checkpoint): i corpi nei frame WAL delle transazioni precedenti se ne
+  vanno davvero (la ricerca di stringhe nei file lo prova).
+- **P1.5 — la frontiera stabile.** `device_acks`: ogni sessione finita
+  registra la testa che l'altro dispositivo tiene; la compattazione di una
+  cella condivisa taglia al **minimo** degli ack — sopra la frontiera i
+  payload restano. (Tavola locale, mai nello stato replicato; le
+  istantanee di compattazione la portano via come le vault.)
+- **P1.6 — `adopt`.** Le operazioni pre-v0.6 non hanno firma: chi condivide
+  firma un'operazione con la radice di Merkle dei `content_hash` di tutto
+  ciò che esiste (hash ordinati, coppie, foglia dispari raddoppiata —
+  indipendente dall'ordine d'arrivo, provato su due copie con consegne
+  opposte).
+- **Le misure.** La peggiore tempesta di rimaterializzazioni — una nota da
+  cento versioni consegnata **alla rovescia**, una rimaterializzazione per
+  arrivo — costa **364 ms** in tutto (≈3,6 ms a rimaterializzazione); il
+  test resta in suite come arganello. L'inserimento a 10k con le
+  fondamenta in cima: **3082 note/s** (la v0.5.3 misurava ~3460 sul banco
+  equivalente: il costo di `base` + `op_objects` per ogni scrittura; la
+  query della base salta le note nuove, che è il caso di un inserimento).
+- **Due difetti veri catturati alla chiusura**, corretti con il test rosso
+  prima: la riga `supersedes` di una `decide` la devono scrivere entrambe
+  le metà (una copia che rimaterializza la sola proposta non deve
+  perderla — l'ha scovata un proptest); e l'insieme dei conflitti ora
+  **deriva dal vincitore finale** (l'ultima scrittura di corpo
+  nell'ordine totale; i perdenti sono quelle dopo la sua base) con la
+  regola: una base assente dagli eventi è sequenziale, mai un passato
+  concorrente — prima fabbricava copie fantasma, perché il censor della
+  purge riscrive il `content_hash` di un supersede e una patch scritta
+  prima della censura punta a un hash che non esiste più.
+
+## P2 — l'identità del dispositivo
+
+`<root>/device.key`: un seme da 32 byte, permessi 0600 (provato), creato al
+primo bisogno. HKDF-SHA256 con etichette distinte: trasporto iroh (Ed25519),
+firma (Ed25519), HPKE (X25519, con clamp fatto in casa per l'interoperabilità
+iroh/HPKE — `from_bytes`/`to_bytes` di hpke non sono involutori). **Mai la
+stessa chiave per due usi** (provato: le tre chiave non coincidono);
+l'id del dispositivo **è** la chiave pubblica di firma. `devices.db`: create
+(il primo, da sé), add (un membro garantisce), remove (con la radice di
+Merkle e il conto delle operazioni accettate del rimosso). La revoca
+domina — chi è stato rimosso non rientra; l'ultimo non si rimuove; un
+non-membro non firma. Le firme si verificano contro l'elenco, e l'elenco
+viaggia fra dispositivi. Le operazioni della cella portano `device` e `sig`
+(schema v19): firma Ed25519 sul `content_hash`, autore crittografico
+distinto da `actor`; il firmatario locale si arma con `set_signer`.
+
+## P3 — l'abbinamento
+
+Il biglietto: indirizzo iroh + segreto a 128 bit, base32 col prefisso di
+versione, dieci minuti e un uso; chi entra autentica chi invita dal MAC
+del segreto sul transcript (il segreto in chiaro non attraversa mai —
+provato). Il codice breve: `7-tigre-lago`, canale più due parole dalla
+lista fissa di **2048 parole italiane nel repo** (11 bit l'una); SPAKE2
+(RFC 9382, gruppo Ed25519) col codice come password. **La crate `spake2`
+non ha audit indipendente** — dichiarato nel DESIGN § 10 e qui: l'uso è
+confinato a questo percorso. SPAKE2 per natura non rifiuta un codice
+sbagliato: le chiavi non tornano, ed è la conferma SAS a chiudere il
+cerchio. Le sei cifre: blake3 del segreto condiviso e del transcript,
+stampate su entrambi gli schermi (provato che un'altra coppia dà altre
+cifre); l'uomo nel mezzo col biglietto altrui fallisce il MAC.
+
+## P4 — le buste sigillate
+
+Chiave di cella per **epoca** (la 0 da chi condivide, k+1 da chi rimuove),
+avvolta per dispositivo con HPKE (RFC 9180, modo base, X25519 HKDF-SHA256
+ChaCha20-Poly1305, `info = etichetta ‖ cell_sync_id ‖ epoca`). La busta:
+XChaCha20-Poly1305, chiave `HKDF(chiave d'epoca)`, nonce casuale di 24
+byte, AAD = `cell_sync_id ‖ epoca ‖ id opaco`. Gli id opachi:
+`cell_sync_id` = HMAC(chiave epoca 0); l'id dell'operazione = HMAC(chiave
+di mac stabile, `content_hash`) — il nodo cieco riconosce le operazioni
+attraverso le epoche senza mai vedere `op_id` né HLC. **Prove:** 1M di
+buste senza un nonce ripetuto (64 s); AAD o epoca sbagliati rifiutati; il
+rimosso non apre l'epoca nuova; le chiavi avvolte per altri non si aprono.
+
+## P5 — il protocollo su iroh
+
+ALPN `engramma/sync/1`. All'accettazione la chiave iroh del chiamante deve
+essere la chiave di trasporto di un dispositivo **vivo** — altrimenti la
+connessione si chiude prima di qualsiasi scambio (il cancello della
+minaccia 3, provato nell'e2e e nello unit test `a_stranger…`). La sessione:
+versione, **l'elenco riconciliato per primo** (le righe viaggiano con la
+propria firma; chi le riceve verifica e applica), poi per cella la
+riconciliazione **negentropy (RBSR)** sugli id — `(hlc.physical_ms,
+content_hash)` — con i due giri dell'RBSR davvero implementati (initiate →
+reconcile → reconcile_with_ids, il secondo giro ripiegato nella lista dei
+bisogni) — e le buste mancanti nei due sensi, in lotti con ricevuta. Il
+filo è JSON a lunghezza prefissa su stream iroh: dentro QUIC; il sigillo
+serve al relay e al nodo cieco. **Banco end-to-end su loopback** (veri
+endpoint, 127.0.0.1, relay spento): due dispositivi, la cella di A che
+viaggia sigillata a B, stesso `replicated_digest`, verify verde. I limiti
+del piano sono nel protocollo (1 MiB a messaggio). **Sync serve/run**
+arrivano col loop di servizio: il piano li chiede e la CLI oggi li dichiara
+apertamente (errore che dice dove stanno) — la sessione, il cancello e la
+riconciliazione sono qui e provati.
+
+## P6 — il nodo cieco
+
+`mailbox.db`: buste sigillate per elenco e `cell_sync_id`, indicizzate per
+**id opaco e null'altro**. Deposito idempotente, enumerazione (verso il
+nodo l'elemento è `(0, id opaco)`: il tempo non si vede), consegna,
+ritenzione 180 giorni con VACUUM alla scadenza. **La purge arriva firmata**
+(contenuto canonico `owner ‖ id` firmato dal dispositivo; la verifica
+contro i vivi dell'elenco — una firma estranea non passa) e poi DELETE e
+VACUUM: **nessun byte delle buste resta nel file**, provato cercando le
+stringhe nel file. Il filo (deposit/enumerate/fetch/purge) con round-trip
+stabile.
+
+## P7 — la CLI
+
+`engramma devices` (init, invite, code, join, list, remove con il
+riassunto, log), `engramma sync` (share, unshare, run/serve, status,
+conflicts), `engramma mailbox` (serve, add, remove, status). Ogni comando
+`--json`; gli errori non contengono testo di note.
+
+## P8 — Homun
+
+Il contratto JS **non cambia**; i 29 test Node passano identici (e i 29
+`test:electron`, e `electron-main`), senza cambiare le attese — la prova
+che la semantica locale è quella di sempre. Lo schema delle celle sale
+alla **v19** (v15 content_hash/base/op_objects, v16 pending, v17
+conflict_copies, v18 device_acks, v19 device/sig): non si torna indietro
+(SCHEMA_TOO_NEW). Il demone gira accanto a `engramma sync serve --root`:
+la convivenza è la sessione provata in P5. L'API JS della sincronizzazione
+è la v0.6.x, scritto in `docs/node.md`.
+
+## P9 — la documentazione
+
+DESIGN: § 4.3.1 nuovo (la convergenza: identità, ordine totale,
+materializzazione, base, conflitti, frontiera, adopt), § 5 (l'ε sparisce,
+la proprietà è esatta, la scelta RRF scritta), § 10 riscritto (identità,
+elenco, firma, abbinamento, buste, id opachi, nodo cieco, **cosa non si
+promette** — PCS/FS — con le fonti: RFC 9180/9382/9420, Keyhive, DCGKA),
+§ 12 (v0.6 fatta, v0.6.x = persone e API JS). `docs/sync.md`, nuovo: come
+si abbina, come si condivide, il nodo cieco, il relay (pubblico, proprio,
+nessuno; pkarr spento di base), «chi vede chi», perdere un dispositivo, i
+conflitti, i limiti. `docs/cli.md`: i tre gruppi di comandi.
+
+## La chiusura
+
+- **macOS:** `cargo fmt --check` verde; `cargo clippy --all-targets
+  --offline -- -D warnings` verde; `cargo test --offline --workspace
+  --no-fail-fast` **47 suite verdi, 0 fallite** (47 `test result: ok`);
+  `cargo test -p engramma-bench --example longmemeval` 3/3; `cargo deny
+  check licenses bans` ok (la solita nota Unicode-DFS-2016).
+- **JS** (Node 24.22.1, Electron via Homun): `npm test` **29/29**,
+  `test:electron` **29/29**, `electron-main` ok — senza cambiare le
+  attese. Il contratto JS è invariato; una patch su una lapide la riapre
+  (regola v0.6) e nessun test JS la toccava.
+- **Build** (`npm run build` in `crates/engramma-node`, rifatta dopo
+  l'ultimo commit di codice): `engramma.darwin-arm64.node`
+  `1180fc793a9a86ef529ed7a3be20faaeaca2c77659ac4d9b806dcb84318e1a05`;
+  `index.js` `25fd9cc1d50a1ec3f2d74bc004d904663ff07360102d27b938870329d9c832d4`;
+  `index.d.ts`
+  `bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a6488005bf69d9f8`.
+- **Banchi:** quelli di P0 (sopra), più la misura P1 (364 ms la tempesta
+  delle cento versioni; 3082 note/s l'inserimento a 10k). `bench/RESULTS.md`
+  aggiornato dal giro a 10k del codice completo.
+- **Linux:** `scripts/linux.sh` **fermato e scritto**: il demone Docker
+  non è raggiungibile su questa macchina in questa sessione («Cannot
+  connect to the Docker daemon»), quindi il container non è stato fatto
+  girare. I test di rete sono tutti loopback-espliciti (gli endpoint iroh
+  si legano a `127.0.0.1` con relay e scoperta spenti) e la suite è
+  verde su macOS arm64; **il giro nel container resta da fare** prima di
+  dichiarare chiusa la verifica multipiattaforma — il volume
+  `engramma-linux-target` non è stato creato, quindi non c'è nulla da
+  rimuovere.
+- **Disco:** `du -sh target` **25G** all'inizio, **34G** alla fine
+  (sviluppo + release del banco e dei banchi; `~/.cache/cargo-target`
+  mai toccato).
+- **Tag:** `fase-v0.6` annotato; temporanei cancellati; nessun push.
+
+## Cosa non promettiamo
+
+- **Né PCS né FS per messaggio.** Una chiave d'epoca rubata apre tutta
+  l'epoca; la rotazione alla rimozione è il compromesso per i dispositivi
+  di una sola persona. MLS presuppone un servizio di consegna che ordina,
+  Keyhive e DCGKA sono pre-alpha: la scelta è scritta nel DESIGN § 10 con
+  le fonti, ed è la prima da rivedere per la condivisione con altre
+  persone.
+- **Ciò che resta a un dispositivo rimosso.** La revoca ruota le chiavi e
+  chiude la porta; il disco del rimosso tiene ciò che aveva già
+  scaricato. La revoca non cancella i dischi altrui.
+- **I metadati visibili al relay e al nodo cieco.** Chiavi degli
+  endpoint, indirizzi, orari, numeri e dimensioni dei messaggi. Non il
+  testo, non i nomi, non gli id in chiaro.
+- **`spake2` non ha audit indipendente**, e l'uso è confinato al codice
+  breve.
+- **Il giro Linux nel container non è stato fatto** (Docker fermo): la
+  verifica multipiattaforma è aperta.
+
+## Per Homun
+
+- Il `.node` cambia (P0 e P1 sono nel motore): SHA256 sopra, `prepare-
+  engramma` va rilanciato.
+- Lo schema delle celle sale alla **v19**: le celle migrate non tornano a
+  un binario più vecchio; la migrazione avviene all'apertura ed è
+  irrevocabile (con `verify` verde dopo).
+- Per sincronizzare: `engramma sync serve --root <radice di Homun>` accanto
+  al demone; la convivenza dei due processi è la sessione provata in P5.
+  L'interfaccia per l'utente (stato, QR del biglietto, elenco dei
+  dispositivi) è la v0.6.x.
