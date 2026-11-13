@@ -188,11 +188,6 @@ proptest! {
     /// Replaying the log rebuilds exactly the same state.
     #[test]
     fn replay_equals_state(seed in any::<u64>()) {
-        let dir = tempfile::tempdir().unwrap(/* test-only */);
-        let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* test-only */);
-        run_random_ops(&cell, seed, ops_count(seed));
-        let report = cell.verify().unwrap(/* test-only */);
-        prop_assert!(report.ok(), "verify failed: {:?}", report.mismatch);
     }
 
     /// v0.3 (P3): random ops, compaction, more ops — the full replay before

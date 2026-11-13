@@ -2569,6 +2569,11 @@ fn apply_decide(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), CellE
                 && let Some(target) = target
             {
                 let trow = read_note(tx, &target)?;
+                // the CLOSE belongs to the target's half alone; the link
+                // row is written by BOTH halves (INSERT OR IGNORE), like a
+                // supersede's: whichever half a copy rematerializes, the
+                // row lands the same — materializing the proposal alone
+                // must not lose it
                 if scope.wants(&target) {
                     if let Some(trow) = &trow {
                         // the closing the creator recorded wins; the fallback
@@ -2590,6 +2595,8 @@ fn apply_decide(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), CellE
                         write_note(tx, &t, true, false)?;
                         reindex_note(tx, &target, Some(trow))?;
                     }
+                }
+                if scope.wants(&id) || scope.wants(&target) {
                     tx.execute(
                         "INSERT OR IGNORE INTO supersedes (new_id, old_id) VALUES (?1, ?2)",
                         rusqlite::params![id.to_string(), target.to_string()],
