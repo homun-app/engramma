@@ -217,3 +217,206 @@ fn concurrent_patches_converge_on_every_copy() {
         "the partitioned copy converges when the rest arrives"
     );
 }
+
+/// Two devices write concurrent patches; the copies that receive the union
+/// in opposite orders must agree on EVERYTHING the conflict rules produce:
+/// the original note holds the WINNER's body, and the loser survives as a
+/// CONFLICT COPY — an active note with the deterministic id, the tag
+/// `conflitto` and an edge to the original, identical on every copy.
+#[test]
+fn the_losing_body_becomes_a_conflict_copy() {
+    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let a = Cell::create(&dir_a.path().join("a.sqlite"), "conv", "device-a")
+        .unwrap(/* test-only */);
+    let note = base_note(7, "il corpo iniziale");
+    let id = note.id;
+    a.put_note(&note, "device-a").unwrap(/* test-only */);
+    let first: Vec<Op> = a.ops().unwrap(/* test-only */);
+    let b = copy_of("b", &first);
+    a.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("il corpo scritto da A".into()),
+            ..Default::default()
+        },
+        "device-a",
+    )
+    .unwrap(/* test-only */);
+    b.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("il corpo scritto da B".into()),
+            ..Default::default()
+        },
+        "device-b",
+    )
+    .unwrap(/* test-only */);
+    let union = union_logs(
+        &a.ops().unwrap(/* test-only */),
+        &b.ops().unwrap(/* test-only */),
+    );
+    let mut by_total: Vec<Op> = union.values().cloned().collect();
+    by_total.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
+    let patch_of = |needle: &str| -> usize {
+        by_total
+            .iter()
+            .position(|o| {
+                o.kind.as_str() == "patch_note"
+                    && o.body
+                        .as_ref()
+                        .and_then(|bd| bd.get("set"))
+                        .and_then(|s| s.get("body"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|t| t.contains(needle))
+            })
+            .unwrap(/* test-only */)
+    };
+    let mut order_x = by_total.clone();
+    let mut order_y = by_total.clone();
+    let (px, py) = (patch_of("da A"), patch_of("da B"));
+    order_x.swap(px, py);
+    order_y.swap(px, py); // the opposite order, twice
+    let x = copy_of("x", &order_x);
+    let y = copy_of("y", &order_y);
+    assert_eq!(
+        x.replicated_digest().unwrap(/* test-only */),
+        y.replicated_digest().unwrap(/* test-only */),
+        "the conflict rules must be a function of the set"
+    );
+
+    // the winner is the LAST body write in total order; the loser's body
+    // survives in the copy
+    let winner = if px < py { "da B" } else { "da A" };
+    let loser = if px < py { "da A" } else { "da B" };
+    for cell in [&x, &y] {
+        let original = cell.get(&id).unwrap(/* test-only */);
+        assert!(
+            original.body.contains(winner),
+            "the original holds the winner's body: {}",
+            original.body
+        );
+        // the conflict copy: an ACTIVE note with the loser's body, the tag,
+        // and an edge to the original
+        let copies: Vec<String> = cell
+            .debug_column(&format!(
+                "SELECT n.id || ' | ' || n.body || ' | ' || n.status FROM notes n
+                 JOIN note_tags t ON t.note_id = n.id
+                 WHERE t.tag = 'conflitto' AND n.id != '{}'",
+                id
+            ))
+            .unwrap(/* test-only */);
+        // the original itself may carry the tag? no: only copies do
+        assert_eq!(copies.len(), 1, "one conflict copy: {copies:?}");
+        assert!(
+            copies[0].contains(loser),
+            "the copy holds the loser's body: {copies:?}"
+        );
+        assert!(
+            copies[0].contains("active"),
+            "the copy is active: {copies:?}"
+        );
+        let copy_id = copies[0].split(" | ").next().unwrap(/* test-only */).to_string();
+        let edge: Vec<String> = cell
+            .debug_column(&format!(
+                "SELECT src || ' ' || rel || ' ' || dst FROM edges
+                 WHERE note_id = '{copy_id}'"
+            ))
+            .unwrap(/* test-only */);
+        assert!(
+            edge.iter().any(|e| e.contains(&id.to_string())),
+            "the copy declares an edge to the original: {edge:?}"
+        );
+    }
+    // and the copy id is the same on both copies of the cell
+    let id_of = |cell: &Cell| -> String {
+        cell.debug_column(
+            "SELECT n.id FROM notes n JOIN note_tags t ON t.note_id = n.id
+             WHERE t.tag = 'conflitto'",
+        )
+        .unwrap(/* test-only */)[0]
+            .clone()
+    };
+    assert_eq!(
+        id_of(&x),
+        id_of(&y),
+        "the conflict copy's id is deterministic"
+    );
+}
+
+/// A tombstone written concurrently with an unseen modification wins; a
+/// modification whose base IS the tombstone (the writer had seen it)
+/// reopens the note.
+#[test]
+fn a_tombstone_wins_over_an_unseen_modification() {
+    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let a = Cell::create(&dir_a.path().join("a.sqlite"), "conv", "device-a")
+        .unwrap(/* test-only */);
+    let note = base_note(9, "il corpo iniziale");
+    let id = note.id;
+    a.put_note(&note, "device-a").unwrap(/* test-only */);
+    let first: Vec<Op> = a.ops().unwrap(/* test-only */);
+    let b = copy_of("b", &first);
+
+    // A deletes; B (having seen only the put) patches — concurrent
+    a.delete_note(&id, "device-a").unwrap(/* test-only */);
+    b.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("il corpo scritto da B senza vedere la lapide".into()),
+            ..Default::default()
+        },
+        "device-b",
+    )
+    .unwrap(/* test-only */);
+    let union = union_logs(
+        &a.ops().unwrap(/* test-only */),
+        &b.ops().unwrap(/* test-only */),
+    );
+    let mut by_total: Vec<Op> = union.values().cloned().collect();
+    by_total.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
+    let x = copy_of("x", &by_total);
+    let mut order_y = by_total.clone();
+    // deliver the patch FIRST (out of order), then the delete
+    let pp = order_y
+        .iter()
+        .position(|o| o.kind.as_str() == "patch_note")
+        .unwrap(/* test-only */);
+    let dd = order_y
+        .iter()
+        .position(|o| o.kind.as_str() == "delete_note")
+        .unwrap(/* test-only */);
+    order_y.swap(pp, dd);
+    let y = copy_of("y", &order_y);
+    assert_eq!(
+        x.replicated_digest().unwrap(/* test-only */),
+        y.replicated_digest().unwrap(/* test-only */)
+    );
+    for cell in [&x, &y] {
+        let n = cell.get(&id).unwrap(/* test-only */);
+        assert_eq!(
+            n.status,
+            Status::Deleted,
+            "the tombstone wins over an unseen modification"
+        );
+    }
+
+    // a modification that SAW the tombstone (its base is the delete)
+    // reopens the note — device B syncs the delete, then patches
+    let c = copy_of("c", &by_total);
+    c.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("il corpo scritto dopo la lapide".into()),
+            ..Default::default()
+        },
+        "device-b",
+    )
+    .unwrap(/* test-only */);
+    let reopened = c.get(&id).unwrap(/* test-only */);
+    assert_eq!(
+        reopened.status,
+        Status::Active,
+        "a patch whose base is the tombstone reopens the note"
+    );
+    assert!(reopened.body.contains("dopo la lapide"));
+}

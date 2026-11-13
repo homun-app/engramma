@@ -1021,6 +1021,41 @@ pub(crate) fn reindex_note_row(tx: &Transaction<'_>, id: &Ulid) -> Result<(), Ce
     reindex_note(tx, id, None)
 }
 
+/// Reopen a tombstone for a body write whose base IS the tombstone (the
+/// writer had seen the lapide, DESIGN §4.3): the row flips to active — an
+/// `external` note to quarantine, the only state it may live in — and the
+/// following write takes it from there. Version and history do not move:
+/// the write that reopens is the one that counts them. Both carriers of
+/// the status move together: the column the queries filter on, and the
+/// header JSON the note is rebuilt from.
+pub(crate) fn reopen_tombstone(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
+    let Some(row) = read_note(tx, id)? else {
+        return Ok(());
+    };
+    let status = if row.note.confidence == crate::format::Confidence::External {
+        Status::Quarantined
+    } else {
+        Status::Active
+    };
+    let mut header: Value = serde_json::from_str(
+        &tx.query_row(
+            "SELECT frontmatter_json FROM notes WHERE id = ?1",
+            [id.to_string()],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_default(),
+    )
+    .unwrap_or_else(|_| row.note.to_json());
+    if let Value::Object(map) = &mut header {
+        map.insert("status".into(), Value::String(status.as_str().into()));
+    }
+    tx.execute(
+        "UPDATE notes SET status = ?2, frontmatter_json = ?3 WHERE id = ?1",
+        rusqlite::params![id.to_string(), status.as_str(), header.to_string()],
+    )?;
+    Ok(())
+}
+
 fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Result<(), CellError> {
     let Some(row) = read_note(tx, id)? else {
         return Err(CellError::NoteNotFound(id.to_string()));
@@ -1032,19 +1067,29 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
     // Each index holds exactly the notes its side of the status split owns:
     // a delete for a rowid that is not there corrupts FTS5's internal
     // accounting (the "database disk image is malformed" error it raises is
-    // not a no-op — one delete later the row refuses to leave the index), so
-    // tombstones never issue one and the error is no longer swallowed.
+    // not a no-op — one delete later the row refuses to leave the index).
+    // v0.6 (P1): the presence is CHECKED, not assumed — a reopened tombstone
+    // is an active row with no index entry, and the purge's own guard
+    // becomes the one discipline everywhere.
     if let Some(old) = old
         && let Some(idx) = index_for(old.note.status)
     {
-        fts_delete(
-            tx,
-            idx,
-            old.rowid,
-            old.note.title.as_deref().unwrap_or(""),
-            &old.body_norm,
-            &old.tags_text,
+        let table = idx.table();
+        let in_index: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM {table}_docsize WHERE id = ?1"),
+            [old.rowid],
+            |r| r.get(0),
         )?;
+        if in_index > 0 {
+            fts_delete(
+                tx,
+                idx,
+                old.rowid,
+                old.note.title.as_deref().unwrap_or(""),
+                &old.body_norm,
+                &old.tags_text,
+            )?;
+        }
     }
     // --- tags tables
     tx.execute("DELETE FROM note_tags WHERE note_id = ?1", [id.to_string()])?;
@@ -1252,32 +1297,39 @@ fn apply_put(tx: &Transaction<'_>, op: &Op, note: &Note) -> Result<(), CellError
         // never the opposite. Every caller builds the note it wants; this
         // is the single place that decides, so the CLI, the vault sync and
         // the Node binding all inherit it (and so does the replay).
-        if row.note.status == Status::Deleted {
-            return Err(CellError::Invalid(
-                "the note is a tombstone: restore it from its history instead \
-                 of rewriting it"
-                    .into(),
-            ));
-        }
-        let preserved = if row.note.status == Status::Active
-            && note.confidence == crate::format::Confidence::External
-        {
-            Status::Quarantined
+        //
+        // v0.6 (P1): a rewrite whose author had SEEN the lapide reopens the
+        // note (their base is the tombstone); one that did not see it is
+        // held back by the materializer, and the lapide wins.
+        let was_deleted = row.note.status == Status::Deleted;
+        if was_deleted {
+            reopen_tombstone(tx, &note.id)?;
+            note.status = if note.confidence == crate::format::Confidence::External {
+                Status::Quarantined
+            } else {
+                Status::Active
+            };
         } else {
-            row.note.status
-        };
-        if note.status != preserved {
-            return Err(CellError::Invalid(format!(
-                "a rewrite preserves the note's state (`{}` requested, `{}` is \
-                 the state): use `setStatus`, `confirm` or `delete` to change it",
-                note.status.as_str(),
-                preserved.as_str(),
-            )));
+            let preserved = if row.note.status == Status::Active
+                && note.confidence == crate::format::Confidence::External
+            {
+                Status::Quarantined
+            } else {
+                row.note.status
+            };
+            if note.status != preserved {
+                return Err(CellError::Invalid(format!(
+                    "a rewrite preserves the note's state (`{}` requested, `{}` is \
+                     the state): use `setStatus`, `confirm` or `delete` to change it",
+                    note.status.as_str(),
+                    preserved.as_str(),
+                )));
+            }
+            note.status = preserved;
         }
-        note.status = preserved;
         // a superseded note must keep a closed validity, and the rewrite of
         // one does not carry it: keep the closing the old version had
-        if preserved == Status::Superseded && note.valid_to.is_none() {
+        if row.note.status == Status::Superseded && note.valid_to.is_none() {
             note.valid_to = row.note.valid_to;
         }
         // v0.4.1 (P1.4): the birth date belongs to the NOTE, not to the
@@ -1302,14 +1354,20 @@ fn apply_patch(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     let Some(old) = read_note(tx, &id)? else {
         return Err(CellError::NoteNotFound(id.to_string()));
     };
-    // v0.4.1 (P0.1): a tombstone is not edited either — restore it first
-    if old.note.status == Status::Deleted {
-        return Err(CellError::Invalid(
-            "the note is a tombstone: restore it from its history instead \
-             of rewriting it"
-                .into(),
-        ));
-    }
+    // v0.6 (P1): a patch whose author had SEEN the lapide reopens the note —
+    // and a local author always has (their base is the tombstone). A patch
+    // that did not see it never reaches this line: the materializer's
+    // tombstone rule holds it back, and the lapide wins. A tombstone has no
+    // FTS row (that is the index's discipline), so the reindex below must
+    // not try to delete one: the note re-enters the index as if new.
+    let mut reopened = false;
+    let old = if old.note.status == Status::Deleted {
+        reopened = true;
+        reopen_tombstone(tx, &id)?;
+        read_note(tx, &id)?.ok_or_else(|| CellError::NoteNotFound(id.to_string()))?
+    } else {
+        old
+    };
     snapshot(tx, &id, old.version, &op.op_id)?;
     let set = op
         .body
@@ -1391,7 +1449,7 @@ fn apply_patch(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     note.updated_at = crate::format::At::parse(&body_str(op, "updated_at")?)
         .map_err(|e| CellError::Invalid(format!("bad `updated_at`: {e}")))?;
     write_note(tx, &note, true, false)?;
-    reindex_note(tx, &id, Some(&old))?;
+    reindex_note(tx, &id, if reopened { None } else { Some(&old) })?;
     Ok(())
 }
 
@@ -2331,21 +2389,42 @@ fn apply_decide(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), CellE
             op.op_id
         )));
     };
-    // the once-only rule belongs to the PROPOSAL's half: the target's half
-    // of the same operation (a copy rematerializing the target alone) reads
-    // the queue row after the proposal half has run — `accepted`, by then —
-    // and must not mistake itself for a second decision
-    if scope.wants(&id) && state != "pending" && state != "reverted" {
-        return Err(CellError::Invalid(format!(
-            "op {}: the proposal is `{state}`; revert the decision before deciding again",
-            op.op_id
-        )));
-    }
     let reason = body.get("reason").and_then(Value::as_str);
     let review = body
         .get("review")
         .filter(|v| !v.is_null())
         .map(|v| v.to_string());
+    // the once-only rule belongs to the PROPOSAL's half: the target's half
+    // of the same operation (a copy rematerializing the target alone) reads
+    // the queue row after the proposal half has run — `accepted`, by then —
+    // and must not mistake itself for a second decision. And a decision that
+    // LOST the total order to a concurrent one stays in the registry
+    // WITHOUT effect («decisione superata», DESIGN §4.3): the proposal's
+    // `decision_op` names the winner, every other row is the record of a
+    // decision that arrived too late.
+    if scope.wants(&id) && state != "pending" && state != "reverted" {
+        if state == "accepted" || state == "rejected" {
+            tx.execute(
+                "INSERT INTO decisions (op_id, proposal, decision, actor, decided_at, reason,
+                                        review_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    op.op_id.to_string(),
+                    id.to_string(),
+                    decision,
+                    op.actor,
+                    decided_at.to_db_string(),
+                    reason,
+                    review,
+                ],
+            )?;
+            return Ok(());
+        }
+        return Err(CellError::Invalid(format!(
+            "op {}: the proposal is `{state}`; revert the decision before deciding again",
+            op.op_id
+        )));
+    }
 
     match decision.as_str() {
         "accept" => {
@@ -2516,16 +2595,15 @@ fn apply_revert_decision(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<
         reopen_target(tx, op, body, decided_at, scope)?;
         return Ok(());
     }
-    // cancel the decision — once
+    // cancel the decision — once. A revert that finds nothing to cancel (a
+    // concurrent revert won the total order, or the decision is unknown
+    // here yet) is the record of a cancelled cancellation: no state moves.
     let n = tx.execute(
         "UPDATE decisions SET reverted_by = ?2 WHERE op_id = ?1 AND reverted_by IS NULL",
         rusqlite::params![decision_op.to_string(), op.op_id.to_string()],
     )?;
     if n == 0 {
-        return Err(CellError::Invalid(format!(
-            "op {}: decision {decision_op} is unknown or already reverted",
-            op.op_id
-        )));
+        return Ok(());
     }
     let n = tx.execute(
         "UPDATE proposals SET state = 'reverted', decision_op = NULL, decided_by = NULL,

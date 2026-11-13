@@ -146,7 +146,10 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
     let objects = ops::objects_of(op);
     let mut to_materialize: Vec<String> = Vec::new();
     for object in &objects {
-        if is_pending(tx, object)? || !is_newest_of(tx, object, op)? {
+        if is_pending(tx, object)?
+            || !is_newest_of(tx, object, op)?
+            || breaks_the_chain(tx, object, op)?
+        {
             to_materialize.push(object.clone());
         }
     }
@@ -156,8 +159,20 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
         // before its put, across a partition) does not fail the arrival —
         // the object turns PENDING and waits for what it leans on; the
         // halves that merely REFERENCE a missing note (the old side of a
-        // supersede, the target side of a decide) already tolerate it.
+        // supersede, the target side of a decide) already tolerate it. The
+        // tombstone rule rides along: a body write on a lapide that it did
+        // not see wins nothing; one whose base is the lapide reopens it.
         for object in &objects {
+            if let Some(nid) = object.strip_prefix("note:")
+                && let Ok(nid) = Ulid::from_string(nid)
+                && is_body_write(op, &nid)
+            {
+                match tombstone_rule(tx, op, &nid)? {
+                    TombstoneOutcome::Wins => continue,
+                    TombstoneOutcome::Reopens => ops::reopen_tombstone(tx, &nid)?,
+                    TombstoneOutcome::NoTombstone => {}
+                }
+            }
             match apply_half(tx, op, object) {
                 Ok(()) => {}
                 Err(CellError::NoteNotFound(_)) => {
@@ -252,7 +267,13 @@ fn materialize_note(
     object: &str,
 ) -> Result<(), CellError> {
     let all = ops_concerning(tx, object)?;
+    // a pure conflict copy has no operations of its own: its whole state is
+    // the derivation (a copy the user edited has ops, and replays them over
+    // the derived base below)
     if all.is_empty() {
+        if let Some((original, note)) = conflict_copy_state(tx, id)? {
+            restore_conflict_copy(tx, id, &original, &note)?;
+        }
         clear_pending(tx, object)?;
         return Ok(());
     }
@@ -260,28 +281,49 @@ fn materialize_note(
     let watermark: Option<String> = tx
         .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
         .optional()?;
-    // --- the state of the note at the cut: the snapshot of the FIRST
-    // above-cut ARRIVAL (its pre-state, in this copy's arrival chain, is
-    // exactly what the cut froze — everything before it came from ops at or
-    // below the cut). The first above-cut arrival may have NO snapshot — it
-    // CREATED the note (or purged it): then the note has no state at the
-    // cut, and nothing is restored.
+    // --- the state of the note at the cut. The cut froze what the ≤-cut
+    // operations produced (their payloads are gone; they cannot replay), so
+    // the anchor is the FIRST above-cut arrival whose `base` points BELOW
+    // the cut: its author had applied everything at or below the cut — the
+    // frontier's own promise — so its pre-state snapshot IS the state at the
+    // cut. No such anchor (the note was born above the cut): replay from
+    // zero. Pending arrivals above the cut never anchor: their bases point
+    // above it, whatever order they landed in.
     let cut_state: Option<(crate::format::Note, i64)> = {
+        let mut anchor: Option<(String, i64)> = None;
         let mut stmt = tx.prepare(
-            "SELECT v.snapshot_json, v.version FROM note_versions v
-             WHERE v.note_id = ?1
-               AND v.op_id = (
-                   SELECT o.op_id FROM ops o
-                   JOIN op_objects oo ON oo.op_id = o.op_id
-                   WHERE oo.object = ?2 AND o.seq > ?3
-                   ORDER BY o.seq ASC LIMIT 1)",
+            "SELECT o.op_id, o.base FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = ?1 AND o.seq > ?2
+             ORDER BY o.seq ASC",
         )?;
-        let found: Option<(String, i64)> = stmt
-            .query_row(rusqlite::params![id.to_string(), object, cut], |r| {
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map(rusqlite::params![object, cut], |r| {
                 Ok((r.get(0)?, r.get(1)?))
-            })
-            .optional()?;
-        match found {
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for (op_id, base) in rows {
+            let Some(base) = base else { continue };
+            let base_seq: Option<i64> = tx
+                .query_row("SELECT seq FROM ops WHERE content_hash = ?1", [base], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            if base_seq.is_some_and(|s| s <= cut) {
+                let snap: Option<(String, i64)> = tx
+                    .query_row(
+                        "SELECT snapshot_json, version FROM note_versions WHERE op_id = ?1",
+                        [&op_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                anchor = snap;
+                break;
+            }
+        }
+        match anchor {
+            None => None,
             Some((json, version)) => {
                 let note = crate::format::Note::from_json(
                     &serde_json::from_str::<serde_json::Value>(&json)
@@ -290,7 +332,6 @@ fn materialize_note(
                 .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?;
                 Some((note, version))
             }
-            None => None,
         }
     };
     // --- delete the current state of the note
@@ -337,25 +378,109 @@ fn materialize_note(
     tx.execute("DELETE FROM supersedes WHERE new_id = ?1", [&id_str])?;
     tx.execute("DELETE FROM proposals WHERE note_id = ?1", [&id_str])?;
     tx.execute("DELETE FROM decisions WHERE proposal = ?1", [&id_str])?;
-    // --- the state at the cut comes back first, at its exact version
+    // --- the state at the cut comes back first, at its exact version; a
+    // note that is a conflict copy starts from its derivation instead
     if let Some((note, version)) = &cut_state {
         ops::restore_note(tx, note, *version)?;
         ops::reindex_note_row(tx, id)?;
+    } else if let Some((original, note)) = conflict_copy_state(tx, id)? {
+        restore_conflict_copy(tx, id, &original, &note)?;
     }
-    // --- replay in total order, scoped to this note
+    // --- replay in total order, scoped to this note, under the conflict
+    // rules (DESIGN §4.3): the last body write in total order wins, every
+    // body write it did not see survives as a CONFLICT COPY, a tombstone
+    // beats every modification except one whose base it is, and a delete
+    // that did not see the intervening writes lands on the state ITS author
+    // had applied
     let mut pending_since: Option<String> = None;
+    let mut events: Vec<ReplayEvent> = Vec::new();
+    let mut losers: Vec<LoserRecord> = Vec::new();
     for op in &all {
         if !note_exists(tx, id)? && !op_creates_note(op, id) {
             pending_since = Some(op.op_id.to_string());
+            events.push(ReplayEvent {
+                hash: op.content_hash.clone(),
+                body: None,
+                op_id: op.op_id,
+                hlc_ms: op.hlc.physical_ms,
+            });
             continue;
         }
-        match ops::apply_scoped(tx, op, Scope::Note(*id)) {
-            Ok(()) => {}
-            // the object the operation leans on is not here yet: it waits
-            Err(CellError::NoteNotFound(_)) => {
-                pending_since = Some(op.op_id.to_string());
+        if is_body_write(op, id) {
+            match tombstone_rule(tx, op, id)? {
+                TombstoneOutcome::Wins => {
+                    // the tombstone wins: the write is stored, without effect
+                    events.push(ReplayEvent {
+                        hash: op.content_hash.clone(),
+                        body: None,
+                        op_id: op.op_id,
+                        hlc_ms: op.hlc.physical_ms,
+                    });
+                    continue;
+                }
+                TombstoneOutcome::Reopens => ops::reopen_tombstone(tx, id)?,
+                TombstoneOutcome::NoTombstone => {}
             }
-            Err(e) => return Err(e),
+            // concurrency: every body write AFTER the one this operation
+            // leaned on is a write it did not see — each survives as a copy
+            if let Some(base) = op.base.as_deref()
+                && let Some(pos) = events.iter().position(|e| e.hash == base)
+            {
+                for e in &events[pos + 1..] {
+                    if let Some((state, _)) = &e.body {
+                        losers.push(LoserRecord {
+                            op_id: e.op_id,
+                            hlc_ms: e.hlc_ms,
+                            content_hash: e.hash.clone(),
+                            state: state.clone(),
+                        });
+                    }
+                }
+            }
+            match ops::apply_scoped(tx, op, Scope::Note(*id)) {
+                Ok(()) => {}
+                Err(CellError::NoteNotFound(_)) => {
+                    pending_since = Some(op.op_id.to_string());
+                }
+                Err(e) => return Err(e),
+            }
+            if let Some(row) = ops::read_note_row(tx, id)? {
+                events.push(ReplayEvent {
+                    hash: op.content_hash.clone(),
+                    body: Some((row.note, row.version)),
+                    op_id: op.op_id,
+                    hlc_ms: op.hlc.physical_ms,
+                });
+            }
+        } else {
+            if op.kind == OpKind::DeleteNote
+                && let Some(base) = op.base.as_deref()
+                && let Some(pos) = events.iter().position(|e| e.hash == base)
+                && events[pos + 1..].iter().any(|e| e.body.is_some())
+            {
+                // the delete did not see the writes after its base: they go.
+                // The tombstone lands on the state the deleter had applied —
+                // last body state at or before the base, at ITS version.
+                if let Some((state, version)) =
+                    events[..=pos].iter().rev().find_map(|e| e.body.clone())
+                {
+                    replace_note_state(tx, id, &state, version)?;
+                }
+            }
+            match ops::apply_scoped(tx, op, Scope::Note(*id)) {
+                Ok(()) => {}
+                // the object the operation leans on is not here yet: it waits
+                Err(CellError::NoteNotFound(_)) => {
+                    pending_since = Some(op.op_id.to_string());
+                }
+                Err(e) => return Err(e),
+            }
+            events.push(ReplayEvent {
+                hash: op.content_hash.clone(),
+                body: None,
+                op_id: op.op_id,
+                hlc_ms: op.hlc.physical_ms,
+            });
         }
     }
     if let Some(since) = pending_since {
@@ -363,7 +488,380 @@ fn materialize_note(
     } else {
         clear_pending(tx, object)?;
     }
+    reconcile_conflict_copies(tx, id, &losers)?;
     restore_hlc_watermark(tx, watermark)?;
+    Ok(())
+}
+
+/// One applied operation of the replay, with what the conflict rules need:
+/// its wire identity and the note state a BODY write produced (at its
+/// version).
+struct ReplayEvent {
+    hash: String,
+    body: Option<(crate::format::Note, i64)>,
+    op_id: Ulid,
+    hlc_ms: u64,
+}
+
+/// A body write a later concurrent write did not see: its state becomes a
+/// conflict copy.
+struct LoserRecord {
+    op_id: Ulid,
+    hlc_ms: u64,
+    content_hash: String,
+    state: crate::format::Note,
+}
+
+/// Replace the note's row with a replayed state, at that state's OWN
+/// version (the delete rollback: the intervening writes vanish without a
+/// trace in the version chain, exactly as they would have if they had
+/// never arrived before the delete). The version rows stay: they are the
+/// history the replay is re-deriving.
+fn replace_note_state(
+    tx: &rusqlite::Transaction<'_>,
+    id: &Ulid,
+    note: &crate::format::Note,
+    version: i64,
+) -> Result<(), CellError> {
+    if let Some(row) = ops::read_note_row(tx, id)?
+        && let Some(idx) = ops::index_for(row.note.status)
+    {
+        let table = idx.table();
+        let in_index: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM {table}_docsize WHERE id = ?1"),
+            [row.rowid],
+            |r| r.get(0),
+        )?;
+        if in_index > 0 {
+            ops::fts_delete_row(
+                tx,
+                idx,
+                row.rowid,
+                row.note.title.as_deref().unwrap_or(""),
+                &row.body_norm,
+                &row.tags_text,
+            )?;
+        }
+    }
+    tx.execute("DELETE FROM notes WHERE id = ?1", [id.to_string()])?;
+    ops::restore_note(tx, note, version)?;
+    ops::reindex_note_row(tx, id)?;
+    Ok(())
+}
+
+/// Does this arrival BREAK THE CHAIN of its note — did its author lean on
+/// a state this copy has already moved past? A write or a delete whose
+/// `base` is not the newest operation of the note (in total order, before
+/// this one) is CONCURRENT with something already applied: the conflict
+/// rules must run, and only the materializer knows them. Pre-v0.6
+/// operations (no base) are sequential by declaration and never break
+/// anything.
+fn breaks_the_chain(
+    tx: &rusqlite::Transaction<'_>,
+    object: &str,
+    op: &Op,
+) -> Result<bool, CellError> {
+    let Some(nid) = object.strip_prefix("note:") else {
+        return Ok(false);
+    };
+    let Ok(nid) = Ulid::from_string(nid) else {
+        return Ok(false);
+    };
+    if !matches!(
+        op.kind,
+        OpKind::PutNote | OpKind::PatchNote | OpKind::DeleteNote
+    ) || op.body.is_none()
+    {
+        return Ok(false);
+    }
+    let Some(base) = op.base.as_deref() else {
+        return Ok(false);
+    };
+    let cut = cut_seq(tx)?;
+    let hlc = op.hlc.to_string();
+    let op_id = op.op_id.to_string();
+    let head: Option<String> = tx
+        .query_row(
+            "SELECT o.content_hash FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = ?1 AND o.seq > ?2
+               AND (o.hlc < ?3 OR (o.hlc = ?3 AND o.op_id < ?4))
+             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
+            rusqlite::params![object, cut, hlc, op_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let _ = nid;
+    Ok(head.as_deref() != Some(base))
+}
+
+/// Does this operation write the BODY of note `id` (a full replace or a
+/// patch carrying one)?
+fn is_body_write(op: &Op, id: &Ulid) -> bool {
+    if op.body.is_none() {
+        return false;
+    }
+    match op.kind {
+        OpKind::PatchNote => op.note_id.is_some_and(|n| n == *id),
+        OpKind::PutNote => op
+            .body
+            .as_ref()
+            .and_then(|b| b.get("note"))
+            .and_then(|n| n.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| Ulid::from_string(s).ok())
+            .is_some_and(|n| n == *id),
+        _ => false,
+    }
+}
+
+/// The tombstone rule on a body write: a note deleted at the write's
+/// position reopens ONLY for a writer whose `base` is the newest operation
+/// of the note at that point — whoever chained onto the state that is
+/// deleted now, be it the lapide itself or a later op that left it deleted
+/// (a restore of a deleted version). A writer that leaned on anything
+/// older did not see what deleted the note, and the lapide wins.
+/// `NoTombstone` when the note is not deleted at all.
+enum TombstoneOutcome {
+    NoTombstone,
+    Wins,
+    Reopens,
+}
+
+fn tombstone_rule(
+    tx: &rusqlite::Transaction<'_>,
+    op: &Op,
+    id: &Ulid,
+) -> Result<TombstoneOutcome, CellError> {
+    let Some(row) = ops::read_note_row(tx, id)? else {
+        return Ok(TombstoneOutcome::NoTombstone);
+    };
+    if row.note.status != crate::format::Status::Deleted {
+        return Ok(TombstoneOutcome::NoTombstone);
+    }
+    let Some(base) = op.base.as_deref() else {
+        return Ok(TombstoneOutcome::Wins);
+    };
+    let cut = cut_seq(tx)?;
+    let hlc = op.hlc.to_string();
+    let op_id = op.op_id.to_string();
+    let head: Option<String> = tx
+        .query_row(
+            "SELECT o.content_hash FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = ?1 AND o.seq > ?2
+               AND (o.hlc < ?3 OR (o.hlc = ?3 AND o.op_id < ?4))
+             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
+            rusqlite::params![format!("note:{id}"), cut, hlc, op_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if head.as_deref() == Some(base) {
+        Ok(TombstoneOutcome::Reopens)
+    } else {
+        Ok(TombstoneOutcome::Wins)
+    }
+}
+
+/// The deterministic id of a conflict copy (DESIGN §4.3):
+/// `blake3("engramma/conflict/v1" ‖ content_hash del perdente)` in ULID
+/// form, the losing operation's HLC as the time part.
+fn conflict_copy_id(loser_hash: &str, loser_hlc_ms: u64) -> Ulid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"engramma/conflict/v1");
+    hasher.update(loser_hash.as_bytes());
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+    let mut randomness: u128 = 0;
+    for b in &bytes[..10] {
+        randomness = (randomness << 8) | u128::from(*b);
+    }
+    Ulid::from_parts(loser_hlc_ms, randomness)
+}
+
+/// The derivation record of a conflict copy, when this note IS one.
+fn conflict_copy_state(
+    tx: &rusqlite::Transaction<'_>,
+    id: &Ulid,
+) -> Result<Option<(Ulid, crate::format::Note)>, CellError> {
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT original_id, state_json FROM conflict_copies WHERE copy_id = ?1",
+            [id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((original, json)) = row else {
+        return Ok(None);
+    };
+    let original = Ulid::from_string(&original)
+        .map_err(|_| CellError::Db(format!("bad conflict original {original}")))?;
+    let note = crate::format::Note::from_json(
+        &serde_json::from_str::<serde_json::Value>(&json)
+            .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?,
+    )
+    .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?;
+    Ok(Some((original, note)))
+}
+
+/// Write (or rewrite) the derived ROWS of one conflict copy: the note —
+/// active, tagged `conflitto`, the loser's content — its FTS and tags, and
+/// the edge to the original. Pure derivation: no operation of its own, and
+/// every copy of the cell produces it identically.
+fn restore_conflict_copy(
+    tx: &rusqlite::Transaction<'_>,
+    copy_id: &Ulid,
+    original: &Ulid,
+    note: &crate::format::Note,
+) -> Result<(), CellError> {
+    delete_note_state(tx, copy_id)?;
+    ops::restore_note(tx, note, 0)?;
+    ops::reindex_note_row(tx, copy_id)?;
+    // the edge to the original: derived (d%), so the copy's own
+    // rematerialization cleans and rebuilds it
+    let edge_id = {
+        let mut h = blake3::Hasher::new();
+        h.update(b"engramma/conflict-edge/v1");
+        h.update(copy_id.to_string().as_bytes());
+        format!("d{}", &h.finalize().to_hex()[..31])
+    };
+    tx.execute(
+        "INSERT OR REPLACE INTO edges (id, src, rel, dst, note_id, valid_from, valid_to,
+                                       confidence, status)
+         VALUES (?1, ?2, 'conflitto', ?3, ?4, NULL, NULL, 'stated', 'active')",
+        rusqlite::params![
+            edge_id,
+            format!("note:{copy_id}"),
+            format!("note:{original}"),
+            copy_id.to_string()
+        ],
+    )?;
+    Ok(())
+}
+
+/// Record and write one conflict copy derived from `original`'s replay.
+fn write_conflict_copy(
+    tx: &rusqlite::Transaction<'_>,
+    original: &Ulid,
+    loser: &LoserRecord,
+) -> Result<Ulid, CellError> {
+    let copy_id = conflict_copy_id(&loser.content_hash, loser.hlc_ms);
+    // the copy's state: the loser's note, active, tagged
+    let mut note = loser.state.clone();
+    note.id = copy_id;
+    note.status = crate::format::Status::Active;
+    if !note.tags.iter().any(|t| t == "conflitto") {
+        note.tags.push("conflitto".into());
+    }
+    // the derivation row first: it is the base the copy's own materialization
+    // (and a user's later edits on the copy) replay from
+    tx.execute(
+        "INSERT INTO conflict_copies (copy_id, original_id, loser_op, state_json)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(copy_id) DO UPDATE SET original_id = ?2, loser_op = ?3, state_json = ?4",
+        rusqlite::params![
+            copy_id.to_string(),
+            original.to_string(),
+            loser.op_id.to_string(),
+            note.to_json().to_string()
+        ],
+    )?;
+    restore_conflict_copy(tx, &copy_id, original, &note)?;
+    Ok(copy_id)
+}
+
+/// Delete every state row of a note (no log rows touched), the
+/// rematerialization's delete-first for derived copies.
+fn delete_note_state(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
+    if let Some(row) = ops::read_note_row(tx, id)?
+        && let Some(idx) = ops::index_for(row.note.status)
+    {
+        let table = idx.table();
+        let in_index: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM {table}_docsize WHERE id = ?1"),
+            [row.rowid],
+            |r| r.get(0),
+        )?;
+        if in_index > 0 {
+            ops::fts_delete_row(
+                tx,
+                idx,
+                row.rowid,
+                row.note.title.as_deref().unwrap_or(""),
+                &row.body_norm,
+                &row.tags_text,
+            )?;
+        }
+    }
+    let id_str = id.to_string();
+    tx.execute("DELETE FROM notes WHERE id = ?1", [&id_str])?;
+    tx.execute("DELETE FROM note_versions WHERE note_id = ?1", [&id_str])?;
+    tx.execute("DELETE FROM note_tags WHERE note_id = ?1", [&id_str])?;
+    tx.execute(
+        "DELETE FROM edges WHERE note_id = ?1 AND id LIKE 'd%'",
+        [&id_str],
+    )?;
+    tx.execute("DELETE FROM supersedes WHERE new_id = ?1", [&id_str])?;
+    tx.execute("DELETE FROM proposals WHERE note_id = ?1", [&id_str])?;
+    tx.execute("DELETE FROM decisions WHERE proposal = ?1", [&id_str])?;
+    Ok(())
+}
+
+/// Does this note have operations of its own (a conflict copy the user
+/// edited, or a note that was never derived)?
+fn note_has_ops(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<bool, CellError> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM op_objects WHERE object = ?1",
+        [format!("note:{id}")],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// After the replay of the original: the copies the conflict rules derive
+/// are written, the copies of conflicts that no longer exist go (unless the
+/// user made them theirs with edits), and a copy whose derivation moved
+/// rematerializes.
+fn reconcile_conflict_copies(
+    tx: &rusqlite::Transaction<'_>,
+    original: &Ulid,
+    losers: &[LoserRecord],
+) -> Result<(), CellError> {
+    let desired: Vec<Ulid> = losers
+        .iter()
+        .map(|l| conflict_copy_id(&l.content_hash, l.hlc_ms))
+        .collect();
+    let existing: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT copy_id FROM conflict_copies WHERE original_id = ?1 ORDER BY copy_id",
+        )?;
+        let rows = stmt.query_map([original.to_string()], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for copy_id in existing {
+        let ulid = Ulid::from_string(&copy_id)
+            .map_err(|_| CellError::Db(format!("bad conflict copy id {copy_id}")))?;
+        if desired.contains(&ulid) {
+            continue;
+        }
+        if note_has_ops(tx, &ulid)? {
+            // the user edited the copy: the note lives on as its own
+            continue;
+        }
+        delete_note_state(tx, &ulid)?;
+        tx.execute("DELETE FROM conflict_copies WHERE copy_id = ?1", [copy_id])?;
+    }
+    let mut written: Vec<Ulid> = Vec::new();
+    for loser in losers {
+        let copy_id = write_conflict_copy(tx, original, loser)?;
+        if !written.contains(&copy_id) && note_has_ops(tx, &copy_id)? && copy_id != *original {
+            // the copy carries the user's edits and its base just moved:
+            // it rematerializes over the new derivation
+            materialize(tx, &format!("note:{copy_id}"))?;
+        }
+        written.push(copy_id);
+        clear_pending(tx, &format!("note:{copy_id}"))?;
+    }
     Ok(())
 }
 

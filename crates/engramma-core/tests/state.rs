@@ -160,10 +160,12 @@ fn external_rewrite_quarantines_and_patch_preserves() {
     assert_eq!(cell.get(&b.id).unwrap(/* t */).status, Status::Quarantined);
 }
 
-/// A tombstone is not resurrected by a `put` (nor edited by a `patch`):
-/// restore from the history instead.
+/// v0.6 (P1): a rewrite by a writer who had SEEN the lapide reopens the
+/// note — their base IS the tombstone. (A rewrite that did not see it never
+/// reaches `apply`: the materializer's tombstone rule holds it back, and
+/// the lapide wins — the convergence tests own that half.)
 #[test]
-fn a_tombstone_is_not_resurrected_by_a_rewrite() {
+fn a_tombstone_reopens_for_a_writer_who_saw_it() {
     let (_d, cell) = cell();
     let n = note(
         4,
@@ -174,6 +176,22 @@ fn a_tombstone_is_not_resurrected_by_a_rewrite() {
     cell.put_note(&n, "t").unwrap(/* test-only */);
     cell.delete_note(&n.id, "t").unwrap(/* test-only */);
 
+    // a local patch: the writer had the tombstone in front of them
+    cell.patch_note(
+        &n.id,
+        &NotePatch {
+            body: Some("riscritta dopo la lapide".into()),
+            ..Default::default()
+        },
+        "t",
+    )
+    .unwrap(/* test-only */);
+    let back = cell.get(&n.id).unwrap(/* test-only */);
+    assert_eq!(back.status, Status::Active, "the note reopens");
+    assert!(back.body.contains("dopo la lapide"));
+
+    // and a full rewrite reopens it too, preserving the birth date
+    cell.delete_note(&n.id, "t").unwrap(/* test-only */);
     let mut same_id = note(
         4,
         "tentativo di resurrezione",
@@ -181,31 +199,12 @@ fn a_tombstone_is_not_resurrected_by_a_rewrite() {
         Status::Active,
     );
     same_id.created_at = At(time::OffsetDateTime::now_utc());
-    let err = cell.put_note(&same_id, "t").unwrap_err(/* test-only */);
-    assert!(
-        matches!(err, CellError::Invalid(ref m) if m.contains("tombstone")),
-        "{err}"
-    );
-
-    let err = cell
-        .patch_note(
-            &n.id,
-            &NotePatch {
-                body: Some("nemmeno con una patch".into()),
-                ..Default::default()
-            },
-            "t",
-        )
-        .unwrap_err(/* test-only */);
-    assert!(
-        matches!(err, CellError::Invalid(ref m) if m.contains("tombstone")),
-        "{err}"
-    );
-    assert_eq!(
-        cell.get(&n.id).unwrap(/* t */).status,
-        Status::Deleted,
-        "the tombstone is intact"
-    );
+    cell.put_note(&same_id, "t").unwrap(/* test-only */);
+    let back = cell.get(&n.id).unwrap(/* test-only */);
+    assert_eq!(back.status, Status::Active, "the rewrite reopens");
+    assert_eq!(back.created_at, n.created_at, "the birth date stays");
+    let vr = cell.verify().unwrap(/* test-only */);
+    assert!(vr.ok(), "{vr:?}");
 }
 
 /// v0.4.1 (P1.4): the birth date belongs to the NOTE, not to the version —

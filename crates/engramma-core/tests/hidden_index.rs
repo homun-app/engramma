@@ -174,6 +174,7 @@ fn a_v13_cell_migrates_its_hidden_rows() {
              ALTER TABLE ops_v13 RENAME TO ops;
              DROP TABLE IF EXISTS op_objects;
              DROP TABLE IF EXISTS pending_objects;
+             DROP TABLE IF EXISTS conflict_copies;  -- v17
              UPDATE meta SET value = '13' WHERE key = 'schema_version';",
         )
         .unwrap(/* test-only */);

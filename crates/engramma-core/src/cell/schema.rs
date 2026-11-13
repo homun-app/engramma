@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 16] = [
+pub const MIGRATIONS: [&str; 17] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -284,6 +284,21 @@ CREATE INDEX idx_op_objects_object ON op_objects(object);
 -- for that object rematerializes it from the whole set, in total order.
 CREATE TABLE pending_objects (object TEXT PRIMARY KEY,
                               since_op TEXT NOT NULL);
+"#,
+    r#"
+-- v17 (v0.6, P1): the CONFLICT COPIES. When two concurrent writes touch a
+-- note's body, the total order picks a winner and every unseen write
+-- survives as a derived note — active, tagged `conflitto`, linked to the
+-- original — created identically on every copy without an operation of its
+-- own. The table is the derivation's memory: which original, which losing
+-- operation, and the note state the loser would have produced. It is
+-- DERIVED (rebuilt by the original's materialization), so it never enters
+-- the replicated digest: the notes rows it produces do.
+CREATE TABLE conflict_copies (copy_id TEXT PRIMARY KEY,
+                              original_id TEXT NOT NULL,
+                              loser_op TEXT NOT NULL,
+                              state_json TEXT NOT NULL);
+CREATE INDEX idx_conflict_copies_original ON conflict_copies(original_id);
 "#,
 ];
 
