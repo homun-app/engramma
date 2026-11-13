@@ -5630,3 +5630,45 @@ prima (la tabella nuova della cache negativa nasce da sola al primo
 aperto). Se Homun espone MCP su HTTP, gli strumenti di compatibilità
 restano al solo collegamento ChatGPT anche per lui, e `deny --all`
 chiude la coda delle richieste in un colpo.
+
+# Verifica v0.5.3 (2026-11-13, revisore)
+
+Esito: **passata, senza correzioni.**
+
+Controllato:
+- **Controlli automatici:** fmt, clippy `-D warnings`, 408 test del
+  workspace + 3 LongMemEval, `cargo deny`.
+- **Build:** `.node` rifatto: hash `419372e0…` uguale al REPORT; JS 29/29.
+- **Codice:** riletti `detect_query_lang`, il filtro di stato dentro
+  `bm25_candidates` e la regola ChatGPT di P2.
+- **Banco delle domande corte:** 48 valutate (25 di una parola, 13 nomi,
+  10 da due o tre parole) più 3 casi di quarantena.
+
+**Prova a mano su una cella nuova di quattro note:**
+- **Domande corte:** «Zebedeo», «zebedeo», «tonno», «Esposito»,
+  «Aurora», «martedi», «verde», «dottoressa» e «crocchette tonno»
+  trovano tutte la nota giusta al primo posto. Con la v0.5.2.2
+  «Zebedeo» e «tonno» non trovavano niente.
+- **Impronte delle note nascoste:** stesse domande in JSON prima e dopo
+  aver aggiunto tre note in quarantena che corrispondono («Zebedeo il
+  gatto ha mangiato tonno…»). Id, ordine, ranghi BM25 densi da 1 e primo
+  punteggio normalizzato a 1 restano identici: i canali strutturali sono
+  chiusi.
+
+**Il residuo dichiarato (ε dell'IDF) è più grande di quanto sembri.**
+- Su «gatto» e «Zebedeo» i punteggi grezzi cambiano alla sesta cifra.
+- Su «Zebedeo tonno» il secondo risultato passa da `1e-06` a `0,4156`,
+  senza nessun cambiamento fra le note visibili. Succede perché la
+  convessa a min-max mette a zero il peggiore candidato di testo, e chi
+  è il peggiore dipende dall'IDF, che FTS5 calcola sull'indice intero.
+- Quindi un client remoto che ripete la stessa domanda nel tempo può
+  accorgersi che è arrivata una nota nascosta che corrisponde. Non vede
+  quale nota né cosa dice.
+- **La correzione strutturale** è un secondo indice FTS per le sole note
+  in quarantena: `include_quarantined` interroga entrambi e fonde, i
+  passaggi di stato spostano la riga da un indice all'altro, e le
+  statistiche dell'indice visibile non vedono mai le note nascoste. Va
+  nella prossima fase. Rimedio parziale e più economico: togliere i
+  punteggi numerici dall'`explain` servito su HTTP.
+
+Disco: `target` 24G (era 22G).
