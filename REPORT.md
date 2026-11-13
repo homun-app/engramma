@@ -5375,3 +5375,258 @@ qui sotto, ognuna con il suo test rosso).
   fissata da un test). Via HTTP, un rango che manca (2 e 3 senza 1)
   rivela a un client remoto che una nota in quarantena corrisponde alla
   ricerca. Da rinumerare dopo i filtri in una fase prossima.
+
+# REPORT — Engramma v0.5.3 (domande corte, note nascoste invisibili, rifiniture di HTTP)
+
+Base `c7d3227` (`fase-v0.5.2.2`). Un commit per punto: P0 `a74709c`,
+P1 `c30e7bb`, P2 `5756ea5`, P3 `f559524`, P4 (documenti) `a826987`; più
+le due correzioni che la verifica di chiusura ha preteso dal P0
+(`775d222` le colonne della forma intera, `0f3ab6b` la potatura delle
+forme assenti e il df del proprietario).
+Non cambia il modello di sicurezza della v0.5.2 né il contratto JS:
+cambiano la qualità della ricerca (per ogni trasporto, Homun compreso) e
+la riservatezza delle note nascoste.
+
+## P0 — La lingua delle domande corte
+
+**Il difetto, com'era:** «Zebedeo» era tedesco e «tonno» francese per
+`whatlang`; la domanda veniva stemmata nella lingua sbagliata e non
+trovava niente («crocchette» e «gatto Zebedeo» trovavano). Dalla v0.1,
+dentro il nucleo.
+
+**Cosa fa ora il nucleo:**
+
+- `text::detect_query_lang` — una domanda è **incerta** con meno di 4
+  parole significative (stopword escluse) o quando `whatlang` dichiara la
+  propria rilevazione inaffidabile (`is_reliable()`: falso anche su buon
+  inglese di una frase — misurato a mano prima di decidere). Le note
+  continuano con la rilevazione piena: hanno testo a sufficienza e la
+  loro lingua vince comunque (l'indice è stemmato con quella).
+- Su una domanda incerta ogni parola porta **la forma intera** (che
+  l'indice contiene quando la nota non ha lingua) più **la radice in
+  ogni lingua presente nella cella**: l'istogramma delle lingue delle
+  note visibili, in `Inner` accanto al grafo, costruito al primo
+  bisogno, invalidato dalle scritture proprie e da `PRAGMA
+  data_version`. Senza lingue note, le sei di sempre. Le forme sono
+  alternative in OR; `q.lang` esplicito vince come sempre; una domanda
+  affidabile stemma esattamente come prima (test: l'elenco dei termini
+  coincide con quello del `--lang it`).
+- **Le coppie adiacenti** (frasi di due radici, P1.7 della v0.2.1) si
+  fanno sulle **radici della lingua più frequente** della cella: mai
+  coppie tra forme alternative della stessa parola (test dedicato).
+- `query_terms` lavora **per parola** (`QueryWord`: forme + forma
+  canonica); la caduta dei termini ubiqui e la copertura ragionano per
+  parola (la frequenza di una parola è la migliore delle sue forme).
+
+**Misure** (regola scritta prima di misurare, vedi la fase; «prima» =
+`c7d3227` nello stesso worktree, stessa macchina, mediana di 3 giri):
+
+| banco | soglia | prima | dopo | verdetto |
+|---|---|---|---|---|
+| domande corte (48 da 1–3 parole, vault dorato) | richiamo@5 **migliore** | 47/48 = 0,979 | **48/48 = 1,000** | ✓ (mancava «Esposito», indovinato portoghese) |
+| banco italiano 100k, MRR pesato (viva) | ≥ −0,005 | 0,683 | 0,683 | ✓ identico |
+| banco italiano 100k, MRR pesato (uniform) | ≥ −0,005 | 0,739 | 0,739 | ✓ identico |
+| LongMemEval dev 150, ibrido turno ndcg@5 | ≥ −0,005 | 0,7303 | 0,7289 | ✓ (−0,0014) |
+| LongMemEval 470 (corsa piena), ibrido turno ndcg@5 | riportata | 0,6970 | 0,6975 | ✓ (+0,0005) |
+| banco 10k, solo testo p50 / testo+grafo p95 | entro +10% | 1,2 / 1,9 ms | 1,1 / 1,9 ms | ✓ |
+
+La soglia di 4 parole regge: non è stato necessario provare 3 e 5.
+Le domande dei banchi grandi sono frasi complete; le incerte sono la
+minoranza (le da 1–3 parole, appunto), e su di loro l'espansione ha
+cambiato i MATCH senza spostare i risultati (i due MRR identici a 100k
+lo mostrano numero per numero).
+
+**Tre difetti trovati dalla verifica di chiusura, corretti prima dei
+numeri definitivi** (commit `775d222` e `0f3ab6b`):
+
+1. *Le forme intere allagavano i titoli.* «dove lavora la sorella di
+   Giulia» (incerta): la forma intera «giulia» matchava la colonna
+   titolo — grezza, peso 10 — e cinque risultati di testo sommergevano
+   la risposta multi-salto del grafo (golden_semantic, rosso). La forma
+   intera ora cerca `body_norm` e `tags_text` — dove l'indice tiene il
+   testo grezzo proprio quando la nota non ha lingua, la ragione per cui
+   esiste — TRANNE quando è tutta la domanda: «Luca» deve trovare
+   «Luca Ferrari» nel titolo (banco corto, rosso finché il filtro era
+   totale).
+2. *Il prezzo dell'espansione.* Rimisurato a 10k il p50 del solo testo
+   era salito da 1,2 a 1,7 ms (+42%, oltre la soglia): una forma per
+   ogni lingua della cella moltiplicava i termini del MATCH. Le forme
+   che la vocabulary non contiene (df = 0) non possono matchare niente:
+   lasciano i termini singoli (resta sempre la forma canonica, su cui si
+   costruiscono le coppie). Tornato a 1,1 ms, p95 invariato.
+3. *La potatura nascondeva al proprietario le sue note.* Il df del
+   percorso testo era calcolato sempre senza quarantena: una forma che
+   viveva solo in una nota in quarantena veniva potata anche nella
+   ricerca `includeQuarantined` del proprietario (test JS della v0.4,
+   rosso). Il df segue ora il filtro della domanda. I banchi non
+   cambiano (cercano sempre senza quarantena).
+
+## P1 — Le note nascoste non lasciano impronte
+
+**Il difetto:** la lista BM25 conteneva anche le note nascoste; i filtri
+arrivavano dopo. Un client remoto con `explain` leggeva ranghi che
+partivano da 2, un `fused_score` sotto 1 al primo posto, e una finestra
+da cui le note visibili potevano essere spinte fuori. Il test della v0.1
+che fissava quel comportamento è aggiornato qui (il primo visibile è
+rango 1).
+
+**Cosa è cambiato:**
+
+- `bm25_candidates` filtra lo stato **dentro la query** (stessi stati
+  della lettura): ranghi densi da 1 sui visibili, niente spostamenti.
+  `EXPLAIN QUERY PLAN` verificato con test dedicato: il MATCH guida
+  l'indice FTS e il JOIN cerca `notes` per rowid (nessuna scansione).
+- I **ranghi vettoriali** si numerano dopo il filtro di visibilità.
+- **Frequenze e totali** contano i visibili: la vocabulary dell'FTS viene
+  corretta togliendo, per ogni termine, i documenti in quarantena (una
+  COUNT puntata per rowid: una lettura per nota nascosta, non una
+  scansione delle posting list) — così una nota nascosta non gira
+  un'etichetta di `support`.
+- **Il grafo**: l'indice ricorda lo stato della nota di ogni nodo; la
+  lista d'uscita del push contiene solo note visibili (prima della
+  finestra dei 50 e della normalizzazione al massimo); il cancello delle
+  entità semina solo entità con almeno uno spigolo percorribile —
+  un'entità dichiarata solo da note nascoste non apre il cammino e non
+  diluisce le quote dei semi.
+- **Gli altri filtri** (tipo, tag, validità, `as_of`, confidenza) restano
+  dove erano: sono scelte di chi chiede, non segreti — un risultato che
+  manca perché la domanda chiedeva il 2023 non dice niente delle note
+  nascoste. Il filtro tipo già viaggia nel JOIN della lettura dei
+  candidati; gli altri vivono in `passes_filters`, dove la loro semantica
+  è dichiarata. Nessuno di loro influenza ranghi o normalizzazioni PRIMA
+  della selezione (agiscono sui candidati già estratti), quindi nessun
+  canale in più da chiudere.
+- **La proprietà d'indistinguibilità** (proptest, 128 casi, celle
+  generate; tre modalità: solo testo, ibrida con embedder finto, testo e
+  grafo): stesse note più un numero qualsiasi di note in quarantena e
+  lapidi che corrispondono alla domanda → **stesso insieme di id, ranghi
+  densi da 1, massimo normalizzato a 1, stessi coseni, supporti, liste,
+  termini trovati e ranghi semantico/grafo, per ogni id**. Lo stesso
+  controllo via MCP stdio: `memory_search` risponde con gli **stessi
+  byte** prima e dopo l'aggiunta delle note nascoste.
+- **L'eccezione dichiarata: l'ε dell'IDF.** SQLite FTS5 calcola l'IDF di
+  bm25 sull'indice **intero** — e le righe in quarantena devono restarci:
+  `include_quarantined` è contratto JS. Una riga nascosta che corrisponde
+  sposta i punteggi dei visibili (e con pareggi vicini, l'ordine interno).
+  Misurata dal banco d'indistinguibilità (stampata a ogni corsa):
+  ≈ 0,8% su tre note con match puliti, fino a **0,83 relativa** su
+  corpus minimi patologici dove più righe nascoste matchano la stessa
+  forma rara, decrescente col corpus. Nessun controfattuale può leggerla:
+  ogni **canale strutturale** (id, ranghi, normalizzazioni, finestra,
+  supporto, coseni) è chiuso ed è ciò che la proprietà asserisce. I casi
+  dove una forma siede in metà dell'indice (la «briciola» 1e-6 di FTS5
+  per gli IDF negativi) sono rifiutati in generazione: lì bm25 non
+  significa niente comunque. Scritto in DESIGN §5.
+- Nota sull'ibrida: la fusione **convessa** a min-max azzera il peggiore
+  candidato di testo (comportamento della v0.2.1, `retain(score > 0)`
+  lo butta) e chi è «il peggiore» può cambiare con l'ε — un dirupo, non
+  un'oscillazione. La proprietà usa la RRF (ogni candidato tiene un
+  reciproco positivo); la convessa resta com'è perché ritoccarla
+  sposterebbe i banchi. Dichiarato qui e nel test.
+
+**Misure P1** (le note in quarantena dei banchi sono poche; il p95 ha il
+tetto più stretto, +5%):
+
+| banco | soglia | prima | dopo | verdetto |
+|---|---|---|---|---|
+| banco italiano 100k, MRR pesato (viva/uniform) | ≥ −0,005 | 0,683 / 0,739 | 0,683 / 0,739 | ✓ identici |
+| LongMemEval dev 150, ibrido turno ndcg@5 | ≥ −0,005 | 0,7303 | 0,7289 | ✓ (−0,0014) |
+| banco 10k, testo+grafo p95 | entro +5% | 1,9 ms | 1,9 ms | ✓ (0%) |
+| banco 10k, ricerca ibrida p95 (viva) | — (riferimento) | 1,9 ms | 1,9 ms | invariato |
+
+## P2 — `search` e `fetch` solo a ChatGPT
+
+- La regola «è ChatGPT» è un **campo di configurazione** della libreria
+  (`HttpConfig.chatgpt_client_id`, base
+  `https://chatgpt.com/oauth/client.json`): i test servono i tre
+  documenti **veri** (scaricati il 2026-11-12, riportati nella fase) con
+  solo il `client_id` diventato l'URL di loopback del documento di prova.
+- `RequestGrant` porta il `client_id` del grant: `tools/list` espone
+  `search`/`fetch` **solo** al grant ChatGPT; il test con tre grant
+  (ChatGPT, Codex, claude.ai) verifica gli elenchi esatti — sette
+  strumenti per ChatGPT, cinque per gli altri due.
+- Chiamare `search` per nome da un altro grant risponde **esattamente**
+  come uno strumento che non esiste: l'errore verbatim del ToolRouter di
+  rmcp (`invalid_params "tool not found"`), stesso codice, stesso
+  messaggio, byte per byte (test di uguaglianza contro uno strumento
+  inventato). Nessun oracolo.
+- Su stdio `--compat chatgpt` è un errore d'uso (prima era ignorato in
+  silenzio): test sull'uscita del binario vero.
+
+## P3 — Le rifiniture di HTTP
+
+1. **Lo spam di `/authorize`**: tetto globale di 30 al minuto (pagina
+   429 con `Retry-After: 60`, come `/token`); **cache negativa del CIMD**
+   (un documento rifiutato o irraggiungibile non si riscarica per 5
+   minuti: l'URL esatto, un evento solo — test con un contatore: tre
+   tentativi, UNO scaricamento); tetti in attesa **2 per client_id e 10
+   in tutto** (un client solo non riempie la coda; lo spammatore con
+   molti domini resta possibile ed è scritto nel DESIGN §8.6);
+   **`engramma oauth deny --all`** rifiuta tutto ciò che aspetta e le
+   pagine d'attesa redirigono i browser con `access_denied` (test con la
+   CLI vera).
+2. **Sessioni legacy**: tetto di 1000 (escono le più vecchie; tiebreaker
+   d'inserimento deterministico — trovato perché la prima versione del
+   test era non deterministica con 1100 sessioni nello stesso secondo),
+   un'ora di inattività, DELETE accettato = voce tolta. Il test apre 1100
+   sessioni e controlla tetto e 404 delle espulse.
+3. **MRTR**: TTL di 10 minuti (uno `requestState` scaduto risponde come
+   uno sconosciuto — unit test), tetto di 1000, e lo stato passa da ULID
+   (80 bit) a **256 bit casuali** (`mint::opaque_token`, prefisso
+   `eng_rs_`).
+4. **`/revoke` di un refresh** porta con sé gli accessi della stessa
+   famiglia (RFC 7009 § 2.1); la revoca di un accesso tocca solo lui e
+   il client continua a rinfrescare (test su entrambi i versi).
+5. **SSRF**: `2002::/16` (6to4) giudicato dall'IPv4 incorporato come i
+   mappati; `64:ff9b:1::/48` (NAT64 locale RFC 8215), `2001::/32`
+   (Teredo) e `::/96` rifiutati. Proptest estesa: la 6to4 equivale
+   sempre al suo IPv4; le tre forme non sono mai pubbliche.
+6. **Test dovuti**: il ciclo di vita DCR (mai usato → 24 h; usato → vivo
+   finché vive un grant, poi cancellato — orologio iniettabile); i bordi
+   della cache del CIMD (max-age=1 → 300 s; 999999 → 86400; assente →
+   3600; non numerico → 3600).
+7. **Eventi con la causa**: `client_rejected` porta il dettaglio locale
+   (`CimdError::detail`: DNS, nessun indirizzo pubblico, timeout, stato
+   HTTP, TLS, regola del documento); sul filo la risposta resta generica.
+8. **ngrok**: nessun codice; la frase di `docs/http.md` è stata
+   rilegata dopo le modifiche e resta esatta.
+
+## Chiusura
+
+- macOS: `cargo fmt --check` ok; `cargo clippy --all-targets --offline --
+  -D warnings` zero avvisi; `cargo test --offline --workspace
+  --no-fail-fast` verde (l'unica corsa rossa in itinere era il
+  golden_semantic del titolo, corretto prima della chiusura);
+  `cargo test -p engramma-bench --example longmemeval` 3/3;
+  `cargo deny check licenses bans` ok.
+- Linux: `scripts/linux.sh` verde in Docker (arm64, rete chiusa, sorgente
+  in sola lettura), volume `engramma-linux-target` rimosso.
+- JS (Node 24): `npm test` 29/29, `test:electron` 29/29,
+  `test:electron-main` ok — **senza cambiare una sola attesa**. Il test
+  della quarantena è diventato rosso a metà chiusura (la potatura delle
+  forme con df=0 nascondeva al proprietario le note che chiede con
+  `includeQuarantined`: il df del percorso testo seguiva sempre il
+  filtro predefinito): corretto, e l'attesa è quella della v0.4.
+- Build: `npm run build` rifatto; il `.node` cambia (P0 e P1 sono nel
+  nucleo). SHA256: `.node`
+  `419372e04d2331644d09af77983290393f4ba692c6b8360c630342841e6878c9`,
+  `index.js`
+  `25fd9cc1d50a1ec3f2d74bc004d904663ff07360102d27b938870329d9c832d4`,
+  `index.d.ts`
+  `bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a6488005bf69d9f8`.
+- Disco: `target` 22G all'inizio, **24G** alla fine (i binari
+  release dei banchi e le ricostruzioni; nessuna pulizia forzata: la
+  fase non tocca `~/.cache/cargo-target`).
+
+## Per Homun
+
+**Aggancio consigliato.** Tutti i miglioramenti sono nel nucleo e valgono
+per ogni trasporto: le domande corte (da una a tre parole — come si fa
+spesso a voce) ora trovano; le note in quarantena non spostano più i
+ranghi né i punteggi normalizzati di ciò che l'utente vede. Il contratto
+JS è invariato: stessi metodi, stesse attese, stesso `.node` che si
+ricompila da sé. Nessuna migrazione: celle e `oauth.db` aprono come
+prima (la tabella nuova della cache negativa nasce da sola al primo
+aperto). Se Homun espone MCP su HTTP, gli strumenti di compatibilità
+restano al solo collegamento ChatGPT anche per lui, e `deny --all`
+chiude la coda delle richieste in un colpo.
