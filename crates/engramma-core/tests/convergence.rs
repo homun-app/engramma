@@ -647,3 +647,372 @@ fn the_adopt_root_covers_the_unsigned_era_identically_on_every_copy() {
         assert!(cell.verify().unwrap(/* test-only */).ok());
     }
 }
+
+// ---------------------------------------------------------------------------
+// the full convergence property (P1.7): 2–4 devices write concurrently and
+// sync through random deliveries — duplicates, partitions, whole
+// exchanges — and when everything has reached everyone, every copy holds
+// the same replicated state, which is also the state of a copy that
+// received the same set in total order.
+// ---------------------------------------------------------------------------
+
+use proptest::prelude::*;
+
+/// The vocabulary a device can write. Every op goes through the public API
+/// of that device's own copy: its base is whatever THAT device had applied,
+/// so concurrency emerges from the delivery order, not from construction.
+enum Write {
+    Put,
+    Patch,
+    Delete,
+    Supersede,
+    Link,
+    Unlink,
+    Propose,
+    Decide,
+    Purge,
+}
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        self.next() % n
+    }
+}
+
+/// One simulated cell fleet. Each device holds its own copy; writes go
+/// through the public API; deliveries carry the sender's operations.
+struct Fleet {
+    cells: Vec<Cell>,
+    notes: Vec<Ulid>,
+    edges: Vec<String>,
+    proposals: Vec<Ulid>,
+}
+
+impl Fleet {
+    fn write(&mut self, dev: usize, w: &Write, rng: &mut Rng) {
+        let cell = &self.cells[dev];
+        let pick = |pool: &[Ulid], rng: &mut Rng| -> Option<Ulid> {
+            pool.get(rng.below(pool.len() as u64) as usize).copied()
+        };
+        match w {
+            Write::Put => {
+                let i = self.notes.len() as u32 + 1;
+                let body = format!(
+                    "nota {i} scritta da {dev}: {}",
+                    ["gatto", "tonno", "treno", "orto"][rng.below(4) as usize]
+                );
+                let n = base_note(90 + i, &body);
+                self.notes.push(n.id);
+                let _ = cell.put_note(&n, &format!("device-{dev}"));
+            }
+            Write::Patch => {
+                if let Some(id) = pick(&self.notes, rng) {
+                    let body = format!(
+                        "il corpo di {dev} su {}: {}",
+                        id,
+                        ["rosso", "blu", "verde"][rng.below(3) as usize]
+                    );
+                    let _ = cell.patch_note(
+                        &id,
+                        &NotePatch {
+                            body: Some(body),
+                            ..Default::default()
+                        },
+                        &format!("device-{dev}"),
+                    );
+                }
+            }
+            Write::Delete => {
+                if let Some(id) = pick(&self.notes, rng) {
+                    let _ = cell.delete_note(&id, &format!("device-{dev}"));
+                }
+            }
+            Write::Supersede => {
+                if let Some(old) = pick(&self.notes, rng) {
+                    let i = self.notes.len() as u32 + 1;
+                    let mut n = base_note(90 + i, &format!("la verità nuova di {dev}"));
+                    n.valid_from = Some(engramma_core::format::Validity(now().get().date(), None));
+                    let _ = cell.supersede(&old, &n, None, &format!("device-{dev}"));
+                    self.notes.push(n.id);
+                }
+            }
+            Write::Link => {
+                if let Some(a) = pick(&self.notes, rng)
+                    && let Some(b) = pick(&self.notes, rng)
+                {
+                    let edge = engramma_core::cell::EdgeInput {
+                        src: format!("note:{a}"),
+                        rel: "vicino".into(),
+                        dst: format!("note:{b}"),
+                        note_id: Some(a),
+                        valid_from: None,
+                        valid_to: None,
+                        confidence: engramma_core::Confidence::Stated,
+                    };
+                    if let Ok(id) = cell.link(&edge, &format!("device-{dev}")) {
+                        self.edges.push(id);
+                    }
+                }
+            }
+            Write::Unlink => {
+                if !self.edges.is_empty() {
+                    let idx = rng.below(self.edges.len() as u64) as usize;
+                    let id = self.edges[idx].clone();
+                    let _ = cell.unlink(&id, &format!("device-{dev}"));
+                }
+            }
+            Write::Propose => {
+                let i = self.notes.len() as u32 + 1;
+                let out = cell.propose(
+                    &engramma_core::cell::proposals::ProposalInput {
+                        note: base_note(90 + i, &format!("la proposta di {dev}")),
+                        mode: engramma_core::cell::proposals::ProposalMode::New,
+                        client: Some("test".into()),
+                        reason: Some("perché".into()),
+                    },
+                    &format!("device-{dev}"),
+                    &engramma_core::cell::proposals::ProposeContext::default(),
+                );
+                if let Ok(out) = out
+                    && let Some(id) = out.id
+                {
+                    self.proposals.push(id);
+                }
+            }
+            Write::Decide => {
+                if let Some(id) = pick(&self.proposals, rng) {
+                    let _ = cell.decide(
+                        &id,
+                        &engramma_core::cell::proposals::DecisionInput {
+                            action: engramma_core::cell::proposals::DecisionAction::Accept {
+                                edited: None,
+                            },
+                            reason: Some("va bene".into()),
+                            review: None,
+                        },
+                        &format!("device-{dev}"),
+                    );
+                }
+            }
+            Write::Purge => {
+                if let Some(id) = pick(&self.notes, rng) {
+                    let _ = cell.purge(&id, "oblio", &format!("device-{dev}"));
+                }
+            }
+        }
+    }
+
+    /// Deliver from `from` to `to`: every operation the sender holds and the
+    /// receiver does not. `fraction` < 1 models a partition (a partial
+    /// delivery); a second pass completes it later.
+    fn deliver(&self, from: usize, to: usize, fraction: u64, rng: &mut Rng) {
+        let sender_ops = self.cells[from].ops().unwrap(/* test-only */);
+        let held: std::collections::HashSet<String> = self.cells[to]
+            .debug_column("SELECT op_id FROM ops")
+            .unwrap(/* test-only */)
+            .into_iter()
+            .collect();
+        let missing: Vec<Op> = sender_ops
+            .into_iter()
+            .filter(|op| !held.contains(&op.op_id.to_string()))
+            .collect();
+        // fraction 4+ delivers everything; 0..3 delivers roughly a quarter
+        // each — a partition that a later pass completes
+        let take = if fraction >= 4 {
+            missing.len()
+        } else {
+            (missing.len() * fraction as usize / 4).min(missing.len())
+        };
+        // deliver a random subset of size `take`
+        let mut idx: Vec<usize> = (0..missing.len()).collect();
+        // deterministic shuffle
+        for i in (1..idx.len()).rev() {
+            let j = rng.below((i + 1) as u64) as usize;
+            idx.swap(i, j);
+        }
+        for &i in idx.iter().take(take) {
+            // an ingest of an op already held is a DUPLICATE: harmless
+            let _ = self.cells[to].ingest_op(&missing[i]);
+        }
+    }
+
+    /// Full sync: the union of everyone's operations, pushed to everyone,
+    /// until nothing new flows.
+    fn settle(&self) {
+        loop {
+            let mut union: std::collections::BTreeMap<String, Op> =
+                std::collections::BTreeMap::new();
+            for cell in &self.cells {
+                for op in cell.ops().unwrap(/* test-only */) {
+                    union.insert(op.op_id.to_string(), op);
+                }
+            }
+            let mut moved = false;
+            for cell in &self.cells {
+                let held: std::collections::HashSet<String> = cell
+                    .debug_column("SELECT op_id FROM ops")
+                    .unwrap(/* test-only */)
+                    .into_iter()
+                    .collect();
+                for op in union.values() {
+                    if !held.contains(&op.op_id.to_string())
+                        && cell.ingest_op(op).unwrap(/* test-only */)
+                    {
+                        moved = true;
+                    }
+                }
+            }
+            if !moved {
+                return;
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+    #[test]
+    fn the_fleet_converges(
+        seed in any::<u64>(),
+        devices in 2_u32..=4,
+        rounds in 12_u32..=28,
+    ) {
+        let mut rng = Rng(seed | 1);
+        let n = devices as usize;
+        let dir0 = tempfile::tempdir().unwrap(/* test-only */);
+        let a = Cell::create(&dir0.path().join("fleet.sqlite"), "conv", "device-0")
+            .unwrap(/* test-only */);
+        std::mem::forget(dir0);
+        a.set_policy(serde_json::json!({ "write": "propose" }), "device-0")
+            .unwrap(/* test-only */);
+        let mut cells = vec![a];
+        for d in 1..n {
+            let dir = tempfile::tempdir().unwrap(/* test-only */);
+            let cell = Cell::open_bare(&dir.path().join(format!("fleet{d}.sqlite")))
+                .unwrap(/* test-only */);
+            std::mem::forget(dir);
+            cells.push(cell);
+        }
+        // deterministic time: each device ticks a fixed clock, so a failing
+        // case reproduces exactly (wall-time HLCs would rewrite the op set
+        // on every run)
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        // the base is the REAL wall, frozen here: always within the drift
+        // cap, and frozen so every device ticks the same deterministic
+        // sequence
+        let base = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        for (d, cell) in cells.iter().enumerate() {
+            let tick = Arc::new(AtomicU64::new(0));
+            let now = Arc::clone(&tick);
+            let node = format!("d{d:011}x");
+            cell.inject_clock(engramma_core::hlc::HlcClock::new(node, move || {
+                base + now.fetch_add(1, Ordering::SeqCst) * 7 + d as u64 * 3
+            }))
+            .unwrap(/* test-only */);
+        }
+        let mut fleet = Fleet { cells, notes: Vec::new(), edges: Vec::new(), proposals: Vec::new() };
+        for _ in 0..rounds {
+            match rng.below(3) {
+                0 | 1 => {
+                    // a device writes
+                    let dev = rng.below(n as u64) as usize;
+                    let w = match rng.below(9) {
+                        0 | 1 => Write::Put,
+                        2 | 3 => Write::Patch,
+                        4 => Write::Delete,
+                        5 => Write::Supersede,
+                        6 => Write::Link,
+                        _ => Write::Unlink,
+                    };
+                    fleet.write(dev, &w, &mut rng);
+                }
+                _ => {
+                    // a delivery between two devices: sometimes partial
+                    let from = rng.below(n as u64) as usize;
+                    let to = rng.below(n as u64) as usize;
+                    if from != to {
+                        let fraction = rng.below(5);
+                        fleet.deliver(from, to, fraction, &mut rng);
+                    }
+                }
+            }
+        }
+        // occasionally exercise the queue and the right to be forgotten
+        fleet.write(rng.below(n as u64) as usize, &Write::Propose, &mut rng);
+        fleet.settle();
+        fleet.write(rng.below(n as u64) as usize, &Write::Decide, &mut rng);
+        if rng.below(2) == 0 && !fleet.notes.is_empty() {
+            fleet.write(rng.below(n as u64) as usize, &Write::Purge, &mut rng);
+        }
+        fleet.settle();
+
+        // every copy holds the same replicated state…
+        let digests: Vec<String> = fleet
+            .cells
+            .iter()
+            .map(|c| c.replicated_digest().unwrap(/* test-only */))
+            .collect();
+        let first = &digests[0];
+        prop_assert!(
+            digests.iter().all(|d| d == first),
+            "the fleet did not converge: {digests:?}"
+        );
+        // …and the same state as a copy that received everything in total
+        // order
+        let mut union: std::collections::BTreeMap<String, Op> = std::collections::BTreeMap::new();
+        for cell in &fleet.cells {
+            for op in cell.ops().unwrap(/* test-only */) {
+                union.insert(op.op_id.to_string(), op);
+            }
+        }
+        let mut by_total: Vec<Op> = union.into_values().collect();
+        by_total.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
+        let reference = copy_of("ref", &by_total);
+        prop_assert_eq!(
+            reference.replicated_digest().unwrap(/* test-only */),
+            first.clone(),
+            "the total-order reference disagrees with the fleet"
+        );
+        // one copy's own log still verifies against its own replay
+        let vr = fleet.cells[0].verify().unwrap(/* test-only */);
+        prop_assert!(vr.ok(), "a converged copy fails verify: {vr:?}");
+    }
+}
+
+#[test]
+fn the_watermark_keeps_the_maximum_across_out_of_order_arrivals() {
+    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let a = Cell::create(&dir_a.path().join("a.sqlite"), "conv", "device-a")
+        .unwrap(/* test-only */);
+    a.put_note(&base_note(21, "prima"), "device-a").unwrap(/* t */);
+    a.put_note(&base_note(22, "seconda"), "device-a").unwrap(/* t */);
+    let ops = a.ops().unwrap(/* test-only */);
+    // deliver in REVERSE: the newer hlc first, the older last
+    let mut rev: Vec<Op> = ops.clone();
+    rev.reverse();
+    let z = copy_of("z", &rev);
+    let max = a
+        .debug_column("SELECT MAX(hlc) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .clone();
+    let got = z
+        .debug_column("SELECT value FROM meta WHERE key = 'hlc'")
+        .unwrap(/* test-only */)[0]
+        .clone();
+    assert_eq!(got, max, "the watermark must hold the maximum ever seen");
+    assert!(z.verify().unwrap(/* test-only */).ok());
+}

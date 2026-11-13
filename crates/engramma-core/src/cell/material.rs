@@ -122,14 +122,40 @@ fn is_newest_of(tx: &rusqlite::Transaction<'_>, object: &str, op: &Op) -> Result
 fn restore_hlc_watermark(
     tx: &rusqlite::Transaction<'_>,
     watermark: Option<String>,
+    arrival: Option<&crate::hlc::Hlc>,
 ) -> Result<(), CellError> {
-    if let Some(w) = watermark {
-        tx.execute(
-            "INSERT INTO meta (key, value) VALUES ('hlc', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = ?1",
-            [w],
-        )?;
+    // the floor is the MAXIMUM of the pre-arrival watermark and the
+    // arriving operation's own HLC: an operation that LOSES every conflict
+    // rule (a body write the lapide beat) still ARRIVED, and the clock
+    // observed it — the watermark is the maximum ever seen, applied or not
+    let floor = {
+        let w = watermark
+            .as_deref()
+            .and_then(|s| crate::hlc::Hlc::parse(s).ok());
+        match (w, arrival) {
+            (Some(w), Some(a)) => Some(w.max(a.clone())),
+            (Some(w), None) => Some(w),
+            (None, Some(a)) => Some(a.clone()),
+            (None, None) => None,
+        }
+    };
+    let Some(floor) = floor else {
+        return Ok(());
+    };
+    let now: Option<String> = tx
+        .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
+        .optional()?;
+    let parsed_n = now.as_deref().and_then(|s| crate::hlc::Hlc::parse(s).ok());
+    if let Some(n) = parsed_n
+        && n >= floor
+    {
+        return Ok(());
     }
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('hlc', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        [floor.to_string()],
+    )?;
     Ok(())
 }
 
@@ -144,6 +170,7 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
         .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
         .optional()?;
     let objects = ops::objects_of(op);
+    let touched_a_note = objects.iter().any(|o| o.starts_with("note:"));
     let mut to_materialize: Vec<String> = Vec::new();
     for object in &objects {
         if is_pending(tx, object)?
@@ -153,48 +180,82 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
             to_materialize.push(object.clone());
         }
     }
-    if to_materialize.is_empty() {
-        // the fast path: every object takes this operation directly, in its
-        // own half. A half that needs a note that is not here yet (a patch
-        // before its put, across a partition) does not fail the arrival —
-        // the object turns PENDING and waits for what it leans on; the
-        // halves that merely REFERENCE a missing note (the old side of a
-        // supersede, the target side of a decide) already tolerate it. The
-        // tombstone rule rides along: a body write on a lapide that it did
-        // not see wins nothing; one whose base is the lapide reopens it.
-        for object in &objects {
-            if let Some(nid) = object.strip_prefix("note:")
-                && let Ok(nid) = Ulid::from_string(nid)
-                && is_body_write(op, &nid)
-            {
-                match tombstone_rule(tx, op, &nid)? {
-                    TombstoneOutcome::Wins => continue,
-                    TombstoneOutcome::Reopens => ops::reopen_tombstone(tx, &nid)?,
-                    TombstoneOutcome::NoTombstone => {}
-                }
-            }
-            match apply_half(tx, op, object) {
-                Ok(()) => {}
-                Err(CellError::NoteNotFound(_)) => {
-                    mark_pending(tx, object, &op.op_id.to_string())?;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        return Ok(());
-    }
-    // the objects that DID take the fast path receive their HALF of this
-    // operation (a two-object operation — a supersede, a decide — splits
-    // along the scope); the others replay from the whole set
-    for object in &objects {
-        if !to_materialize.contains(object) {
-            apply_half(tx, op, object)?;
+    // an unlink whose link has not arrived waits like a patch before its
+    // put: the edge object goes pending, and the link's arrival replays
+    let mut unlink_waits = false;
+    if op.kind == OpKind::Unlink
+        && let Some(edge) = objects.iter().find(|o| o.starts_with("edge:"))
+    {
+        let edge_id = edge.strip_prefix("edge:").unwrap_or_default();
+        let n: i64 = tx.query_row("SELECT COUNT(*) FROM edges WHERE id = ?1", [edge_id], |r| {
+            r.get(0)
+        })?;
+        if n == 0 {
+            mark_pending(tx, edge, &op.op_id.to_string())?;
+            unlink_waits = true;
         }
     }
-    for object in &to_materialize {
-        materialize(tx, object)?;
+    if !unlink_waits {
+        if to_materialize.is_empty() {
+            // the fast path: every object takes this operation directly, in
+            // its own half. A half that needs a note that is not here yet (a
+            // patch before its put, across a partition) does not fail the
+            // arrival — the object turns PENDING and waits for what it leans
+            // on; the halves that merely REFERENCE a missing note (the old
+            // side of a supersede, the target side of a decide) already
+            // tolerate it. The tombstone rule rides along: a body write on a
+            // lapide that it did not see wins nothing; one whose base is the
+            // lapide reopens it.
+            for object in &objects {
+                if let Some(nid) = object.strip_prefix("note:")
+                    && let Ok(nid) = Ulid::from_string(nid)
+                    && is_body_write(op, &nid)
+                {
+                    match tombstone_rule(tx, op, &nid)? {
+                        TombstoneOutcome::Wins => continue,
+                        TombstoneOutcome::Reopens => ops::reopen_tombstone(tx, &nid)?,
+                        TombstoneOutcome::NoTombstone => {}
+                    }
+                }
+                match apply_half(tx, op, object) {
+                    Ok(()) => {}
+                    Err(CellError::NoteNotFound(_)) => {
+                        mark_pending(tx, object, &op.op_id.to_string())?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        } else {
+            // the objects that DID take the fast path receive their HALF of
+            // this operation (a two-object operation — a supersede, a
+            // decide — splits along the scope); the others replay from the
+            // whole set
+            for object in &objects {
+                if !to_materialize.contains(object) {
+                    apply_half(tx, op, object)?;
+                }
+            }
+            for object in &to_materialize {
+                materialize(tx, object)?;
+            }
+        }
     }
-    restore_hlc_watermark(tx, watermark)?;
+    // a note that just landed may unblock PENDING edges that cite it (a
+    // link whose note arrived after it, across a partition): they retry,
+    // once, now — materialize_edge keeps them pending while the note is
+    // still missing
+    if touched_a_note {
+        let pending_edges: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT object FROM pending_objects WHERE object LIKE 'edge:%'")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for edge in pending_edges {
+            materialize(tx, &edge)?;
+        }
+    }
+    restore_hlc_watermark(tx, watermark, Some(&op.hlc))?;
     Ok(())
 }
 
@@ -496,7 +557,7 @@ fn materialize_note(
         clear_pending(tx, object)?;
     }
     reconcile_conflict_copies(tx, id, &losers)?;
-    restore_hlc_watermark(tx, watermark)?;
+    restore_hlc_watermark(tx, watermark, None)?;
     Ok(())
 }
 
@@ -811,6 +872,17 @@ fn delete_note_state(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<(), Ce
     tx.execute("DELETE FROM supersedes WHERE new_id = ?1", [&id_str])?;
     tx.execute("DELETE FROM proposals WHERE note_id = ?1", [&id_str])?;
     tx.execute("DELETE FROM decisions WHERE proposal = ?1", [&id_str])?;
+    // a removed conflict copy leaves its tags orphaned in the global table:
+    // the tags are a function of note_tags (the purge's own rule), and a
+    // copy that never existed on some copies must not leave its name
+    // behind on others
+    tx.execute(
+        "DELETE FROM tags WHERE NOT EXISTS (
+             SELECT 1 FROM note_tags nt
+             WHERE nt.tag = tags.name OR nt.tag LIKE tags.name || '/%'
+         )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -924,7 +996,7 @@ fn materialize_policy(tx: &rusqlite::Transaction<'_>) -> Result<(), CellError> {
     for op in &all {
         ops::apply_scoped(tx, op, Scope::Full)?;
     }
-    restore_hlc_watermark(tx, watermark)?;
+    restore_hlc_watermark(tx, watermark, None)?;
     Ok(())
 }
 
@@ -946,7 +1018,14 @@ fn materialize_edge(
     for op in &all {
         match op.kind {
             OpKind::Link => {
-                ops::apply_scoped(tx, op, Scope::Full)?;
+                match ops::apply_scoped(tx, op, Scope::Full) {
+                    Ok(()) => {}
+                    // a cited note has not arrived yet: the edge waits
+                    Err(CellError::NoteNotFound(_)) => {
+                        pending_since = Some(op.op_id.to_string());
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             OpKind::Unlink => {
                 let n: i64 =
@@ -967,7 +1046,7 @@ fn materialize_edge(
     } else {
         clear_pending(tx, object)?;
     }
-    restore_hlc_watermark(tx, watermark)?;
+    restore_hlc_watermark(tx, watermark, None)?;
     Ok(())
 }
 

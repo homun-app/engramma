@@ -922,9 +922,11 @@ impl Cell {
     }
 
     /// Replace the HLC clock — tests inject skewed wall clocks to play
-    /// multiple processes on the same file.
-    #[cfg(test)]
-    pub(crate) fn inject_clock(&self, clock: HlcClock) -> Result<(), CellError> {
+    /// multiple processes on the same file, and the convergence simulator
+    /// fixes time so a failing case reproduces byte for byte (the HLCs
+    /// embed the wall clock: without this, the same seed writes a different
+    /// op set on every run, and a divergence hides between runs).
+    pub fn inject_clock(&self, clock: HlcClock) -> Result<(), CellError> {
         let mut inner = self.lock()?;
         inner.clock = clock;
         Ok(())
@@ -1385,6 +1387,11 @@ impl Cell {
         override_valid_to: Option<Validity>,
         actor: &str,
     ) -> Result<(), CellError> {
+        // a LOCAL writer closes a note it has in front of them: the old note
+        // must exist here (the apply tolerates its absence for the REPLAY of
+        // a redacted log, but an operation BORN here without its target
+        // would claim a causality its author never had)
+        let _ = self.get(old_id)?;
         let old_updated_at = self.now_at()?;
         let valid_to = override_valid_to
             .or(new.valid_from)
@@ -1765,6 +1772,16 @@ impl Cell {
     pub fn replicated_digest(&self) -> Result<String, CellError> {
         let inner = self.lock()?;
         replicated_digest(&inner.conn)
+    }
+
+    /// The row-by-row dump behind [`Cell::replicated_digest`] — the tool
+    /// that finds WHERE two copies diverge (line by line).
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn replicated_dump(&self) -> Result<String, CellError> {
+        let inner = self.lock()?;
+        dump_tables(&inner.conn, &replicated_dump_tables())
     }
 
     /// The markdown view's reconciliation state: one view's rows (last

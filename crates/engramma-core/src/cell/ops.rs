@@ -1794,8 +1794,15 @@ pub(crate) fn purge_state(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellErr
         "DELETE FROM supersedes WHERE new_id = ?1 OR old_id = ?1",
         [&id_str],
     )?;
-    // the edges the note declares (derived and manual alike)
-    tx.execute("DELETE FROM edges WHERE note_id = ?1", [&id_str])?;
+    // the edges the note declares (derived and manual alike), and every
+    // edge that NAMES it as an endpoint (v0.6, P1: a manual edge pointing
+    // at the purged note would survive on the copies that built it before
+    // the purge arrived and never exist on the others — the name is part of
+    // what the purge forgets)
+    tx.execute(
+        "DELETE FROM edges WHERE note_id = ?1 OR src = ?2 OR dst = ?2",
+        rusqlite::params![id_str, format!("note:{id_str}")],
+    )?;
     // The purged note's subject entity: unhook it, then RE-DERIVE the claim
     // (an alive note with the same title) and only then delete the entities
     // left with no claim and no references. The re-derivation is what keeps
