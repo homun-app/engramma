@@ -834,6 +834,17 @@ fn a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint() {
              DROP TABLE IF EXISTS proposals;
              DROP TABLE IF EXISTS decisions;
              DROP TABLE IF EXISTS notes_fts_hidden;  -- v14: a real v9 cell has one index
+             -- v15/v16 left columns and tables behind: rebuild ops without
+             -- them and drop the object index, as a real v9 cell would be
+             CREATE TABLE ops_v9 (seq INTEGER PRIMARY KEY, op_id TEXT UNIQUE, hlc TEXT, actor TEXT,
+                                   kind TEXT, note_id TEXT, payload_digest TEXT,
+                                   prev_hash TEXT, hash TEXT);
+             INSERT INTO ops_v9 SELECT seq, op_id, hlc, actor, kind, note_id, payload_digest,
+                                        prev_hash, hash FROM ops;
+             DROP TABLE ops;
+             ALTER TABLE ops_v9 RENAME TO ops;
+             DROP TABLE IF EXISTS op_objects;
+             DROP TABLE IF EXISTS pending_objects;
              UPDATE meta SET value = '9' WHERE key = 'schema_version';
              DELETE FROM meta WHERE key = 'dump_v13';",
         )

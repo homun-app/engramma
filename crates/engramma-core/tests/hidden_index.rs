@@ -156,7 +156,8 @@ fn a_v13_cell_migrates_its_hidden_rows() {
         .unwrap(/* test-only */);
     drop(cell);
 
-    // the v13 shape: ONE index holding everything, version 13
+    // the v13 shape: ONE index holding everything, version 13, no v15/v16
+    // leftovers (the ops table is rebuilt without the columns they added)
     {
         let conn = rusqlite::Connection::open(&path).unwrap(/* test-only */);
         conn.execute_batch(
@@ -164,6 +165,15 @@ fn a_v13_cell_migrates_its_hidden_rows() {
              INSERT INTO notes_fts(rowid, title, body_norm, tags_text)
                   SELECT rowid, COALESCE(title, ''), COALESCE(body_norm, ''), COALESCE(tags_text, '')
                   FROM notes WHERE status = 'quarantined';
+             CREATE TABLE ops_v13 (seq INTEGER PRIMARY KEY, op_id TEXT UNIQUE, hlc TEXT, actor TEXT,
+                                   kind TEXT, note_id TEXT, payload_digest TEXT,
+                                   prev_hash TEXT, hash TEXT);
+             INSERT INTO ops_v13 SELECT seq, op_id, hlc, actor, kind, note_id, payload_digest,
+                                         prev_hash, hash FROM ops;
+             DROP TABLE ops;
+             ALTER TABLE ops_v13 RENAME TO ops;
+             DROP TABLE IF EXISTS op_objects;
+             DROP TABLE IF EXISTS pending_objects;
              UPDATE meta SET value = '13' WHERE key = 'schema_version';",
         )
         .unwrap(/* test-only */);

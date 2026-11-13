@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 15] = [
+pub const MIGRATIONS: [&str; 16] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -274,6 +274,16 @@ CREATE TABLE op_objects (op_id TEXT NOT NULL,
                          object TEXT NOT NULL,
                          PRIMARY KEY (op_id, object));
 CREATE INDEX idx_op_objects_object ON op_objects(object);
+"#,
+    r#"
+-- v16 (v0.6, P1): per-object materialization bookkeeping, LOCAL to this
+-- copy (like `meta.hlc` and the vault tables: never part of the replicated
+-- digest). An object is PENDING while it holds stored operations its state
+-- does not reflect yet (a patch that arrived before the put it leans on,
+-- an operation waiting for the purge that dominates it): the next arrival
+-- for that object rematerializes it from the whole set, in total order.
+CREATE TABLE pending_objects (object TEXT PRIMARY KEY,
+                              since_op TEXT NOT NULL);
 "#,
 ];
 

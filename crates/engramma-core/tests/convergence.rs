@@ -157,4 +157,63 @@ fn concurrent_patches_converge_on_every_copy() {
         dx, dy,
         "two copies of the same op SET must hold the same replicated state"
     );
+
+    // a duplicate delivery changes nothing: ingest is idempotent by op_id
+    for op in &order_x {
+        let fresh = x.ingest_op(op).unwrap(/* test-only */);
+        assert!(!fresh, "op {} was already held", op.op_id);
+    }
+    assert_eq!(
+        x.replicated_digest().unwrap(/* test-only */),
+        dx,
+        "a duplicate delivery must not move the state"
+    );
+
+    // a partition: a copy that sees one patch BEFORE the put it leans on
+    // holds it pending, and converges when the rest arrives
+    let patch_of = |who: &str| -> Op {
+        union
+            .values()
+            .find(|o| {
+                o.kind.as_str() == "patch_note"
+                    && o.body
+                        .as_ref()
+                        .and_then(|b| b.get("set"))
+                        .and_then(|s| s.get("body"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|t| t.contains(who))
+            })
+            .cloned()
+            .unwrap(/* test-only */)
+    };
+    let put = union
+        .values()
+        .find(|o| o.kind.as_str() == "put_note")
+        .cloned()
+        .unwrap(/* test-only */);
+    let init = union
+        .values()
+        .find(|o| o.kind.as_str() == "init")
+        .cloned()
+        .unwrap(/* test-only */);
+    let dir_z = tempfile::tempdir().unwrap(/* test-only */);
+    let z = Cell::open_bare(&dir_z.path().join("z.sqlite")).unwrap(/* test-only */);
+    std::mem::forget(dir_z);
+    z.ingest_op(&init).unwrap(/* test-only */);
+    z.ingest_op(&patch_of("da A")).unwrap(/* test-only */);
+    // the patch waits: its note is not here yet
+    assert!(
+        z.debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes")
+            .unwrap(/* test-only */)
+            .first()
+            .is_some_and(|n| n == "0"),
+        "a patch before its put materializes nothing"
+    );
+    z.ingest_op(&put).unwrap(/* test-only */);
+    z.ingest_op(&patch_of("da B")).unwrap(/* test-only */);
+    assert_eq!(
+        z.replicated_digest().unwrap(/* test-only */),
+        dx,
+        "the partitioned copy converges when the rest arrives"
+    );
 }

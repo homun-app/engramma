@@ -6,6 +6,7 @@
 //! `BEGIN IMMEDIATE` transaction, so exactly one writer at a time. Readers
 //! (search, get) share the same connection in WAL mode.
 
+pub(crate) mod material;
 pub mod ops;
 pub mod policy;
 pub mod proposals;
@@ -1036,7 +1037,7 @@ impl Cell {
         let mut arrival = op.clone();
         arrival.seq = prev_seq + 1;
         arrival.seal(&prev_hash);
-        ops::apply(&tx, &arrival)?;
+        material::arrive(&tx, &arrival)?;
         if let Some(s) = logged
             && let Ok(prev) = Hlc::parse(&s)
             && prev > arrival.hlc
@@ -2781,7 +2782,7 @@ impl Cell {
         if !chain_only {
             let tx = rebuild_conn.transaction()?;
             for op in tail {
-                if let Err(e) = ops::apply(&tx, op) {
+                if let Err(e) = material::arrive(&tx, op) {
                     replay_err = Some(e.to_string());
                     break;
                 }

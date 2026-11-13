@@ -1,0 +1,465 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! v0.6 (P1): per-object materialization. The state of a copy is a function
+//! of the SET of operations it holds, never of the order they arrived in —
+//! so an operation that lands BEFORE the newest one already applied to its
+//! object forces that object to REMATERIALIZE: its state rows go, and every
+//! operation concerning it replays in the TOTAL ORDER
+//! `(hlc.physical_ms, hlc.counter, hlc.node, op_id)`. The node ids are
+//! fixed-width (12 hex chars), so `ORDER BY hlc, op_id` in SQL walks exactly
+//! this order.
+//!
+//! An operation that arrives last of its objects (the common case) applies
+//! directly, as ever — no replay, no extra cost. An operation on an object
+//! that does not exist yet (a patch before its put, across a partition) is
+//! STORED and waits: the object is PENDING (`pending_objects`, local
+//! bookkeeping like `meta.hlc`), and the next arrival rematerializes it.
+
+use rusqlite::OptionalExtension;
+use ulid::Ulid;
+
+use crate::error::CellError;
+
+use super::ops::{self, Op, OpKind, Scope};
+
+/// The compaction cut: the newest checkpoint's seq (0 when the cell never
+/// compacted). Below the cut the payloads are gone — the state there is
+/// frozen and stable (P1.6 will make it the frontier), so materialization
+/// only ever replays ABOVE it, starting from the state the cut left.
+fn cut_seq(tx: &rusqlite::Transaction<'_>) -> Result<i64, CellError> {
+    let cut: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
+        r.get(0)
+    })?;
+    Ok(cut)
+}
+
+/// Every stored operation concerning one object ABOVE the compaction cut, in
+/// total order.
+pub(crate) fn ops_concerning(
+    tx: &rusqlite::Transaction<'_>,
+    object: &str,
+) -> Result<Vec<Op>, CellError> {
+    let cut = cut_seq(tx)?;
+    let mut stmt = tx.prepare(
+        "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.base, o.content_hash,
+                o.payload_digest, p.salt, p.body, o.prev_hash, o.hash
+         FROM ops o
+         JOIN op_objects oo ON oo.op_id = o.op_id
+         LEFT JOIN op_payloads p ON p.op_id = o.op_id
+         WHERE oo.object = ?1 AND o.seq > ?2
+         ORDER BY o.hlc, o.op_id",
+    )?;
+    let out = stmt
+        .query_map(rusqlite::params![object, cut], |r| {
+            Ok(ops::op_from_row(ops::OpRow {
+                seq: r.get(0)?,
+                op_id: &r.get::<_, String>(1)?,
+                hlc: &r.get::<_, String>(2)?,
+                actor: &r.get::<_, String>(3)?,
+                kind: &r.get::<_, String>(4)?,
+                note_id: r.get::<_, Option<String>>(5)?.as_deref(),
+                base: r.get::<_, Option<String>>(6)?.as_deref(),
+                content_hash: &r.get::<_, String>(7)?,
+                payload_digest: &r.get::<_, String>(8)?,
+                salt: r.get::<_, Option<Vec<u8>>>(9)?.as_deref(),
+                body_json: r.get::<_, Option<String>>(10)?.as_deref(),
+                prev_hash: &r.get::<_, String>(11)?,
+                hash: &r.get::<_, String>(12)?,
+            }))
+        })?
+        .collect::<Result<Result<Vec<_>, _>, _>>()??;
+    Ok(out)
+}
+
+fn is_pending(tx: &rusqlite::Transaction<'_>, object: &str) -> Result<bool, CellError> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pending_objects WHERE object = ?1",
+        [object],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+fn mark_pending(
+    tx: &rusqlite::Transaction<'_>,
+    object: &str,
+    since_op: &str,
+) -> Result<(), CellError> {
+    tx.execute(
+        "INSERT INTO pending_objects (object, since_op) VALUES (?1, ?2)
+         ON CONFLICT(object) DO UPDATE SET since_op = ?2",
+        rusqlite::params![object, since_op],
+    )?;
+    Ok(())
+}
+
+fn clear_pending(tx: &rusqlite::Transaction<'_>, object: &str) -> Result<(), CellError> {
+    tx.execute("DELETE FROM pending_objects WHERE object = ?1", [object])?;
+    Ok(())
+}
+
+/// Is this operation the NEWEST of its object, among the stored ones above
+/// the compaction cut? (Below the cut nothing arrives anymore — that is the
+/// frontier's promise.)
+fn is_newest_of(tx: &rusqlite::Transaction<'_>, object: &str, op: &Op) -> Result<bool, CellError> {
+    let cut = cut_seq(tx)?;
+    let head: Option<(String, String)> = tx
+        .query_row(
+            "SELECT o.hlc, o.op_id FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = ?1 AND o.seq > ?2
+             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
+            rusqlite::params![object, cut],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(head.is_some_and(|(hlc, op_id)| hlc == op.hlc.to_string() && op_id == op.op_id.to_string()))
+}
+
+/// The HLC watermark of the cell (`meta.hlc`) must hold the MAXIMUM ever
+/// seen — a replay of older operations writes lower values as it goes, so
+/// the arrival path restores the watermark it found.
+fn restore_hlc_watermark(
+    tx: &rusqlite::Transaction<'_>,
+    watermark: Option<String>,
+) -> Result<(), CellError> {
+    if let Some(w) = watermark {
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('hlc', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            [w],
+        )?;
+    }
+    Ok(())
+}
+
+/// One operation ARRIVES at this copy: the log row is stored (idempotence
+/// is the caller's — `ingest_op` — business), then every object it touches
+/// either takes the fast path (the operation is the newest and the object
+/// is not pending: it applies whole, as it always did) or rematerializes
+/// from the full set.
+pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), CellError> {
+    ops::store_op(tx, op)?;
+    let watermark: Option<String> = tx
+        .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
+        .optional()?;
+    let objects = ops::objects_of(op);
+    let mut to_materialize: Vec<String> = Vec::new();
+    for object in &objects {
+        if is_pending(tx, object)? || !is_newest_of(tx, object, op)? {
+            to_materialize.push(object.clone());
+        }
+    }
+    if to_materialize.is_empty() {
+        // the fast path: every object takes this operation directly, in its
+        // own half. A half that needs a note that is not here yet (a patch
+        // before its put, across a partition) does not fail the arrival —
+        // the object turns PENDING and waits for what it leans on; the
+        // halves that merely REFERENCE a missing note (the old side of a
+        // supersede, the target side of a decide) already tolerate it.
+        for object in &objects {
+            match apply_half(tx, op, object) {
+                Ok(()) => {}
+                Err(CellError::NoteNotFound(_)) => {
+                    mark_pending(tx, object, &op.op_id.to_string())?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        return Ok(());
+    }
+    // the objects that DID take the fast path receive their HALF of this
+    // operation (a two-object operation — a supersede, a decide — splits
+    // along the scope); the others replay from the whole set
+    for object in &objects {
+        if !to_materialize.contains(object) {
+            apply_half(tx, op, object)?;
+        }
+    }
+    for object in &to_materialize {
+        materialize(tx, object)?;
+    }
+    restore_hlc_watermark(tx, watermark)?;
+    Ok(())
+}
+
+/// The half of one operation that concerns one object.
+fn apply_half(tx: &rusqlite::Transaction<'_>, op: &Op, object: &str) -> Result<(), CellError> {
+    let Some(id) = object.strip_prefix("note:") else {
+        // an edge or the policy: the operation's whole state step is that
+        // object's half
+        return ops::apply_scoped(tx, op, Scope::Full);
+    };
+    let id = Ulid::from_string(id)
+        .map_err(|_| CellError::Invalid(format!("bad object key `{object}`")))?;
+    ops::apply_scoped(tx, op, Scope::Note(id))
+}
+
+/// Rematerialize one object from the whole set of its operations.
+pub(crate) fn materialize(tx: &rusqlite::Transaction<'_>, object: &str) -> Result<(), CellError> {
+    if let Some(id) = object.strip_prefix("note:") {
+        let id = Ulid::from_string(id)
+            .map_err(|_| CellError::Invalid(format!("bad object key `{object}`")))?;
+        materialize_note(tx, &id, object)
+    } else if object == "policy" {
+        materialize_policy(tx)
+    } else if let Some(edge_id) = object.strip_prefix("edge:") {
+        materialize_edge(tx, edge_id, object)
+    } else {
+        Err(CellError::Invalid(format!("unknown object `{object}`")))
+    }
+}
+
+/// Does this operation CREATE the note `id` (so the object materializes even
+/// while the row is absent)?
+fn op_creates_note(op: &Op, id: &Ulid) -> bool {
+    let note_id = op.note_id.is_some_and(|n| n == *id);
+    match op.kind {
+        OpKind::PutNote | OpKind::Propose => note_id,
+        OpKind::Supersede => op
+            .body
+            .as_ref()
+            .and_then(|b| b.get("note"))
+            .and_then(|n| n.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| Ulid::from_string(s).ok())
+            .is_some_and(|n| n == *id),
+        _ => false,
+    }
+}
+
+fn note_exists(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<bool, CellError> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM notes WHERE id = ?1",
+        [id.to_string()],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Rematerialize one note: the state ABOVE the compaction cut goes (the
+/// note row and everything derived from it — versions, tags, its declared
+/// edges, its queue rows, its FTS row in whichever index holds it — but NOT
+/// the manual edges that cite it: they are objects of their own), the state
+/// at the cut comes back from the version snapshot the first above-cut
+/// writer took, and every operation concerning it replays in total order,
+/// each scoped to this note's half. An operation whose note is not there
+/// yet (and does not create it) waits: the object stays pending, and the
+/// next arrival replays the whole set again.
+fn materialize_note(
+    tx: &rusqlite::Transaction<'_>,
+    id: &Ulid,
+    object: &str,
+) -> Result<(), CellError> {
+    let all = ops_concerning(tx, object)?;
+    if all.is_empty() {
+        clear_pending(tx, object)?;
+        return Ok(());
+    }
+    let cut = cut_seq(tx)?;
+    let watermark: Option<String> = tx
+        .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
+        .optional()?;
+    // --- the state of the note at the cut: the snapshot of the FIRST
+    // above-cut ARRIVAL (its pre-state, in this copy's arrival chain, is
+    // exactly what the cut froze — everything before it came from ops at or
+    // below the cut). The first above-cut arrival may have NO snapshot — it
+    // CREATED the note (or purged it): then the note has no state at the
+    // cut, and nothing is restored.
+    let cut_state: Option<(crate::format::Note, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT v.snapshot_json, v.version FROM note_versions v
+             WHERE v.note_id = ?1
+               AND v.op_id = (
+                   SELECT o.op_id FROM ops o
+                   JOIN op_objects oo ON oo.op_id = o.op_id
+                   WHERE oo.object = ?2 AND o.seq > ?3
+                   ORDER BY o.seq ASC LIMIT 1)",
+        )?;
+        let found: Option<(String, i64)> = stmt
+            .query_row(rusqlite::params![id.to_string(), object, cut], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        match found {
+            Some((json, version)) => {
+                let note = crate::format::Note::from_json(
+                    &serde_json::from_str::<serde_json::Value>(&json)
+                        .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?,
+                )
+                .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?;
+                Some((note, version))
+            }
+            None => None,
+        }
+    };
+    // --- delete the current state of the note
+    if let Some(row) = ops::read_note_row(tx, id)?
+        && let Some(idx) = ops::index_for(row.note.status)
+    {
+        // the delete must find the row in the index it lives in, exactly
+        // as `purge_state` guards: a delete for a rowid that is not
+        // there corrupts FTS5's accounting
+        let table = idx.table();
+        let in_index: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM {table}_docsize WHERE id = ?1"),
+            [row.rowid],
+            |r| r.get(0),
+        )?;
+        if in_index > 0 {
+            ops::fts_delete_row(
+                tx,
+                idx,
+                row.rowid,
+                row.note.title.as_deref().unwrap_or(""),
+                &row.body_norm,
+                &row.tags_text,
+            )?;
+        }
+    }
+    let id_str = id.to_string();
+    tx.execute("DELETE FROM notes WHERE id = ?1", [&id_str])?;
+    // only the versions the above-cut writers recorded: the ones at or
+    // below the cut are the frozen history the cut state came from
+    for op in &all {
+        tx.execute(
+            "DELETE FROM note_versions WHERE note_id = ?1 AND op_id = ?2",
+            rusqlite::params![id_str, op.op_id.to_string()],
+        )?;
+    }
+    tx.execute("DELETE FROM note_tags WHERE note_id = ?1", [&id_str])?;
+    // the note's DECLARED edges are its own; the manual ones are objects of
+    // their own and survive this note's rematerialization
+    tx.execute(
+        "DELETE FROM edges WHERE note_id = ?1 AND id LIKE 'd%'",
+        [&id_str],
+    )?;
+    tx.execute("DELETE FROM supersedes WHERE new_id = ?1", [&id_str])?;
+    tx.execute("DELETE FROM proposals WHERE note_id = ?1", [&id_str])?;
+    tx.execute("DELETE FROM decisions WHERE proposal = ?1", [&id_str])?;
+    // --- the state at the cut comes back first, at its exact version
+    if let Some((note, version)) = &cut_state {
+        ops::restore_note(tx, note, *version)?;
+        ops::reindex_note_row(tx, id)?;
+    }
+    // --- replay in total order, scoped to this note
+    let mut pending_since: Option<String> = None;
+    for op in &all {
+        if !note_exists(tx, id)? && !op_creates_note(op, id) {
+            pending_since = Some(op.op_id.to_string());
+            continue;
+        }
+        match ops::apply_scoped(tx, op, Scope::Note(*id)) {
+            Ok(()) => {}
+            // the object the operation leans on is not here yet: it waits
+            Err(CellError::NoteNotFound(_)) => {
+                pending_since = Some(op.op_id.to_string());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if let Some(since) = pending_since {
+        mark_pending(tx, object, &since)?;
+    } else {
+        clear_pending(tx, object)?;
+    }
+    restore_hlc_watermark(tx, watermark)?;
+    Ok(())
+}
+
+/// The policy object: `init` and `set_policy` in total order — last write
+/// wins, the whole history of the meta keys replays.
+fn materialize_policy(tx: &rusqlite::Transaction<'_>) -> Result<(), CellError> {
+    let all = ops_concerning(tx, "policy")?;
+    let watermark: Option<String> = tx
+        .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
+        .optional()?;
+    tx.execute_batch("DELETE FROM meta WHERE key IN ('cell_id', 'cell_name', 'policy');")?;
+    for op in &all {
+        ops::apply_scoped(tx, op, Scope::Full)?;
+    }
+    restore_hlc_watermark(tx, watermark)?;
+    Ok(())
+}
+
+/// The edge object: its link and unlink operations in total order — the
+/// edge exists iff its newest operation is the link. An unlink whose link
+/// has not arrived yet waits (pending), exactly like a patch before its
+/// put.
+fn materialize_edge(
+    tx: &rusqlite::Transaction<'_>,
+    edge_id: &str,
+    object: &str,
+) -> Result<(), CellError> {
+    let all = ops_concerning(tx, object)?;
+    let watermark: Option<String> = tx
+        .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
+        .optional()?;
+    tx.execute("DELETE FROM edges WHERE id = ?1", [edge_id])?;
+    let mut pending_since: Option<String> = None;
+    for op in &all {
+        match op.kind {
+            OpKind::Link => {
+                ops::apply_scoped(tx, op, Scope::Full)?;
+            }
+            OpKind::Unlink => {
+                let n: i64 =
+                    tx.query_row("SELECT COUNT(*) FROM edges WHERE id = ?1", [edge_id], |r| {
+                        r.get(0)
+                    })?;
+                if n == 0 {
+                    pending_since = Some(op.op_id.to_string());
+                } else {
+                    ops::apply_scoped(tx, op, Scope::Full)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(since) = pending_since {
+        mark_pending(tx, object, &since)?;
+    } else {
+        clear_pending(tx, object)?;
+    }
+    restore_hlc_watermark(tx, watermark)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The total order `ORDER BY hlc, op_id` speaks: the HLC's own structure
+    /// (physical, counter, node — fixed-width node ids compare the same as
+    /// strings) with the op id as the final tiebreak. The SQL and this
+    /// tuple must never disagree.
+    #[test]
+    fn the_sql_order_walks_the_total_order() {
+        let mk = |ms: u64, counter: u32, node: &str, id: u64| {
+            let op_id = Ulid::from_string(&format!("01{}{id:08}", "0".repeat(16)))
+                .unwrap(/* test-only */);
+            let hlc = crate::hlc::Hlc {
+                physical_ms: ms,
+                counter,
+                node: node.into(),
+            };
+            (hlc.to_string(), op_id.to_string())
+        };
+        let a = mk(1, 0, "aaaaaaaaaaaa", 1);
+        let b = mk(1, 0, "aaaaaaaaaaaa", 2);
+        let c = mk(1, 1, "000000000000", 1);
+        let d = mk(0, 9, "ffffffffffff", 9);
+        let mut all = [a.clone(), b.clone(), c, d.clone()];
+        all.sort();
+        // the string sort the SQL does == the structural order
+        assert_eq!(all[0], d, "physical first");
+        assert!(
+            all[1].0.ends_with("aaaaaaaaaaaa")
+                && all[2].0.ends_with("aaaaaaaaaaaa")
+                && all[3].0.ends_with("000000000000"),
+            "counter before node: {:?}",
+            all
+        );
+        assert!(a < b, "same hlc: the op id breaks the tie");
+    }
+}
