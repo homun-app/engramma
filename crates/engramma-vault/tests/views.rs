@@ -266,6 +266,8 @@ fn v032_cell_migrates_roots_to_views_and_the_first_sync_adopts() {
              ALTER TABLE ops_v11 RENAME TO ops;
              DROP TABLE IF EXISTS op_objects;
              DROP TABLE IF EXISTS pending_objects;
+             DROP TABLE IF EXISTS conflict_copies;
+             DROP TABLE IF EXISTS device_acks;  -- v18  -- v17
              DELETE FROM meta WHERE key = 'dump_v13';",
         )
         .unwrap(/* test-only */);

@@ -845,7 +845,8 @@ fn a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint() {
              ALTER TABLE ops_v9 RENAME TO ops;
              DROP TABLE IF EXISTS op_objects;
              DROP TABLE IF EXISTS pending_objects;
-             DROP TABLE IF EXISTS conflict_copies;  -- v17
+             DROP TABLE IF EXISTS conflict_copies;
+             DROP TABLE IF EXISTS device_acks;  -- v18  -- v17
              UPDATE meta SET value = '9' WHERE key = 'schema_version';
              DELETE FROM meta WHERE key = 'dump_v13';",
         )

@@ -525,3 +525,65 @@ fn dir_of(cell: &Cell) -> std::path::PathBuf {
     p.set_extension("sqlite");
     p
 }
+
+/// A SHARED cell compacts only under the STABLE FRONTIER: the deepest seq
+/// every live device has confirmed holding. Above it the payloads stay —
+/// someone could still ask for them — and when every device has confirmed,
+/// the cut reaches the head again.
+#[test]
+fn a_shared_cell_compacts_only_under_the_stable_frontier() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let cell = Cell::create(&dir.path().join("f.sqlite"), "conv", "device-a")
+        .unwrap(/* test-only */);
+    for i in 1..=3_u32 {
+        cell.put_note(&base_note(i, &format!("nota {i} della frontiera")), "device-a")
+            .unwrap(/* test-only */);
+    }
+    cell.mark_shared().unwrap(/* test-only */);
+    // the laptop synced when the log was four ops tall
+    let acked = cell.record_session_ack("portatile").unwrap(/* test-only */);
+    assert_eq!(acked, 4, "init + three puts");
+    // three more ops arrive; the Mac syncs NOW, the laptop did not
+    for i in 4..=6_u32 {
+        cell.put_note(&base_note(i, &format!("nota {i} della frontiera")), "device-a")
+            .unwrap(/* test-only */);
+    }
+    cell.record_session_ack("mac").unwrap(/* test-only */);
+    let head: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    assert_eq!(head, 7);
+    assert_eq!(
+        cell.stable_frontier().unwrap(/* test-only */),
+        4,
+        "the frontier is the OLDEST device's ack"
+    );
+    cell.compact(head, &engramma_core::cell::CompactOptions::default())
+        .unwrap(/* test-only */);
+    // the payloads BELOW the frontier are gone, those above stay
+    let payloads_above: Vec<String> = cell
+        .debug_column("SELECT CAST(o.seq AS TEXT) FROM ops o
+             JOIN op_payloads p ON p.op_id = o.op_id WHERE o.seq > 4 ORDER BY o.seq")
+        .unwrap(/* test-only */);
+    assert_eq!(
+        payloads_above.len(),
+        usize::try_from(head - 4).unwrap(/* test-only */),
+        "the tail keeps its payloads"
+    );
+    let cut: i64 = cell
+        .debug_column("SELECT CAST(COALESCE(MAX(seq),0) AS TEXT) FROM snapshots")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    assert_eq!(cut, 4, "the checkpoint sits at the frontier, not the head");
+    assert!(cell.verify().unwrap(/* test-only */).ok());
+    // the laptop catches up: the frontier reaches the head, the next
+    // compaction cuts there
+    cell.record_session_ack("portatile").unwrap(/* test-only */);
+    assert_eq!(cell.stable_frontier().unwrap(/* test-only */), head);
+    cell.compact(head, &engramma_core::cell::CompactOptions::default())
+        .unwrap(/* test-only */);
+    assert!(cell.verify().unwrap(/* test-only */).ok());
+}

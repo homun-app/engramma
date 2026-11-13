@@ -2244,6 +2244,67 @@ impl Cell {
     /// [`CellError::Invalid`] when `up_to_seq` is outside the live log;
     /// [`CellError::Db`] on SQL or I/O failures (a failed compaction leaves
     /// the previous row and its file alone).
+    /// The stable frontier of this cell (v0.6, P1.5): the deepest seq every
+    /// live device has confirmed holding — everything at or below it is
+    /// causally stable, and only there may a compaction forget payloads. An
+    /// unshared cell is its own only device: the frontier is the head.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn stable_frontier(&self) -> Result<i64, CellError> {
+        let inner = self.lock()?;
+        stable_frontier(&inner.conn)
+    }
+
+    /// Record that a sync session with `device` ended with both sides
+    /// holding the same set: this copy's head, as it stands now, is
+    /// confirmed there (v0.6, P1.5).
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn record_session_ack(&self, device: &str) -> Result<i64, CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let mut inner = self.lock()?;
+        let tx = inner
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let head: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM ops", [], |r| r.get(0))?;
+        let at = OffsetDateTime::now_utc()
+            .replace_millisecond(0)
+            .unwrap_or(OffsetDateTime::now_utc())
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        tx.execute(
+            "INSERT INTO device_acks (device, ack_seq, at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(device) DO UPDATE SET ack_seq = ?2, at = ?3",
+            rusqlite::params![device, head, at],
+        )?;
+        tx.commit()?;
+        Ok(head)
+    }
+
+    /// This cell is SHARED (v0.6, P1.5): its compactions hold at the stable
+    /// frontier of the device list, not at its own head.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn mark_shared(&self) -> Result<(), CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let inner = self.lock()?;
+        inner.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('sync_shared', '1')
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+            [],
+        )?;
+        Ok(())
+    }
+
     pub fn compact(
         &self,
         up_to_seq: i64,
@@ -2262,6 +2323,20 @@ impl Cell {
             return Err(CellError::Invalid(format!(
                 "compact wants a seq within the live log (1..={head_seq}), got {up_to_seq}"
             )));
+        }
+        // v0.6 (P1.5): a SHARED cell compacts only under the stable
+        // frontier — the deepest seq every live device has confirmed. Above
+        // it the payloads stay: someone could still ask for them. An
+        // unshared cell is its own only device: its frontier is the head.
+        let mut up_to_seq = up_to_seq;
+        let frontier = stable_frontier(&inner.conn)?;
+        if up_to_seq > frontier {
+            up_to_seq = frontier;
+        }
+        if up_to_seq < 1 {
+            return Err(CellError::Invalid(
+                "nothing is stable yet: no device has confirmed any operation".into(),
+            ));
         }
         let head_hash: String = inner
             .conn
@@ -2319,6 +2394,9 @@ impl Cell {
                     tx.execute("DELETE FROM vault_views", [])?;
                     tx.execute("DELETE FROM vault_conflicts", [])?;
                     tx.execute("DELETE FROM snapshots", [])?;
+                    // v0.6: local bookkeeping never travels with the state
+                    tx.execute("DELETE FROM device_acks", [])?;
+                    tx.execute("DELETE FROM pending_objects", [])?;
                     // external-content FTS5: `delete-all` empties both
                     // indices (their segments carry the stems); verify
                     // rebuilds them from the content table before the tail
@@ -3172,6 +3250,25 @@ pub fn state_digest(conn: &Connection) -> Result<String, CellError> {
     Ok(blake3::hash(state_dump(conn)?.as_bytes())
         .to_hex()
         .to_string())
+}
+
+/// The stable frontier (v0.6, P1.5): the minimum ack over the live devices
+/// of a SHARED cell; the head of an unshared one (a cell that shares
+/// nothing confirms everything to itself).
+fn stable_frontier(conn: &Connection) -> Result<i64, CellError> {
+    let head: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM ops", [], |r| r.get(0))?;
+    let shared: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM meta WHERE key = 'sync_shared' AND value = '1'",
+        [],
+        |r| r.get(0),
+    )?;
+    if shared == 0 {
+        return Ok(head);
+    }
+    let min_ack: Option<i64> = conn
+        .query_row("SELECT MIN(ack_seq) FROM device_acks", [], |r| r.get(0))
+        .optional()?;
+    Ok(min_ack.unwrap_or(0))
 }
 
 /// blake3 of the canonical dump of the REPLICATED tables (v0.6, P1): the

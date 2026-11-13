@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 17] = [
+pub const MIGRATIONS: [&str; 18] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -299,6 +299,18 @@ CREATE TABLE conflict_copies (copy_id TEXT PRIMARY KEY,
                               loser_op TEXT NOT NULL,
                               state_json TEXT NOT NULL);
 CREATE INDEX idx_conflict_copies_original ON conflict_copies(original_id);
+"#,
+    r#"
+-- v18 (v0.6, P1.5): the STABLE FRONTIER. A sync session ends with both
+-- peers holding the same set of operations, so this copy records, per
+-- device, the head it knows that device has seen. The frontier is the
+-- MINIMUM over the live devices: everything at or below it is causally
+-- stable, and ONLY there may a compaction forget payloads — above it
+-- someone could still ask for them. LOCAL bookkeeping (like the vault
+-- tables and meta.hlc): never part of the replicated state.
+CREATE TABLE device_acks (device TEXT PRIMARY KEY,
+                          ack_seq INTEGER NOT NULL,
+                          at TEXT NOT NULL);
 "#,
 ];
 
