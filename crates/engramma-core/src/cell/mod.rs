@@ -3087,15 +3087,28 @@ fn execute_op(
     // applied (the local log holds exactly what was applied, in total
     // order). Two operations with the same base are concurrent.
     let base = if let Some(id) = note_id {
-        tx.query_row(
-            "SELECT o.content_hash FROM ops o
-             JOIN op_objects oo ON oo.op_id = o.op_id
-             WHERE oo.object = ?1
-             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
-            [format!("note:{id}")],
+        // a note that does not exist yet has nothing to lean on: the
+        // indexed probe skips the join for every fresh note (the common
+        // write, and the whole cost of a bulk import — the join alone cost
+        // 13% of the insert rate at 10k)
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM notes WHERE id = ?1",
+            [id.to_string()],
             |r| r.get(0),
-        )
-        .optional()?
+        )?;
+        if exists == 0 {
+            None
+        } else {
+            tx.query_row(
+                "SELECT o.content_hash FROM ops o
+                 JOIN op_objects oo ON oo.op_id = o.op_id
+                 WHERE oo.object = ?1
+                 ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
+                [format!("note:{id}")],
+                |r| r.get(0),
+            )
+            .optional()?
+        }
     } else {
         None
     };
