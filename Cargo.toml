@@ -9,7 +9,7 @@ debug = false
 
 [workspace]
 resolver = "2"
-members = ["crates/engramma-core", "crates/engramma-embed", "crates/engramma-vault", "crates/engramma-cli", "crates/engramma-mcp", "crates/engramma-node", "bench"]
+members = ["crates/engramma-core", "crates/engramma-embed", "crates/engramma-vault", "crates/engramma-cli", "crates/engramma-mcp", "crates/engramma-node", "crates/engramma-sync", "bench"]
 
 [workspace.package]
 version = "0.1.0-dev"
@@ -22,6 +22,7 @@ repository = "https://github.com/homun-app/engramma"
 engramma-core = { path = "crates/engramma-core", version = "0.1.0-dev" }
 engramma-embed = { path = "crates/engramma-embed", version = "0.1.0-dev" }
 engramma-vault = { path = "crates/engramma-vault", version = "0.1.0-dev" }
+engramma-sync = { path = "crates/engramma-sync", version = "0.1.0-dev" }
 # `hooks`: query-progress callback, used by the bounded-walk tests; `backup`:
 # the compaction verify restores a snapshot into memory (no new crates: the
 # features only compile more of rusqlite itself).
@@ -72,3 +73,23 @@ ring = "0.17"
 # returns them. NOT for the libraries: whoever produces the executable
 # chooses its allocator.
 mimalloc = "0.1.39"
+
+# v0.6: sync between the owner's devices (verified 2026-11-13).
+# iroh 1.x (stable since 2026-06-15, MIT/Apache): QUIC dialed by Ed25519
+# key, hole punching inside QUIC, stateless relays that see only
+# ciphertext. ring TLS (already in the tree), no metrics.
+iroh = { version = "1.4", default-features = false, features = ["tls-ring", "portmapper", "fast-apple-datapath"] }
+# Range-based set reconciliation (Meyer 2023; NIP-77): exchange only the
+# missing op ids, cost proportional to the difference.
+negentropy = "0.5"
+# Pairing with a short code (PAKE, RFC 9382 — the magic-wormhole pattern).
+spake2 = "0.4"
+# RFC 9180: the cell key wrapped for each device (X25519, HKDF-SHA256,
+# ChaCha20-Poly1305).
+hpke = "0.15"
+# Ops sealed end to end (XChaCha20-Poly1305: 192-bit random nonces) and
+# signed by their author device.
+chacha20poly1305 = "0.11"
+ed25519-dalek = "3"
+hkdf = "0.13"
+sha2 = "0.11"

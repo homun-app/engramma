@@ -1,6 +1,19 @@
 # cargo-deny configuration. Advisory checks need the network and are skipped
 # in this project's offline CI (`cargo deny check licenses bans` only).
 
+# v0.6: only the platforms engramma ships on. iroh carries wasm-only
+# dependencies (ws_stream_wasm and friends, under the Unlicense) that never
+# build for these targets.
+[graph]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+]
+
 [advisories]
 version = 2
 yanked = "warn"
@@ -23,10 +36,12 @@ allow = [
 # happens not to need ISC, MPL-2.0 or Unicode-DFS-2016.
 confidence-threshold = 0.93
 # Mozilla's CA root bundle (data, not code) under a permissive data licence,
-# pulled by ureq for TLS to external embedding endpoints (v0.2). Allowed for
-# this crate only.
+# pulled by ureq for TLS to external embedding endpoints (v0.2), and the
+# same bundle as certificates by iroh's relay client (v0.6). Allowed for
+# these crates only.
 exceptions = [
   { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+  { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 [bans]
