@@ -2286,6 +2286,40 @@ impl Cell {
         Ok(head)
     }
 
+    /// Adopt the log as it stands (v0.6, P1.6): the operation records the
+    /// Merkle root of the wire identities of everything written before the
+    /// sync era, so a copy that joins later accepts the unsigned operations
+    /// only under the root that covers them. Called by `sync share`.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn adopt_log(&self, actor: &str) -> Result<Ulid, CellError> {
+        let mut hashes: Vec<String> = {
+            let inner = self.lock()?;
+            let mut stmt = inner.conn.prepare("SELECT content_hash FROM ops")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let count = i64::try_from(hashes.len()).unwrap_or(0);
+        let root = ops::merkle_root(&mut hashes);
+        let payload = serde_json::json!({ "root": root, "count": count });
+        self.execute(OpKind::Adopt, None, actor, payload)?;
+        // the adopt itself is not covered by its own root: the sharing
+        // device signs IT (P2), and it lands above the covered set
+        let inner = self.lock()?;
+        let op_id: Option<String> = inner
+            .conn
+            .query_row(
+                "SELECT op_id FROM ops WHERE kind = 'adopt' ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        op_id
+            .and_then(|s| Ulid::from_string(&s).ok())
+            .ok_or_else(|| CellError::Db("the adopt operation did not land".into()))
+    }
+
     /// This cell is SHARED (v0.6, P1.5): its compactions hold at the stable
     /// frontier of the device list, not at its own head.
     ///

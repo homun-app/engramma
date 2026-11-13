@@ -73,11 +73,16 @@ pub enum OpKind {
     /// v0.5 (P2): set the cell's policy. Introduced with the schema in P1;
     /// the op belongs to the log so the history says who allowed what, when.
     SetPolicy,
+    /// v0.6 (P1.6): a cell becomes shared — the sharing device signs the
+    /// Merkle root of the content hashes of every operation written before
+    /// the sync era. Those operations carry no signature of their own: an
+    /// unsigned operation is accepted only under a valid `adopt`.
+    Adopt,
 }
 
 impl OpKind {
     /// Every kind, in declaration order (tests count coverage).
-    pub const ALL: [OpKind; 15] = [
+    pub const ALL: [OpKind; 16] = [
         OpKind::Init,
         OpKind::PutNote,
         OpKind::PatchNote,
@@ -93,6 +98,7 @@ impl OpKind {
         OpKind::Decide,
         OpKind::RevertDecision,
         OpKind::SetPolicy,
+        OpKind::Adopt,
     ];
 
     /// Wire name.
@@ -113,6 +119,7 @@ impl OpKind {
             OpKind::Decide => "decide",
             OpKind::RevertDecision => "revert_decision",
             OpKind::SetPolicy => "set_policy",
+            OpKind::Adopt => "adopt",
         }
     }
 
@@ -137,6 +144,7 @@ impl OpKind {
             "decide" => OpKind::Decide,
             "revert_decision" => OpKind::RevertDecision,
             "set_policy" => OpKind::SetPolicy,
+            "adopt" => OpKind::Adopt,
             other => return Err(CellError::Invalid(format!("unknown op kind `{other}`"))),
         })
     }
@@ -404,7 +412,9 @@ pub fn make_op(parts: OpParts) -> Result<Op, CellError> {
 pub fn objects_of(op: &Op) -> Vec<String> {
     let mut objects = Vec::new();
     match op.kind {
-        OpKind::Init | OpKind::SetPolicy => objects.push("policy".to_string()),
+        OpKind::Init | OpKind::SetPolicy | OpKind::Adopt => {
+            objects.push("policy".to_string());
+        }
         OpKind::Link | OpKind::Unlink => {
             // a link carries its edge under `edge`, an unlink names the edge
             // by `edge_id` — both address the same object key
@@ -649,6 +659,7 @@ pub fn apply_scoped(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), C
             OpKind::Decide => apply_decide(tx, op, scope)?,
             OpKind::RevertDecision => apply_revert_decision(tx, op, scope)?,
             OpKind::SetPolicy => apply_set_policy(tx, op)?,
+            OpKind::Adopt => apply_adopt(tx, op)?,
         }
     }
     // The cell HLC always advances to the op's HLC (ops apply in order).
@@ -2689,6 +2700,72 @@ fn reopen_target(
 /// The cell's policy, an operation of the log (P2 owns the semantics; P1
 /// introduces the op with the schema so the history can say who allowed
 /// what, and when). The body IS the policy document.
+/// The Merkle root over the wire identities of a set of operations (v0.6,
+/// P1.6): the content hashes sorted, paired, hashed; an odd level carries
+/// its last leaf twice. Order-independent — two copies that hold the same
+/// operations, however they arrived, compute the same root.
+pub fn merkle_root(content_hashes: &mut [String]) -> String {
+    content_hashes.sort();
+    let mut level: Vec<[u8; 32]> = content_hashes
+        .iter()
+        .filter_map(|h| {
+            let bytes = blake3::Hash::from_hex(h).ok()?;
+            let mut out = [0_u8; 32];
+            out.copy_from_slice(bytes.as_bytes());
+            Some(out)
+        })
+        .collect::<Vec<_>>();
+    if level.is_empty() {
+        return blake3::Hasher::new().finalize().to_hex().to_string();
+    }
+    while level.len() > 1 {
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len().div_ceil(2));
+        let mut i = 0;
+        while i < level.len() {
+            let a = level[i];
+            let b = if i + 1 < level.len() {
+                level[i + 1]
+            } else {
+                level[i]
+            };
+            let mut h = blake3::Hasher::new();
+            h.update(&a);
+            h.update(&b);
+            let mut out = [0_u8; 32];
+            out.copy_from_slice(h.finalize().as_bytes());
+            next.push(out);
+            i += 2;
+        }
+        level = next;
+    }
+    blake3::Hash::from_bytes(level[0]).to_hex().to_string()
+}
+
+/// The cell becomes shared (v0.6, P1.6): the sharing device records the
+/// Merkle root of everything written before the sync era, so an unsigned
+/// operation is accepted only under the root that covers it — the
+/// signatures of P2 hang the device's key on this very op.
+fn apply_adopt(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
+    let root = body_str(op, "root")?;
+    let count = op
+        .body
+        .as_ref()
+        .and_then(|b| b.get("count"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('adopted_root', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        [root],
+    )?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES ('adopted_count', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = ?1",
+        [count.to_string()],
+    )?;
+    Ok(())
+}
+
 fn apply_set_policy(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     let Some(body) = op.body.as_ref() else {
         return Ok(());

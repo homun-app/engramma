@@ -587,3 +587,63 @@ fn a_shared_cell_compacts_only_under_the_stable_frontier() {
         .unwrap(/* test-only */);
     assert!(cell.verify().unwrap(/* test-only */).ok());
 }
+
+/// The `adopt` root covers the unsigned era identically on every copy:
+/// whatever order the operations arrived in, the Merkle root over their
+/// content hashes is the same, and a copy that receives the adopt records
+/// the root of exactly the set it holds.
+#[test]
+fn the_adopt_root_covers_the_unsigned_era_identically_on_every_copy() {
+    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let a = Cell::create(&dir_a.path().join("a.sqlite"), "conv", "device-a")
+        .unwrap(/* test-only */);
+    for i in 1..=3_u32 {
+        a.put_note(&base_note(i, &format!("nota {i} dell'era senza firma")), "device-a")
+            .unwrap(/* test-only */);
+    }
+    let pre: Vec<Op> = a.ops().unwrap(/* test-only */);
+    // two copies receive the same set in opposite orders
+    let mut reversed: Vec<Op> = pre.clone();
+    reversed.reverse();
+    let x = copy_of("x", &pre);
+    let y = copy_of("y", &reversed);
+
+    // the root over each copy's own set is the same
+    let root_of = |cell: &Cell| -> String {
+        let mut hashes: Vec<String> = cell
+            .debug_column("SELECT content_hash FROM ops")
+            .unwrap(/* test-only */);
+        engramma_core::cell::ops::merkle_root(&mut hashes)
+    };
+    assert_eq!(root_of(&a), root_of(&x));
+    assert_eq!(
+        root_of(&x),
+        root_of(&y),
+        "the root ignores the arrival order"
+    );
+
+    // A adopts; the copies receive the adopt; every copy records the root
+    // of exactly the set it holds
+    a.adopt_log("device-a").unwrap(/* test-only */);
+    let adopt: Vec<Op> = a
+        .ops()
+        .unwrap(/* test-only */)
+        .into_iter()
+        .filter(|o| o.kind.as_str() == "adopt")
+        .collect();
+    assert_eq!(adopt.len(), 1);
+    for cell in [&x, &y] {
+        cell.ingest_op(&adopt[0]).unwrap(/* test-only */);
+        let recorded = cell
+            .debug_column("SELECT value FROM meta WHERE key = 'adopted_root'")
+            .unwrap(/* test-only */);
+        // the root of the era BELOW the adopt (the adopt covers what
+        // came before it, not itself)
+        let mut hashes: Vec<String> = cell
+            .debug_column("SELECT content_hash FROM ops WHERE kind != 'adopt'")
+            .unwrap(/* test-only */);
+        let expected = engramma_core::cell::ops::merkle_root(&mut hashes);
+        assert_eq!(recorded, vec![expected]);
+        assert!(cell.verify().unwrap(/* test-only */).ok());
+    }
+}

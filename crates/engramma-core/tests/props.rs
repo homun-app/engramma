@@ -531,7 +531,7 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) -> std::collections::HashMap<O
         }
     };
     for i in 0..n {
-        let choice = next() % 16;
+        let choice = next() % 17;
         let fresh = any_note_of(next(), i);
         match choice {
             0..=2 => {
@@ -706,6 +706,12 @@ fn run_random_ops(cell: &Cell, seed: u64, n: u16) -> std::collections::HashMap<O
                     .is_ok()
                 {
                     *counts.entry(OpKind::SetPolicy).or_insert(0) += 1;
+                }
+            }
+            16 => {
+                // v0.6 (P1.6): the adopt must not rot either
+                if cell.adopt_log("prop").is_ok() {
+                    *counts.entry(OpKind::Adopt).or_insert(0) += 1;
                 }
             }
             9 => {
