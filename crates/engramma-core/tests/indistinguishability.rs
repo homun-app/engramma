@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! v0.5.3 (P1): the indistinguishability property — the SAME question gives
-//! IDENTICAL results whether or not the cell also holds quarantined notes
-//! and tombstones that match the question. Over HTTP `explain` is an
-//! oracle: ranks that start at 2, a `fused_score` under 1 at the top, a
-//! displaced answer — each of those tells a remote client that a hidden
-//! note exists. This is the property that closes it, in the three modes:
-//! text only, hybrid with a fake embedder, text + graph.
+//! The indistinguishability property — the SAME question gives BIT-IDENTICAL
+//! results whether or not the cell also holds quarantined notes and
+//! tombstones that match the question. Over HTTP `explain` is an oracle:
+//! ranks that start at 2, a `fused_score` under 1 at the top, a displaced
+//! answer, a score that moves by an ε — each of those tells a remote client
+//! that a hidden note exists. v0.5.3 held the property on every structural
+//! field and declared an ε on the scores (FTS5 computed bm25's IDF over the
+//! whole index, hidden rows included); v0.6 (P0) splits the index in two —
+//! `notes_fts` holds the visible notes, `notes_fts_hidden` the quarantined
+//! ones — so the visible statistics never see a hidden row and the property
+//! is EXACT: same ids, same ranks, same scores, same `raw_score`, same
+//! `fused_score`, same cosines, bit for bit, in the three modes: text only,
+//! hybrid with a fake embedder, text + graph.
 
 use engramma_core::format::{At, Note, NoteType};
-use engramma_core::search::{Fusion, Hit, Mode, Query, Semantic};
+use engramma_core::search::{Hit, Mode, Query, Semantic};
 use engramma_core::{Cell, Confidence, EmbedError, Embedder, Status, TextKind};
 use proptest::prelude::*;
 use time::OffsetDateTime;
@@ -144,11 +150,12 @@ fn cell_of(dir: &std::path::Path, bodies: &[String]) -> Cell {
     cell
 }
 
-/// The fields the property compares exactly (see the module doc for the one
-/// exception: scores carry the ε of FTS5's table-wide IDF).
+/// The fields the property compares, all EXACTLY (v0.6, P0: the two indices
+/// closed the ε — a hidden row cannot move a visible statistic anymore).
 struct Snapshot {
     ids: Vec<String>,
     scores: Vec<f64>,
+    raw_scores: Vec<f64>,
     fused: Vec<Option<f64>>,
     bm25_ranks: Vec<Option<usize>>,
     sem_ranks: Vec<Option<usize>>,
@@ -163,6 +170,7 @@ fn snapshot(hits: &[Hit]) -> Snapshot {
     Snapshot {
         ids: hits.iter().map(|h| h.note.id.to_string()).collect(),
         scores: hits.iter().map(|h| h.score).collect(),
+        raw_scores: hits.iter().map(|h| h.raw_score).collect(),
         fused: hits.iter().map(|h| h.explain.fused_score).collect(),
         bm25_ranks: hits.iter().map(|h| h.explain.bm25_rank).collect(),
         sem_ranks: hits.iter().map(|h| h.explain.semantic_rank).collect(),
@@ -183,8 +191,7 @@ fn snapshot(hits: &[Hit]) -> Snapshot {
     }
 }
 
-/// What the property holds EXACTLY, and what it holds within the declared ε
-/// (REPORT §P1, DESIGN §5):
+/// What the property holds, BIT for BIT (v0.6, P0; DESIGN §5):
 ///
 /// - the SET of result ids: a hidden note never appears, and no visible
 ///   result is pushed out of the window by one (the displacement tell);
@@ -193,64 +200,15 @@ fn snapshot(hits: &[Hit]) -> Snapshot {
 /// - the top result's score is 1.0: every normalisation (bm25 max, fused
 ///   max) is computed over the visible lists alone (the "fused_score under
 ///   1" tell);
-/// - per id, EXACTLY: support, lists, matched terms, cosine, semantic rank,
-///   graph rank.
+/// - per id, EXACTLY: score, raw_score, fused_score, cosine, support,
+///   lists, matched terms, semantic rank, graph rank.
 ///
-/// The ε covers what SQLite cannot avoid: FTS5 computes bm25 IDF over the
-/// WHOLE index, hidden rows included (they must stay searchable for the
-/// owner's `include_quarantined` — part of the JS contract). A hidden row
-/// matching one of the query's forms moves that form's IDF, so visible
-/// scores and their internal order wobble. Measured: ≈ 0.8% on a 3-note
-/// corpus with clean matches, up to ~55% on minimal corpora whose notes
-/// match different synonym FORMS of the question (asymmetric IDF), under
-/// 1% on real-sized corpora. A remote client has no counterfactual to read
-/// the wobble from: every STRUCTURAL tell is closed, and the wobble itself
-/// carries no content beyond "this corpus also holds hidden rows matching
-/// your question" — which ranks, gaps and displacement already leaked
-/// before, and no longer do. Cases where a query form sits in half of
-/// either index (FTS5's negative-IDF crumb flips on/off) are degenerate and
-/// rejected in generation.
-const SCORE_EPSILON: f64 = 0.7;
-
-/// The no-cramp/no-knife-edge precondition: reject the case when any form
-/// of the question sits in half or more of EITHER index (FTS5 replaces a
-/// negative idf by a 1e-6 crumb and the exact n = N/2 idf is zero — both
-/// knife-edges a hidden row can flip, moving scores by whole units).
-fn query_avoids_the_idf_clamp(cell: &Cell, question: &str) -> bool {
-    // the rows FTS5's statistics see: everything indexed (tombstones left
-    // the index; quarantined rows did not)
-    let n: i64 = cell
-        .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes WHERE status != 'deleted'")
-        .unwrap_or_default()
-        .first()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if n == 0 {
-        return false;
-    }
-    let terms = engramma_core::text::query_terms(question, None, &[]).flat();
-    for t in &terms {
-        let doc: i64 = cell
-            .debug_column(&format!(
-                "SELECT CAST(COALESCE((SELECT doc FROM notes_fts_vocab WHERE term = '{}'), 0) AS TEXT)",
-                t.replace('\'', "''")
-            ))
-            .unwrap_or_default()
-            .first()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if doc * 2 >= n {
-            return false;
-        }
-    }
-    true
-}
-
-/// The measured wobble this comparison observed (max relative shift of a
-/// score or fused score), reported by the test — asserted nowhere, because
-/// no honest bound exists: the shift scales with how many hidden rows
-/// match the same rare form. REPORT §P1 carries the numbers.
-fn diff(a: &Snapshot, b: &Snapshot, what: &str, wobble: &mut f64) -> Option<String> {
+/// Before v0.6 the scores carried the ε of FTS5's table-wide IDF (the
+/// quarantined rows had to stay in the one index for the owner's
+/// `include_quarantined`); with the hidden rows in their own index the
+/// visible statistics cannot see them, and what cannot move a statistic
+/// cannot move a score.
+fn diff(a: &Snapshot, b: &Snapshot, what: &str) -> Option<String> {
     // the same ids, as a set
     let mut sa = a.ids.clone();
     let mut sb = b.ids.clone();
@@ -283,7 +241,7 @@ fn diff(a: &Snapshot, b: &Snapshot, what: &str, wobble: &mut f64) -> Option<Stri
     // the top of each list normalises to 1
     for (snap, name) in [(a, "A"), (b, "B")] {
         if let Some(top) = snap.scores.first()
-            && (*top - 1.0).abs() > SCORE_EPSILON
+            && *top != 1.0
         {
             return Some(format!(
                 "{what}: {name} top score {top} — a hidden maximum?"
@@ -295,12 +253,23 @@ fn diff(a: &Snapshot, b: &Snapshot, what: &str, wobble: &mut f64) -> Option<Stri
     };
     for id in &a.ids {
         let (ia, ib) = (at(a, id), at(b, id));
-        let shift = (a.scores[ia] - b.scores[ib]).abs()
-            / a.scores[ia].abs().max(b.scores[ib].abs()).max(1e-6);
-        *wobble = wobble.max(shift);
-        if let (Some(x), Some(y)) = (a.fused[ia], b.fused[ib]) {
-            let shift = (x - y).abs() / x.abs().max(y.abs()).max(1e-6);
-            *wobble = wobble.max(shift);
+        if a.scores[ia] != b.scores[ib] {
+            return Some(format!(
+                "{what}: {id} score {} vs {}",
+                a.scores[ia], b.scores[ib]
+            ));
+        }
+        if a.raw_scores[ia] != b.raw_scores[ib] {
+            return Some(format!(
+                "{what}: {id} raw_score {} vs {}",
+                a.raw_scores[ia], b.raw_scores[ib]
+            ));
+        }
+        if a.fused[ia] != b.fused[ib] {
+            return Some(format!(
+                "{what}: {id} fused_score {:?} vs {:?}",
+                a.fused[ia], b.fused[ib]
+            ));
         }
         if a.cosines[ia] != b.cosines[ib] {
             return Some(format!("{what}: {id} cosine differs"));
@@ -333,7 +302,8 @@ proptest! {
     fn hidden_notes_leave_no_fingerprint(
         bodies in proptest::collection::vec(body(), 4..10).prop_map(|v| {
             // distinct bodies: two identical texts are an exact bm25 tie the
-            // IDF ε may flip — pathological, and not the fingerprint we hunt
+            // tie-break must not be asked to settle — the property hunts the
+            // hidden-row fingerprint, not the sorter's patience
             let mut seen = std::collections::BTreeSet::new();
             v.into_iter().filter(|b| seen.insert(b.clone())).collect::<Vec<_>>()
         }),
@@ -361,20 +331,13 @@ proptest! {
             cell_b.put_note(&n, "t").unwrap(/* test-only */);
             cell_b.delete_note(&id, "t").unwrap(/* test-only */);
         }
-        prop_assume!(
-            query_avoids_the_idf_clamp(&cell_a, &question)
-                && query_avoids_the_idf_clamp(&cell_b, &question),
-            "degenerate question: one of its forms sits in half of either index"
-        );
-        let mut max_wobble = 0.0_f64;
-        // RRF: the convex min-max fusion zeroes the WORST text candidate of
-        // the union (v0.2.1 behaviour, `retain(score > 0)` drops it) and
-        // which candidate is worst swings with the IDF ε — a cliff, not a
-        // wobble. Declared in REPORT §P1; the property runs the hybrid mode
-        // on RRF, where every candidate keeps a positive rank reciprocal.
+        // v0.6, P0: no ε is declared anymore, so the hybrid mode runs on the
+        // DEFAULT (convex) fusion too — v0.5.3 kept it on RRF because the
+        // IDF ε could flip which candidate is the worst of the union and the
+        // convex `retain(score > 0)` cut it: a cliff born with the shared
+        // index, gone with it.
         let sem = Semantic::new(std::sync::Arc::new(FakeEmbedder))
-            .with_mode(Mode::Hybrid)
-            .with_fusion(Fusion::Rrf { k: 60 });
+            .with_mode(Mode::Hybrid);
         let modes: &[(&str, Query, bool)] = &[
             ("testo", Query::text(&question).k(8), false),
             ("ibrida", Query::text(&question).k(8), true),
@@ -391,34 +354,66 @@ proptest! {
             } else {
                 cell_b.search_with_now(q, now().get()).unwrap(/* test-only */)
             };
-            let mut wobble = 0.0_f64;
-            if let Some(why) = diff(&snapshot(&a), &snapshot(&b), what, &mut wobble) {
+            if let Some(why) = diff(&snapshot(&a), &snapshot(&b), what) {
                 prop_assert!(false, "{}", why);
-            }
-            max_wobble = max_wobble.max(wobble);
-        }
-        // a new maximum wobble prints itself: measured evidence for
-        // REPORT §P1, asserted nowhere — no honest bound exists (the shift
-        // scales with how many hidden rows match one rare form)
-        let bits = max_wobble.to_bits();
-        let mut prev = MAX_WOBBLE.load(std::sync::atomic::Ordering::Relaxed);
-        while bits > prev {
-            match MAX_WOBBLE.compare_exchange_weak(
-                prev,
-                bits,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    eprintln!(
-                        "banco indistinguibilità: nuova ε massima sui punteggi (relativa): {max_wobble:.3}"
-                    );
-                    break;
-                }
-                Err(cur) => prev = cur,
             }
         }
     }
 }
 
-static MAX_WOBBLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The reviewer's measured case (v0.6, P0): on «Zebedeo tonno» the second
+/// VISIBLE result moved from `1e-06` to `0.4156` when a quarantined note
+/// matching the question landed in the one index FTS5 shares — the IDF of
+/// both terms moved, and with them every visible score. A remote client
+/// repeating the question reads the arrival of a hidden note off the
+/// numbers. With the quarantined rows in their own index the visible
+/// statistics cannot move: every score is bit-identical.
+#[test]
+fn the_zebedeo_tonno_case_is_bit_identical() {
+    let question = "Zebedeo tonno";
+    // the strong first result (both terms), a thin second (one term, long
+    // body — the one the reviewer saw jump), and fillers so the corpus is
+    // not two notes tall
+    let strong = "Zebedeo compra il tonno al mercato".to_string();
+    let thin = format!("tonno {}", "porto vela campo neve pioggia ".repeat(60));
+    let fillers: Vec<String> = (1..=6)
+        .map(|i| {
+            format!(
+                "la nota {i} parla di {} e {}",
+                WORDS[10 + i % 20],
+                WORDS[11 + i % 20]
+            )
+        })
+        .collect();
+    let mut bodies = vec![strong, thin];
+    bodies.extend(fillers);
+    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let cell_a = cell_of(dir_a.path(), &bodies);
+    let dir_b = tempfile::tempdir().unwrap(/* test-only */);
+    let cell_b = cell_of(dir_b.path(), &bodies);
+    // the hidden note: quarantined, external, matching BOTH terms — the
+    // fingerprint carrier
+    let mut hidden = base_note(100, "Zebedeo tonno Zebedeo tonno", now());
+    hidden.confidence = Confidence::External;
+    hidden.status = Status::Quarantined;
+    hidden.source = "import:web".into();
+    cell_b.put_note(&hidden, "t").unwrap(/* test-only */);
+
+    let q = Query::text(question).k(8);
+    let a = cell_a.search_with_now(&q, now().get()).unwrap(/* test-only */);
+    let b = cell_b.search_with_now(&q, now().get()).unwrap(/* test-only */);
+    // the case is about the SECOND result: it must exist and be thin in A
+    assert!(
+        a.len() >= 2,
+        "the case needs a second visible result, got {}",
+        a.len()
+    );
+    assert!(
+        a[1].score < 0.2,
+        "the second result must be thin (one term of two, a long body), got {}",
+        a[1].score
+    );
+    if let Some(why) = diff(&snapshot(&a), &snapshot(&b), "zebedeo") {
+        panic!("{why}");
+    }
+}
