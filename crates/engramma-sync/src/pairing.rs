@@ -303,6 +303,33 @@ pub fn six_digits(shared: &[u8], transcript: &[u8]) -> String {
     format!("{:06}", n % 1_000_000)
 }
 
+/// RFC 9382 § 4 key confirmation: two MACs over the shared secret and the
+/// transcript, one per side, domain-separated — a wrong password (a wrong
+/// short code) is discovered HERE, without asking the human for a SAS.
+#[must_use]
+pub fn confirm_mac(side: Side, shared: &[u8], transcript: &[u8]) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"engramma/pair/confirm/v1");
+    hasher.update(match side {
+        Side::Inviter => b"A",
+        Side::Joiner => b"B",
+    });
+    hasher.update(shared);
+    hasher.update(transcript);
+    let mut out = [0_u8; 16];
+    out.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    out
+}
+
+/// Which side of the pairing one MAC belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// The inviter (the ticket's owner, the code's owner).
+    Inviter,
+    /// The one who enters.
+    Joiner,
+}
+
 /// The inviter's proof over the connection transcript: the ticket's
 /// secret, MACed over the transcript, so the joiner authenticates the
 /// inviter WITHOUT the secret ever crossing in the clear.

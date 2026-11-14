@@ -134,6 +134,26 @@ impl SharedCell {
             .key_of(&self.sync_id, epoch)?
             .ok_or(Error::BadKey)
     }
+
+    /// The key of one epoch this device holds.
+    ///
+    /// # Errors
+    /// [`Error::BadKey`] when this device holds no key for that epoch.
+    pub fn epoch_key(&self, epoch: u64) -> Result<EpochKey> {
+        self.key_of(epoch)
+    }
+
+    /// The cell's stable MAC key (from epoch 0), when this device holds
+    /// the epoch-0 key: what turns a content hash into its opaque id.
+    #[must_use]
+    pub fn epoch0_mac_key(&self) -> Option<[u8; 32]> {
+        let reg = self.registry();
+        KeyStore::new(reg.conn())
+            .key_of(&self.sync_id, 0)
+            .ok()
+            .flatten()
+            .map(|k| k.mac_key())
+    }
 }
 
 impl SyncedCell for SharedCell {
@@ -220,6 +240,67 @@ impl SharedCell {
             .ok()?
             .into_iter()
             .find(|op| op.content_hash == wanted)
+    }
+
+    /// The operation of one content-hash id.
+    #[must_use]
+    pub fn op_of(&self, id32: &[u8; 32]) -> Option<Op> {
+        self.find_op(id32)
+    }
+
+    /// Every local operation identity (the trait's `ids`, as a method).
+    #[must_use]
+    pub fn local_ids(&self) -> Vec<(u64, [u8; 32])> {
+        <Self as SyncedCell>::ids(self)
+    }
+
+    /// Ingest one envelope addressed by its OPAQUE id (the mailbox road):
+    /// the seal's AAD binds the opaque id, and the operation inside must
+    /// HMAC to exactly that id under the cell's stable MAC key.
+    ///
+    /// # Errors
+    /// [`Error::BadKey`] when this device holds no epoch-0 key; the gate's
+    /// refusals; the seal's own refusal.
+    pub fn ingest_opaque(
+        &self,
+        epoch: u64,
+        opaque: &[u8; 32],
+        nonce: &[u8],
+        ct: &[u8],
+    ) -> Result<()> {
+        let nonce: [u8; 24] = nonce
+            .try_into()
+            .map_err(|_| Error::Malformed("bad nonce length".into()))?;
+        let key = self.key_of(epoch)?;
+        let aad = crate::mailbox_net::opaque_aad(&self.sync_id, epoch, opaque);
+        let env = Envelope {
+            nonce,
+            ct: ct.to_vec(),
+        };
+        let plaintext = crypto::open_op(&key, &aad, &env)?;
+        let (op, proof) = wire::envelope_from_wire(&plaintext)?;
+        // the opaque id must be the HMAC of the identity inside
+        let reg = self.registry();
+        let mac_key = KeyStore::new(reg.conn())
+            .key_of(&self.sync_id, 0)?
+            .ok_or(Error::BadKey)?
+            .mac_key();
+        if EpochKey::opaque_op_id(
+            &mac_key,
+            unhex32(&op.content_hash)
+                .ok_or_else(|| Error::Malformed("bad content hash".into()))?
+                .as_slice(),
+        ) != *opaque
+        {
+            return Err(Error::Malformed(
+                "the opaque id and the operation disagree".into(),
+            ));
+        }
+        arrival::check(&reg, &self.cell, &op, proof.as_deref())?;
+        self.cell
+            .ingest_op(&op)
+            .map_err(|e| Error::Malformed(format!("ingest refused the op: {e}")))?;
+        Ok(())
     }
 }
 

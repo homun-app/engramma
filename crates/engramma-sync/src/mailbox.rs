@@ -101,6 +101,47 @@ impl MailboxStore {
         Ok(out)
     }
 
+    /// How many envelopes one owner keeps.
+    ///
+    /// # Errors
+    /// [`Error::Db`] on SQL failure.
+    pub fn count_of(&self, owner: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM envelopes WHERE owner = ?1",
+            [owner],
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// The bytes of ciphertext one owner keeps.
+    ///
+    /// # Errors
+    /// [`Error::Db`] on SQL failure.
+    pub fn bytes_of(&self, owner: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(LENGTH(ct)), 0) FROM envelopes WHERE owner = ?1",
+            [owner],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The distinct cell sync ids of one owner.
+    ///
+    /// # Errors
+    /// [`Error::Db`] on SQL failure.
+    pub fn sync_ids_of(&self, owner: &str) -> Result<Vec<Vec<u8>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT sync_id FROM envelopes WHERE owner = ?1")?;
+        let rows = stmt.query_map([owner], |r| r.get::<_, Vec<u8>>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// The envelope of one opaque id.
     ///
     /// # Errors

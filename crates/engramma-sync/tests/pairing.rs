@@ -107,3 +107,78 @@ fn the_inviter_proves_itself_over_the_transcript_not_in_the_clear() {
     let forged = transcript_mac(&attacker_secret, transcript);
     assert_ne!(forged, mac);
 }
+
+// ---------------------------------------------------------------------------
+// v0.6.1 (P2): the persistent-wire exchange under load — the per-frame
+// streams wedged after a handful of frames under lockstep traffic; this
+// pins the one-stream wire at twenty frames each way.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_wire_carries_many_frames_in_lockstep() {
+    use engramma_sync::device::DeviceKey;
+    use engramma_sync::protocol::{bind_endpoint, connect};
+    let key_a = DeviceKey::from_seed([1; 32]);
+    let key_b = DeviceKey::from_seed([2; 32]);
+    let ep_a = bind_endpoint(&key_a, "127.0.0.1:0").await.unwrap(/* t */);
+    let ep_b = bind_endpoint(&key_b, "127.0.0.1:0").await.unwrap(/* t */);
+    let addr = ep_a.addr();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let Some(incoming) = ep_a.accept().await else {
+                    return;
+                };
+                let conn = incoming.await.unwrap(/* t */);
+                for i in 0..20_u64 {
+                    eprintln!("S: waiting ping {i}");
+                    let frame = recv_one(&conn).await;
+                    eprintln!("S: got ping {i}");
+                    assert_eq!(frame["kind"].as_str(), Some("ping"));
+                    assert_eq!(frame["i"].as_u64(), Some(i));
+                    send_one(&conn, &serde_json::json!({"kind": "pong", "i": i})).await;
+                    eprintln!("S: sent pong {i}");
+                }
+                // the peer's goodbye: only then may we drop the
+                // connection (a sooner drop resets the wire and the last
+                // frame in flight vanishes)
+                let bye = recv_one(&conn).await;
+                assert_eq!(bye["kind"].as_str(), Some("bye"));
+            });
+            let conn = connect(&ep_b, addr).await.unwrap(/* t */);
+            for i in 0..20_u64 {
+                eprintln!("C: sending ping {i}");
+                send_one(&conn, &serde_json::json!({"kind": "ping", "i": i})).await;
+                eprintln!("C: sent ping {i}");
+                let frame = recv_one(&conn).await;
+                assert_eq!(frame["kind"].as_str(), Some("pong"));
+                assert_eq!(frame["i"].as_u64(), Some(i));
+            }
+            // everything arrived: say goodbye so the peer may close clean
+            send_one(&conn, &serde_json::json!({"kind": "bye"})).await;
+            server.await.unwrap(/* t */);
+        })
+        .await;
+}
+
+/// one frame on one stream, with FINISH and the EOF drain — the pattern
+/// the protocol uses (v0.6.1, P2: without them the transport wedges)
+async fn send_one(conn: &iroh::endpoint::Connection, msg: &serde_json::Value) {
+    let body = msg.to_string();
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(body.as_bytes());
+    let mut send = conn.open_uni().await.unwrap(/* t */);
+    send.write_all(&frame).await.unwrap(/* t */);
+    send.finish().unwrap(/* t */);
+}
+
+async fn recv_one(conn: &iroh::endpoint::Connection) -> serde_json::Value {
+    let mut recv = conn.accept_uni().await.unwrap(/* t */);
+    let mut len_buf = [0_u8; 4];
+    recv.read_exact(&mut len_buf).await.unwrap(/* t */);
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut buf = vec![0_u8; len];
+    recv.read_exact(&mut buf).await.unwrap(/* t */);
+    let _ = recv.read_to_end(1).await;
+    serde_json::from_slice(&buf).unwrap(/* t */)
+}

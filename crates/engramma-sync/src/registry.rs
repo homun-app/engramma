@@ -172,6 +172,10 @@ impl DeviceRegistry {
              CREATE TABLE IF NOT EXISTS shared_cells (
                 name TEXT PRIMARY KEY,          -- the cell file's name (under cells/)
                 sync_id BLOB NOT NULL UNIQUE);  -- HMAC of the epoch-0 key
+             CREATE TABLE IF NOT EXISTS device_addrs (
+                device TEXT PRIMARY KEY,        -- the device id
+                addrs TEXT NOT NULL,            -- JSON: {node_id, relay, addrs}
+                seen_at TEXT NOT NULL);         -- last session that updated it
              CREATE TABLE IF NOT EXISTS cell_keys (
                 sync_id BLOB NOT NULL, epoch INTEGER NOT NULL,
                 key BLOB NOT NULL,        -- the raw epoch key, for holders
