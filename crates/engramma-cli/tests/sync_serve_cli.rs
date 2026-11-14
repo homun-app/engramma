@@ -86,18 +86,6 @@ impl Daemon {
         Self { child, lines: rx }
     }
 
-    fn wait_for_line(&self, want: &str) -> String {
-        loop {
-            let line = self
-                .lines
-                .recv_timeout(Duration::from_secs(30))
-                .expect(/* prints at start */ "the daemon spoke");
-            if line.contains(want) {
-                return line;
-            }
-        }
-    }
-
     /// The daemon's first JSON object (pretty-printed over several lines).
     fn first_json(&self) -> serde_json::Value {
         let mut text = String::new();
@@ -356,7 +344,7 @@ fn the_blind_node_carries_and_forgets() {
     let (ok, _, err) = run(&b.root, &["mailbox", "add", &ticket]);
     assert!(ok, "B registers: {err}");
     // A goes away (no serve daemon): B pushes to and pulls from the node
-    let (ok, out, err) = run(&b.root, &["--json", "sync", "run"]);
+    let (ok, _out, err) = run(&b.root, &["--json", "sync", "run"]);
     assert!(ok, "B's pass (node only): {err}");
     // B purges the secret note, then tells the node at the next pass
     let (ok, _, err) = run(
