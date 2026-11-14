@@ -56,7 +56,7 @@ fn sync_id_of(v: &Value) -> Result<Vec<u8>> {
 }
 
 /// One cell this device shares: the driver's hooks. `ids` are
-/// `(hlc_ms, first-16-bytes-of-content_hash)`.
+/// `(hlc_ms, content_hash)` — the immutable wire identity.
 pub trait SyncedCell: Send + Sync {
     /// The cell's opaque sync id.
     fn sync_id(&self) -> Vec<u8>;
@@ -65,9 +65,11 @@ pub trait SyncedCell: Send + Sync {
     /// Every local operation identity.
     fn ids(&self) -> Vec<(u64, [u8; 32])>;
     /// The sealed envelope of an id the peer needs: (epoch, nonce, ct).
-    fn envelope_of(&self, id32: &[u8]) -> Option<(u64, Vec<u8>, Vec<u8>)>;
-    /// Ingest a received envelope.
-    fn ingest(&self, epoch: u64, nonce: &[u8], ct: &[u8]) -> Result<()>;
+    fn envelope_of(&self, id32: &[u8; 32]) -> Option<(u64, Vec<u8>, Vec<u8>)>;
+    /// Ingest a received envelope. `id32` is the operation id the frame
+    /// named — the seal's AAD bound envelope and id together, and the
+    /// identity inside must be that very id.
+    fn ingest(&self, epoch: u64, id32: &[u8; 32], nonce: &[u8], ct: &[u8]) -> Result<()>;
 }
 
 /// A session's per-cell summary.
@@ -79,6 +81,11 @@ pub struct CellReport {
     pub sent: usize,
     /// Envelopes received and ingested.
     pub received: usize,
+    /// Envelopes refused at the gate (a refusal is an event, not an error:
+    /// the session goes on).
+    pub refused: usize,
+    /// The frontier head after the session.
+    pub head: i64,
 }
 
 /// What a session did.
@@ -97,7 +104,7 @@ pub struct SessionCtx<'a> {
     /// This device's key.
     pub device: &'a DeviceKey,
     /// The shared cells.
-    pub cells: Vec<Box<dyn SyncedCell>>,
+    pub cells: Vec<&'a dyn SyncedCell>,
 }
 
 /// Bind the sync endpoint: our TRANSPORT key, loopback in tests, the
@@ -205,19 +212,25 @@ pub async fn run_initiator(conn: Connection, ctx: &SessionCtx<'_>) -> Result<Ses
     )
     .await?;
     // 2. their registry rows (the answerer validates nothing of ours: every
-    //    row carries its signature)
+    //    row carries its signature) and their device id
     let answer = recv_frame(&conn).await?;
     if answer.get("kind").and_then(Value::as_str) != Some("registry") {
         return Err(Error::Malformed("expected the registry answer".into()));
     }
     ctx.registry
         .arrive_rows(answer["ops"].as_array().unwrap_or(&Vec::new()))?;
+    // the epoch-key wraps addressed to US (a rotation reaches everyone
+    // through the sessions: the remover wraps for every live device)
+    if let Some(peer) = answer.get("device").and_then(Value::as_str) {
+        send_wraps(&conn, ctx, peer).await?;
+        recv_wraps(&conn, ctx).await?;
+    }
     // 3. every shared cell: offer, reconcile, exchange envelopes
     let mut report = SessionReport::default();
-    for cell in &ctx.cells {
+    for cell in ctx.cells.iter().copied() {
         report
             .cells
-            .push(cell_exchange_initiator(&conn, cell.as_ref()).await?);
+            .push(cell_exchange_initiator(&conn, cell).await?);
     }
     // 4. ack: the heads we now hold (the frontier's ack)
     send_frame(
@@ -255,14 +268,20 @@ pub async fn run_answerer(conn: Connection, ctx: &SessionCtx<'_>) -> Result<Sess
         .arrive_rows(hello["registry"].as_array().unwrap_or(&Vec::new()))?;
     send_frame(
         &conn,
-        &json!({"kind": "registry", "ops": ctx.registry.rows_json()}),
+        &json!({"kind": "registry", "device": ctx.device.device_id(),
+                "ops": ctx.registry.rows_json()}),
     )
     .await?;
+    // the epoch-key wraps addressed to US
+    if let Some(peer) = hello.get("device").and_then(Value::as_str) {
+        send_wraps(&conn, ctx, peer).await?;
+        recv_wraps(&conn, ctx).await?;
+    }
     let mut report = SessionReport::default();
-    for cell in &ctx.cells {
+    for cell in ctx.cells.iter().copied() {
         report
             .cells
-            .push(cell_exchange_answerer(&conn, cell.as_ref()).await?);
+            .push(cell_exchange_answerer(&conn, cell).await?);
     }
     // our ack closes the session; theirs closes ours
     send_frame(
@@ -324,7 +343,8 @@ async fn finish_initiator_exchange(
     have: Vec<[u8; 32]>,
     my_need: Vec<[u8; 32]>,
 ) -> Result<CellReport> {
-    let mut received = 0;
+    let mut received = 0_usize;
+    let mut refused = 0_usize;
     for chunk in my_need.chunks(64) {
         send_frame(
             conn,
@@ -336,10 +356,22 @@ async fn finish_initiator_exchange(
         if let Some(envs) = lot["envs"].as_array() {
             for env in envs {
                 let epoch = env["epoch"].as_u64().unwrap_or(0);
+                let Some(id) = unb64(env["id"].as_str().unwrap_or(""))
+                    .ok()
+                    .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                else {
+                    refused += 1;
+                    continue;
+                };
                 let nonce = unb64(env["nonce"].as_str().unwrap_or(""))?;
                 let ct = unb64(env["ct"].as_str().unwrap_or(""))?;
-                mut_cell.ingest(epoch, &nonce, &ct)?;
-                received += 1;
+                match mut_cell.ingest(epoch, &id, &nonce, &ct) {
+                    Ok(()) => received += 1,
+                    // a refusal is an event, not an error: the session goes
+                    // on and the summary carries it
+                    Err(e) if refusal(&e) => refused += 1,
+                    Err(e) => return Err(e),
+                }
             }
         }
     }
@@ -347,8 +379,12 @@ async fn finish_initiator_exchange(
     for chunk in have.chunks(64) {
         let envs: Vec<Value> = chunk
             .iter()
-            .filter_map(|id| mut_cell.envelope_of(id))
-            .map(|(epoch, nonce, ct)| json!({"epoch": epoch, "nonce": b64(&nonce), "ct": b64(&ct)}))
+            .filter_map(|id| {
+                mut_cell.envelope_of(id).map(|(epoch, nonce, ct)| {
+                    json!({"id": b64(id), "epoch": epoch,
+                               "nonce": b64(&nonce), "ct": b64(&ct)})
+                })
+            })
             .collect();
         send_frame(
             conn,
@@ -363,7 +399,19 @@ async fn finish_initiator_exchange(
         sync_id: mut_cell.sync_id(),
         sent,
         received,
+        refused,
+        head: mut_cell.head_seq(),
     })
+}
+
+/// Is this error a gate refusal (count and go on) rather than a failure
+/// (abort the session)? The gate refuses without note text; a broken
+/// envelope, an unknown epoch and a stranger's signature are all refusals.
+fn refusal(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Registry(_) | Error::Malformed(_) | Error::BadKey | Error::BadSignature
+    )
 }
 
 async fn cell_exchange_answerer(conn: &Connection, cell: &dyn SyncedCell) -> Result<CellReport> {
@@ -383,6 +431,8 @@ async fn cell_exchange_answerer(conn: &Connection, cell: &dyn SyncedCell) -> Res
                  "reply": b64(&reply)}),
     )
     .await?;
+    let mut received = 0_usize;
+    let mut refused = 0_usize;
     // the initiator may run a second round
     if let Ok(next) = recv_frame(conn).await {
         if next.get("kind").and_then(Value::as_str) == Some("cell_query") {
@@ -397,18 +447,23 @@ async fn cell_exchange_answerer(conn: &Connection, cell: &dyn SyncedCell) -> Res
         } else if next.get("kind").and_then(Value::as_str) == Some("need") {
             serve_need(conn, mut_cell, &next).await?;
         } else if next.get("kind").and_then(Value::as_str) == Some("envelopes") {
-            ingest_envelopes(conn, mut_cell, &next).await?;
+            let (n, r) = ingest_envelopes(conn, mut_cell, &next).await?;
+            received = n;
+            refused = r;
         }
     }
     let mut sent = 0;
-    let mut received = 0;
     loop {
         let Ok(msg) = recv_frame(conn).await else {
             break;
         };
         match msg.get("kind").and_then(Value::as_str) {
             Some("need") => sent += serve_need(conn, mut_cell, &msg).await?,
-            Some("envelopes") => received += ingest_envelopes(conn, mut_cell, &msg).await?,
+            Some("envelopes") => {
+                let (n, r) = ingest_envelopes(conn, mut_cell, &msg).await?;
+                received += n;
+                refused += r;
+            }
             _ => break, // the ack closes the session
         }
     }
@@ -416,6 +471,8 @@ async fn cell_exchange_answerer(conn: &Connection, cell: &dyn SyncedCell) -> Res
         sync_id: mut_cell.sync_id(),
         sent,
         received,
+        refused,
+        head: mut_cell.head_seq(),
     })
 }
 
@@ -430,8 +487,12 @@ async fn serve_need(conn: &Connection, cell: &dyn SyncedCell, msg: &Value) -> Re
         .collect();
     let envs: Vec<Value> = ids
         .iter()
-        .filter_map(|id| cell.envelope_of(id))
-        .map(|(epoch, nonce, ct)| json!({"epoch": epoch, "nonce": b64(&nonce), "ct": b64(&ct)}))
+        .filter_map(|id| {
+            cell.envelope_of(id).map(|(epoch, nonce, ct)| {
+                json!({"id": b64(id), "epoch": epoch,
+                           "nonce": b64(&nonce), "ct": b64(&ct)})
+            })
+        })
         .collect();
     let count = envs.len();
     send_frame(
@@ -442,20 +503,93 @@ async fn serve_need(conn: &Connection, cell: &dyn SyncedCell, msg: &Value) -> Re
     Ok(count)
 }
 
-/// Ingest one envelope lot, with the receipt.
-async fn ingest_envelopes(conn: &Connection, cell: &dyn SyncedCell, msg: &Value) -> Result<usize> {
+/// Ingest one envelope lot, with the receipt. Returns the ingested count
+/// and the refused count.
+async fn ingest_envelopes(
+    conn: &Connection,
+    cell: &dyn SyncedCell,
+    msg: &Value,
+) -> Result<(usize, usize)> {
     let mut n = 0;
+    let mut refused = 0;
     if let Some(envs) = msg["envs"].as_array() {
         for env in envs {
             let epoch = env["epoch"].as_u64().unwrap_or(0);
+            let Some(id) = unb64(env["id"].as_str().unwrap_or(""))
+                .ok()
+                .and_then(|v| <[u8; 32]>::try_from(v).ok())
+            else {
+                refused += 1;
+                continue;
+            };
             let nonce = unb64(env["nonce"].as_str().unwrap_or(""))?;
             let ct = unb64(env["ct"].as_str().unwrap_or(""))?;
-            cell.ingest(epoch, &nonce, &ct)?;
-            n += 1;
+            match cell.ingest(epoch, &id, &nonce, &ct) {
+                Ok(()) => n += 1,
+                Err(e) if refusal(&e) => refused += 1,
+                Err(e) => return Err(e),
+            }
         }
     }
     send_frame(conn, &json!({"kind": "receipt"})).await?;
-    Ok(n)
+    Ok((n, refused))
+}
+
+/// Send every epoch-key wrap this root holds FOR one peer device (each wrap
+/// carries its own epoch; a rotation reaches everyone through the sessions).
+async fn send_wraps(conn: &Connection, ctx: &SessionCtx<'_>, peer: &str) -> Result<()> {
+    let mut frames: Vec<Value> = Vec::new();
+    for cell in &ctx.cells {
+        let sync_id = cell.sync_id();
+        let Ok(id) = <[u8; 32]>::try_from(sync_id.as_slice()) else {
+            continue;
+        };
+        // every epoch's wraps for this peer
+        let mut pairs = Vec::new();
+        for epoch in ctx.keys.epochs_of(&id)?.into_iter().rev() {
+            for (for_device, wrapped) in ctx.keys.wraps_for(&id, epoch)? {
+                if for_device == peer {
+                    pairs.push(json!({"epoch": epoch, "wrapped": b64(&wrapped)}));
+                }
+            }
+        }
+        if !pairs.is_empty() {
+            frames.push(json!({"sync_id": sync_id_json(&sync_id), "wraps": pairs}));
+        }
+    }
+    send_frame(conn, &json!({"kind": "keys", "for": peer, "cells": frames})).await
+}
+
+/// Receive and apply the peer's wraps: each opens with THIS device's HPKE
+/// secret and lands in the keystore.
+async fn recv_wraps(conn: &Connection, ctx: &SessionCtx<'_>) -> Result<()> {
+    let Ok(msg) = recv_frame(conn).await else {
+        return Ok(());
+    };
+    if msg.get("kind").and_then(Value::as_str) != Some("keys") {
+        return Ok(()); // an old peer sends none: not an error
+    }
+    let secret = ctx.device.hpke_secret();
+    for cell in msg["cells"].as_array().unwrap_or(&Vec::new()) {
+        let Some(id_vec) = sync_id_of(cell).ok() else {
+            continue;
+        };
+        let Ok(sync_id) = <[u8; 32]>::try_from(id_vec) else {
+            continue;
+        };
+        for wrap in cell["wraps"].as_array().unwrap_or(&Vec::new()) {
+            let epoch = wrap["epoch"].as_u64().unwrap_or(0);
+            let Ok(wrapped) = unb64(wrap["wrapped"].as_str().unwrap_or("")) else {
+                continue;
+            };
+            if let Ok(key) = crate::crypto::unwrap_key(&wrapped, &sync_id, epoch, &secret) {
+                ctx.keys
+                    .store_wrap(&sync_id, epoch, &ctx.device.device_id(), &wrapped)?;
+                ctx.keys.store_key(&sync_id, epoch, &key)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// negentropy (RBSR) over `(hlc_ms, id32)` items, frame limit 64 KiB.

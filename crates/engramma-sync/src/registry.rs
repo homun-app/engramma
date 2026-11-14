@@ -157,6 +157,9 @@ impl DeviceRegistry {
         std::fs::create_dir_all(root)?;
         let path = root.join("devices.db");
         let conn = Connection::open(&path)?;
+        // several handles share one devices.db (the registry, every
+        // SharedCell adapter, the keystore): a write must wait, not fail
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS registry (
                 seq INTEGER PRIMARY KEY, op_id TEXT UNIQUE, hlc TEXT, kind TEXT,
@@ -166,6 +169,9 @@ impl DeviceRegistry {
                 hpke TEXT NOT NULL, added_by TEXT NOT NULL, added_at TEXT NOT NULL,
                 removed_at TEXT, removed_by TEXT);
              CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE IF NOT EXISTS shared_cells (
+                name TEXT PRIMARY KEY,          -- the cell file's name (under cells/)
+                sync_id BLOB NOT NULL UNIQUE);  -- HMAC of the epoch-0 key
              CREATE TABLE IF NOT EXISTS cell_keys (
                 sync_id BLOB NOT NULL, epoch INTEGER NOT NULL,
                 key BLOB NOT NULL,        -- the raw epoch key, for holders

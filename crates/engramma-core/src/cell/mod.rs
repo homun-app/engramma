@@ -3364,12 +3364,18 @@ fn dump_tables(conn: &Connection, tables: &[(&str, &str)]) -> Result<String, Cel
 /// that ride with the arrivals (`hlc`) — everything else a copy must agree
 /// on, `cell_id` and the policy included.
 fn state_dump_tables(replicated: bool) -> Vec<(&'static str, &'static str)> {
+    // `sync_shared` is LOCAL bookkeeping written without an operation (a
+    // device decides which cells IT syncs): it never rides with the state,
+    // or a copy that joined would fail verify against its own replay
+    // (v0.6.1, found by the two-device loopback session).
     let meta_sql = if replicated {
         "SELECT key, value FROM meta
-         WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13', 'hlc') ORDER BY key"
+         WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13', 'hlc',
+                           'sync_shared') ORDER BY key"
     } else {
         "SELECT key, value FROM meta
-         WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13') ORDER BY key"
+         WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13',
+                           'sync_shared') ORDER BY key"
     };
     vec![
         (

@@ -5,6 +5,7 @@
 //! iroh, and the blind mailbox node. Empty until the phase builds it: this
 //! crate exists so its dependencies are in the lock before the offline work.
 
+pub mod arrival;
 pub mod crypto;
 pub mod device;
 pub mod keystore;
@@ -12,6 +13,8 @@ pub mod mailbox;
 pub mod pairing;
 pub mod protocol;
 pub mod registry;
+pub mod sharedcell;
+pub mod wire;
 pub mod words;
 
 use thiserror::Error;

@@ -443,6 +443,93 @@ pub fn op_hash_v1(prev_hash: &str, payload_json: &str) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// One step of a Merkle proof over the adopt tree: the sibling hash and
+/// whether it is the RIGHT operand of the pair (the walker is the left).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerkleStep {
+    /// The sibling's hash bytes.
+    pub sibling: [u8; 32],
+    /// Is the sibling the right operand of the pair?
+    pub right: bool,
+}
+
+/// The Merkle proof that one hash is a leaf of the tree whose root
+/// [`merkle_root`] computes over `content_hashes` (v0.6.1, P1): what an
+/// UNSIGNED operation carries on the wire, so the receiver can verify it
+/// sits inside an `adopt`'s root while holding none of the other leaves.
+/// The tree pairs the SORTED hashes two by two, an odd trailing leaf
+/// duplicating itself as its own right operand.
+///
+/// # Errors
+/// [`CellError::Invalid`] when the target is not among the hashes.
+pub fn merkle_prove(
+    content_hashes: &mut [String],
+    target: &str,
+) -> Result<Vec<MerkleStep>, CellError> {
+    content_hashes.sort();
+    let leaf = hash_bytes32(target).ok_or_else(|| CellError::Invalid("bad content hash".into()))?;
+    let mut level: Vec<[u8; 32]> = content_hashes
+        .iter()
+        .filter_map(|h| hash_bytes32(h))
+        .collect();
+    let mut idx = level
+        .iter()
+        .position(|h| h == &leaf)
+        .ok_or_else(|| CellError::Invalid("the hash is not a leaf of the set".into()))?;
+    let mut path = Vec::new();
+    while level.len() > 1 {
+        let sibling_idx = if idx % 2 == 0 {
+            // the odd trailing leaf pairs with itself, as its own right
+            // operand — exactly as `merkle_root` does
+            (idx + 1).min(level.len() - 1)
+        } else {
+            idx - 1
+        };
+        path.push(MerkleStep {
+            sibling: level[sibling_idx],
+            right: sibling_idx >= idx,
+        });
+        level = level
+            .chunks(2)
+            .map(|pair| {
+                let a = pair[0];
+                let b = if pair.len() > 1 { pair[1] } else { pair[0] };
+                let mut h = blake3::Hasher::new();
+                h.update(&a);
+                h.update(&b);
+                h.finalize().into()
+            })
+            .collect();
+        idx /= 2;
+    }
+    Ok(path)
+}
+
+/// The root a Merkle proof walks to: the leaf's hash, paired up the path.
+#[must_use]
+pub fn merkle_root_with(target: &str, path: &[MerkleStep]) -> Option<String> {
+    let mut cur = hash_bytes32(target)?;
+    for step in path {
+        let mut h = blake3::Hasher::new();
+        if step.right {
+            h.update(&cur);
+            h.update(&step.sibling);
+        } else {
+            h.update(&step.sibling);
+            h.update(&cur);
+        }
+        cur = h.finalize().into();
+    }
+    Some(blake3::Hash::from(cur).to_hex().to_string())
+}
+
+fn hash_bytes32(hex: &str) -> Option<[u8; 32]> {
+    let parsed = blake3::Hash::from_hex(hex).ok()?;
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(parsed.as_bytes());
+    Some(out)
+}
+
 /// The parts an operation is CREATED from (v0.6, P1): the envelope fields
 /// plus the payload and its salt — everything minted at creation time (op
 /// id, HLC, salt) so `apply` stays deterministic.
@@ -3087,5 +3174,55 @@ mod tests {
         };
         assert!(make_op(parts(serde_json::json!({ "kind": "confirm" }))).is_err());
         assert!(make_op(parts(serde_json::json!([]))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod merkle_proof_tests {
+    use super::*;
+
+    /// The proof of every leaf walks to the very root `merkle_root`
+    /// computes — for every set size around the powers of two, where the
+    /// odd-leaf duplication kicks in.
+    #[test]
+    fn every_leaf_proves_to_the_root() {
+        for n in [1_usize, 2, 3, 4, 5, 7, 8, 9, 16, 17, 100, 1000] {
+            let hashes: Vec<String> = (0..n)
+                .map(|i| blake3::hash(&(i as u64).to_le_bytes()).to_hex().to_string())
+                .collect();
+            let root = merkle_root(&mut hashes.clone());
+            for target in &hashes {
+                let path = merkle_prove(&mut hashes.clone(), target)
+                    .unwrap_or_else(|e| panic!("n={n}: {e}"));
+                assert_eq!(
+                    merkle_root_with(target, &path).as_deref(),
+                    Some(root.as_str()),
+                    "n={n} leaf {target} proves to the root"
+                );
+            }
+        }
+    }
+
+    /// A proof for a leaf that is not in the set cannot be built, and a
+    /// tampered step walks somewhere else.
+    #[test]
+    fn a_proof_cannot_be_forged() {
+        let mut hashes: Vec<String> = (0..7)
+            .map(|i| blake3::hash(&(i as u64).to_le_bytes()).to_hex().to_string())
+            .collect();
+        let outsider = blake3::hash(&[255_u8; 8]).to_hex().to_string();
+        assert!(merkle_prove(&mut hashes.clone(), &outsider).is_err());
+        let target = hashes[3].clone();
+        let mut path = merkle_prove(&mut hashes.clone(), &target).unwrap(/* t */);
+        let root = merkle_root(&mut hashes);
+        assert_eq!(
+            merkle_root_with(&target, &path).as_deref(),
+            Some(root.as_str())
+        );
+        path[0].sibling[0] ^= 0xff;
+        assert_ne!(
+            merkle_root_with(&target, &path).as_deref(),
+            Some(root.as_str())
+        );
     }
 }
