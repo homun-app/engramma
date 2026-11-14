@@ -13,3 +13,4 @@ cc e584f8385cabfd8a1fa9d0b40d069115ee6676ed4a30212f5f4c73d78e3decec # shrinks to
 cc d1abcb238a73b5d8ae8080bf70fe25989c6b594cedb823086ac3ddc0dc2e936c # shrinks to seed = 14335429117429864748, devices = 2, rounds = 21
 cc 35344dc9dd0d787b8d992e96b9ab17bdbea94abb3afc66fc5b11b54e13a2de04 # shrinks to seed = 12313477229222461014, devices = 2, rounds = 28
 cc c542b31d67dfc40ef4582bbd18011b238e0a4e129786b68e6661264d8e692e10 # shrinks to seed = 14236341178258306056, devices = 2, rounds = 22
+cc aa12c4a37e71b086b3e7bb512b1d149d63b03a2c69906e449be6b15fe7557dab # shrinks to seed = 6463025515774629240, devices = 2, rounds = 16

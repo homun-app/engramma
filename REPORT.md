@@ -5968,3 +5968,56 @@ conflitti, i limiti. `docs/cli.md`: i tre gruppi di comandi.
   al demone; la convivenza dei due processi è la sessione provata in P5.
   L'interfaccia per l'utente (stato, QR del biglietto, elenco dei
   dispositivi) è la v0.6.x.
+
+# Verifica v0.6 (2026-11-14, revisore)
+
+Esito: **NON superata.** Le correzioni sono nella spec
+`progetti/engramma/prompts/engramma-v0.6.1.md`.
+
+**La base è buona:**
+- P0, i due indici FTS: l'indistinguibilità è esatta;
+- le fondamenta di P1: identità, materializzazione per oggetto, regole
+  dei conflitti, purge, frontiera, `adopt`;
+- le primitive di P2–P4: chiavi derivate, elenco firmato, buste, HPKE,
+  SPAKE2, SAS;
+- la sessione di P5 con negentropy;
+- fmt, clippy e `cargo deny` verdi; JS invariato.
+
+**Cosa non va:**
+
+1. **La convergenza non regge.** `the_fleet_converges` fallisce in ogni
+   corsa del revisore (447 test passati, 1 fallito), con un caso
+   ridotto nuovo ogni volta.
+   - **Causa:** la censura della purge (v0.3) riscrive il payload dei
+     `supersede` e quindi il loro `content_hash`. Ma nella v0.6 quello è
+     l'identità che viaggia: la `base`, l'elemento RBSR, ciò che la firma
+     copre.
+   - **Effetto:** una patch che punta all'hash originale è concorrente su
+     una copia e sequenziale sull'altra, e una delle due ha una copia di
+     conflitto fantasma. La regola «base assente = sequenziale»
+     (`2e5f4e9`) dipende dall'ordine d'arrivo.
+   - **Il test non è deterministico come dichiara.** L'ora di base è
+     quella reale e gli `op_id` sono casuali: un seme salvato non
+     riproduce lo stesso caso, ed è così che il difetto è passato per
+     verde. Il seme nuovo è in `convergence.proptest-regressions`.
+2. **La sincronizzazione utilizzabile non c'è.**
+   - `sync run`, `sync serve`, `devices join` e `mailbox add/remove/status`
+     rispondono con un errore.
+   - `mailbox serve` stampa «in ascolto» ed esce.
+   - `devices invite` dà un biglietto senza indirizzi.
+   - La conversione delle operazioni per il filo e l'adattatore fra
+     sessione e cella stanno nel file di test, con l'epoca fissa a 0.
+   - Il nodo cieco non ha un servizio di rete; l'abbinamento non ha un
+     flusso in rete.
+3. **Le firme non si verificano all'arrivo.** In produzione nessuno
+   controlla `sig` e `device` contro l'elenco, né la copertura `adopt`.
+4. **Due soglie superate ma segnate ✓:**
+   - p95 a 10k da 1,8 a 2,0 ms (+11% contro +5%);
+   - inserimento da circa 3460 a 3082 note/s (circa +12% contro +10%).
+5. **Mancano** gli end-to-end con tre dispositivi, col relay e col
+   dispositivo che torna, e le due misure nuove (bootstrap di 10k,
+   latenza).
+6. **Il REPORT descrive P7 e P8 come fatti, e non lo sono.** Il giro
+   Linux non c'è: Docker è fermo anche sulla macchina del revisore.
+
+`du -sh target`: 34G.
