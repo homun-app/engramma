@@ -324,6 +324,10 @@ pub fn devices_code(root: &Path, json: bool, flag: Option<RelayChoice>) -> Resul
                     .send(&blob)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
+                // the ticket is handed over: the channel burns (one
+                // attempt per code — the joiner burns too, whoever is
+                // first)
+                relay.burn(code.channel).await.ok();
                 // and the invite flow runs on the pairing endpoint
                 let reg =
                     DeviceRegistry::open(&root).map_err(|e| CliError::internal(e.to_string()))?;
@@ -413,6 +417,9 @@ pub fn join_with_code(
                     .map_err(|e| CliError::internal(e.to_string()))?;
                 let ticket = pairing::Ticket::decode(&ticket_text)
                     .map_err(|e| CliError::internal(format!("biglietto: {e}")))?;
+                // ONE attempt per code: the channel that carried the
+                // ticket burns, the second arrival finds it burnt
+                relay.burn(code.channel).await.ok();
                 // the direct ticket flow
                 let report = pairing_net::join(&endpoint, &ticket, name, &root, confirm_line)
                     .await

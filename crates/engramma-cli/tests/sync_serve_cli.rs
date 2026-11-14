@@ -827,18 +827,26 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
         let (ok, _, err) = run(&stranger.root, &["mailbox", "add", &ticket]);
         assert!(ok, "the stranger registers too: {err}");
         // A opens the channel and prints the code (SAS confirmed on stdin)
-        let code_err_path = std::env::temp_dir().join("engramma-code-stderr.txt");
-        let code_err = std::fs::File::create(&code_err_path).expect(/* t */ "file");
-        let code_err = unsafe { Stdio::from(code_err) };
         let mut code_proc = bin()
             .arg("--root")
             .arg(&a.root)
             .args(["devices", "code", "--no-relay"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(code_err)
+            .stderr(Stdio::piped())
             .spawn()
             .expect(/* bin */ "spawn code");
+        // the inviter's SAS confirms (one for the code meeting, one for
+        // the ticket flow that follows) ride the pipe from the start
+        {
+            use std::io::Write;
+            code_proc
+                .stdin
+                .as_mut()
+                .expect(/* piped */ "code stdin")
+                .write_all(b"s\ns\n")
+                .expect(/* pipe */ "code confirm");
+        }
         {
             use std::io::BufRead;
             let mut reader =
@@ -861,6 +869,12 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
                     && word_ok(parts[2])
                 {
                     CODE.with(|c| c.borrow_mut().clone_from(&trimmed.to_string()));
+                    // keep draining the inviter's stdout: closing the read
+                    // end would break its next print (the SAS prompt)
+                    std::thread::spawn(move || {
+                        use std::io::BufRead;
+                        for _ in reader.lines() {}
+                    });
                     break;
                 }
                 if n == 0 || std::time::Instant::now() > deadline {
@@ -870,20 +884,17 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
         }
         let code = CODE.with(|c| c.borrow().clone());
         assert!(!code.is_empty(), "the code was printed");
-        let _ = &code_err_path;
         // B enters with the code (SAS confirmed on stdin)
+        // B enters with the code (two SAS confirms on stdin: the code
+        // meeting's and the ticket flow's)
         let (ok, out, err) = run_with_stdin(
             &b.root,
             &["devices", "join", "--no-relay", &code, "--name", "mac"],
-            b"s\n",
+            b"s\ns\n",
         );
         assert!(ok, "join col codice: {err} {out}");
-        // the inviter side finishes too
-        if let Some(stdin) = code_proc.stdin.as_mut() {
-            use std::io::Write;
-            let _ = stdin.write_all(b"s\n");
-        }
-        let code_out = wait_bounded(code_proc, "devices code", 120);
+        // the inviter side finishes (its confirm was already in the pipe)
+        let code_out = wait_bounded(code_proc, "devices code", 180);
         assert!(
             code_out.status.success(),
             "devices code: {} {}",
@@ -930,3 +941,4 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
 thread_local! {
     static CODE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
+

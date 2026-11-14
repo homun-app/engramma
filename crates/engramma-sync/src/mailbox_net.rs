@@ -898,22 +898,34 @@ pub async fn meet_code(
     node: &NodeAddr,
     channel: u16,
 ) -> Result<RelayConnection> {
-    let conn = endpoint
-        .connect(node.endpoint_addr()?, MAILBOX_NET_ALPN)
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    // the node's own dial discipline (one address at a time): the bare
+    // endpoint connect stalls on a virtual interface that does not answer
+    // its own address
+    let conn = node.dial(endpoint).await?;
     send_frame(
         &conn,
         &json!({"kind": "code-open", "v": MAILBOX_VERSION, "channel": channel}),
     )
     .await?;
-    let answer = recv_frame(&conn).await?;
-    match answer.get("kind").and_then(Value::as_str) {
-        Some("paired") => Ok(RelayConnection { conn }),
-        Some("burnt") => Err(Error::Registry(
-            "il canale è bruciato: un tentativo per codice".into(),
-        )),
-        _ => Err(Error::Malformed("the node did not pair the channel".into())),
+    // the FIRST side of the channel is told to WAIT — the node pairs the
+    // channel only when the other side arrives (v0.6.1: the code flow
+    // never worked because this read the one "waiting" answer and died)
+    loop {
+        let answer = recv_frame(&conn).await?;
+        match answer.get("kind").and_then(Value::as_str) {
+            Some("waiting") => continue,
+            Some("paired") => return Ok(RelayConnection { conn }),
+            Some("burnt") => {
+                return Err(Error::Registry(
+                    "il canale è bruciato: un tentativo per codice".into(),
+                ));
+            }
+            _ => {
+                return Err(Error::Malformed(
+                    "the node did not pair the channel".into(),
+                ));
+            }
+        }
     }
 }
 
@@ -998,6 +1010,7 @@ pub async fn code_pake(
 pub fn relay_key(shared: &[u8], transcript: &[u8]) -> [u8; 32] {
     use blake3::Hasher;
     let mut h = Hasher::new();
+
     h.update(b"engramma/relay-session/v1");
     h.update(shared);
     h.update(transcript);
@@ -1011,11 +1024,12 @@ pub fn relay_key(shared: &[u8], transcript: &[u8]) -> [u8; 32] {
 /// # Errors
 /// [`Error::Io`] on CSPRNG failure, [`Error::Malformed`] on seal failure.
 pub fn relay_seal(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
-    let mut nonce = [0_u8; 24];
-    getrandom::fill(&mut nonce).map_err(std::io::Error::other)?;
     let epoch_key = crate::crypto::EpochKey(*key);
     let env = crate::crypto::seal_op(&epoch_key, b"engramma/relay/v1", blob)?;
-    let mut out = nonce.to_vec();
+    // the ENVELOPE's nonce is the one the ciphertext was sealed with — a
+    // fresh local one prefixed instead could never open (v0.6.1: the code
+    // flow's sealed turns never crossed for this)
+    let mut out = env.nonce.to_vec();
     out.extend_from_slice(&env.ct);
     Ok(out)
 }
@@ -1047,15 +1061,37 @@ pub fn relay_open(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
 pub async fn node_relay(state: &NodeState, conn: &Connection, channel: u16) -> Result<()> {
     if state.channel_burnt(channel)? {
         send_frame(conn, &json!({"kind": "burnt"})).await?;
+        let _ = conn.closed().await;
         return Ok(());
     }
     // the other side registers in the channel table when it arrives
-    let peer = wait_pair(state, conn, channel).await?;
-    let (mine, theirs) = peer;
+    let Some((mine, theirs)) = wait_pair(state, conn, channel).await? else {
+        // the SECOND arrival: the FIRST's task owns the pair and relays —
+        // a second relay would compete for the very same frames (v0.6.1:
+        // the code flow's seals never opened because of it)
+        return Ok(());
+    };
+    let relayed = relay_between(state, &mine, &theirs, channel).await;
+    // hold both wires until the peers are done: returning sooner closes
+    // the QUIC connections and DISCARDS frames still in flight (v0.6.1:
+    // the sealed ticket raced the burn's close)
+    let _ = mine.closed().await;
+    let _ = theirs.closed().await;
+    relayed
+}
+
+/// The relay loop proper: bytes both ways until a burn or a close.
+async fn relay_between(
+    state: &NodeState,
+    mine: &Connection,
+    theirs: &Connection,
+    channel: u16,
+) -> Result<()> {
+
     // relay until either side closes; `burn` is the only other frame
     loop {
         tokio::select! {
-            msg = recv_frame(&mine) => {
+            msg = recv_frame(mine) => {
                 match msg {
                     Ok(v) if v.get("kind").and_then(Value::as_str) == Some("burn") => {
                         state.burn_channel(channel)?;
@@ -1074,7 +1110,7 @@ pub async fn node_relay(state: &NodeState, conn: &Connection, channel: u16) -> R
                     }
                 }
             }
-            msg = recv_frame(&theirs) => {
+            msg = recv_frame(theirs) => {
                 match msg {
                     Ok(v) if v.get("kind").and_then(Value::as_str) == Some("burn") => {
                         state.burn_channel(channel)?;
@@ -1103,7 +1139,7 @@ async fn wait_pair(
     _state: &NodeState,
     conn: &Connection,
     channel: u16,
-) -> Result<(Connection, Connection)> {
+) -> Result<Option<(Connection, Connection)>> {
     let notify = {
         let mut channels = channels()
             .lock()
@@ -1137,15 +1173,15 @@ async fn wait_pair(
         }
     };
     if let Some(first) = second_side {
-        // the second side: wake the parked first
+        // the second side: wake the parked first — and LEAVE the entry:
+        // the first side still has to take `second` out of it (v0.6.1:
+        // removing it here closed the channel under the first side's
+        // feet, and the code flow never paired). The second side relays
+        // nothing: `None` says the first side's task owns the pair.
         notify.notify_one();
         send_frame(conn, &json!({"kind": "paired"})).await?;
-        let second = conn.clone();
-        channels()
-            .lock()
-            .expect(/* as above */ "node channels")
-            .remove(&channel);
-        Ok((first, second))
+        let _ = first;
+        Ok(None)
     } else {
         // the first side: park (registered above) and wait for the second
         send_frame(conn, &json!({"kind": "waiting"})).await?;
@@ -1166,18 +1202,17 @@ async fn wait_pair(
             .expect(/* as above */ "node channels")
             .get_mut(&channel)
             .and_then(|c| c.second.take());
+        // the entry's work is done whoever won: the pair is made (or lost)
+        channels()
+            .lock()
+            .expect(/* as above */ "node channels")
+            .remove(&channel);
         match second {
             Some(second) => {
                 send_frame(conn, &json!({"kind": "paired"})).await?;
-                Ok((conn.clone(), second))
+                Ok(Some((conn.clone(), second)))
             }
-            None => {
-                channels()
-                    .lock()
-                    .expect(/* as above */ "node channels")
-                    .remove(&channel);
-                Err(Error::Malformed("il canale si è chiuso".into()))
-            }
+            None => Err(Error::Malformed("il canale si è chiuso".into())),
         }
     }
 }
@@ -1211,6 +1246,9 @@ pub async fn serve_or_relay(state: &NodeState, conn: &Connection) -> Result<()> 
             let channel = first["channel"].as_u64().unwrap_or(0) as u16;
             if state.channel_burnt(channel)? {
                 send_frame(conn, &json!({"kind": "burnt"})).await?;
+                // hold the wire until the caller read the answer: an early
+                // return would race the close against the frame
+                let _ = conn.closed().await;
                 return Ok(());
             }
             node_relay(state, conn, channel).await
