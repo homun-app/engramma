@@ -3538,6 +3538,10 @@ fn sync_run(cli: &Cli, action: &SyncAction) -> Result<(), CliError> {
                 .live_members()
                 .map_err(|e| CliError::internal(e.to_string()))?
                 .len();
+            // R4: the operations that still cannot leave (each an event,
+            // no note text)
+            let unsent = engramma_sync::sharedcell::unsent_events(&r)
+                .map_err(|e| CliError::internal(e.to_string()))?;
             if cli.json {
                 let rows: Vec<serde_json::Value> = cells
                     .iter()
@@ -3545,16 +3549,27 @@ fn sync_run(cli: &Cli, action: &SyncAction) -> Result<(), CliError> {
                         let head = engramma_sync::protocol::SyncedCell::head_seq(c);
                         let frontier = c.cell().stable_frontier().unwrap_or(0);
                         let epoch = c.current_epoch().unwrap_or(0);
+                        let name = engramma_sync::serve::cell_name(
+                            &r, c.sync_id()).unwrap_or_default();
                         serde_json::json!({
-                            "cell": engramma_sync::serve::cell_name(
-                                &r, c.sync_id()).unwrap_or_default(),
+                            "cell": name,
                             "head": head, "frontier": frontier,
                             "pending": (head - frontier).max(0),
                             "epoch": epoch,
+                            "unsent": unsent.iter()
+                                .filter(|(cell, ..)| *cell == name).count(),
                         })
                     })
                     .collect();
-                print_json(&serde_json::json!({ "devices": devices, "cells": rows }));
+                let mut v = serde_json::json!({ "devices": devices, "cells": rows });
+                if !unsent.is_empty() {
+                    v["unsent_events"] = serde_json::json!(unsent.iter()
+                        .map(|(cell, at, op_id, kind, reason)| serde_json::json!({
+                            "cell": cell, "at": at, "op": op_id,
+                            "kind": kind, "why": reason,
+                        })).collect::<Vec<_>>());
+                }
+                print_json(&v);
             } else {
                 println!("dispositivi {devices}");
                 for c in &cells {

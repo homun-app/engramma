@@ -172,12 +172,16 @@ pub fn adopt_proof(cell: &Cell, op: &Op) -> Result<Vec<MerkleStep>> {
         .map_err(|e| Error::Registry(Rejection::UnsignedUncovered.with(&e)))
 }
 
-/// The content hashes of the cell's pre-era set — the leaves of the adopt
-/// tree. One whole-log read; the session's cache pays it once.
+/// The content hashes of the cell's COVERED set — the leaves of the adopt
+/// tree: every operation that precedes the LAST `adopt` in the log, which
+/// is exactly the set its root was computed over. A later unsigned
+/// write (an unarmed hand after the era) is NOT part of it: its proof
+/// cannot exist, and it must not bend the tree for everyone else.
+/// One whole-log read; the session's cache pays it once.
 pub fn adopt_hashes(cell: &Cell) -> Vec<String> {
     cell.debug_column(
         "SELECT o.content_hash FROM ops o
-         WHERE o.sig IS NULL AND o.kind != 'adopt'",
+         WHERE o.seq < (SELECT COALESCE(MAX(seq), 0) FROM ops WHERE kind = 'adopt')",
     )
     .unwrap_or_default()
 }

@@ -84,6 +84,9 @@ pub struct CellReport {
     /// Envelopes refused at the gate (a refusal is an event, not an error:
     /// the session goes on).
     pub refused: usize,
+    /// Operations this side could NOT seal or prove (R4): they never left,
+    /// and each is an event — never silence.
+    pub unsent: usize,
     /// The frontier head after the session.
     pub head: i64,
 }
@@ -376,6 +379,7 @@ async fn finish_initiator_exchange(
         }
     }
     let mut sent = 0;
+    let mut unsent = 0;
     for chunk in have.chunks(64) {
         let envs: Vec<Value> = chunk
             .iter()
@@ -386,13 +390,15 @@ async fn finish_initiator_exchange(
                 })
             })
             .collect();
+        // R4: what did not seal is counted, never dropped in silence
+        unsent += chunk.len() - envs.len();
         send_frame(
             conn,
             &json!({"kind": "envelopes", "sync_id": sync_id_json(&mut_cell.sync_id()),
                      "envs": envs}),
         )
         .await?;
-        sent += chunk.len();
+        sent += envs.len();
         let _ = recv_frame(conn).await; // the receipt
     }
     Ok(CellReport {
@@ -400,6 +406,7 @@ async fn finish_initiator_exchange(
         sent,
         received,
         refused,
+        unsent,
         head: mut_cell.head_seq(),
     })
 }
@@ -433,6 +440,8 @@ async fn cell_exchange_answerer(conn: &Connection, cell: &dyn SyncedCell) -> Res
     .await?;
     let mut received = 0_usize;
     let mut refused = 0_usize;
+    let mut unsent = 0_usize;
+    let mut sent = 0_usize;
     // the initiator may run a second round
     if let Ok(next) = recv_frame(conn).await {
         if next.get("kind").and_then(Value::as_str) == Some("cell_query") {
@@ -445,20 +454,25 @@ async fn cell_exchange_answerer(conn: &Connection, cell: &dyn SyncedCell) -> Res
             )
             .await?;
         } else if next.get("kind").and_then(Value::as_str) == Some("need") {
-            serve_need(conn, mut_cell, &next).await?;
+            let (n, u) = serve_need(conn, mut_cell, &next).await?;
+            sent += n;
+            unsent += u;
         } else if next.get("kind").and_then(Value::as_str) == Some("envelopes") {
             let (n, r) = ingest_envelopes(conn, mut_cell, &next).await?;
             received = n;
             refused = r;
         }
     }
-    let mut sent = 0;
     loop {
         let Ok(msg) = recv_frame(conn).await else {
             break;
         };
         match msg.get("kind").and_then(Value::as_str) {
-            Some("need") => sent += serve_need(conn, mut_cell, &msg).await?,
+            Some("need") => {
+                let (n, u) = serve_need(conn, mut_cell, &msg).await?;
+                sent += n;
+                unsent += u;
+            }
             Some("envelopes") => {
                 let (n, r) = ingest_envelopes(conn, mut_cell, &msg).await?;
                 received += n;
@@ -472,12 +486,18 @@ async fn cell_exchange_answerer(conn: &Connection, cell: &dyn SyncedCell) -> Res
         sent,
         received,
         refused,
+        unsent,
         head: mut_cell.head_seq(),
     })
 }
 
-/// Serve one need lot: the envelopes of the ids we hold.
-async fn serve_need(conn: &Connection, cell: &dyn SyncedCell, msg: &Value) -> Result<usize> {
+/// Serve one need lot: the envelopes of the ids we hold, and the count of
+/// what could not be sealed (R4 — never silence).
+async fn serve_need(
+    conn: &Connection,
+    cell: &dyn SyncedCell,
+    msg: &Value,
+) -> Result<(usize, usize)> {
     let ids: Vec<[u8; 32]> = msg["ids"]
         .as_array()
         .unwrap_or(&Vec::new())
@@ -494,13 +514,14 @@ async fn serve_need(conn: &Connection, cell: &dyn SyncedCell, msg: &Value) -> Re
             })
         })
         .collect();
+    let unsent = ids.len() - envs.len();
     let count = envs.len();
     send_frame(
         conn,
         &json!({"kind": "envelopes", "sync_id": msg["sync_id"].clone(), "envs": envs}),
     )
     .await?;
-    Ok(count)
+    Ok((count, unsent))
 }
 
 /// Ingest one envelope lot, with the receipt. Returns the ingested count

@@ -174,6 +174,9 @@ pub struct CellSummary {
     pub received: usize,
     /// Refusals at the gate this pass.
     pub refused: usize,
+    /// Operations this pass could NOT seal or prove (R4): each is an
+    /// event in the root, never silence.
+    pub unsent: usize,
     /// Conflict copies this copy holds now.
     pub conflicts: usize,
     /// The head seq now.
@@ -317,8 +320,15 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
     let registry = DeviceRegistry::open(root)?;
     let mut report = PassReport::default();
     let conflicts_now = conflict_counts(root)?;
-    let mut per_cell: std::collections::HashMap<Vec<u8>, (usize, usize, usize)> =
+    let mut per_cell: std::collections::HashMap<Vec<u8>, (usize, usize, usize, usize)> =
         std::collections::HashMap::new();
+    // R4: the pass starts by forgetting the cells' unsent events — what
+    // still cannot leave will be named again below
+    for shared in SharedCell::all_of(root)? {
+        if let Ok(name) = cell_name(root, shared.sync_id()) {
+            crate::sharedcell::clear_unsent(root, &name).ok();
+        }
+    }
     // the blind node, when one is configured: deposit what it lacks,
     // fetch what we lack, deliver the purge queue (a failure is a trace
     // line under ENGRAMMA_TRACE, never a failed pass)
@@ -368,10 +378,13 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
             Ok(Ok(conn)) => match session_with(root, conn, &member.device, &endpoint_addr).await {
                 Ok(session) => {
                     for cell in &session.report.cells {
-                        let entry = per_cell.entry(cell.sync_id.clone()).or_insert((0, 0, 0));
+                        let entry = per_cell
+                            .entry(cell.sync_id.clone())
+                            .or_insert((0, 0, 0, 0));
                         entry.0 += cell.sent;
                         entry.1 += cell.received;
                         entry.2 += cell.refused;
+                        entry.3 += cell.unsent;
                     }
                     via = Some(session.via);
                     Ok(())
@@ -392,13 +405,14 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
         let name = cell_name(root, shared.sync_id())?;
         let delta = per_cell
             .remove(shared.sync_id().as_slice())
-            .unwrap_or((0, 0, 0));
+            .unwrap_or((0, 0, 0, 0));
         let path_key = shared.cell().file_path().display().to_string();
         report.cells.push(CellSummary {
             name,
             sent: delta.0,
             received: delta.1,
             refused: delta.2,
+            unsent: delta.3,
             conflicts: conflicts_now
                 .iter()
                 .find(|(p, _)| *p == path_key)

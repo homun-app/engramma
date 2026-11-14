@@ -233,27 +233,70 @@ impl SyncedCell for SharedCell {
     }
 
     fn envelope_of(&self, id32: &[u8; 32]) -> Option<(u64, Vec<u8>, Vec<u8>)> {
-        let op = self.find_op(id32)?;
-        let epoch = self.current_epoch().ok()?;
-        let key = self.key_of(epoch).ok()?;
+        let op = match self.find_op(id32) {
+            Some(op) => op,
+            None => {
+                self.record_unsent(&crate::device::hex(id32)[..16], "?", "non trovata in questa copia");
+                return None;
+            }
+        };
+        let epoch = match self.current_epoch() {
+            Ok(epoch) => epoch,
+            Err(_) => {
+                self.record_unsent(&op.op_id.to_string()[..16], op.kind.as_str(), "nessuna epoca");
+                return None;
+            }
+        };
+        let Ok(key) = self.key_of(epoch) else {
+            self.record_unsent(&op.op_id.to_string()[..16], op.kind.as_str(), "chiave dell'epoca assente");
+            return None;
+        };
         // an unsigned operation travels with its adopt proof; a SIGNED
         // operation of a REMOVED device travels with its membership proof
         // (R1) — whoever sends it must be able to prove it sits inside a
-        // root its remove recorded; everything else travels alone
+        // root its remove recorded; everything else travels alone. A
+        // failure is NEVER silent (R4): the operation stays, the event
+        // names it — id short, kind, reason; no note text by construction.
         let plaintext = if op.sig.is_none() && op.kind != engramma_core::cell::ops::OpKind::Adopt {
-            let proof = self.adopt_tree().prove(&op.content_hash)?;
+            let proof = match self.adopt_tree().prove(&op.content_hash) {
+                Some(proof) => proof,
+                None => {
+                    self.record_unsent(
+                        &op.op_id.to_string()[..16],
+                        op.kind.as_str(),
+                        "senza firma e fuori dall'albero dell'adopt",
+                    );
+                    return None;
+                }
+            };
             wire::envelope_wire(&op, Some(&proof))
         } else if let Some(device) = op.device.as_deref()
             && op.sig.is_some()
             && self.device_is_removed(device)
         {
-            let proof = self.removal_proof(device, &op.content_hash)?;
+            let proof = match self.removal_proof(device, &op.content_hash) {
+                Some(proof) => proof,
+                None => {
+                    self.record_unsent(
+                        &op.op_id.to_string()[..16],
+                        op.kind.as_str(),
+                        "del rimosso, senza prova dell'insieme",
+                    );
+                    return None;
+                }
+            };
             wire::envelope_wire(&op, Some(&proof))
         } else {
             wire::envelope_wire(&op, None)
         };
         let aad = op_aad(&self.sync_id, epoch, id32);
-        let env = crypto::seal_op(&key, &aad, plaintext.as_bytes()).ok()?;
+        let env = match crypto::seal_op(&key, &aad, plaintext.as_bytes()) {
+            Ok(env) => env,
+            Err(_) => {
+                self.record_unsent(&op.op_id.to_string()[..16], op.kind.as_str(), "sigillatura fallita");
+                return None;
+            }
+        };
         Some((epoch, env.nonce.to_vec(), env.ct))
     }
 
@@ -303,6 +346,25 @@ impl SharedCell {
     fn find_op(&self, id32: &[u8; 32]) -> Option<Op> {
         let wanted = crate::device::hex(id32);
         self.cell.op_of_hash(&wanted).ok().flatten()
+    }
+
+    /// R4: name an operation that could not leave — an event without
+    /// note text (op id SHORT, kind, reason) in the root's own store. The
+    /// pass clears what it re-tries, so `sync status` shows what still
+    /// cannot leave.
+    fn record_unsent(&self, op_id_short: &str, kind: &str, reason: &str) {
+        let reg = self.registry();
+        let cell = crate::serve::cell_name(&self.root, &self.sync_id)
+            .unwrap_or_else(|_| crate::device::hex(&self.sync_id)[..8].to_string());
+        let at = time::OffsetDateTime::now_utc()
+            .replace_millisecond(0)
+            .unwrap_or(time::OffsetDateTime::now_utc())
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default();
+        let _ = reg.conn().execute(
+            "INSERT INTO sync_events (at, cell, op_id, kind, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![at, cell, op_id_short, kind, reason],
+        );
     }
 
     /// The adopt tree, built on first use and kept for the session (R3).
@@ -521,5 +583,44 @@ pub fn unshare_cell(root: &std::path::Path, name: &str) -> Result<()> {
     let reg = DeviceRegistry::open(root)?;
     reg.conn()
         .execute("DELETE FROM shared_cells WHERE name = ?1", [name])?;
+    Ok(())
+}
+
+/// R4: the unsent events a root still holds — `(cell, at, op_id short,
+/// kind, reason)`, no note text by construction. `sync status` shows them
+/// until a pass can send what they name.
+///
+/// # Errors
+/// [`Error::Db`] on SQL failure.
+pub fn unsent_events(root: &std::path::Path) -> Result<Vec<(String, String, String, String, String)>> {
+    let reg = DeviceRegistry::open(root)?;
+    let mut stmt = reg
+        .conn()
+        .prepare("SELECT cell, at, op_id, kind, reason FROM sync_events ORDER BY seq")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// R4: forget one cell's unsent events — what a pass does when it starts,
+/// before the envelopes that fail are named again.
+///
+/// # Errors
+/// [`Error::Db`] on SQL failure.
+pub fn clear_unsent(root: &std::path::Path, cell: &str) -> Result<()> {
+    let reg = DeviceRegistry::open(root)?;
+    reg.conn()
+        .execute("DELETE FROM sync_events WHERE cell = ?1", [cell])?;
     Ok(())
 }

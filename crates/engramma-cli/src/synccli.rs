@@ -186,7 +186,7 @@ pub fn sync_run_cmd(
             })).collect::<Vec<_>>(),
             "cells": report.cells.iter().map(|c| serde_json::json!({
                 "cell": c.name, "sent": c.sent, "received": c.received,
-                "refused": c.refused, "conflicts": c.conflicts,
+                "refused": c.refused, "conflicts": c.conflicts, "unsent": c.unsent,
                 "head": c.head, "frontier": c.frontier,
             })).collect::<Vec<_>>(),
         }));
@@ -202,8 +202,8 @@ pub fn sync_run_cmd(
         }
         for c in &report.cells {
             println!(
-                "cella «{}»: {} inviate, {} ricevute, {} rifiuti, {} conflitti, frontiera {}",
-                c.name, c.sent, c.received, c.refused, c.conflicts, c.frontier
+                "cella «{}»: {} inviate, {} ricevute, {} rifiuti, {} conflitti, {} non speditibili, frontiera {}",
+                c.name, c.sent, c.received, c.refused, c.conflicts, c.unsent, c.frontier
             );
         }
     }

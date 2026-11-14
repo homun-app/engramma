@@ -176,6 +176,13 @@ impl DeviceRegistry {
                 device TEXT PRIMARY KEY,        -- the device id
                 addrs TEXT NOT NULL,            -- JSON: {node_id, relay, addrs}
                 seen_at TEXT NOT NULL);         -- last session that updated it
+             CREATE TABLE IF NOT EXISTS sync_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,               -- when the pass said it
+                cell TEXT NOT NULL,             -- the cell's name in this root
+                op_id TEXT NOT NULL,            -- SHORT (16 chars): no full ids
+                kind TEXT NOT NULL,             -- the operation's kind
+                reason TEXT NOT NULL);          -- why it could not leave
              CREATE TABLE IF NOT EXISTS cell_keys (
                 sync_id BLOB NOT NULL, epoch INTEGER NOT NULL,
                 key BLOB NOT NULL,        -- the raw epoch key, for holders
