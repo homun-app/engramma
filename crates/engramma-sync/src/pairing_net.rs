@@ -429,7 +429,7 @@ pub async fn join(
                 cell.mark_shared().ok();
                 cell.set_signer(std::sync::Arc::new(crate::arrival::DeviceSigner::new(&dk)))
                     .ok();
-                let shared = SharedCell::new(cell, registry_open(root)?, sync_id);
+                let shared = SharedCell::new(cell, registry_open(root)?, sync_id, root);
                 let mut count = 0_usize;
                 let mut batch: Vec<JoinEnvelope> = Vec::new();
                 // the sealed operations, in lots with a receipt each, until

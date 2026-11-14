@@ -18,7 +18,7 @@
 //! copy accepts from that device only those, and nothing else (the cell
 //! log enforces its side in P1's terms).
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use ulid::Ulid;
 
@@ -600,28 +600,39 @@ impl DeviceRegistry {
     /// # Errors
     /// [`Error::Db`] on SQL failure.
     pub fn accepted_set_of(&self, device: &str) -> Result<Option<(String, u64)>> {
-        let row: Option<(String, String)> = self
-            .conn
-            .query_row(
-                "SELECT payload_json FROM registry
-                 WHERE kind = 'remove' AND json_extract(payload_json, '$.device') = ?1
-                 ORDER BY hlc DESC, op_id DESC LIMIT 1",
-                [device],
-                |r| Ok((r.get(0)?, String::new())),
-            )
-            .optional()?;
-        let Some((payload, _)) = row else {
-            return Ok(None);
-        };
-        let v: Value = serde_json::from_str(&payload)
-            .map_err(|e| Error::Malformed(format!("bad remove payload: {e}")))?;
-        Ok(Some((
-            v.get("accepted_root")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .into(),
-            v.get("accepted_count").and_then(Value::as_u64).unwrap_or(0),
-        )))
+        Ok(self.accepted_sets_of(device)?.into_iter().next_back())
+    }
+
+    /// EVERY remove of a device this list holds, oldest first: the union of
+    /// the accepted sets (R1, v0.6.1) — concurrent removes by different
+    /// members name different sets, and an operation of the removed device
+    /// enters with a proof toward ANY of the recorded roots.
+    ///
+    /// # Errors
+    /// [`Error::Db`] on SQL failure.
+    pub fn accepted_sets_of(&self, device: &str) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload_json FROM registry
+             WHERE kind = 'remove' AND json_extract(payload_json, '$.device') = ?1
+             ORDER BY hlc, op_id",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map([device], |r| r.get(0))?
+            .flatten()
+            .collect();
+        let mut out = Vec::with_capacity(rows.len());
+        for payload in rows {
+            let v: Value = serde_json::from_str(&payload)
+                .map_err(|e| Error::Malformed(format!("bad remove payload: {e}")))?;
+            out.push((
+                v.get("accepted_root")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .into(),
+                v.get("accepted_count").and_then(Value::as_u64).unwrap_or(0),
+            ));
+        }
+        Ok(out)
     }
 }
 

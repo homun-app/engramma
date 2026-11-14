@@ -20,7 +20,6 @@
 
 use engramma_core::Cell;
 use engramma_core::cell::ops::{self, MerkleStep, Op};
-use rusqlite::OptionalExtension;
 
 use crate::device::DeviceKey;
 use crate::registry::DeviceRegistry;
@@ -64,9 +63,7 @@ pub fn check(
     proof: Option<&[MerkleStep]>,
 ) -> Result<()> {
     match (&op.device, &op.sig) {
-        (Some(device), Some(sig)) => {
-            signed_checks(registry, device, &op.content_hash, sig, op.hlc.to_string())
-        }
+        (Some(_), Some(_)) => signed_checks(registry, cell, op, proof),
         (None, None) => unsigned_checks(cell, op, proof),
         // half an author is no author: a device without its signature, or a
         // signature naming no device, is exactly as good as a bad one
@@ -76,18 +73,24 @@ pub fn check(
 
 fn signed_checks(
     registry: &DeviceRegistry,
-    device: &str,
-    content_hash: &str,
-    sig: &str,
-    hlc: String,
+    cell: &Cell,
+    op: &Op,
+    proof: Option<&[MerkleStep]>,
 ) -> Result<()> {
+    let bad = || Error::Registry(Rejection::BadSignature.to_string());
+    let device = op.device.as_deref().unwrap_or_default();
+    // the author enters the identity (R1, v0.6.1): the signing device IS
+    // the HLC node, and both live inside the content the signature covers —
+    // a disagreement is a forged authorship, whatever key signed it
+    if op.hlc.node != device {
+        return Err(bad());
+    }
     let mut key = [0_u8; 32];
     if !hex_into(device, &mut key) {
-        return Err(Error::Registry(Rejection::BadSignature.to_string()));
+        return Err(bad());
     }
-    let sig_bytes = unb64(sig)?;
-    DeviceKey::verify(&key, content_hash.as_bytes(), &sig_bytes)
-        .map_err(|_| Error::Registry(Rejection::BadSignature.to_string()))?;
+    let sig_bytes = unb64(op.sig.as_deref().unwrap_or_default())?;
+    DeviceKey::verify(&key, op.content_hash.as_bytes(), &sig_bytes).map_err(|_| bad())?;
     // live, or removed with the operation inside the accepted set
     let live = registry
         .conn()
@@ -100,31 +103,32 @@ fn signed_checks(
     if live > 0 {
         return Ok(());
     }
-    let removed: Option<String> = registry
-        .conn()
-        .query_row(
-            "SELECT hlc FROM registry
-             WHERE kind = 'remove' AND json_extract(payload_json, '$.device') = ?1
-             ORDER BY hlc DESC, op_id DESC LIMIT 1",
-            [device],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(Error::from)?;
-    match removed {
-        // the accepted set of a remove, in its operative form: everything
-        // the remover had accepted sits BEFORE the remove in total order
-        // (the payload's Merkle root stays as the audit of what that was).
-        // A removed device cannot write anything at or after its removal.
-        Some(remove_hlc) => {
-            if hlc < remove_hlc {
-                Ok(())
-            } else {
-                Err(Error::Registry(Rejection::RemovedOutsideSet.to_string()))
-            }
-        }
-        None => Err(Error::Registry(Rejection::UnknownDevice.to_string())),
+    // the HLC does not decide this (R1): the author chooses it, and dating
+    // an operation before its removal was the stolen key's open door. The
+    // operative set is the Merkle root the remove carries — an operation
+    // of the removed device enters only if already held (a duplicate) or
+    // with the PROOF of membership toward one of the recorded roots (the
+    // union of concurrent removes)
+    let removes = registry.accepted_sets_of(device)?;
+    if removes.is_empty() {
+        return Err(Error::Registry(Rejection::UnknownDevice.to_string()));
     }
+    if held_here(cell, &op.content_hash) {
+        return Ok(());
+    }
+    if let Some(path) = proof
+        && let Some(walked) = ops::merkle_root_with(&op.content_hash, path)
+        && removes.iter().any(|(root, _)| *root == walked)
+    {
+        return Ok(());
+    }
+    Err(Error::Registry(Rejection::RemovedOutsideSet.to_string()))
+}
+
+/// Is this operation already in the copy? A point query — the index of
+/// `content_hash` answers it without reading the log.
+fn held_here(cell: &Cell, content_hash: &str) -> bool {
+    cell.holds_content_hash(content_hash).unwrap_or(false)
 }
 
 /// An unsigned operation enters only under a valid `adopt`: the sharer
@@ -143,10 +147,7 @@ fn unsigned_checks(cell: &Cell, op: &Op, proof: Option<&[MerkleStep]>) -> Result
     };
     // already held: the duplicate is the ingest's own business, not a gate
     // refusal
-    let held: Vec<String> = cell
-        .debug_column("SELECT content_hash FROM ops")
-        .unwrap_or_default();
-    if held.contains(&op.content_hash) {
+    if held_here(cell, &op.content_hash) {
         return Ok(());
     }
     let Some(path) = proof else {

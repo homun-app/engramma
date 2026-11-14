@@ -939,6 +939,22 @@ impl Cell {
         Ok(out)
     }
 
+    /// Does the log already hold an operation with this `content_hash`?
+    /// The arrival gate's duplicate check — a point query over the v20
+    /// index, never a walk of the log.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn holds_content_hash(&self, content_hash: &str) -> Result<bool, CellError> {
+        let inner = self.lock()?;
+        let n: i64 = inner.conn.query_row(
+            "SELECT COUNT(*) FROM ops WHERE content_hash = ?1",
+            [content_hash],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>, CellError> {
         self.inner
             .lock()
@@ -3188,7 +3204,15 @@ fn execute_op(
     {
         inner.clock.observe(&h);
     }
-    let hlc = inner.clock.tick();
+    let mut hlc = inner.clock.tick();
+    // the author enters the identity (v0.6.1, R1): when the signer is
+    // armed, the HLC node of a LOCAL operation is the DEVICE id — the
+    // clock keeps its physical part and counter, only the node changes.
+    // The gate demands `device == hlc.node` on every signed operation;
+    // the machine id would name the wrong author forever.
+    if let Some(signer) = &inner.signer {
+        hlc.node = signer.device_id();
+    }
     let (prev_seq, prev_hash): (i64, String) = tx
         .query_row(
             "SELECT seq, hash FROM ops ORDER BY seq DESC LIMIT 1",

@@ -116,7 +116,7 @@ impl Fixture {
         let reg = DeviceRegistry::open(self.dir_a.path()).unwrap(/* t */);
         cell.set_signer(std::sync::Arc::new(DeviceSigner::new(&self.key_a)))
             .unwrap(/* t */);
-        SharedCell::new(cell, reg, self.sync_id)
+        SharedCell::new(cell, reg, self.sync_id, self.dir_a.path())
     }
 
     /// B's side: a bare cell, epoch 0 in its keystore (the pairing handed
@@ -141,7 +141,7 @@ impl Fixture {
         // the cell IS shared — the fact rides with the replicated state,
         // so every copy that joins marks it too
         cell.mark_shared().unwrap(/* t */);
-        SharedCell::new(cell, reg, self.sync_id)
+        SharedCell::new(cell, reg, self.sync_id, self.dir_b.path())
     }
 }
 
@@ -363,8 +363,8 @@ fn an_unknown_device_is_refused() {
     );
 }
 
-/// 3. a REMOVED device whose op is outside the set its remove accepted
-///    (at or after the remove in total order): refused.
+/// 3. a REMOVED device whose op is outside the set its remove accepted:
+///    refused — the proof decides, not the clock (R1).
 #[test]
 fn a_removed_device_outside_its_set_is_refused() {
     let fx = Fixture::new();
@@ -386,18 +386,39 @@ fn a_removed_device_outside_its_set_is_refused() {
     // B learns the add and the remove
     let reg_b = DeviceRegistry::open(fx.dir_b.path()).unwrap(/* t */);
     reg_b.arrive_rows(&reg_a.rows_json()).unwrap(/* t */);
-    // the removed device writes AFTER its removal — outside the set
-    let mut op = signed_put(&a, "la nota del rimosso");
-    op.device = Some(doomed.device_id());
-    op.sig = Some({
-        use base64ct::{Base64UrlUnpadded as B64, Encoding};
-        B64::encode_string(&doomed.sign(op.content_hash.as_bytes()))
-    });
+    // the removed device writes — a true authorship (device == hlc.node,
+    // the identity minted over it, the genuine key), but OUTSIDE the set:
+    // no proof can cover it
+    let op = {
+        let hlc = engramma_core::hlc::Hlc {
+            physical_ms: OffsetDateTime::now_utc().unix_timestamp() as u64 * 1000,
+            counter: 0,
+            node: doomed.device_id(),
+        };
+        let op = OpParts {
+            op_id: Ulid::from_string("01HANDMADE0000000000000035").unwrap(/* t */),
+            hlc,
+            actor: "cli".into(),
+            kind: engramma_core::cell::ops::OpKind::PutNote,
+            note_id: Some(note(35, "la nota del rimosso").id),
+            base: None,
+            body: serde_json::json!({ "note": note(35, "la nota del rimosso").to_json() }),
+            salt: vec![5_u8; 16],
+            device: Some(doomed.device_id()),
+            sig: None,
+        };
+        let mut op = engramma_core::cell::ops::make_op(op).unwrap(/* t */);
+        op.sig = Some({
+            use base64ct::{Base64UrlUnpadded as B64, Encoding};
+            B64::encode_string(&doomed.sign(op.content_hash.as_bytes()))
+        });
+        op
+    };
     let (epoch, id, nonce, ct) = envelope_of_op(&a, &op);
     let err = b.ingest(epoch, &id, &nonce, &ct).unwrap_err(/* t */);
     assert!(
         err.to_string().contains("removed"),
-        "a removed device's late op must be refused: {err}"
+        "a removed device's op outside the accepted set must be refused: {err}"
     );
 }
 

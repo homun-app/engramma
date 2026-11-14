@@ -47,17 +47,27 @@ pub struct SharedCell {
     cell: Cell,
     keys: std::sync::Mutex<DeviceRegistry>,
     sync_id: [u8; 32],
+    root: std::path::PathBuf,
 }
 
 impl SharedCell {
     /// Bind an opened cell to a sync id (the name→id row is the caller's
     /// to write: `share_cell` for the sharer, the pairing for the joiner).
+    /// The root names the tree this cell lives in — the membership proofs
+    /// of a removed device's operations are built over the whole tree, as
+    /// its `remove` computed them.
     #[must_use]
-    pub fn new(cell: Cell, keys: DeviceRegistry, sync_id: [u8; 32]) -> Self {
+    pub fn new(
+        cell: Cell,
+        keys: DeviceRegistry,
+        sync_id: [u8; 32],
+        root: &std::path::Path,
+    ) -> Self {
         Self {
             cell,
             keys: std::sync::Mutex::new(keys),
             sync_id,
+            root: root.to_path_buf(),
         }
     }
 
@@ -98,6 +108,7 @@ impl SharedCell {
                 cell,
                 keys: std::sync::Mutex::new(keys),
                 sync_id,
+                root: root.to_path_buf(),
             });
         }
         Ok(out)
@@ -186,10 +197,18 @@ impl SyncedCell for SharedCell {
         let op = self.find_op(id32)?;
         let epoch = self.current_epoch().ok()?;
         let key = self.key_of(epoch).ok()?;
-        // an unsigned operation travels with its adopt proof; everything
-        // else travels alone
+        // an unsigned operation travels with its adopt proof; a SIGNED
+        // operation of a REMOVED device travels with its membership proof
+        // (R1) — whoever sends it must be able to prove it sits inside a
+        // root its remove recorded; everything else travels alone
         let plaintext = if op.sig.is_none() && op.kind != engramma_core::cell::ops::OpKind::Adopt {
             let proof = arrival::adopt_proof(&self.cell, &op).ok()?;
+            wire::envelope_wire(&op, Some(&proof))
+        } else if let Some(device) = op.device.as_deref()
+            && op.sig.is_some()
+            && self.device_is_removed(device)
+        {
+            let proof = self.removal_proof(device, &op.content_hash)?;
             wire::envelope_wire(&op, Some(&proof))
         } else {
             wire::envelope_wire(&op, None)
@@ -249,6 +268,54 @@ impl SharedCell {
             .ok()?
             .into_iter()
             .find(|op| op.content_hash == wanted)
+    }
+
+    /// Is this device REMOVED in the list this root holds? (Live devices
+    /// and strangers answer false: their operations carry no proof.)
+    fn device_is_removed(&self, device: &str) -> bool {
+        let reg = self.registry();
+        let live: i64 = reg
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM members WHERE device = ?1 AND removed_at IS NULL",
+                [device],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        live == 0 && reg.accepted_sets_of(device).map_or(false, |r| !r.is_empty())
+    }
+
+    /// The membership proof of one operation of a REMOVED device (R1): the
+    /// path from its `content_hash` to a root one of the device's removes
+    /// recorded. The set is the removed device's operations across the
+    /// WHOLE tree — exactly what its `remove` computed. A copy whose set
+    /// rebuilds no recorded root cannot prove, and does not send.
+    fn removal_proof(
+        &self,
+        device: &str,
+        target_hash: &str,
+    ) -> Option<Vec<engramma_core::cell::ops::MerkleStep>> {
+        let removes = self.registry().accepted_sets_of(device).ok()?;
+        if removes.is_empty() {
+            return None;
+        }
+        let mut hashes: Vec<String> = Vec::new();
+        for shared in SharedCell::all_of(&self.root).ok()? {
+            hashes.extend(
+                shared
+                    .cell()
+                    .debug_column(&format!(
+                        "SELECT o.content_hash FROM ops o WHERE o.device = '{}'",
+                        device.replace('\'', "''")
+                    ))
+                    .ok()?,
+            );
+        }
+        let root = engramma_core::cell::ops::merkle_root(&mut hashes.clone());
+        if !removes.iter().any(|(recorded, _)| *recorded == root) {
+            return None; // our set is not any remove's set: no proof exists
+        }
+        engramma_core::cell::ops::merkle_prove(&mut hashes, target_hash).ok()
     }
 
     /// The operation of one content-hash id.

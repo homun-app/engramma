@@ -161,7 +161,7 @@ Il trait `CellStore` isola SQL, FTS e vettori: un'implementazione SQLite oggi, T
 Lo stato di una copia è funzione dell'**insieme** delle operazioni che possiede, mai dell'ordine di arrivo (§ 4). Le regole:
 
 - **L'identità in rete.** `content_hash` = blake3 del contenuto canonico `{op_id, hlc, actor, kind, note_id, base, payload_digest}` (più `base` quando vive). La stessa operazione ha la stessa identità su ogni copia; `prev_hash`/`hash` restano la **catena locale d'arrivo** di quel disco. Il payload digest già impegna corpo e sale: l'identità è stabile sotto redazione.
-- **L'ordine totale.** `(hlc.physical_ms, hlc.counter, hlc.node, op_id)`. I node id sono a larghezza fissa (12 esadecimali): `ORDER BY hlc, op_id` in SQL percorre lo stesso ordine.
+- **L'ordine totale.** `(hlc.physical_ms, hlc.counter, hlc.node, op_id)`. La parte fisica e il contatore sono a larghezza fissa; il nodo no (12 esadecimali prima dell'era firmata, l'id del dispositivo — 64 esadecimali — da quando il firmatario è armato, vedi sotto), e questo non rompe l'ordine: il confronto SQL `ORDER BY hlc, op_id` è binario su stringhe e il confronto Rust su `Hlc` è binario sugli stessi campi nello stesso ordine, quindi i due percorsi percorrono lo stesso ordine qualunque sia la larghezza del nodo.
 - **La materializzazione per oggetto.** Un'operazione che nell'ordine totale cade **prima** dell'ultima già applicata al suo oggetto lo fa **rimaterializzare**: le righe di stato vanno, lo stato al taglio di compattazione torna dall'istantaneo di versione del primo arrivo sopra il taglio, e tutte le operazioni dell'oggetto si rigiocano in ordine totale, ciascuna nella metà che lo riguarda (un `supersede` vale per la nota nuova e per la vecchia; una `decide` per la proposta e per il bersaglio; la riga `supersedes` la scrivono entrambe le metà, `INSERT OR IGNORE`). Chi arriva ultimo applica diretto: il caso comune non costa di più. Un'operazione su un oggetto che non c'è ancora si **conserva** in attesa (`pending_objects`, tavola locale) e materializza quando arriva la put.
 - **`base`: chi ha visto cosa.** Ogni operazione che modifica una nota esistente porta `base`, il `content_hash` dell'ultima operazione di quella nota che l'autore aveva applicato. Due operazioni con la stessa `base` sono **concorrenti**. Prima della v0.6 non c'è: sequenziali per dichiarazione.
 - **Le regole dei conflitti.** Intestazione (titolo, tag, validità, tipo, confidenza, stato): l'ultima scrittura per campo nell'ordine totale. Corpo con modifiche concorrenti: vince l'ultima nell'ordine totale; la perdente diventa una **copia di conflitto** — nota attiva con id deterministico `blake3("engramma/conflict/v1" ‖ content_hash del perdente)` in forma ULID con la parte temporale dell'HLC del perdente, tag `conflitto`, arco verso l'originale — **stato derivato**: ogni copia la produce identica senza un'operazione; le correzioni dell'utente su di lei sono operazioni normali sul suo id. `decide` concorrenti sulla stessa proposta: vale la **prima** nell'ordine totale; le altre restano nel registro come «decisione superata» (`decisions`), senza effetto; `revert_decision` segue le stesse regole. `delete` contro modifica concorrente: vince la lapide se è l'ultima nell'ordine; una modifica successiva alla lapide la riapre **solo se la sua `base` è la lapide stessa** (chi modifica l'aveva vista — la lapide o chi dopo di lei la lasciò chiusa). **La `purge` domina sempre**: quando l'insieme contiene una purge della nota X, ogni operazione di X si conserva **redatta**, X non materializza, e le sue copie di conflitto vanno con lei; anche gli archi che la nominano come estremo.
@@ -218,10 +218,30 @@ rompe la catena — estesa all'identità di rete.
   `merkle_root_with`: coppie in ordine, la foglia dispari raddoppiata a
   destra). Il ricevente — che può non tenere ancora nessun'altra foglia
   — verifica la prova contro la radice registrata dall'`adopt`.
-- **L'insieme accettato di un rimosso**, in forma operativa: tutto ciò
-  che precede la sua `remove` nell'ordine totale (ogni copia calcola lo
-  stesso verdetto dal solo elenco firmato); la radice di Merkle nel
-  payload resta come audit di ciò che chi rimuoveva aveva accettato.
+- **L'insieme accettato di un rimosso è la radice, non l'orologio.** La
+  `remove` porta la radice di Merkle dell'insieme delle operazioni del
+  rimosso che chi rimuoveva aveva accettato (`accepted_root`,
+  `accepted_count`, calcolata sull'intero albero delle celle condivise di
+  quella radice). Un'operazione firmata da un rimosso entra **solo** se:
+  è già nella copia (un duplicato), o arriva con la **prova di
+  appartenenza** a una delle radici registrate (`merkle_root_with`, la
+  stessa meccanica dell'`adopt`). L'HLC non conta per questa decisione:
+  lo sceglie l'autore, e retrodatare era la porta aperta della chiave
+  rubata. Chi **manda** un'operazione di un rimosso allega la prova,
+  costruita sul proprio insieme quando la sua radice è una delle radici
+  registrate; una copia che non può costruirla non manda l'operazione e
+  lo segnala come evento.
+- **Più `remove` dello stesso dispositivo** (concorrenti, da membri
+  diversi): vale l'**unione** degli insiemi — una prova verso una
+  qualunque delle radici registrate ammette l'operazione.
+- **L'autore entra nell'identità.** Quando la cella ha il firmatario
+  armato (`set_signer`), il nodo dell'HLC delle operazioni **locali** è
+  l'id del dispositivo (l'orologio tiene la parte fisica e il contatore;
+  cambia solo il nodo). Al cancello, ogni operazione firmata deve avere
+  `device == hlc.node` — entrambi dentro il `content_hash` che la firma
+  copre — e una discordanza è `BadSignature`: una stessa identità non può
+  avere autori diversi su copie diverse. Le operazioni scritte prima
+  dell'era firmata restano senza firma e passano dall'`adopt`.
 - **Il filo.** Un flusso **unidirezionale** per frame, con `finish` e
   con il FIN consumato dal ricevente; e il congedo esplicito (`bye` +
   `bye-ack`, chi finisce tiene la connessione finché l'altro non
