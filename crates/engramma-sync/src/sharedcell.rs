@@ -48,6 +48,10 @@ pub struct SharedCell {
     keys: std::sync::Mutex<DeviceRegistry>,
     sync_id: [u8; 32],
     root: std::path::PathBuf,
+    /// How many WHOLE-LOG reads the adapter's sync roads have performed
+    /// (a test-only counter: the regression test of the bootstrap wants
+    /// them LINEAR — a fixed number per envelope, never one per op).
+    whole_log_reads: std::sync::atomic::AtomicU64,
 }
 
 impl SharedCell {
@@ -68,7 +72,22 @@ impl SharedCell {
             keys: std::sync::Mutex::new(keys),
             sync_id,
             root: root.to_path_buf(),
+            whole_log_reads: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// The test-only counter: how many whole-log reads the sync roads have
+    /// performed on this adapter so far (`Cell::ops()` or a scan of the
+    /// `ops` table). Point queries do not count.
+    #[must_use]
+    pub fn log_reads(&self) -> u64 {
+        self.whole_log_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_log_read(&self) {
+        self.whole_log_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The registry this adapter reads keys and members from.
@@ -109,6 +128,7 @@ impl SharedCell {
                 keys: std::sync::Mutex::new(keys),
                 sync_id,
                 root: root.to_path_buf(),
+                whole_log_reads: std::sync::atomic::AtomicU64::new(0),
             });
         }
         Ok(out)
@@ -182,6 +202,7 @@ impl SyncedCell for SharedCell {
     }
 
     fn ids(&self) -> Vec<(u64, [u8; 32])> {
+        self.count_log_read();
         self.cell
             .ops()
             .unwrap_or_default()
@@ -202,6 +223,7 @@ impl SyncedCell for SharedCell {
         // (R1) — whoever sends it must be able to prove it sits inside a
         // root its remove recorded; everything else travels alone
         let plaintext = if op.sig.is_none() && op.kind != engramma_core::cell::ops::OpKind::Adopt {
+            self.count_log_read(); // adopt_proof walks the whole log
             let proof = arrival::adopt_proof(&self.cell, &op).ok()?;
             wire::envelope_wire(&op, Some(&proof))
         } else if let Some(device) = op.device.as_deref()
@@ -262,6 +284,7 @@ impl SyncedCell for SharedCell {
 
 impl SharedCell {
     fn find_op(&self, id32: &[u8; 32]) -> Option<Op> {
+        self.count_log_read();
         let wanted = crate::device::hex(id32);
         self.cell
             .ops()
@@ -301,6 +324,7 @@ impl SharedCell {
         }
         let mut hashes: Vec<String> = Vec::new();
         for shared in SharedCell::all_of(&self.root).ok()? {
+            self.count_log_read(); // one whole-log scan per cell of the tree
             hashes.extend(
                 shared
                     .cell()
@@ -308,7 +332,7 @@ impl SharedCell {
                         "SELECT o.content_hash FROM ops o WHERE o.device = '{}'",
                         device.replace('\'', "''")
                     ))
-                    .ok()?,
+                    .ok()?
             );
         }
         let root = engramma_core::cell::ops::merkle_root(&mut hashes.clone());
