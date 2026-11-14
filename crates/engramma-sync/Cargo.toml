@@ -32,6 +32,13 @@ rusqlite.workspace = true
 [dev-dependencies]
 # a local iroh relay server for the tests (offline, loopback only)
 iroh = { workspace = true, features = ["test-utils"] }
+# the self dev-dependency turns this crate's own `test-utils` feature on in
+# test builds: the local relay's certificate is self-signed, and iroh gates
+# the verifier that trusts it behind that feature
+engramma-sync = { path = ".", features = ["test-utils"] }
 tempfile.workspace = true
 proptest.workspace = true
 
+[features]
+# forwards to iroh's test-utils: the local relay of the tests
+test-utils = ["iroh/test-utils"]

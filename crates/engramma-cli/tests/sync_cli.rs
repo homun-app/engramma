@@ -153,13 +153,13 @@ fn invite_and_join_share_the_cells() {
     let (ok, _, err) = run(&a.root, &["sync", "share", "memoria"], b"");
     assert!(ok, "sync share: {err}");
     // A invites (waits); B joins with the ticket; both confirm the SAS
-    let (inviter, tickets) = Running::spawn(&a.root, &["devices", "invite"], b"s\n");
+    let (inviter, tickets) = Running::spawn(&a.root, &["devices", "invite", "--no-relay"], b"s\n");
     let ticket = tickets
         .recv_timeout(std::time::Duration::from_secs(20))
         .expect(/* printed */ "the invite printed its ticket");
     let (ok, out, err) = run(
         &b.root,
-        &["devices", "join", &ticket, "--name", "mac"],
+        &["devices", "join", "--no-relay", &ticket, "--name", "mac"],
         b"s\n",
     );
     assert!(ok, "join: {err} {out}");
@@ -185,13 +185,13 @@ fn invite_and_join_share_the_cells() {
 fn a_refused_sas_leaves_no_add() {
     let a = Root::new("root-c");
     let b = Root::new("root-d");
-    let (inviter, tickets) = Running::spawn(&a.root, &["devices", "invite"], b"n\n");
+    let (inviter, tickets) = Running::spawn(&a.root, &["devices", "invite", "--no-relay"], b"n\n");
     let ticket = tickets
         .recv_timeout(std::time::Duration::from_secs(20))
         .expect(/* printed */ "the invite printed its ticket");
     let (ok, _, err) = run(
         &b.root,
-        &["devices", "join", &ticket, "--name", "mac"],
+        &["devices", "join", "--no-relay", &ticket, "--name", "mac"],
         b"s\n",
     );
     // the joiner fails too: the inviter said no and closed
@@ -226,7 +226,7 @@ fn an_expired_ticket_is_refused() {
     };
     let (ok, _, err) = run(
         &b.root,
-        &["devices", "join", &ticket.encode(), "--name", "mac"],
+        &["devices", "join", "--no-relay", &ticket.encode(), "--name", "mac"],
         b"s\n",
     );
     assert!(!ok, "an expired ticket must be refused: {err}");
@@ -238,13 +238,13 @@ fn an_expired_ticket_is_refused() {
 fn a_reused_ticket_finds_nobody() {
     let a = Root::new("root-f");
     let b = Root::new("root-g");
-    let (inviter, tickets) = Running::spawn(&a.root, &["devices", "invite"], b"s\n");
+    let (inviter, tickets) = Running::spawn(&a.root, &["devices", "invite", "--no-relay"], b"s\n");
     let ticket = tickets
         .recv_timeout(std::time::Duration::from_secs(20))
         .expect(/* printed */ "the invite printed its ticket");
     let (ok, _, err) = run(
         &b.root,
-        &["devices", "join", &ticket, "--name", "mac"],
+        &["devices", "join", "--no-relay", &ticket, "--name", "mac"],
         b"s\n",
     );
     assert!(ok, "the first join works: {err}");
@@ -253,7 +253,7 @@ fn a_reused_ticket_finds_nobody() {
     // the second use: the inviter exited, nobody listens at that address
     let (ok, _, err) = run(
         &b.root,
-        &["devices", "join", &ticket, "--name", "mac"],
+        &["devices", "join", "--no-relay", &ticket, "--name", "mac"],
         b"s\n",
     );
     assert!(!ok, "a reused ticket must fail: {err}");
@@ -267,7 +267,7 @@ fn a_stolen_ticket_fails_the_mac() {
     let other = Root::new("root-i");
     let b = Root::new("root-l");
     // a real inviter (never joined: nobody has its secret)
-    let (inviter, tickets) = Running::spawn(&a.root, &["devices", "invite"], b"s\n");
+    let (inviter, tickets) = Running::spawn(&a.root, &["devices", "invite", "--no-relay"], b"s\n");
     let ticket_text = tickets
         .recv_timeout(std::time::Duration::from_secs(20))
         .expect(/* printed */ "the invite printed its ticket");
@@ -277,7 +277,7 @@ fn a_stolen_ticket_fails_the_mac() {
     // `other`'s pairing endpoint), keeping the victim's secret — the MITM
     // does not know it, so the inviter-side MAC cannot verify
     let (other_inviter, other_tickets) =
-        Running::spawn(&other.root, &["devices", "invite"], b"s\n");
+        Running::spawn(&other.root, &["devices", "invite", "--no-relay"], b"s\n");
     let other_ticket = engramma_sync::pairing::Ticket::decode(
         &other_tickets
             .recv_timeout(std::time::Duration::from_secs(20))
@@ -288,7 +288,7 @@ fn a_stolen_ticket_fails_the_mac() {
     ticket.addrs = other_ticket.addrs;
     let (ok, _, err) = run(
         &b.root,
-        &["devices", "join", &ticket.encode(), "--name", "mac"],
+        &["devices", "join", "--no-relay", &ticket.encode(), "--name", "mac"],
         b"s\n",
     );
     assert!(!ok, "a stolen ticket must fail the MAC: {err}");

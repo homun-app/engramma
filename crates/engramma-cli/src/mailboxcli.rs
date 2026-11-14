@@ -11,6 +11,7 @@ use engramma_sync::mailbox_net::{self, NodeState};
 use engramma_sync::pairing::{self, Side};
 use engramma_sync::pairing_net;
 use engramma_sync::registry::DeviceRegistry;
+use engramma_sync::relay::{self as relay_choice_mod, RelayChoice};
 use engramma_sync::serve;
 
 use crate::{CliError, print_json};
@@ -29,10 +30,13 @@ fn confirm_line(sas: &str) -> bool {
     )
 }
 
-/// `engramma mailbox serve --root <dir>`: the node runs until the signal.
-pub fn serve(json: bool, dir: &Path) -> Result<(), CliError> {
+/// `engramma mailbox serve --root <dir> [--relay <url>|--no-relay]`: the
+/// node runs until the signal.
+pub fn serve(json: bool, dir: &Path, flag: Option<RelayChoice>) -> Result<(), CliError> {
     let dir = dir.to_path_buf();
     let key = DeviceKey::load_or_create(&dir).map_err(|e| CliError::internal(e.to_string()))?;
+    let choice =
+        relay_choice_mod::resolve(&dir, flag.as_ref()).map_err(|e| CliError::internal(e.to_string()))?;
     // the node opens its state again per connection, inside the loop
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -41,7 +45,7 @@ pub fn serve(json: bool, dir: &Path) -> Result<(), CliError> {
     rt.block_on(async {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let endpoint = mailbox_net::bind_node(&key, "0.0.0.0:0")
+                let endpoint = mailbox_net::bind_node(&key, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
                 let ticket = mailbox_net::node_ticket(&endpoint);
@@ -151,11 +155,13 @@ pub fn add(root: &Path, json: bool, ticket: &str) -> Result<(), CliError> {
         .enable_all()
         .build()
         .map_err(|e| CliError::internal(e.to_string()))?;
+    let choice =
+        relay_choice_mod::resolve(&root, None).map_err(|e| CliError::internal(e.to_string()))?;
     let owner = rt
         .block_on(async {
             tokio::task::LocalSet::new()
                 .run_until(async {
-                    let endpoint = serve::bind(&dk, "0.0.0.0:0")
+                    let endpoint = serve::bind(&dk, "0.0.0.0:0", &choice)
                         .await
                         .map_err(|e| CliError::internal(e.to_string()))?;
                     mailbox_net::add_node(&root, &endpoint, ticket)
@@ -202,11 +208,13 @@ pub fn status(root: &Path, json: bool) -> Result<(), CliError> {
         .enable_all()
         .build()
         .map_err(|e| CliError::internal(e.to_string()))?;
+    let choice =
+        relay_choice_mod::resolve(&root, None).map_err(|e| CliError::internal(e.to_string()))?;
     let stats = rt
         .block_on(async {
             tokio::task::LocalSet::new()
                 .run_until(async {
-                    let endpoint = serve::bind(&dk, "0.0.0.0:0")
+                    let endpoint = serve::bind(&dk, "0.0.0.0:0", &choice)
                         .await
                         .map_err(|e| CliError::internal(e.to_string()))?;
                     mailbox_net::node_stats(&root, &endpoint, &node)
@@ -244,7 +252,7 @@ pub fn status(root: &Path, json: bool) -> Result<(), CliError> {
 /// owner opens the channel, runs the PAKE with whoever enters, shows the
 /// SAS, and hands over a FRESH invite ticket — sealed, over the relay: the
 /// join then runs the ticket flow directly, device to device.
-pub fn devices_code(root: &Path, json: bool) -> Result<(), CliError> {
+pub fn devices_code(root: &Path, json: bool, flag: Option<RelayChoice>) -> Result<(), CliError> {
     let root = root.to_path_buf();
     let Some(node) = mailbox_net::node_of(&root).map_err(|e| CliError::internal(e.to_string()))?
     else {
@@ -260,6 +268,8 @@ pub fn devices_code(root: &Path, json: bool) -> Result<(), CliError> {
         println!("codice breve (dieci minuti, un tentativo):");
         println!("{}", code.encode());
     }
+    let choice =
+        relay_choice_mod::resolve(&root, flag.as_ref()).map_err(|e| CliError::internal(e.to_string()))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -267,7 +277,7 @@ pub fn devices_code(root: &Path, json: bool) -> Result<(), CliError> {
     rt.block_on(async {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let endpoint = serve::bind(&dk, "0.0.0.0:0")
+                let endpoint = serve::bind(&dk, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
                 let relay = mailbox_net::meet_code(&endpoint, &node, code.channel)
@@ -303,10 +313,10 @@ pub fn devices_code(root: &Path, json: bool) -> Result<(), CliError> {
                 mailbox_net::relay_open(&rkey, &their_blob)
                     .map_err(|e| CliError::internal(e.to_string()))?;
                 // the pairing endpoint and its fresh ticket
-                let pair_endpoint = pairing_net::bind_pairing(&dk, "0.0.0.0:0")
+                let pair_endpoint = pairing_net::bind_pairing(&dk, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
-                let ticket = pairing_net::ticket_of(&pair_endpoint, None)
+                let ticket = pairing_net::ticket_of(&pair_endpoint)
                     .map_err(|e| CliError::internal(e.to_string()))?;
                 let blob = mailbox_net::relay_seal(&rkey, ticket.encode().as_bytes())
                     .map_err(|e| CliError::internal(e.to_string()))?;
@@ -340,6 +350,7 @@ pub fn join_with_code(
     json: bool,
     code_text: &str,
     name: &str,
+    flag: Option<RelayChoice>,
 ) -> Result<(), CliError> {
     let root = root.to_path_buf();
     let Some(node) = mailbox_net::node_of(&root).map_err(|e| CliError::internal(e.to_string()))?
@@ -351,6 +362,8 @@ pub fn join_with_code(
     let code = pairing::ShortCode::decode(code_text)
         .map_err(|e| CliError::usage(format!("codice non valido: {e}")))?;
     let dk = DeviceKey::load_or_create(&root).map_err(|e| CliError::internal(e.to_string()))?;
+    let choice =
+        relay_choice_mod::resolve(&root, flag.as_ref()).map_err(|e| CliError::internal(e.to_string()))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -358,7 +371,7 @@ pub fn join_with_code(
     rt.block_on(async {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let endpoint = serve::bind(&dk, "0.0.0.0:0")
+                let endpoint = serve::bind(&dk, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
                 let relay = mailbox_net::meet_code(&endpoint, &node, code.channel)

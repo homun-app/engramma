@@ -120,8 +120,8 @@ async fn the_wire_carries_many_frames_in_lockstep() {
     use engramma_sync::protocol::{bind_endpoint, connect};
     let key_a = DeviceKey::from_seed([1; 32]);
     let key_b = DeviceKey::from_seed([2; 32]);
-    let ep_a = bind_endpoint(&key_a, "127.0.0.1:0").await.unwrap(/* t */);
-    let ep_b = bind_endpoint(&key_b, "127.0.0.1:0").await.unwrap(/* t */);
+    let ep_a = bind_endpoint(&key_a, "127.0.0.1:0", &engramma_sync::relay::RelayChoice::Disabled).await.unwrap(/* t */);
+    let ep_b = bind_endpoint(&key_b, "127.0.0.1:0", &engramma_sync::relay::RelayChoice::Disabled).await.unwrap(/* t */);
     let addr = ep_a.addr();
     tokio::task::LocalSet::new()
         .run_until(async {

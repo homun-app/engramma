@@ -224,21 +224,17 @@ fn decode_registry_row(row: &Value) -> Result<RegistryOp> {
     })
 }
 
-/// The node's endpoint: its own device key, the mailbox ALPN.
+/// The node's endpoint: its own device key, the mailbox ALPN, the one
+/// relay-aware builder of the sync road (R2) — see [`crate::relay`].
 ///
 /// # Errors
 /// [`Error::Io`] when iroh cannot bind.
-pub async fn bind_node(key: &DeviceKey, bind: &str) -> Result<Endpoint> {
-    let secret = iroh::SecretKey::from_bytes(&key.transport_seed());
-    let builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-        .secret_key(secret)
-        .alpns(vec![MAILBOX_NET_ALPN.to_vec()])
-        .bind_addr(bind)
-        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-    builder
-        .bind()
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))
+pub async fn bind_node(
+    key: &DeviceKey,
+    bind: &str,
+    choice: &crate::relay::RelayChoice,
+) -> Result<Endpoint> {
+    crate::relay::bind(key, bind, MAILBOX_NET_ALPN, choice).await
 }
 
 /// Serve ONE device connection at the node: authorize, then serve the

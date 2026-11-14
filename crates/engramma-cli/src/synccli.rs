@@ -14,6 +14,7 @@ use engramma_sync::keystore::KeyStore;
 use engramma_sync::pairing::Ticket;
 use engramma_sync::pairing_net;
 use engramma_sync::registry::DeviceRegistry;
+use engramma_sync::relay::{self, RelayChoice};
 use engramma_sync::serve;
 use engramma_sync::sharedcell::{self, SharedCell};
 
@@ -33,10 +34,14 @@ fn confirm_line(sas: &str) -> bool {
     )
 }
 
-/// `engramma devices invite [--no-relay]`: bind the pairing endpoint, print
-/// the ticket with the REAL address, wait (ten minutes, one use) for the
-/// device that enters.
-pub fn devices_invite(root: &std::path::Path, json: bool, no_relay: bool) -> Result<(), CliError> {
+/// `engramma devices invite [--relay <url>|--no-relay]`: bind the pairing
+/// endpoint, print the ticket with the REAL address, wait (ten minutes,
+/// one use) for the device that enters.
+pub fn devices_invite(
+    root: &std::path::Path,
+    json: bool,
+    flag: Option<RelayChoice>,
+) -> Result<(), CliError> {
     let root = root.to_path_buf();
     let dk = DeviceKey::load_or_create(&root).map_err(|e| CliError::internal(e.to_string()))?;
     let reg = DeviceRegistry::open(&root).map_err(|e| CliError::internal(e.to_string()))?;
@@ -49,6 +54,8 @@ pub fn devices_invite(root: &std::path::Path, json: bool, no_relay: bool) -> Res
         reg.create_first(&dk, "portatile")
             .map_err(|e| CliError::internal(e.to_string()))?;
     }
+    let choice =
+        relay::resolve(&root, flag.as_ref()).map_err(|e| CliError::internal(e.to_string()))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -56,12 +63,11 @@ pub fn devices_invite(root: &std::path::Path, json: bool, no_relay: bool) -> Res
     rt.block_on(async {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let endpoint = pairing_net::bind_pairing(&dk, "0.0.0.0:0")
+                let endpoint = pairing_net::bind_pairing(&dk, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
-                let ticket =
-                    pairing_net::ticket_of(&endpoint, if no_relay { None } else { Some("") })
-                        .map_err(|e| CliError::internal(e.to_string()))?;
+                let ticket = pairing_net::ticket_of(&endpoint)
+                    .map_err(|e| CliError::internal(e.to_string()))?;
                 let addrs = serve::direct_addresses(&endpoint);
                 if json {
                     print_json(&serde_json::json!({
@@ -99,17 +105,19 @@ pub fn devices_join(
     json: bool,
     ticket_or_code: &str,
     name: &str,
+    flag: Option<RelayChoice>,
 ) -> Result<(), CliError> {
     // the code way in meets at the blind node (P4)
     if !ticket_or_code.starts_with("engramma-invite-v1") {
         let root = root.to_path_buf();
-        return mailbox_join_with_code(&root, json, ticket_or_code, name);
+        return mailbox_join_with_code(&root, json, ticket_or_code, name, flag);
     }
-    let root = root.to_path_buf();
     let root = root.to_path_buf();
     let dk = DeviceKey::load_or_create(&root).map_err(|e| CliError::internal(e.to_string()))?;
     let ticket = Ticket::decode(ticket_or_code)
         .map_err(|e| CliError::usage(format!("biglietto non valido: {e}")))?;
+    let choice =
+        relay::resolve(&root, flag.as_ref()).map_err(|e| CliError::internal(e.to_string()))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -117,7 +125,7 @@ pub fn devices_join(
     rt.block_on(async {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let endpoint = pairing_net::bind_pairing(&dk, "0.0.0.0:0")
+                let endpoint = pairing_net::bind_pairing(&dk, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
                 let report = pairing_net::join(&endpoint, &ticket, name, &root, confirm_line)
@@ -141,12 +149,18 @@ pub fn devices_join(
     })
 }
 
-/// `engramma sync run`: one pass with every live device the book reaches,
-/// then the mailbox when one is configured. An unreachable device is a
-/// row of the summary, never an error.
-pub fn sync_run_cmd(root: &std::path::Path, json: bool) -> Result<(), CliError> {
+/// `engramma sync run [--relay <url>|--no-relay]`: one pass with every live
+/// device the book reaches, then the mailbox when one is configured. An
+/// unreachable device is a row of the summary, never an error.
+pub fn sync_run_cmd(
+    root: &std::path::Path,
+    json: bool,
+    flag: Option<RelayChoice>,
+) -> Result<(), CliError> {
     let root = root.to_path_buf();
     let dk = DeviceKey::load_or_create(&root).map_err(|e| CliError::internal(e.to_string()))?;
+    let choice =
+        relay::resolve(&root, flag.as_ref()).map_err(|e| CliError::internal(e.to_string()))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -154,7 +168,7 @@ pub fn sync_run_cmd(root: &std::path::Path, json: bool) -> Result<(), CliError> 
     let report = rt.block_on(async {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let endpoint = serve::bind(&dk, "0.0.0.0:0")
+                let endpoint = serve::bind(&dk, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
                 serve::run_pass(&root, &endpoint)
@@ -168,6 +182,7 @@ pub fn sync_run_cmd(root: &std::path::Path, json: bool) -> Result<(), CliError> 
             "devices": report.peers.iter().map(|p| serde_json::json!({
                 "name": p.name, "device": &p.device[..16.min(p.device.len())],
                 "reached": p.reached, "why_not": p.why_not,
+                "via": p.via,
             })).collect::<Vec<_>>(),
             "cells": report.cells.iter().map(|c| serde_json::json!({
                 "cell": c.name, "sent": c.sent, "received": c.received,
@@ -179,8 +194,10 @@ pub fn sync_run_cmd(root: &std::path::Path, json: bool) -> Result<(), CliError> 
         for p in &report.peers {
             match (&p.why_not, p.reached) {
                 (Some(why), _) => println!("{}: non raggiunto — {why}", p.name),
-                (None, true) => println!("{}: sessione fatta", p.name),
-                (None, false) => println!("{}: sessione fatta", p.name),
+                (None, _) => {
+                    let via = p.via.unwrap_or("diretta");
+                    println!("{}: sessione fatta ({})", p.name, via);
+                }
             }
         }
         for c in &report.cells {
@@ -193,12 +210,19 @@ pub fn sync_run_cmd(root: &std::path::Path, json: bool) -> Result<(), CliError> 
     Ok(())
 }
 
-/// `engramma sync serve`: accept (the gate first), sync at every local
-/// write (data_version, 2 s debounce) and every five minutes, stop clean
-/// on SIGINT/SIGTERM.
-pub fn sync_serve_cmd(root: &std::path::Path, json: bool) -> Result<(), CliError> {
+/// `engramma sync serve [--relay <url>|--no-relay]`: accept (the gate
+/// first), sync at every local write (data_version, 2 s debounce) and
+/// every five minutes, stop clean on SIGINT/SIGTERM. The relay choice is
+/// saved in the root: it is asked once, not at every start.
+pub fn sync_serve_cmd(
+    root: &std::path::Path,
+    json: bool,
+    flag: Option<RelayChoice>,
+) -> Result<(), CliError> {
     let root = root.to_path_buf();
     let dk = DeviceKey::load_or_create(&root).map_err(|e| CliError::internal(e.to_string()))?;
+    let choice =
+        relay::resolve(&root, flag.as_ref()).map_err(|e| CliError::internal(e.to_string()))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -206,7 +230,7 @@ pub fn sync_serve_cmd(root: &std::path::Path, json: bool) -> Result<(), CliError
     rt.block_on(async {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let endpoint = serve::bind(&dk, "0.0.0.0:0")
+                let endpoint = serve::bind(&dk, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
                 let addrs = serve::direct_addresses(&endpoint);
@@ -541,11 +565,15 @@ pub fn devices_remove_cmd(root: &std::path::Path, json: bool, name: &str) -> Res
 // the blind mailbox (P4)
 // ---------------------------------------------------------------------------
 
-/// `engramma mailbox serve --root <dir>`: the node that stores sealed
-/// envelopes for the device lists it knows, indexes by opaque id and
-/// nothing else, and meets the short codes.
-pub fn mailbox_serve_cmd(json: bool, dir: &std::path::Path) -> Result<(), CliError> {
-    crate::mailboxcli::serve(json, dir)
+/// `engramma mailbox serve --root <dir> [--relay <url>|--no-relay]`: the
+/// node that stores sealed envelopes for the device lists it knows,
+/// indexes by opaque id and nothing else, and meets the short codes.
+pub fn mailbox_serve_cmd(
+    json: bool,
+    dir: &std::path::Path,
+    flag: Option<RelayChoice>,
+) -> Result<(), CliError> {
+    crate::mailboxcli::serve(json, dir, flag)
 }
 
 /// `engramma mailbox add <ticket>`: register the node in the owner's list
@@ -570,6 +598,7 @@ fn mailbox_join_with_code(
     json: bool,
     code: &str,
     name: &str,
+    flag: Option<RelayChoice>,
 ) -> Result<(), CliError> {
-    crate::mailboxcli::join_with_code(root, json, code, name)
+    crate::mailboxcli::join_with_code(root, json, code, name, flag)
 }

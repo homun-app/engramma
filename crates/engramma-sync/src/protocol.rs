@@ -107,23 +107,17 @@ pub struct SessionCtx<'a> {
     pub cells: Vec<&'a dyn SyncedCell>,
 }
 
-/// Bind the sync endpoint: our TRANSPORT key, loopback in tests, the
-/// relay off by default (the direct path; the relay path rides the same
-/// protocol through a relay map).
+/// Bind the sync endpoint: our TRANSPORT key and the one relay-aware
+/// builder of the sync road (R2) — see [`crate::relay`].
 ///
 /// # Errors
 /// [`Error::Io`] when iroh cannot bind.
-pub async fn bind_endpoint(key: &DeviceKey, bind: &str) -> Result<Endpoint> {
-    let secret = iroh::SecretKey::from_bytes(&key.transport_seed());
-    let builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-        .secret_key(secret)
-        .alpns(vec![ALPN.to_vec()])
-        .bind_addr(bind)
-        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-    builder
-        .bind()
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))
+pub async fn bind_endpoint(
+    key: &DeviceKey,
+    bind: &str,
+    choice: &crate::relay::RelayChoice,
+) -> Result<Endpoint> {
+    crate::relay::bind(key, bind, ALPN, choice).await
 }
 
 /// Connect to a peer.

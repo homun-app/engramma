@@ -475,6 +475,31 @@ enum ModelAction {
     Use { id: String },
 }
 
+/// The relay flags every command that binds an endpoint carries (R2):
+/// `--relay <url>` for one's own, `--no-relay` for direct connections only,
+/// nothing for the saved choice (n0's public relays when nothing is saved).
+#[derive(clap::Args)]
+struct RelayArgs {
+    /// A relay of one's own (https://host:port)
+    #[arg(long, conflicts_with = "no_relay")]
+    relay: Option<String>,
+    /// No relay: direct connections only
+    #[arg(long)]
+    no_relay: bool,
+}
+
+/// The flags to the sync layer's resolver: `Some` when given explicitly
+/// (it wins over what is saved), `None` when the saved choice rules.
+fn relay_flag(args: &RelayArgs) -> Option<engramma_sync::relay::RelayChoice> {
+    if let Some(url) = &args.relay {
+        Some(engramma_sync::relay::RelayChoice::Own(url.clone()))
+    } else if args.no_relay {
+        Some(engramma_sync::relay::RelayChoice::Disabled)
+    } else {
+        None
+    }
+}
+
 #[derive(Subcommand)]
 enum DevicesAction {
     /// Create the device key (or show the existing one)
@@ -482,12 +507,14 @@ enum DevicesAction {
     /// Bind the pairing endpoint and print the invite ticket with the real
     /// address; waits (10 minutes, one use) for the device that enters
     Invite {
-        /// No relay in the ticket: direct addresses only
-        #[arg(long)]
-        no_relay: bool,
+        #[command(flatten)]
+        relay: RelayArgs,
     },
     /// Print a short pairing code
-    Code,
+    Code {
+        #[command(flatten)]
+        relay: RelayArgs,
+    },
     /// Join with a ticket or a code
     Join {
         /// The ticket (textual) or the code (NUMBER-WORD-WORD)
@@ -495,6 +522,8 @@ enum DevicesAction {
         /// This device's name
         #[arg(long)]
         name: String,
+        #[command(flatten)]
+        relay: RelayArgs,
     },
     /// List the devices (name, short id, last contact, epochs)
     List,
@@ -511,9 +540,15 @@ enum SyncAction {
     /// Stop sharing a cell from here (copies elsewhere stay)
     Unshare { cell: String },
     /// One pass with every reachable device and the mailbox, then exit
-    Run,
+    Run {
+        #[command(flatten)]
+        relay: RelayArgs,
+    },
     /// Serve: sync on every local write and every 5 minutes
-    Serve,
+    Serve {
+        #[command(flatten)]
+        relay: RelayArgs,
+    },
     /// Per cell: devices, last session, pending ops, frontier, epoch
     Status,
     /// The conflict copies this copy holds
@@ -527,6 +562,8 @@ enum MailboxAction {
         /// The node's data root
         #[arg(long)]
         root: PathBuf,
+        #[command(flatten)]
+        relay: RelayArgs,
     },
     /// Add the mailbox to this data root's device list
     Add { ticket: String },
@@ -3412,12 +3449,15 @@ fn devices_run(cli: &Cli, action: &DevicesAction) -> Result<(), CliError> {
             }
             Ok(())
         }
-        DevicesAction::Invite { no_relay } => synccli::devices_invite(&r, cli.json, *no_relay),
-        DevicesAction::Code => crate::mailboxcli::devices_code(&r, cli.json),
+        DevicesAction::Invite { relay } => {
+            synccli::devices_invite(&r, cli.json, relay_flag(relay))
+        }
+        DevicesAction::Code { relay } => crate::mailboxcli::devices_code(&r, cli.json, relay_flag(relay)),
         DevicesAction::Join {
             ticket_or_code,
             name,
-        } => synccli::devices_join(&r, cli.json, ticket_or_code, name),
+            relay,
+        } => synccli::devices_join(&r, cli.json, ticket_or_code, name, relay_flag(relay)),
         DevicesAction::List => {
             let reg = DeviceRegistry::open(&r).map_err(|e| CliError::internal(e.to_string()))?;
             let members = reg
@@ -3479,8 +3519,8 @@ fn sync_run(cli: &Cli, action: &SyncAction) -> Result<(), CliError> {
             synccli::sync_share_cmd(&r, cli.json, cell, &path)
         }
         SyncAction::Unshare { cell } => synccli::sync_unshare_cmd(&r, cli.json, cell),
-        SyncAction::Run => synccli::sync_run_cmd(&r, cli.json),
-        SyncAction::Serve => synccli::sync_serve_cmd(&r, cli.json),
+        SyncAction::Run { relay } => synccli::sync_run_cmd(&r, cli.json, relay_flag(relay)),
+        SyncAction::Serve { relay } => synccli::sync_serve_cmd(&r, cli.json, relay_flag(relay)),
         SyncAction::Status => {
             let cells = engramma_sync::sharedcell::SharedCell::all_of(&r)
                 .map_err(|e| CliError::internal(e.to_string()))?;
@@ -3580,7 +3620,9 @@ fn sync_run(cli: &Cli, action: &SyncAction) -> Result<(), CliError> {
 fn mailbox_run(cli: &Cli, action: &MailboxAction) -> Result<(), CliError> {
     let r = root(cli);
     match action {
-        MailboxAction::Serve { root: dir } => synccli::mailbox_serve_cmd(cli.json, dir),
+        MailboxAction::Serve { root: dir, relay } => {
+            synccli::mailbox_serve_cmd(cli.json, dir, relay_flag(relay))
+        }
         MailboxAction::Add { ticket } => synccli::mailbox_add_cmd(&r, cli.json, ticket),
         MailboxAction::Remove => synccli::mailbox_remove_cmd(&r, cli.json),
         MailboxAction::Status => synccli::mailbox_status_cmd(&r, cli.json),

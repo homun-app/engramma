@@ -159,6 +159,8 @@ pub struct PeerOutcome {
     pub reached: bool,
     /// Why not, when it did not (one line, no note text).
     pub why_not: Option<String>,
+    /// Which road the session rode (R2): `"diretta"` or `"relay"`.
+    pub via: Option<&'static str>,
 }
 
 /// One cell's row of the pass summary.
@@ -189,12 +191,27 @@ pub struct PassReport {
     pub cells: Vec<CellSummary>,
 }
 
-/// Bind this root's sync endpoint (the transport key of the device key).
+/// Bind this root's sync endpoint (the transport key of the device key),
+/// with the root's relay choice (R2).
 ///
 /// # Errors
 /// [`Error::Io`] when iroh cannot bind.
-pub async fn bind(key: &DeviceKey, bind_addr: &str) -> Result<Endpoint> {
-    bind_endpoint(key, bind_addr).await
+pub async fn bind(
+    key: &DeviceKey,
+    bind_addr: &str,
+    choice: &crate::relay::RelayChoice,
+) -> Result<Endpoint> {
+    bind_endpoint(key, bind_addr, choice).await
+}
+
+/// What one session did, for the pass summary: the protocol's own report
+/// and which road the connection rode (R2).
+#[derive(Debug)]
+pub struct SessionOutcome {
+    /// The protocol's per-cell report.
+    pub report: protocol::SessionReport,
+    /// `"diretta"` or `"relay"`.
+    pub via: &'static str,
 }
 
 /// Run ONE session as the initiator against one peer, over an already
@@ -208,7 +225,7 @@ pub async fn session_with(
     conn: Connection,
     peer_device: &str,
     peer_addr: &EndpointAddr,
-) -> Result<protocol::SessionReport> {
+) -> Result<SessionOutcome> {
     let registry = DeviceRegistry::open(root)?;
     let dk = DeviceKey::load_or_create(root)?;
     let cells = SharedCell::all_of(root)?;
@@ -227,16 +244,18 @@ pub async fn session_with(
     };
     // a bounded session: a wedged exchange must not hang the pass (the
     // one-shot run above all — nothing else would ever unblock it)
-    let report = tokio::time::timeout(Duration::from_secs(90), run_initiator(conn, &ctx))
+    let report = tokio::time::timeout(Duration::from_secs(90), run_initiator(conn.clone(), &ctx))
         .await
         .map_err(|_| Error::Malformed("la sessione non è finita in 90 s".into()))??;
+    // which road the session rode (the connection outlives the exchange)
+    let via = via_of_conn(&conn);
     // the session ended: both sides hold the same sets — the acks move the
     // frontier, ours for them
     for shared in &cells {
         shared.cell().record_session_ack(peer_device).ok();
     }
     remember_addr(root, peer_device, peer_addr)?;
-    Ok(report)
+    Ok(SessionOutcome { report, via })
 }
 
 /// Serve ONE inbound session (the gate already passed).
@@ -261,6 +280,21 @@ pub async fn answer_session(root: &Path, conn: Connection) -> Result<protocol::S
         cells: cells.iter().map(|c| c as &dyn SyncedCell).collect(),
     };
     run_answerer(conn, &ctx).await
+}
+
+/// Which road a connection rode (R2): the SELECTED path says it — a relay
+/// transport or a direct IP one. The summary's per-device line carries it.
+#[must_use]
+pub fn via_of_conn(conn: &Connection) -> &'static str {
+    let paths = conn.paths();
+    if let Some(path) = paths.iter().find(|p| p.is_selected()) {
+        return if path.is_relay() { "relay" } else { "diretta" };
+    }
+    if paths.iter().any(|p| p.is_relay()) {
+        "relay"
+    } else {
+        "diretta"
+    }
 }
 
 /// The device id this root is.
@@ -303,6 +337,7 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
                 device: member.device.clone(),
                 reached: false,
                 why_not: Some("nessun indirizzo noto: servono un invito o una sessione".into()),
+                via: None,
             });
             continue;
         };
@@ -314,6 +349,7 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
                     device: member.device.clone(),
                     reached: false,
                     why_not: Some(format!("indirizzo inutilizzabile: {e}")),
+                    via: None,
                 });
                 continue;
             }
@@ -326,16 +362,18 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
             connect(endpoint, endpoint_addr.clone()),
         )
         .await;
+        let mut via = None;
         let outcome = match dialed {
             Err(_) => Err("timeout della connessione (10 s)".to_string()),
             Ok(Ok(conn)) => match session_with(root, conn, &member.device, &endpoint_addr).await {
                 Ok(session) => {
-                    for cell in &session.cells {
+                    for cell in &session.report.cells {
                         let entry = per_cell.entry(cell.sync_id.clone()).or_insert((0, 0, 0));
                         entry.0 += cell.sent;
                         entry.1 += cell.received;
                         entry.2 += cell.refused;
                     }
+                    via = Some(session.via);
                     Ok(())
                 }
                 Err(e) => Err(e.to_string()),
@@ -347,6 +385,7 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
             device: member.device.clone(),
             reached: outcome.is_ok(),
             why_not: outcome.err(),
+            via,
         });
     }
     for shared in SharedCell::all_of(root)? {

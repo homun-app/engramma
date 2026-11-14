@@ -14,6 +14,7 @@ pub mod mailbox_net;
 pub mod pairing;
 pub mod pairing_net;
 pub mod protocol;
+pub mod relay;
 pub mod registry;
 pub mod serve;
 pub mod sharedcell;

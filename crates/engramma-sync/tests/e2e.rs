@@ -191,8 +191,8 @@ async fn two_devices_converge_over_loopback() {
         .unwrap(/* t */);
     let b = fx.side_b();
 
-    let ep_a = bind_endpoint(&fx.key_a, "127.0.0.1:0").await.unwrap(/* t */);
-    let ep_b = bind_endpoint(&fx.key_b, "127.0.0.1:0").await.unwrap(/* t */);
+    let ep_a = bind_endpoint(&fx.key_a, "127.0.0.1:0", &engramma_sync::relay::RelayChoice::Disabled).await.unwrap(/* t */);
+    let ep_b = bind_endpoint(&fx.key_b, "127.0.0.1:0", &engramma_sync::relay::RelayChoice::Disabled).await.unwrap(/* t */);
     let addr_a = ep_a.addr();
 
     // the SQLite handles are not Send: everything on the current thread

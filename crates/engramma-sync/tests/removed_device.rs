@@ -110,7 +110,7 @@ impl Fixture {
         let reg = DeviceRegistry::open(self.dir_a.path()).unwrap(/* t */);
         cell.set_signer(std::sync::Arc::new(DeviceSigner::new(&self.key_a)))
             .unwrap(/* t */);
-        SharedCell::new(cell, reg, self.sync_id)
+        SharedCell::new(cell, reg, self.sync_id, self.dir_a.path())
     }
 
     /// B's side: a bare cell, epoch 0 in its keystore, the signer armed.
@@ -137,7 +137,7 @@ impl Fixture {
         cell.set_signer(std::sync::Arc::new(DeviceSigner::new(&self.key_b)))
             .unwrap(/* t */);
         cell.mark_shared().unwrap(/* t */);
-        SharedCell::new(cell, reg, self.sync_id)
+        SharedCell::new(cell, reg, self.sync_id, self.dir_b.path())
     }
 }
 

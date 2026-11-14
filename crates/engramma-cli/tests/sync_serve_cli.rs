@@ -129,7 +129,7 @@ impl Root {
 
 /// The pairing helper: A invites (waiting), B joins, both SAS confirmed.
 fn pair(a: &Root, b: &Root, b_name: &str) {
-    let mut inviter = Daemon::spawn(&a.root, &["devices", "invite"]);
+    let mut inviter = Daemon::spawn(&a.root, &["devices", "invite", "--no-relay"]);
     // feed the inviter's stdin: not piped here — the invite reads one line
     // at its prompt, so run it through `yes s`-style piping instead
     inviter.child.kill().ok();
@@ -138,7 +138,7 @@ fn pair(a: &Root, b: &Root, b_name: &str) {
     let mut child = bin()
         .arg("--root")
         .arg(&a.root)
-        .args(["devices", "invite"])
+        .args(["devices", "invite", "--no-relay"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -162,7 +162,7 @@ fn pair(a: &Root, b: &Root, b_name: &str) {
     let join = bin()
         .arg("--root")
         .arg(&b.root)
-        .args(["devices", "join", &ticket, "--name", b_name])
+        .args(["devices", "join", "--no-relay", &ticket, "--name", b_name])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -240,7 +240,7 @@ fn serve_receives_and_converges_beside_a_second_writer() {
     assert!(ok, "share: {err}");
     pair(&a, &b, "mac");
     // A serves; its address reaches B's book
-    let serve = Daemon::spawn(&a.root, &["--json", "sync", "serve"]);
+    let serve = Daemon::spawn(&a.root, &["--json", "sync", "serve", "--no-relay"]);
     let v = serve.first_json();
     let addrs: Vec<String> = v["addrs"]
         .as_array()
@@ -272,13 +272,13 @@ fn serve_receives_and_converges_beside_a_second_writer() {
     );
     let _ = (ok, err);
     // B's one pass reaches A
-    let (ok, out, err) = run(&b.root, &["--json", "sync", "run"]);
+    let (ok, out, err) = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
     assert!(ok, "run: {err}");
     assert!(out.contains("memoria"), "the summary names the cell: {out}");
     // a second pass settles whatever arrived between the purge and the
     // session (the daemon synced it on its own trigger)
     std::thread::sleep(Duration::from_secs(4));
-    let _ = run(&b.root, &["--json", "sync", "run"]);
+    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
     // the three copies of the truth agree: A, B, and A's own verify
     let ca = Cell::open(&a.cell_path("memoria")).unwrap(/* t */);
     let cb = Cell::open(&b.cell_path("memoria")).unwrap(/* t */);
@@ -315,7 +315,7 @@ fn the_blind_node_carries_and_forgets() {
     // the node serves
     let mut node_cmd = bin();
     node_cmd
-        .args(["--json", "mailbox", "serve", "--root"])
+        .args(["--json", "mailbox", "serve", "--no-relay", "--root"])
         .arg(&node_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -344,7 +344,7 @@ fn the_blind_node_carries_and_forgets() {
     let (ok, _, err) = run(&b.root, &["mailbox", "add", &ticket]);
     assert!(ok, "B registers: {err}");
     // A goes away (no serve daemon): B pushes to and pulls from the node
-    let (ok, _out, err) = run(&b.root, &["--json", "sync", "run"]);
+    let (ok, _out, err) = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
     assert!(ok, "B's pass (node only): {err}");
     // B purges the secret note, then tells the node at the next pass
     let (ok, _, err) = run(
@@ -359,7 +359,7 @@ fn the_blind_node_carries_and_forgets() {
         ],
     );
     assert!(ok, "B purges: {err}");
-    let _ = run(&b.root, &["--json", "sync", "run"]);
+    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
     // the node's file holds no note text and no op id — ciphertext only
     let bytes = std::fs::read(node_root.join("mailbox.db"))
         .expect(/* the node's store */ "mailbox.db");
@@ -411,7 +411,7 @@ fn three_devices_concurrent_and_one_returns() {
     pair(&a, &b, "mac");
     pair(&a, &c, "telefono");
     // A serves; B and C know its address and run passes
-    let serve = Daemon::spawn(&a.root, &["--json", "sync", "serve"]);
+    let serve = Daemon::spawn(&a.root, &["--json", "sync", "serve", "--no-relay"]);
     let v = serve.first_json();
     let addrs: Vec<String> = v["addrs"]
         .as_array()
@@ -434,8 +434,8 @@ fn three_devices_concurrent_and_one_returns() {
     for r in [&b.root, &c.root] {
         remember_all(r, &a_device, &node, &addrs);
     }
-    let _ = run(&b.root, &["--json", "sync", "run"]);
-    let _ = run(&c.root, &["--json", "sync", "run"]);
+    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+    let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
     // concurrent writes on all three, through the CLI: every local write
     // of the sync era carries its device and signature, or the peers'
     // gate refuses it
@@ -444,25 +444,25 @@ fn three_devices_concurrent_and_one_returns() {
     }
     // the passes cross: A's daemon syncs on its own writes, B and C run
     std::thread::sleep(Duration::from_secs(4));
-    let _ = run(&b.root, &["--json", "sync", "run"]);
-    let _ = run(&c.root, &["--json", "sync", "run"]);
+    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+    let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
     std::thread::sleep(Duration::from_secs(4));
-    let _ = run(&b.root, &["--json", "sync", "run"]);
-    let _ = run(&c.root, &["--json", "sync", "run"]);
+    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+    let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
     // C goes away; A and B keep writing
     for (root, who) in [(&a.root, "A2"), (&b.root, "B2")] {
         add_note(root, who);
     }
     std::thread::sleep(Duration::from_secs(4));
-    let _ = run(&b.root, &["--json", "sync", "run"]);
+    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
     // C comes back; the pull-only topology settles in rounds (each run
     // pulls what the peer had, the daemon pushes nothing — rounds until
     // the three digests agree, as many passes as the truth needs)
     let digests: Vec<String>;
     let mut rounds = 0;
     loop {
-        let _ = run(&c.root, &["--json", "sync", "run"]);
-        let (ok, out, err) = run(&b.root, &["--json", "sync", "run"]);
+        let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
+        let (ok, out, err) = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
         eprintln!("B RUN ok={ok} err={err} out={out}");
         std::thread::sleep(Duration::from_secs(2));
         let d: Vec<String> = [&a, &b, &c]

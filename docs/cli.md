@@ -344,9 +344,9 @@ The human surface of the HTTP authorization flow (state in
 ## `engramma devices` (v0.6.1)
 
 - `init` — crea `device.key` (o mostra l'esistente) e il primo dispositivo dell'elenco
-- `invite [--no-relay]` — lega l'endpoint, stampa il biglietto con l'indirizzo vero e resta in attesa (10 minuti, un uso); SPAKE2 sul segreto, conferma di chiave RFC 9382, sei cifre su entrambi gli schermi
-- `code` — apre il canale sul nodo cieco e stampa il codice breve (`7-tigre-lago`); dopo le sei cifre un biglietto fresco passa sigillato nel relay e l'ingresso corre in diretta
-- `join <biglietto-o-codice> --name <nome>` — l'ingresso (biglietto in diretta, codice tramite il nodo); le sei cifre si confermano su entrambi
+- `invite [--relay <url>|--no-relay]` — lega l'endpoint, stampa il biglietto con l'indirizzo vero e resta in attesa (10 minuti, un uso); SPAKE2 sul segreto, conferma di chiave RFC 9382, sei cifre su entrambi gli schermi
+- `code [--relay <url>|--no-relay]` — apre il canale sul nodo cieco e stampa il codice breve (`7-tigre-lago`); dopo le sei cifre un biglietto fresco passa sigillato nel relay e l'ingresso corre in diretta
+- `join <biglietto-o-codice> --name <nome> [--relay <url>|--no-relay]` — l'ingresso (biglietto in diretta, codice tramite il nodo); le sei cifre si confermano su entrambi
 - `list` — nome, id corto, chiave di trasporto
 - `remove <nome>` — la `remove` firmata con la radice e il conto dell'insieme accettato, l'epoca nuova di ogni cella condivisa, le chiavi avvolte per i rimasti; tutto raggiunge gli altri alla sessione successiva. Ciò che il rimosso aveva lo tiene
 - `log` — il registro dell'elenco, con le firme
@@ -355,14 +355,14 @@ The human surface of the HTTP authorization flow (state in
 
 - `share <cella>` — `adopt` + epoca 0; dopo la conferma la cella viaggia verso tutti i dispositivi
 - `unshare <cella>` — smette da qui; le copie altrove restano (e lo dice)
-- `run` — una passata con ogni dispositivo vivo raggiungibile e il nodo cieco configurato, poi esce; il riepilogo JSON dice inviate/ricevute/rifiuti/conflitti/frontiera per cella, e per dispositivo se la sessione è avvenuta (un irraggiungibile è una riga, non un errore)
-- `serve` — in ascolto (ALPN `engramma/sync/1`), cancello all'accettazione, sincronizza a ogni scrittura locale (rimbalzo 2 s) e ogni 5 minuti; stop pulito su SIGINT/SIGTERM; convive con un altro processo che scrive sulla stessa radice
+- `run [--relay <url>|--no-relay]` — una passata con ogni dispositivo vivo raggiungibile e il nodo cieco configurato, poi esce; il riepilogo JSON dice inviate/ricevute/rifiuti/conflitti/frontiera per cella, e per dispositivo se la sessione è avvenuta e per quale strada (diretta o via relay) — un irraggiungibile è una riga, non un errore
+- `serve [--relay <url>|--no-relay]` — in ascolto (ALPN `engramma/sync/1`), cancello all'accettazione, sincronizza a ogni scrittura locale (rimbalzo 2 s) e ogni 5 minuti; stop pulito su SIGINT/SIGTERM; convive con un altro processo che scrive sulla stessa radice. La scelta del relay si salva nella radice: la si dà una volta, non a ogni avvio (un flag esplicito vince)
 - `status` — per cella: dispositivi, ultima sessione, operazioni in attesa, frontiera stabile, epoca
 - `conflicts` — le copie di conflitto che questa copia tiene
 
 ## `engramma mailbox` (v0.6.1)
 
-- `serve --root <dir>` — il nodo cieco in esecuzione (ALPN `engramma/mailbox/1`, ritenzione 180 giorni): stampa il proprio biglietto, deposito/enumerazione/consegna, purge firmata, incontro dei codici
+- `serve --root <dir> [--relay <url>|--no-relay]` — il nodo cieco in esecuzione (ALPN `engramma/mailbox/1`, ritenzione 180 giorni): stampa il proprio biglietto, deposito/enumerazione/consegna, purge firmata, incontro dei codici
 - `add <biglietto del nodo>` — registra il nodo e gli consegna l'elenco firmato
 - `status` — ultimo contatto, buste conservate (conteggio e byte, chiesti al nodo), ritenzione
 - `remove` — la radice lo dimentica

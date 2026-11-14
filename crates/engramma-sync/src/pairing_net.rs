@@ -91,27 +91,35 @@ fn io_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> Error {
     Error::Io(std::io::Error::other(e))
 }
 
-/// Bind the pairing endpoint of one root.
+/// Bind the pairing endpoint of one root: the one relay-aware builder of
+/// the sync road (R2) — see [`crate::relay`].
 ///
 /// # Errors
 /// [`Error::Io`] when iroh cannot bind.
-pub async fn bind_pairing(key: &DeviceKey, bind: &str) -> Result<Endpoint> {
-    let secret = iroh::SecretKey::from_bytes(&key.transport_seed());
-    let builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-        .secret_key(secret)
-        .alpns(vec![PAIRING_ALPN.to_vec()])
-        .bind_addr(bind)
-        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-    builder
-        .bind()
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))
+pub async fn bind_pairing(
+    key: &DeviceKey,
+    bind: &str,
+    choice: &crate::relay::RelayChoice,
+) -> Result<Endpoint> {
+    crate::relay::bind(key, bind, PAIRING_ALPN, choice).await
 }
 
 /// The ticket an inviter mints from its LIVE endpoint: node id, direct
-/// addresses, the relay when there is one (`--no-relay` leaves it out).
-pub fn ticket_of(endpoint: &Endpoint, relay: Option<&str>) -> Result<Ticket> {
+/// addresses, and the RELAY the endpoint actually rides (R2) — the own
+/// relay's URL when `--relay` chose one, one of n0's when the default
+/// rules, none with `--no-relay`. The endpoint knows which: its address
+/// carries the relay it is connected to.
+pub fn ticket_of(endpoint: &Endpoint) -> Result<Ticket> {
     let addrs = crate::serve::direct_addresses(endpoint);
+    let relay = endpoint
+        .addr()
+        .addrs
+        .iter()
+        .find_map(|a| match a {
+            iroh::TransportAddr::Relay(url) => Some(url.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -124,7 +132,7 @@ pub fn ticket_of(endpoint: &Endpoint, relay: Option<&str>) -> Result<Ticket> {
             .to_vec()
             .try_into()
             .unwrap_or([0; 32]),
-        relay.unwrap_or_default(),
+        &relay,
         &addrs,
         now,
     )
@@ -364,7 +372,9 @@ pub async fn join(
     let before = registry.rows_json().len();
     registry.arrive_rows(reg_frame["ops"].as_array().unwrap_or(&Vec::new()))?;
     // the address book learns the inviter's endpoint (the address we
-    // dialed is the best there is)
+    // dialed is the best there is) — the ticket's relay rides with it
+    // (R2: without the relay URL, a device behind NAT would never be
+    // reachable again)
     if let Some(inviter) = reg_frame.get("device").and_then(Value::as_str)
         && let Ok(node) = iroh::PublicKey::from_bytes(&ticket.node_id)
     {
@@ -374,6 +384,9 @@ pub async fn join(
                 if let Ok(ip) = a.parse() {
                     addr = addr.with_ip_addr(ip);
                 }
+            }
+            if let Ok(relay) = ticket.relay.parse() {
+                addr = addr.with_relay_url(relay);
             }
             crate::serve::remember_addr(root, inviter, &addr).ok();
         }
