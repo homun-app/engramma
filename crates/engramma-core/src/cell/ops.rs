@@ -2348,6 +2348,10 @@ fn forget_payload(tx: &Transaction<'_>, op_id: &str) -> Result<(), CellError> {
 /// content in, or claims a field the rule never writes, fails this and the
 /// op is refused. This is the whole point: the identity stopped covering the
 /// payload, so the shape is what bounds what a censored payload may say.
+///
+/// The kept strings must also be WHAT THEY CLAIM (R6, v0.6.1): the ids are
+/// ULIDs, the closings parse as a `Validity`, the timestamps as an RFC 3339
+/// `At` — the keys alone left a live device a place to hide text.
 #[must_use]
 pub fn censor_shape_ok(op: &Op) -> bool {
     let Some(body) = &op.body else {
@@ -2357,6 +2361,11 @@ pub fn censor_shape_ok(op: &Op) -> bool {
         return false;
     };
     let is_str = |v: &Value| v.is_string();
+    let is_ulid = |v: &Value| v.as_str().is_some_and(|s| Ulid::from_string(s).is_ok());
+    let is_validity =
+        |v: &Value| v.as_str().is_some_and(|s| crate::format::Validity::parse(s).is_ok());
+    let is_at =
+        |v: &Value| v.as_str().is_some_and(|s| crate::format::At::parse(s).is_ok());
     match op.kind {
         OpKind::Supersede => {
             // {old_id?, valid_to?, old_updated_at?, note: null} — the closing
@@ -2368,9 +2377,9 @@ pub fn censor_shape_ok(op: &Op) -> bool {
                         "old_id" | "valid_to" | "old_updated_at" | "note"
                     )
                 })
-                && fields.get("old_id").is_none_or(is_str)
-                && fields.get("valid_to").is_none_or(is_str)
-                && fields.get("old_updated_at").is_none_or(is_str)
+                && fields.get("old_id").is_none_or(is_ulid)
+                && fields.get("valid_to").is_none_or(is_validity)
+                && fields.get("old_updated_at").is_none_or(is_at)
         }
         OpKind::Decide => {
             // an accepted supersede proposal: {proposal, decision:
@@ -2378,10 +2387,10 @@ pub fn censor_shape_ok(op: &Op) -> bool {
             // decided_at?}
             fields.get("decision").and_then(Value::as_str) == Some("accept")
                 && fields.get("censored") == Some(&Value::Bool(true))
-                && fields.get("proposal").is_some_and(is_str)
-                && fields.get("target").is_some_and(is_str)
-                && fields.get("target_closing").is_none_or(is_str)
-                && fields.get("decided_at").is_none_or(is_str)
+                && fields.get("proposal").is_some_and(is_ulid)
+                && fields.get("target").is_some_and(is_ulid)
+                && fields.get("target_closing").is_none_or(is_validity)
+                && fields.get("decided_at").is_none_or(is_at)
                 && fields.keys().all(|k| {
                     matches!(
                         k.as_str(),
@@ -2401,7 +2410,7 @@ pub fn censor_shape_ok(op: &Op) -> bool {
             // verbatim: an object, never free-form text
             fields.get("censored") == Some(&Value::Bool(true))
                 && fields.get("decision").is_none_or(is_str)
-                && fields.get("decided_at").is_none_or(is_str)
+                && fields.get("decided_at").is_none_or(is_at)
                 && fields
                     .get("restore_target")
                     .is_none_or(|v| v.is_object() || v.is_null())

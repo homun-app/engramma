@@ -256,9 +256,12 @@ impl Signer for FakeSigner {
     }
 }
 
-/// The property the phase asks for (P0.5): the `content_hash` and the `sig`
-/// of every operation are IDENTICAL after `purge`, after censorship, and
-/// after `compact` — the payload state may change, the identity never does.
+/// The property the phase asks for (P0.5), as a PROPERTEST on generated
+/// histories (R6, v0.6.1): the `content_hash`, the `sig` and the payload
+/// digest of every operation are IDENTICAL after `purge`, after
+/// censorship, and after `compact` at a generated cut — the payload state
+/// may change, the identity never does. The fixed test above keeps the
+/// reviewer's exact scenario; this one sweeps the space.
 #[test]
 fn purge_compact_and_censorship_never_move_the_identity() {
     let dir = tempfile::tempdir().unwrap(/* t */);
@@ -403,4 +406,175 @@ fn purge_compact_and_censorship_never_move_the_identity() {
         );
     }
     assert!(cell.verify().unwrap(/* t */).ok());
+}
+
+// ---------------------------------------------------------------------------
+// the property as a proptest (R6, v0.6.1): generated histories, generated
+// purges, a generated compaction cut — the identity never moves
+// ---------------------------------------------------------------------------
+
+use proptest::prelude::*;
+
+/// One generated step of a history: what to write, and on which note.
+#[derive(Debug, Clone)]
+enum Step {
+    Put(u16),
+    Patch(u16),
+    Delete(u16),
+    Supersede(u16),
+    Purge(u16),
+}
+
+fn step_strategy() -> impl Strategy<Value = Step> {
+    prop_oneof![
+        (0u16..6).prop_map(Step::Put),
+        any::<u16>().prop_map(Step::Patch),
+        any::<u16>().prop_map(Step::Delete),
+        any::<u16>().prop_map(Step::Supersede),
+        any::<u16>().prop_map(Step::Purge),
+    ]
+}
+
+fn word() -> impl Strategy<Value = String> {
+    prop::collection::vec(any::<u16>(), 1..8).prop_map(|v| {
+        v.iter()
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect()
+    })
+}
+
+fn body() -> impl Strategy<Value = String> {
+    prop::collection::vec(word(), 1..4).prop_map(|parts| parts.join(" "))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// purge, censorship and compaction never move the identity, on any
+    /// generated history and any generated cut.
+    #[test]
+    fn the_identity_never_moves_on_generated_histories(
+        steps in prop::collection::vec(step_strategy(), 1..24),
+        bodies in prop::collection::vec(body(), 1..24),
+        cut in 0.0f64..1.0,
+    ) {
+        let dir = tempfile::tempdir().unwrap(/* t */);
+        let cell = Cell::create(&dir.path().join("g.sqlite"), "gen", "device-a")
+            .unwrap(/* t */);
+        cell.set_signer(std::sync::Arc::new(FakeSigner {
+            device: "fakesigningdevice".into(),
+            key: [11; 32],
+        }))
+        .unwrap(/* t */);
+
+        // run the generated history: impossible steps (a patch of a note
+        // that is not there) are skipped — the history is what DID happen
+        let mut living: Vec<Ulid> = Vec::new();
+        let mut next_id = 100_u32;
+        for (i, step) in steps.iter().enumerate() {
+            let text = bodies[i % bodies.len()].clone();
+            let pick = |living: &[Ulid], i: usize| living[i % living.len()];
+            match step {
+                Step::Put(_) => {
+                    let n = note(next_id, &text);
+                    next_id += 1;
+                    if cell.put_note(&n, "device-a").is_ok() {
+                        living.push(n.id);
+                    }
+                }
+                Step::Patch(k) => {
+                    if !living.is_empty() {
+                        let _ = cell.patch_note(
+                            &pick(&living, *k as usize),
+                            &NotePatch { body: Some(text), ..Default::default() },
+                            "device-a",
+                        );
+                    }
+                }
+                Step::Delete(k) => {
+                    if !living.is_empty() {
+                        let _ = cell.delete_note(&pick(&living, *k as usize), "device-a");
+                    }
+                }
+                Step::Supersede(k) => {
+                    if !living.is_empty() {
+                        let old = pick(&living, *k as usize);
+                        let mut new = note(next_id, &text);
+                        next_id += 1;
+                        new.supersedes = vec![old];
+                        if cell.supersede(&old, &new, None, "device-a").is_ok() {
+                            living.retain(|id| *id != old);
+                            living.push(new.id);
+                        }
+                    }
+                }
+                Step::Purge(k) => {
+                    if !living.is_empty() {
+                        let id = pick(&living, *k as usize);
+                        if cell.purge(&id, "oblio", "device-a").is_ok() {
+                            living.retain(|x| *x != id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // the identities at the cut: content_hash, sig AND payload digest
+        let before: BTreeMap<String, (String, Option<String>, String)> = cell
+            .ops()
+            .unwrap(/* t */)
+            .into_iter()
+            .map(|o| {
+                (
+                    o.op_id.to_string(),
+                    (o.content_hash.clone(), o.sig.clone(), o.payload_digest.clone()),
+                )
+            })
+            .collect();
+        prop_assume!(!before.is_empty());
+
+        // a compaction at the generated cut, under the whole history
+        let head: i64 = cell
+            .debug_column("SELECT CAST(COALESCE(MAX(seq),0) AS TEXT) FROM ops")
+            .unwrap(/* t */)[0]
+            .parse()
+            .unwrap(/* t */);
+        // the cut stays WITHIN the live log (compact refuses anything else)
+        let cut_seq = (1.0 + (head as f64 - 1.0) * cut).floor() as i64;
+        let cut_seq = cut_seq.clamp(1, head);
+        cell.compact(cut_seq, &engramma_core::cell::CompactOptions::default())
+            .unwrap(/* t */);
+
+        // nothing moved — one byte less and this fails
+        let after: BTreeMap<String, (String, Option<String>, String)> = cell
+            .ops()
+            .unwrap(/* t */)
+            .into_iter()
+            .map(|o| {
+                (
+                    o.op_id.to_string(),
+                    (o.content_hash.clone(), o.sig.clone(), o.payload_digest.clone()),
+                )
+            })
+            .collect();
+        for (id, was) in &before {
+            prop_assert_eq!(
+                after.get(id),
+                Some(was),
+                "op {} moved its identity",
+                id
+            );
+        }
+        // and every censored body still has the shape the censor produces
+        for op in cell.ops().unwrap(/* t */) {
+            if op.payload_state.as_str() == "censored" {
+                prop_assert!(
+                    engramma_core::cell::ops::censor_shape_ok(&op),
+                    "op {} has a censored body outside the censor's shape",
+                    op.op_id
+                );
+            }
+        }
+        prop_assert!(cell.verify().unwrap(/* t */).ok());
+    }
 }
