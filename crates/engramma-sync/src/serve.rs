@@ -225,7 +225,11 @@ pub async fn session_with(
         device: &dk,
         cells: cells.iter().map(|c| c as &dyn SyncedCell).collect(),
     };
-    let report = run_initiator(conn, &ctx).await?;
+    // a bounded session: a wedged exchange must not hang the pass (the
+    // one-shot run above all — nothing else would ever unblock it)
+    let report = tokio::time::timeout(Duration::from_secs(90), run_initiator(conn, &ctx))
+        .await
+        .map_err(|_| Error::Malformed("la sessione non è finita in 90 s".into()))??;
     // the session ended: both sides hold the same sets — the acks move the
     // frontier, ours for them
     for shared in &cells {
@@ -281,6 +285,14 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
     let conflicts_now = conflict_counts(root)?;
     let mut per_cell: std::collections::HashMap<Vec<u8>, (usize, usize, usize)> =
         std::collections::HashMap::new();
+    // the blind node, when one is configured: deposit what it lacks,
+    // fetch what we lack, deliver the purge queue (a failure is a trace
+    // line under ENGRAMMA_TRACE, never a failed pass)
+    if let Err(e) = crate::mailbox_net::push(root, endpoint).await
+        && std::env::var("ENGRAMMA_TRACE").is_ok()
+    {
+        eprintln!("mailbox push: {e}");
+    }
     for member in registry.live_members()? {
         if member.device == dk.device_id() {
             continue;
@@ -306,8 +318,17 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
                 continue;
             }
         };
-        let outcome = match connect(endpoint, endpoint_addr.clone()).await {
-            Ok(conn) => match session_with(root, conn, &member.device, &endpoint_addr).await {
+        // a bounded dial: an unreachable device must not stall the pass
+        // (the serve loop is one thread — a hanging dial would freeze the
+        // accepts too)
+        let dialed = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect(endpoint, endpoint_addr.clone()),
+        )
+        .await;
+        let outcome = match dialed {
+            Err(_) => Err("timeout della connessione (10 s)".to_string()),
+            Ok(Ok(conn)) => match session_with(root, conn, &member.device, &endpoint_addr).await {
                 Ok(session) => {
                     for cell in &session.cells {
                         let entry = per_cell.entry(cell.sync_id.clone()).or_insert((0, 0, 0));
@@ -319,7 +340,7 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
                 }
                 Err(e) => Err(e.to_string()),
             },
-            Err(e) => Err(e.to_string()),
+            Ok(Err(e)) => Err(e.to_string()),
         };
         report.peers.push(PeerOutcome {
             name: member.name.clone(),

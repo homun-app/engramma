@@ -1190,3 +1190,60 @@ fn rematerializing_a_hundred_version_note_stays_cheap() {
         "a hundred-version rematerialization storm took {elapsed:?}"
     );
 }
+
+/// v0.6.1 (P0, found by the three-device CLI test): devices CREATE the
+/// same note id concurrently (the same import on two machines) — the puts
+/// carry no base (the note does not exist for any author). Every copy
+/// must converge, whatever order the puts arrive in, for two, three and
+/// four concurrent creations.
+#[test]
+fn concurrent_creates_of_the_same_note_converge() {
+    for n in [2_u32, 3, 4] {
+        concurrent_creates_case(n);
+    }
+}
+
+fn concurrent_creates_case(authors: u32) {
+    let dir0 = tempfile::tempdir().unwrap(/* t */);
+    let seed = Cell::create(&dir0.path().join("seed.sqlite"), "conv", "device-0")
+        .unwrap(/* t */);
+    let note = base_note(41, "il corpo di 0");
+    let id = note.id;
+    seed.put_note(&note, "device-0").unwrap(/* t */);
+    let first: Vec<Op> = seed.ops().unwrap(/* t */);
+    // each author writes its own concurrent creation of the SAME id from
+    // the same base set
+    let mut all: Vec<Op> = first.clone();
+    for k in 1..=authors {
+        let dir = tempfile::tempdir().unwrap(/* t */);
+        let cell = Cell::open_bare(&dir.path().join(format!("c{k}.sqlite")))
+            .unwrap(/* t */);
+        std::mem::forget(dir);
+        for op in &first {
+            cell.ingest_op(op).unwrap(/* t */);
+        }
+        let mut own = base_note(41, &format!("il corpo concorrente di {k}"));
+        own.id = id;
+        cell.put_note(&own, &format!("device-{k}")).unwrap(/* t */);
+        all.extend(
+            cell.ops()
+                .unwrap(/* t */)
+                .into_iter()
+                .filter(|o| !first.iter().any(|f| f.op_id == o.op_id)),
+        );
+    }
+    // total order and its reverse must land on the same state
+    let mut x_ops = all.clone();
+    x_ops.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
+    let x = copy_of("x", &x_ops);
+    let mut y_ops = x_ops.clone();
+    y_ops.reverse();
+    let y = copy_of("y", &y_ops);
+    let dx = x.replicated_digest().unwrap(/* t */);
+    let dy = y.replicated_digest().unwrap(/* t */);
+    assert_eq!(
+        dx, dy,
+        "{authors} concurrent creates of the same note converge in any order"
+    );
+    assert!(x.verify().unwrap(/* t */).ok());
+}

@@ -1301,6 +1301,7 @@ dependencies = [
  "engramma-vault",
  "mimalloc",
  "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

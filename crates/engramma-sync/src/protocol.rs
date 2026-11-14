@@ -158,6 +158,9 @@ pub fn authorize(caller_transport: &[u8; 32], registry: &DeviceRegistry) -> Resu
 }
 
 async fn send_frame(conn: &Connection, msg: &Value) -> Result<()> {
+    if std::env::var("ENGRAMMA_TRACE").is_ok() {
+        eprintln!("> {:?}", msg.get("kind").and_then(Value::as_str));
+    }
     let bytes = msg.to_string();
     let body = bytes.as_bytes();
     if body.len() > MAX_MESSAGE {
@@ -177,6 +180,9 @@ async fn send_frame(conn: &Connection, msg: &Value) -> Result<()> {
 async fn recv_frame(conn: &Connection) -> Result<Value> {
     let (send, mut recv) = conn.accept_bi().await.map_err(io_err)?;
     drop(send);
+    if std::env::var("ENGRAMMA_TRACE").is_ok() {
+        eprintln!("< (bi)");
+    }
     let mut len_buf = [0_u8; 4];
     recv.read_exact(&mut len_buf)
         .await

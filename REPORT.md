@@ -6021,3 +6021,77 @@ Esito: **NON superata.** Le correzioni sono nella spec
    Linux non c'è: Docker è fermo anche sulla macchina del revisore.
 
 `du -sh target`: 34G.
+
+# REPORT — Engramma v0.6.1 (la sincronizzazione, finita davvero) — LAVORO IN CORSO
+
+Data: 2026-11-14. Base: `main` @ `ac31aba`. **La fase NON è chiusa**: questo
+report dice ciò che è fatto e provato, e ciò che resta. Nessun tag.
+
+## Fatto e provato
+
+**P0 — l'identità non cambia mai (commit `425e2fc`).** `payload_state`
+(whole|redacted|censored, schema v20): la censura tocca il corpo, mai
+`content_hash`/`sig`; `verify` controlla forma e sale del censurato; una
+`base` assente è «non ancora arrivata» (attesa in `pending_objects`,
+legata all'oggetto della base); la testa prima di un arrivo si cerca sopra
+il taglio e, se non c'è, su tutto il log; il cammino rapido riconcilia i
+conflitti; una body write senza base su una nota che vive è concorrente.
+`the_fleet_converges` **deterministico** (orologio a costante, mint
+iniettabile): **2048 casi + 5 corse a semi nuovi, tutte verdi**; lo
+scenario del revisore e la proprietà (purge/censura/compattazione non
+muovono l'identità) in `tests/identity.rs`; i difetti trovati per strada
+(conflitti stantii sul cammino rapido, create concorrenti dello stesso
+id) sono test propri. Diffetti trovati e corretti: il rebuild di verify
+ora conosce il taglio; `sync_shared` esce dal dump logico.
+
+**P1 — la strada dal filo (commit `f02237c`).** `wire` (v2, con lo stato
+del payload e rifiuto di ogni campo mancante), `SharedCell` (epoche dal
+keystore, id opachi), il cancello d'arrivo (firma, elenco, rimosso con
+l'insieme in forma operativa = tutto ciò che precede la remove; l'adopt
+con **la prova di Merkle** per l'era senza firma), `DeviceSigner`. Un
+test per rifiuto in `tests/e2e.rs`. Il frame `keys` porta le chiavi
+avvolte a ogni sessione.
+
+**P2–P4 (commit `3f10c03` + questo).** `devices invite/join` in rete
+(biglietto con indirizzo vero, SPAKE2 sul segreto, conferma di chiave
+RFC 9382, SAS su entrambi, poi elenco/chiavi/celle — con la seconda
+passata della coda); `sync run` (riepilogo JSON, irraggiungibile = riga)
+e `sync serve` (cancello, data_version + 2 s, 5 minuti, segnali); il nodo
+cieco in rete (deposito/enumerazione/consegna/purge firmata/stats,
+l'incontro del codice col relay cieco e il canale che brucia); la coda
+purge parte da sola; `mailbox add/remove/status`; la CLI arma il
+firmatario. Provato dal **binario vero**: invito completo, SAS rifiutata,
+biglietto scaduto/riusato/rubato; il servizio accanto a un secondo
+scrittore; **tre dispositivi con scritture concorrenti e uno che torna**;
+il nodo cieco tra due radici con la purge che svuota il file. Il filo:
+**uno stream unidirezionale per frame, con FINISH e FIN consumato, e il
+congedo esplicito (bye/bye-ack)** — senza, l'ultimo frame sparisce nel
+reset (prova nel test lockstep a venti frame).
+
+**Suite completa: 50 suite verdi, 0 fallite; fmt e clippy verdi.**
+
+## Non fatto (e dichiarato tale)
+
+- **Il giro Linux non è stato fatto** (Docker oggi risponde: resta da
+  eseguire `scripts/linux.sh`).
+- **Le prove di P5 che mancano**: il giro via relay locale; la
+  rimozione-rotazione end-to-end; il flusso del codice breve col canale
+  bruciato (l'implementazione c'è, il test no); il bootstrap di 10k e la
+  latenza (mancano le misure); **le due soglie non sono state rimesurate**
+  (p95 testo+grafo, inserimento) — i numeri della v0.6 restano superate e
+  non si segnano ✓.
+- **`the_fleet_converges` va riportato a 2048** dopo l'ultima regola (le
+  create concorrenti): le 2048 corse verdi precedono quella modifica.
+- **JS (`npm test`, build, SHA256) non rigirati**; `du -sh target` da
+  rileggere alla ripresa.
+- **Nessun tag**: la chiusura esige tutto quanto sopra.
+
+## Cosa non promettiamo (aggiunte)
+
+- Il nodo cieco accetta una lista **autocoerente** di uno sconosciuto
+  (firme valide, cifrario senza senso per lui, solo spazio): un limite da
+  chiudere con elenchi ammessi dall'operatore.
+- L'istanzanea completa di un dispositivo nuovo viaggia come coda di
+  operazioni (con le prove Merkle): l'istantanea al taglio resta da fare.
+- Il libro degli indirizzi vive di abbinamenti e sessioni riuscite; il
+  dial prova un indirizzo alla volta (loopback primo).

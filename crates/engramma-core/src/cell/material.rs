@@ -784,7 +784,18 @@ fn breaks_the_chain(
         return Ok(false);
     }
     let Some(base) = op.base.as_deref() else {
-        return Ok(false);
+        // a BASE-LESS body write over a note that already lives here is
+        // CONCURRENT by construction: its author created the note fresh,
+        // and this copy holds someone else's creation of the very same id
+        // (the same import on two machines — found by the three-device
+        // test). The conflict rules must run: without this, the LAST
+        // ARRIVAL won and the copies diverged by delivery order.
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM notes WHERE id = ?1",
+            [op.note_id.map(|n| n.to_string()).unwrap_or_default()],
+            |r| r.get(0),
+        )?;
+        return Ok(exists > 0);
     };
     let head = head_hash_before(tx, object, &op.hlc.to_string(), &op.op_id.to_string())?;
     Ok(head.as_deref() != Some(base))

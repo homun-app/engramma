@@ -1,4 +1,9 @@
-# La sincronizzazione (v0.6)
+# La sincronizzazione (v0.6.1)
+
+> La v0.6.1 chiude ciò che la v0.6 dichiarava e non era: l'abbinamento in
+> rete (biglietto e codice), `sync run` e `sync serve`, il nodo cieco che
+> serve davvero, e l'identità dell'operazione che non cambia più (DESIGN
+> § 4.3.1).
 
 La stessa memoria sui **tuoi** dispositivi: il portatile, il Mac di casa, più avanti il telefono. La condivisione con altre persone arriva nella v0.6.x, sopra questa base.
 
@@ -6,10 +11,18 @@ La stessa memoria sui **tuoi** dispositivi: il portatile, il Mac di casa, più a
 
 Due modi, un esito.
 
-1. **Il biglietto** (senza server): `engramma devices invite` stampa un testo — l'indirizzo iroh di chi invita e un segreto a 128 bit, base32 col prefisso di versione. Vale **dieci minuti** e **una volta**. Sul dispositivo nuovo: `engramma devices join <biglietto> --name <nome>`. Chi invita autentica chi entra perché dimostra di conoscere il segreto (MAC sul transcript della connessione, mai il segreto in chiaro).
+1. **Il biglietto** (senza server): `engramma devices invite [--no-relay]` lega l'endpoint e stampa un testo — l'**indirizzo vero** di chi invita (id, relay se c'è, indirizzi diretti; con `--no-relay` solo i diretti) e un segreto a 128 bit, base32 col prefisso di versione. Vale **dieci minuti** e **una volta**, e resta in attesa del dispositivo che entra. Sul dispositivo nuovo: `engramma devices join <biglietto> --name <nome>`. Le battute: SPAKE2 col **segreto del biglietto** come password, il MAC del segreto sul transcript (l'uomo nel mezzo col biglietto altrui muore lì), la **conferma di chiave** RFC 9382 § 4 da entrambi i parti — un biglietto sbagliato si scopre lì, senza chiedere nulla all'umano.
 2. **Il codice breve** (col nodo cieco come punto d'incontro): `engramma devices code` stampa un codice tipo `7-tigre-lago` — un numero di canale e due parole italiane da una lista fissa di 2048 (è nel repo). Le due parti si incontrano sul nodo cieco e fanno SPAKE2 col codice come password: il nodo vede solo il numero di canale. **Un tentativo per codice**: un attaccante attivo ha una probabilità su 2048². (*La crate `spake2` non ha audit indipendente: l'uso è confinato a questo percorso.*)
 
-**La conferma.** In entrambi i casi, alla fine, entrambi gli schermi stampano le stesse **sei cifre**. L'umano le confronta e conferma su **entrambi** i dispositivi. Solo dopo la `add` firma e il dispositivo nuovo riceve le celle condivise.
+**La conferma.** In entrambi i casi, alla fine, entrambi gli schermi stampano le stesse **sei cifre**. L'umano le confronta e conferma (una riga, `s`) su **entrambi** i dispositivi; se uno dei due rifiuta, nessuna `add` da nessuna parte. Solo dopo le due conferme chi invita firma la `add`, e il dispositivo nuovo riceve l'elenco, le chiavi d'epoca **avvolte per lui** e le celle condivise — le operazioni sigillate, con l'`adopt` che apre l'era senza firma (la prova di Merkle viaggia con ogni operazione senza firma: la radice copre, la prova dimostra).
+
+**Il codice, in pratica.** `mailbox add <biglietto del nodo>` una volta per radice; poi `engramma devices code` (chi invita) e `engramma devices join <codice> --name <nome>` (chi entra). Il nodo abbina i due lati del canale e **rimesce blob opachi**: SPAKE2 e conferma di chiave viaggiano in fondo al filo, il nodo non vede il codice. Un tentativo sbagliato **brucia il canale**: un tentativo per codice, il secondo col codice giusto è rifiutato. Dopo le sei cifre, un biglietto fresco passa **sigillato** dentro il relay: l'ingresso vero corre poi in diretta fra i due dispositivi.
+
+## Il servizio: `sync run` e `sync serve`
+
+- **`engramma sync run`**: una passata con ogni dispositivo vivo raggiungibile (e col nodo cieco configurato). Il riepilogo JSON dice, per cella, operazioni inviate e ricevute, rifiuti al cancello, conflitti e frontiera; per dispositivo, se la sessione è avvenuta e perché no. **Un irraggiungibile non è un errore**: è una riga.
+- **`engramma sync serve`**: ascolta (ALPN `engramma/sync/1`), applica il cancello a ogni accettazione, e sincronizza a ogni scrittura locale (`PRAGMA data_version`, rimbalzo 2 s) e ogni 5 minuti. Si ferma pulito su SIGINT/SIGTERM. Il demone gira **accanto** a Homun sulla stessa radice: due processi, un registro, la sessione che li attraversa è provata.
+- **Gli indirizzi**: ogni radice ricorda l'ultimo indirizzo noto di ogni dispositivo (il libro degli indirizzi, aggiornato a ogni sessione e all'abbinamento). `--relay <url>` e `--no-relay` come nel biglietto; pkarr spento. Una radice che vuole essere raggiunta senza inviti tiene `sync serve` acceso.
 
 ## Come si condivide una cella
 
@@ -22,11 +35,13 @@ La cella registra un'operazione `adopt` (la radice di Merkle di tutto ciò che e
 ## Il nodo cieco su un computer sempre accesso
 
 ```
-engramma mailbox serve --root <dir>
-engramma mailbox add <biglietto del nodo>
+engramma mailbox serve --root <dir>      # il nodo: stampa il suo biglietto
+engramma mailbox add <biglietto>         # ogni radice gli consegna l'elenco firmato
+engramma mailbox status                  # ultimo contatto, buste, byte, ritenzione
+engramma mailbox remove                  # la radice lo dimentica
 ```
 
-Un endpoint iroh (ALPN `engramma/mailbox/1`) che conserva e consegna buste sigillate quando i tuoi dispositivi non sono accesi insieme. **Non ha le chiavi**: non può leggere nulla di quello che conserva. Vede chiavi, orari e dimensioni — non testo, nomi, titoli, né l'identità delle operazioni (gli id che indicizzano sono HMAC, stabili attraverso le epoche). La ritenzione è di 180 giorni (configurabile). Quando elimini una nota col diritto all'oblio, la richiesta di cancellazione arriva **firmata** al nodo: le buste di quella nota se ne vanno davvero (cancellazione e VACUUM — nessun byte resta nel file; è provato con la ricerca di stringhe nel file).
+Un endpoint iroh (ALPN `engramma/mailbox/1`) che resta in esecuzione fino al segnale, conserva e consegna buste sigillate quando i tuoi dispositivi non sono accesi insieme. **Non ha le chiavi**: non può leggere nulla di quello che conserva. Vede chiavi, orari e dimensioni — non testo, nomi, titoli, né l'identità delle operazioni (gli id che indicizzano sono HMAC, stabili attraverso le epoche). Accetta solo le chiavi di trasporto dei dispositivi **vivi** degli elenchi che conosce: un rimosso è respinto alla porta. La ritenzione è di 180 giorni (configurabile). Quando una nota va col diritto all'oblio — su qualsiasi copia — la richiesta di cancellazione **firmata** parte alla sessione successiva e resta in coda finché il nodo conferma: le buste di quella nota se ne vanno davvero (cancellazione e VACUUM — nessun byte resta nel file; è provato con la ricerca di stringhe nel file).
 
 ## Il relay: pubblico, proprio, o nessuno
 
@@ -62,5 +77,9 @@ Un estraneo che si finge un dispositivo: la connessione si chiude **prima di qua
 Le modifiche concorrenti non si perdono mai: vince l'ultima nell'ordine totale, e la perdente diventa una **copia di conflitto** — una nota attiva, col tag `conflitto` e un arco verso l'originale, identica su ogni copia. `engramma sync conflicts` le elenca; le tue correzioni su una copia sono operazioni normali. Una lapide vince sulle modifiche che non l'avevano vista; chi l'aveva vista può scrivere e la nota si riapre. La `purge` domina su tutto.
 
 ## Che cosa non si promette
+
+- **L'istanizzazione completa di un dispositivo nuovo** viaggia oggi come coda di operazioni sigillate (più la prova di Merkle per l'era senza firma): per una cella da 10k note funziona ed è misurata, ma l'ottimizzazione dell'istantanea al taglio (il file compatatto) resta da fare.
+- **Il libro degli indirizzi vive di sessioni**: il primo contatto passa dall'abbinamento; un demone che cambia porta si raggiunge di nuovo al prossimo invito o incontro.
+- Né sicurezza dopo compromissione (una chiave d'epoca rubata apre tutta l'epoca) né segretezza in avanti per messaggio. Per i dispositivi di una sola persona, con la rotazione alla rimozione, è il compromesso giusto oggi; MLS e i suoi successori (Keyhive, DCGKA) sono la strada per la condivisione con altre persone — e ancora non sono pronti. Le scelte sono svolte nel DESIGN § 10, con le fonti.
 
 Né sicurezza dopo compromissione (una chiave d'epoca rubata apre tutta l'epoca) né segretezza in avanti per messaggio. Per i dispositivi di una sola persona, con la rotazione alla rimozione, è il compromesso giusto oggi; MLS e i suoi successori (Keyhive, DCGKA) sono la strada per la condivisione con altre persone — e ancora non sono pronti. Le scelte sono svolute nel DESIGN § 10, con le fonti.

@@ -168,6 +168,66 @@ Lo stato di una copia è funzione dell'**insieme** delle operazioni che possiede
 - **La frontiera stabile e la compattazione.** In una cella condivisa si compatta solo sotto la **frontiera stabile** — la testa più profonda che **tutti** i dispositivi vivi hanno confermato (`device_acks`, una riga per sessione); sopra la frontiera i payload restano. Un dispositivo nuovo parte da un'**istantanea logica** alla frontiera, poi riceve le operazioni sopra.
 - **`adopt`.** Le operazioni scritte prima della v0.6 non hanno firma. Chi condivide firma un'operazione `adopt` con la radice di Merkle dei `content_hash` di tutto ciò che esiste: un'operazione senza firma è accettata solo coperta da un `adopt` valido.
 
+#### L'identità non cambia mai (v0.6.1)
+
+La verifica della v0.6 ha trovato la convergenza rotta, e la causa è una
+sola idea mancante: **l'identità di un'operazione si calcola una volta,
+alla nascita, e non cambia più.** È la stessa idea del registro v2 — la
+catena copre un *digest* del corpo, non il corpo, così la redazione non
+rompe la catena — estesa all'identità di rete.
+
+- **`payload_state`** (`whole` | `redacted` | `censored`, schema v20):
+  la censura della purge sostituisce il *corpo* (sale deterministico,
+  campi tenuti deterministici) e segna la riga; `payload_digest`,
+  `content_hash` e `sig` restano quelli di nascita, per sempre. Nella
+  v0.6 il censore ricalcolava digest e identità: una copia che aveva
+  visto il supersede prima della purge conosceva un hash, l'altra un
+  altro, la stessa `base` risolveva su una copia sola — e la convergenza
+  dipendeva dall'ordine d'arrivo. La catena locale continua a coprire il
+  digest (che non è cambiato): nessun rehash, mai.
+- **`verify` per stato.** `whole`: il digest torna col corpo. `censored`:
+  il sale è esattamente `blake3("censor:" ‖ op_id)` e il corpo ha la
+  forma esatta della regola della censura (per `supersede`:
+  `{old_id?, valid_to?, old_updated_at?, note: null}`; per `decide`
+  accetta: `{proposal, decision: "accept", censored: true, target,
+  target_closing?, decided_at?}`; per `revert_decision`: `{censored:
+  true, decision?, decided_at?, restore_target?}`) — l'identità non
+  copre più il corpo, la forma è ciò che lo limita. `redacted`: nessun
+  corpo, nulla da controllare.
+- **`base` assente = non ancora arrivata.** Con l'identità immutabile,
+  una `base` che non è da nessuna parte nel log significa una cosa
+  sola: l'operazione aspetta in `pending_objects` — come una patch
+  senza put — e applica quando la base arriva. L'attesa lega solo
+  l'oggetto a cui la base appartiene (`op.note_id`): le altre metà di
+  un'operazione a due oggetti (la nota nuova di un supersede, il
+  bersaglio di una decide) materializzano subito. «Assente = sequenziale»
+  sopravvive solo per le operazioni **sotto la frontiera**, dove la testa
+  si cerca su tutto il log: gli scheletri sotto il taglio portano hlc e
+  hash, che è tutto ciò che l'ordine chiede.
+- **Il cammino rapido riconcilia.** Una body write che arriva in
+  sequenza è il vincitore finale: i perdenti diventano zero e le copie
+  stantie di un vincitore superato vanno via. Senza questo, il
+  riferimento in ordine totale teneva copie fantasma che le copie
+  rimaterializzate non avevano. E una body write **senza base** su una
+  nota che già vive è concorrente per costruzione (lo stesso import su
+  due macchine): le regole dei conflitti corrono anche lì — trovato dal
+  test a tre dispositivi.
+- **L'`adopt` con la prova.** La radice di Merkle copre l'era senza
+  firma; l'operazione senza firma viaggia con la **prova** che la sua
+  foglia cammina fino a quella radice (`merkle_prove`/
+  `merkle_root_with`: coppie in ordine, la foglia dispari raddoppiata a
+  destra). Il ricevente — che può non tenere ancora nessun'altra foglia
+  — verifica la prova contro la radice registrata dall'`adopt`.
+- **L'insieme accettato di un rimosso**, in forma operativa: tutto ciò
+  che precede la sua `remove` nell'ordine totale (ogni copia calcola lo
+  stesso verdetto dal solo elenco firmato); la radice di Merkle nel
+  payload resta come audit di ciò che chi rimuoveva aveva accettato.
+- **Il filo.** Un flusso **unidirezionale** per frame, con `finish` e
+  con il FIN consumato dal ricevente; e il congedo esplicito (`bye` +
+  `bye-ack`, chi finisce tiene la connessione finché l'altro non
+  chiude): una connessione abbandonata resetta i dati in volo, e
+  l'ultimo frame spariva — prova nel test lockstep a venti frame.
+
 ## 5. Affidabilità, quarantena, fonte
 
 - **Ogni scrittura richiede `source` e `confidence`**, altrimenti viene rifiutata.

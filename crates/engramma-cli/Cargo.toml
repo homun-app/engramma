@@ -37,5 +37,7 @@ mimalloc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# v0.6.1 (P3): the sync tests write a root's address book by hand
+rusqlite.workspace = true
 # v0.5 (P5): the review-page tests speak HTTP; ureq is already in the lock
 ureq.workspace = true

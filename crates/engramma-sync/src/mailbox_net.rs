@@ -102,7 +102,7 @@ impl NodeState {
     /// [`Error::Db`] on SQL failure.
     pub fn open(root: &Path) -> Result<Self> {
         let reg = DeviceRegistry::open(root)?;
-        reg.conn().execute(
+        reg.conn().execute_batch(
             "CREATE TABLE IF NOT EXISTS owner_lists (
                  owner TEXT PRIMARY KEY,
                  rows_json TEXT NOT NULL,
@@ -110,7 +110,6 @@ impl NodeState {
              CREATE TABLE IF NOT EXISTS burnt_channels (
                  channel INTEGER PRIMARY KEY,
                  at TEXT NOT NULL);",
-            [],
         )?;
         Ok(Self {
             root: root.to_path_buf(),
@@ -370,6 +369,35 @@ impl NodeAddr {
                 .collect::<Vec<_>>(),
         ))
     }
+
+    /// Dial the node, one address at a time (loopback first): the
+    /// transport's own address race stalls on a virtual interface that
+    /// does not answer its own address.
+    ///
+    /// # Errors
+    /// [`Error::Io`] when no address answers.
+    pub async fn dial(&self, endpoint: &Endpoint) -> Result<Connection> {
+        let node = iroh::PublicKey::from_bytes(&self.node_id)
+            .map_err(|e| Error::Malformed(format!("bad node id: {e}")))?;
+        let mut addrs: Vec<std::net::SocketAddr> =
+            self.addrs.iter().filter_map(|a| a.parse().ok()).collect();
+        addrs.sort_by_key(|a| !a.ip().is_loopback());
+        let mut last = "nessun indirizzo noto".to_string();
+        for socket in addrs {
+            let addr = EndpointAddr::from_parts(node, [iroh::TransportAddr::Ip(socket)]);
+            let tried = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                endpoint.connect(addr, MAILBOX_NET_ALPN),
+            )
+            .await;
+            match tried {
+                Err(_) => last = format!("{socket}: timeout"),
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(e)) => last = format!("{socket}: {e}"),
+            }
+        }
+        Err(Error::Io(std::io::Error::other(last)))
+    }
 }
 
 /// The mailbox ticket: `engramma-mailbox-v1.base32(payload)` — the node's
@@ -438,7 +466,7 @@ pub fn remember_node(root: &Path, ticket: &str, addr: &NodeAddr) -> Result<()> {
     )?;
     reg.conn().execute(
         "INSERT INTO mailbox (id, ticket, last_contact, at) VALUES (1, ?1, ?2, ?3)
-         ON CONFLICT(id) DO UPDATE SET ticket = ?1, last_contact = ?2",
+         ON CONFLICT(id) DO UPDATE SET ticket = ?1, last_contact = ?2, at = ?3",
         rusqlite::params![
             ticket,
             now_iso(),
@@ -478,9 +506,7 @@ pub fn node_of(root: &Path) -> Result<Option<NodeAddr>> {
     )?;
     let row: Option<String> = reg
         .conn()
-        .query_row("SELECT last_contact FROM mailbox WHERE id = 1", [], |r| {
-            r.get(0)
-        })
+        .query_row("SELECT at FROM mailbox WHERE id = 1", [], |r| r.get(0))
         .optional()?;
     let Some(text) = row else {
         return Ok(None);
@@ -524,10 +550,7 @@ pub fn node_of(root: &Path) -> Result<Option<NodeAddr>> {
 /// Whatever the dial or the node refuses.
 pub async fn add_node(root: &Path, endpoint: &Endpoint, ticket: &str) -> Result<String> {
     let addr = node_ticket_parse(ticket)?;
-    let conn = endpoint
-        .connect(addr.endpoint_addr()?, MAILBOX_NET_ALPN)
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    let conn = addr.dial(endpoint).await?;
     let reg = DeviceRegistry::open(root)?;
     send_frame(&conn, &json!({"kind": "list", "rows": reg.rows_json()})).await?;
     let answer = recv_frame(&conn).await?;
@@ -559,12 +582,10 @@ pub async fn push(root: &Path, endpoint: &Endpoint) -> Result<(usize, usize)> {
     let Some(node) = node_of(root)? else {
         return Ok((0, 0));
     };
-    let conn = endpoint
-        .connect(node.endpoint_addr()?, MAILBOX_NET_ALPN)
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    let conn = node.dial(endpoint).await?;
     let owner = owner_of_root(root)?;
     let dk = DeviceKey::load_or_create(root)?;
+    let trace = std::env::var("ENGRAMMA_TRACE").is_ok();
     let mut deposited = 0_usize;
     let mut fetched = 0_usize;
     for shared in SharedCell::all_of(root)? {
@@ -621,6 +642,9 @@ pub async fn push(root: &Path, endpoint: &Endpoint) -> Result<(usize, usize)> {
             }));
         }
         if !envs.is_empty() {
+            if trace {
+                eprintln!("push: depositing {} envelopes", envs.len());
+            }
             deposited += envs.len();
             send_frame(
                 &conn,
@@ -720,6 +744,64 @@ pub fn purge_queue(root: &Path, dk: &DeviceKey) -> Result<Vec<PendingPurge>> {
         let _ = id;
     }
     Ok(out)
+}
+
+/// Enqueue a purge for the node from a SHARED CELL adapter (the device
+/// just ingested or applied one): the opaque ids of every operation of
+/// the purged note. Failures are silent: the queue retries at every pass.
+pub fn enqueue_purge_shared(shared: &SharedCell, note_id: &ulid::Ulid) {
+    let root = shared_root(shared);
+    let Ok(reg) = DeviceRegistry::open(&root) else {
+        return;
+    };
+    let Ok(owner) = owner_of_root(&root) else {
+        return;
+    };
+    let Some(mac_key) = shared.epoch0_mac_key() else {
+        return;
+    };
+    let note = format!("note:{note_id}");
+    let mut ids: Vec<Vec<u8>> = shared
+        .cell()
+        .debug_column(&format!(
+            "SELECT o.content_hash FROM ops o JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = '{}' ORDER BY o.op_id",
+            note.replace('\'', "''")
+        ))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|h| unhex32(&h))
+        .map(|ch| crate::crypto::EpochKey::opaque_op_id(&mac_key, &ch).to_vec())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    reg.conn()
+        .execute(
+            "CREATE TABLE IF NOT EXISTS purge_queue (
+                 id INTEGER PRIMARY KEY, owner TEXT NOT NULL,
+                 ids_json TEXT NOT NULL, at TEXT NOT NULL)",
+            [],
+        )
+        .ok();
+    reg.conn()
+        .execute(
+            "INSERT INTO purge_queue (owner, ids_json, at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                owner,
+                serde_json::to_string(&ids).unwrap_or_default(),
+                now_iso()
+            ],
+        )
+        .ok();
+}
+
+fn shared_root(shared: &SharedCell) -> std::path::PathBuf {
+    // the registry of the adapter is the root's devices.db: its file path
+    // sits beside the cell, two levels up from cells/<name>.sqlite
+    let mut path = shared.cell().file_path().to_path_buf();
+    path.pop();
+    path.pop();
+    path
 }
 
 /// Enqueue a purge for the node (the device just applied one).
@@ -1150,7 +1232,13 @@ async fn handle_frame(state: &NodeState, conn: &Connection, msg: &Value) -> Resu
     let authorized = state.authorizes(caller.as_bytes())?;
     let owner_of_root = |v: &Value| v["owner"].as_str().unwrap_or_default().to_string();
     match msg.get("kind").and_then(Value::as_str) {
-        Some("list") if authorized => {
+        // the LIST is how a device first introduces itself to the node:
+        // no prior authorization can exist yet — the rows carry their own
+        // signatures, and that is the security (a row that does not
+        // verify is refused). What the node does NOT promise: refusing a
+        // stranger's SELF-CONSISTENT list (storage-bounded, ciphertext
+        // only) — declared in the REPORT.
+        Some("list") => {
             let rows = msg["rows"].as_array().cloned().unwrap_or_default();
             let owner = state.take_list(&rows)?;
             send_frame(conn, &json!({"kind": "ok", "owner": owner})).await?;
@@ -1252,10 +1340,7 @@ async fn handle_frame(state: &NodeState, conn: &Connection, msg: &Value) -> Resu
 /// # Errors
 /// Whatever the dial or the node refuses.
 pub async fn node_stats(root: &Path, endpoint: &Endpoint, node: &NodeAddr) -> Result<(usize, i64)> {
-    let conn = endpoint
-        .connect(node.endpoint_addr()?, MAILBOX_NET_ALPN)
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    let conn = node.dial(endpoint).await?;
     let owner = owner_of_root(root)?;
     send_frame(&conn, &json!({"kind": "stats", "owner": owner})).await?;
     let answer = recv_frame(&conn).await?;

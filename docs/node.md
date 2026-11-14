@@ -390,20 +390,26 @@ restituisce al sistema, ma riusa — 1000 `embedPending` e 2000 ricerche
 ibride sopra non spostano la misura, REPORT §v0.4.2) — e l'interfaccia
 chiede tutto al demone via RPC.
 
-## La sincronizzazione accanto al demone (v0.6)
+## La sincronizzazione accanto al demone (v0.6.1)
 
 In questa fase **il contratto JS non cambia**: Homun sincronizza le sue
 celle facendo girare accanto `engramma sync serve --root <radice di
 Homun>`. I due processi convivono: il demone scrive, `sync serve`
-sincronizza a ogni scrittura (la rileva con `PRAGMA data_version`) e ogni
-5 minuti. La convivenza è provata nel banco end-to-end di `engramma-sync`.
+sincronizza a ogni scrittura (la rileva con `PRAGMA data_version`,
+rimbalzo 2 s) e ogni 5 minuti, e si ferma pulito su SIGINT/SIGTERM. La
+convivenza — un secondo processo che scrive sulla stessa radice mentre il
+servizio riceve da un altro dispositivo — è provata dal banco end-to-end
+della CLI: alla fine tutte le copie convergono e `verify` passa.
 
-**Lo schema delle celle sale alla versione 19** (v15: `content_hash`,
+**Lo schema delle celle sale alla versione 20** (v15: `content_hash`,
 `base`, `op_objects`; v16: `pending_objects`; v17: `conflict_copies`;
-v18: `device_acks`; v19: `device`, `sig`): le celle migrate **non tornano
-indietro** a un binario più vecchio (il `SCHEMA_TOO_NEW` della v0.5 le
-rifiuta). Migrazione all'apertura, irrovocabile, con `verify` verde dopo.
+v18: `device_acks`; v19: `device`, `sig`; v20: `payload_state` e l'indice
+su `content_hash` — l'identità non cambia più, DESIGN § 4.3.1): le celle
+migrate **non tornano indietro** a un binario più vecchio (il
+`SCHEMA_TOO_NEW` della v0.5 le rifiuta). Migrazione all'apertura,
+irrovocabile, con `verify` verde dopo.
 
 **L'API JS della sincronizzazione** (stato, abbinamento col QR del
-biglietto, elenco dei dispositivi) è la v0.6.x, con l'interfaccia di
-Homun: questa fase ha consegnato il demone `sync serve` e la CLI.
+biglietto, elenco dei dispositivi) resta la v0.6.x, con l'interfaccia di
+Homun: questa fase ha consegnato il demone `sync serve`, `sync run` e la
+CLI completa (`devices`, `sync`, `mailbox`, docs/sync.md).

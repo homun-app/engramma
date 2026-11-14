@@ -587,17 +587,36 @@ fn cell_path(cli: &Cli, name: &str) -> Result<PathBuf, CliError> {
 
 fn open_cell(cli: &Cli) -> Result<Cell, CliError> {
     let path = cell_path(cli, &cli.cell)?;
-    Cell::open(&path).map_err(|e| {
-        // v0.5 (P0): a newer schema keeps its own exit code and its own
-        // words — "run `engramma init` first?" would be exactly wrong.
+    let cell = open_cell_armed(&path)?;
+    Ok(cell)
+}
+
+/// Open a cell and arm the sync era's signer when this root has a device
+/// key: every LOCAL write on a shared cell must carry its device and
+/// signature, or the peers' gate refuses it (rightly).
+fn open_cell_armed(path: &std::path::Path) -> Result<Cell, CliError> {
+    let cell = Cell::open(path).map_err(|e| {
         if matches!(e, CellError::SchemaTooNew { .. }) {
-            return CliError::from(e);
+            CliError::from(e)
+        } else {
+            CliError::internal(format!(
+                "cell `{}`: {e} (run `engramma init` first?)",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ))
         }
-        CliError::internal(format!(
-            "cell `{}`: {e} (run `engramma init` first?)",
-            cli.cell
+    })?;
+    // the root two levels up from cells/<name>.sqlite
+    if let Some(root) = path.parent().and_then(|c| c.parent())
+        && let Ok(key) = engramma_sync::device::DeviceKey::load_or_create(root)
+    {
+        cell.set_signer(std::sync::Arc::new(
+            engramma_sync::arrival::DeviceSigner::new(&key),
         ))
-    })
+        .ok();
+    }
+    Ok(cell)
 }
 
 fn parse_confidence(s: &str) -> Result<Confidence, CliError> {

@@ -341,28 +341,30 @@ The human surface of the HTTP authorization flow (state in
   alarms, rejected clients. No secrets, no note text.
 
 
-## `engramma devices` (v0.6)
+## `engramma devices` (v0.6.1)
 
 - `init` — crea `device.key` (o mostra l'esistente) e il primo dispositivo dell'elenco
-- `invite` — stampa un biglietto d'invito (10 minuti, un uso)
-- `code` — stampa un codice breve (`7-tigre-lago`)
-- `join <biglietto-o-codice> --name <nome>` — abbinamento; le sei cifre si confermano su entrambi
+- `invite [--no-relay]` — lega l'endpoint, stampa il biglietto con l'indirizzo vero e resta in attesa (10 minuti, un uso); SPAKE2 sul segreto, conferma di chiave RFC 9382, sei cifre su entrambi gli schermi
+- `code` — apre il canale sul nodo cieco e stampa il codice breve (`7-tigre-lago`); dopo le sei cifre un biglietto fresco passa sigillato nel relay e l'ingresso corre in diretta
+- `join <biglietto-o-codice> --name <nome>` — l'ingresso (biglietto in diretta, codice tramite il nodo); le sei cifre si confermano su entrambi
 - `list` — nome, id corto, chiave di trasporto
-- `remove <nome>` — con il riassunto: rotazione delle chiavi, ciò che il rimosso aveva lo tiene
+- `remove <nome>` — la `remove` firmata con la radice e il conto dell'insieme accettato, l'epoca nuova di ogni cella condivisa, le chiavi avvolte per i rimasti; tutto raggiunge gli altri alla sessione successiva. Ciò che il rimosso aveva lo tiene
 - `log` — il registro dell'elenco, con le firme
 
-## `engramma sync` (v0.6)
+## `engramma sync` (v0.6.1)
 
 - `share <cella>` — `adopt` + epoca 0; dopo la conferma la cella viaggia verso tutti i dispositivi
 - `unshare <cella>` — smette da qui; le copie altrove restano (e lo dice)
-- `run` — una passata con tutti i dispositivi e il nodo cieco raggiungibili, poi esce (JSON)
-- `serve` — in ascolto: sincronizza a ogni scrittura locale e ogni 5 minuti; convive con un altro processo che scrive
+- `run` — una passata con ogni dispositivo vivo raggiungibile e il nodo cieco configurato, poi esce; il riepilogo JSON dice inviate/ricevute/rifiuti/conflitti/frontiera per cella, e per dispositivo se la sessione è avvenuta (un irraggiungibile è una riga, non un errore)
+- `serve` — in ascolto (ALPN `engramma/sync/1`), cancello all'accettazione, sincronizza a ogni scrittura locale (rimbalzo 2 s) e ogni 5 minuti; stop pulito su SIGINT/SIGTERM; convive con un altro processo che scrive sulla stessa radice
 - `status` — per cella: dispositivi, ultima sessione, operazioni in attesa, frontiera stabile, epoca
 - `conflicts` — le copie di conflitto che questa copia tiene
 
-## `engramma mailbox` (v0.6)
+## `engramma mailbox` (v0.6.1)
 
-- `serve --root <dir>` — il nodo cieco (ALPN `engramma/mailbox/1`, ritenzione 180 giorni)
-- `add <biglietto del nodo>` / `remove` / `status`
+- `serve --root <dir>` — il nodo cieco in esecuzione (ALPN `engramma/mailbox/1`, ritenzione 180 giorni): stampa il proprio biglietto, deposito/enumerazione/consegna, purge firmata, incontro dei codici
+- `add <biglietto del nodo>` — registra il nodo e gli consegna l'elenco firmato
+- `status` — ultimo contatto, buste conservate (conteggio e byte, chiesti al nodo), ritenzione
+- `remove` — la radice lo dimentica
 
 Ogni comando accetta `--json`. Gli errori non contengono testo di note.

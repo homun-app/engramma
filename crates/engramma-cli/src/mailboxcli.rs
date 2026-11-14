@@ -87,11 +87,16 @@ pub fn serve(json: bool, dir: &Path) -> Result<(), CliError> {
                             tokio::task::spawn_local(async move {
                                 let state = match NodeState::open(&state_dir) {
                                     Ok(s) => s,
-                                    Err(_) => return,
+                                    Err(e) => {
+                                        eprintln!("node: state: {e}");
+                                        return;
+                                    }
                                 };
                                 // the first frame decides: a code meeting
                                 // or a device frame
-                                let _ = mailbox_net::serve_or_relay(&state, &conn).await;
+                                if let Err(e) = mailbox_net::serve_or_relay(&state, &conn).await {
+                                    eprintln!("node: connection: {e}");
+                                }
                             });
                         }
                     });

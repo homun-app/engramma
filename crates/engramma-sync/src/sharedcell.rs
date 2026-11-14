@@ -225,9 +225,18 @@ impl SyncedCell for SharedCell {
             let reg = self.registry();
             arrival::check(&reg, &self.cell, &op, proof.as_deref())?;
         }
-        self.cell
+        let was_new = self
+            .cell
             .ingest_op(&op)
             .map_err(|e| Error::Malformed(format!("ingest refused the op: {e}")))?;
+        // a purge that LANDED (here or arriving) queues its request for
+        // the blind node: the right to be forgotten reaches its store
+        if was_new
+            && op.kind == engramma_core::cell::ops::OpKind::Purge
+            && let Some(note) = op.note_id
+        {
+            crate::mailbox_net::enqueue_purge_shared(self, &note);
+        }
         Ok(())
     }
 }
@@ -297,9 +306,16 @@ impl SharedCell {
             ));
         }
         arrival::check(&reg, &self.cell, &op, proof.as_deref())?;
-        self.cell
+        let was_new = self
+            .cell
             .ingest_op(&op)
             .map_err(|e| Error::Malformed(format!("ingest refused the op: {e}")))?;
+        if was_new
+            && op.kind == engramma_core::cell::ops::OpKind::Purge
+            && let Some(note) = op.note_id
+        {
+            crate::mailbox_net::enqueue_purge_shared(self, &note);
+        }
         Ok(())
     }
 }
