@@ -91,6 +91,35 @@ fn wait_bounded(mut child: Child, name: &str, secs: u64) -> std::process::Output
     }
 }
 
+/// Run to completion feeding stdin first (the SAS confirms).
+fn run_with_stdin(
+    root: &std::path::Path,
+    args: &[&str],
+    stdin: &[u8],
+) -> (bool, String, String) {
+    let mut child = bin()
+        .arg("--root")
+        .arg(root)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(/* t */);
+    child
+        .stdin
+        .as_mut()
+        .expect(/* piped */ "stdin")
+        .write_all(stdin)
+        .expect(/* pipe */ "stdin write");
+    let out = wait_bounded(child, &args.join(" "), 180);
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
 fn run(root: &std::path::Path, args: &[&str]) -> (bool, String, String) {
     let mut child = bin()
         .env("ENGRAMMA_TRACE", "1")
@@ -580,4 +609,324 @@ fn three_devices_concurrent_and_one_returns() {
     }
     drop(serve);
     });
+}
+
+// ---------------------------------------------------------------------------
+// the removal with its rotation, end to end (v0.6.1): what the spec
+// promises and the reviewer found missing — the removed device cannot open
+// the new envelopes (the epoch turned), its copy stays behind, and no
+// session of its own passes the gate anymore
+// ---------------------------------------------------------------------------
+
+/// The digests of every root's cell, in order.
+fn digests_of(roots: &[&Root]) -> Vec<String> {
+    roots
+        .iter()
+        .map(|r| {
+            Cell::open(&r.cell_path("memoria"))
+                .unwrap(/* t */)
+                .replicated_digest()
+                .unwrap(/* t */)
+        })
+        .collect()
+}
+
+#[test]
+fn the_removal_rotates_and_the_removed_stays_out() {
+    bounded("the_removal_rotates", 900, || {
+        let a = Root::new("rem-a");
+        let b = Root::new("rem-b");
+        let c = Root::new("rem-c");
+        let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
+        cell.put_note(&note(1, "la base comune"), "cli").unwrap(/* t */);
+        drop(cell);
+        run(&a.root, &["sync", "share", "memoria"]);
+        pair(&a, &b, "mac");
+        pair(&a, &c, "telefono");
+        // A serves; B and C know its address and run passes
+        let serve = Daemon::spawn(&a.root, &["--json", "sync", "serve", "--no-relay"]);
+        let v = serve.first_json();
+        let addrs: Vec<String> = v["addrs"]
+            .as_array()
+            .map(|x| {
+                x.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let node = v["node"].as_str().expect(/* printed */ "node").to_string();
+        let reg = rusqlite::Connection::open(a.root.join("devices.db")).unwrap(/* t */);
+        let a_device: String = reg
+            .query_row(
+                "SELECT json_extract(payload_json, '$.device') FROM registry WHERE kind='create'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(/* t */);
+        for r in [&b.root, &c.root] {
+            remember_all(r, &a_device, &node, &addrs);
+        }
+        let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
+        // C writes a note of its own, and the three converge
+        add_note(&c.root, "C");
+        let mut rounds = 0;
+        let digests;
+        loop {
+            let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
+            let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+            std::thread::sleep(Duration::from_secs(2));
+            let d = digests_of(&[&a, &b, &c]);
+            rounds += 1;
+            if (d[0] == d[1] && d[1] == d[2]) || rounds > 6 {
+                digests = d;
+                break;
+            }
+        }
+        assert_eq!(digests[0], digests[2], "C's note reached everyone (rounds {rounds})");
+
+        // --- A removes C: the signed remove with the accepted set, the new
+        // epoch of every shared cell, the wraps for the survivors
+        let (ok, out, err) = run(&a.root, &["--json", "devices", "remove", "telefono"]);
+        assert!(ok, "remove: {err}");
+        assert!(
+            out.contains("\"rotated\"") || out.contains("rotated"),
+            "the removal reports the rotation: {out}"
+        );
+        // the pass carries the remove and the new epoch to B
+        let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        let (ok, out, _) = run(&b.root, &["--json", "sync", "status"]);
+        assert!(ok);
+        assert!(
+            out.contains("\"epoch\": 1"),
+            "B now holds the rotated epoch: {out}"
+        );
+        // A writes a NEW note, sealed under the new epoch
+        add_note(&a.root, "A-dopo-la-rimozione");
+        let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        std::thread::sleep(Duration::from_secs(3));
+        let (ok, out, _) = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        assert!(ok, "B's pass: {out}");
+
+        // --- the removed device stays out
+        // 1. its own sessions are refused at the gate: no device of the
+        //    list answers, and the pass says so — a row, not an error
+        let (ok, out, _) = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
+        assert!(ok, "a pass never fails on an unreachable peer");
+        assert!(
+            out.contains("\"reached\": false"),
+            "C reaches nobody anymore: {out}"
+        );
+        // 2. its copy stays behind: A and B moved on without it
+        let [da, db, dc] = digests_of(&[&a, &b, &c]).try_into().unwrap(/* three */);
+        assert_eq!(da, db, "A and B agree after the rotation");
+        assert_ne!(db, dc, "the removed device's copy stays behind");
+        // 3. it cannot OPEN the new envelopes: the epoch turned, and no
+        //    wrap of it exists — the very seal, tried on its own adapter
+        let sync_id: [u8; 32] = {
+            let reg = rusqlite::Connection::open(a.root.join("devices.db")).unwrap(/* t */);
+            let raw: Vec<u8> = reg
+                .query_row(
+                    "SELECT sync_id FROM shared_cells WHERE name = 'memoria'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap(/* t */);
+            raw.try_into().expect(/* 32 */ "the sync id")
+        };
+        let a_shared = engramma_sync::sharedcell::SharedCell::new(
+            Cell::open(&a.cell_path("memoria")).unwrap(/* t */),
+            engramma_sync::registry::DeviceRegistry::open(&a.root).unwrap(/* t */),
+            sync_id,
+            &a.root,
+        );
+        let c_shared = engramma_sync::sharedcell::SharedCell::new(
+            Cell::open(&c.cell_path("memoria")).unwrap(/* t */),
+            engramma_sync::registry::DeviceRegistry::open(&c.root).unwrap(/* t */),
+            sync_id,
+            &c.root,
+        );
+        use engramma_sync::protocol::SyncedCell;
+        let new_note_op = a_shared
+            .cell()
+            .ops()
+            .unwrap(/* t */)
+            .into_iter()
+            .find(|o| o.actor == "cli" && o.hlc.physical_ms > 0 && {
+                // the note written after the removal: the highest put of A
+                o.kind.as_str() == "put_note"
+            })
+            .expect(/* just written */ "A's new note");
+        let mut id32 = [0_u8; 32];
+        for (i, chunk) in new_note_op.content_hash.as_bytes().chunks(2).enumerate() {
+            let hi = (chunk[0] as char).to_digit(16).unwrap_or(0) as u8;
+            let lo = (chunk[1] as char).to_digit(16).unwrap_or(0) as u8;
+            id32[i] = (hi << 4) | lo;
+        }
+        let (epoch, nonce, ct) =
+            a_shared.envelope_of(&id32).expect(/* A seals */ "A's envelope");
+        assert!(epoch >= 1, "the new note is sealed under the rotated epoch");
+        let opened = c_shared.ingest(epoch, &id32, &nonce, &ct);
+        assert!(
+            opened.is_err(),
+            "the removed device must not open the new envelopes: {opened:?}"
+        );
+        drop(serve);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// the short code with its burnt channel, end to end (v0.6.1): the meeting
+// at the blind node, the SAS on both screens, the cells that arrive — and
+// the SECOND attempt with the same code refused by the burnt channel
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_short_code_pairs_and_the_second_attempt_burns() {
+    bounded("the_short_code", 600, || {
+        let a = Root::new("code-a");
+        let b = Root::new("code-b");
+        let stranger = Root::new("code-s");
+        let node_dir = tempfile::tempdir().unwrap(/* t */);
+        let node_root = node_dir.path().join("node");
+        std::fs::create_dir_all(&node_root).unwrap(/* t */);
+        // the cell on A, shared
+        let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
+        cell.put_note(&note(3, "la nota del codice"), "cli").unwrap(/* t */);
+        drop(cell);
+        run(&a.root, &["sync", "share", "memoria"]);
+        // the blind node serves (its --root is the subcommand's own)
+        let node = {
+            let mut node_cmd = bin();
+            node_cmd
+                .args(["--json", "mailbox", "serve", "--no-relay", "--root"])
+                .arg(&node_root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = node_cmd.spawn().expect(/* bin */ "node spawn");
+            let (tx, rx) = std::sync::mpsc::channel();
+            if let Some(out) = child.stdout.take() {
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(out).lines() {
+                        let Ok(line) = line else { break };
+                        tx.send(line).ok();
+                    }
+                });
+            }
+            Daemon { child, lines: rx }
+        };
+        let v = node.first_json();
+        let ticket = v["ticket"].as_str().expect(/* printed */ "ticket").to_string();
+        let (ok, _, err) = run(&a.root, &["mailbox", "add", &ticket]);
+        assert!(ok, "A registers: {err}");
+        let (ok, _, err) = run(&b.root, &["mailbox", "add", &ticket]);
+        assert!(ok, "B registers: {err}");
+        let (ok, _, err) = run(&stranger.root, &["mailbox", "add", &ticket]);
+        assert!(ok, "the stranger registers too: {err}");
+        // A opens the channel and prints the code (SAS confirmed on stdin)
+        let code_err_path = std::env::temp_dir().join("engramma-code-stderr.txt");
+        let code_err = std::fs::File::create(&code_err_path).expect(/* t */ "file");
+        let code_err = unsafe { Stdio::from(code_err) };
+        let mut code_proc = bin()
+            .arg("--root")
+            .arg(&a.root)
+            .args(["devices", "code", "--no-relay"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(code_err)
+            .spawn()
+            .expect(/* bin */ "spawn code");
+        {
+            use std::io::BufRead;
+            let mut reader =
+                std::io::BufReader::new(code_proc.stdout.take().expect(/* p */ "stdout"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).expect(/* pipe */ "read");
+                // the code is NUMBER-WORD-WORD (the words are Italian:
+                // accents included)
+                let trimmed = line.trim();
+                let parts: Vec<&str> = trimmed.split('-').collect();
+                let word_ok = |w: &str| {
+                    w.chars().all(|c| c.is_alphanumeric() && !c.is_ascii_uppercase())
+                };
+                if parts.len() == 3
+                    && parts[0].len() <= 4
+                    && parts[0].bytes().all(|b| b.is_ascii_digit())
+                    && word_ok(parts[1])
+                    && word_ok(parts[2])
+                {
+                    CODE.with(|c| c.borrow_mut().clone_from(&trimmed.to_string()));
+                    break;
+                }
+                if n == 0 || std::time::Instant::now() > deadline {
+                    panic!("`devices code` non ha stampato il codice in 30 s");
+                }
+            }
+        }
+        let code = CODE.with(|c| c.borrow().clone());
+        assert!(!code.is_empty(), "the code was printed");
+        let _ = &code_err_path;
+        // B enters with the code (SAS confirmed on stdin)
+        let (ok, out, err) = run_with_stdin(
+            &b.root,
+            &["devices", "join", "--no-relay", &code, "--name", "mac"],
+            b"s\n",
+        );
+        assert!(ok, "join col codice: {err} {out}");
+        // the inviter side finishes too
+        if let Some(stdin) = code_proc.stdin.as_mut() {
+            use std::io::Write;
+            let _ = stdin.write_all(b"s\n");
+        }
+        let code_out = wait_bounded(code_proc, "devices code", 120);
+        assert!(
+            code_out.status.success(),
+            "devices code: {} {}",
+            String::from_utf8_lossy(&code_out.stdout),
+            String::from_utf8_lossy(&code_out.stderr),
+        );
+        // B is in the list and holds the cell
+        let (ok, out, _) = run(&a.root, &["--json", "devices", "list"]);
+        assert!(ok && out.contains("mac"), "B entered: {out}");
+        assert!(
+            Cell::open(&b.cell_path("memoria"))
+                .unwrap(/* t */)
+                .replicated_digest()
+                .unwrap(/* t */)
+                == Cell::open(&a.cell_path("memoria"))
+                    .unwrap(/* t */)
+                    .replicated_digest()
+                    .unwrap(/* t */),
+            "the cell arrived whole through the code"
+        );
+        // --- the burnt channel: the SECOND attempt with the same code is
+        // refused — one attempt per code, the second fails even with the
+        // right code in hand
+        let (ok, out, err) = run_with_stdin(
+            &stranger.root,
+            &["devices", "join", "--no-relay", &code, "--name", "estraneo"],
+            b"s\n",
+        );
+        assert!(
+            !ok,
+            "the second attempt with the same code must fail: {ok} {out}"
+        );
+        let all = format!("{out}{err}");
+        assert!(
+            all.contains("bruciato") || all.contains("burnt"),
+            "the refusal names the burnt channel: {all}"
+        );
+        let (ok, out, _) = run(&a.root, &["--json", "devices", "list"]);
+        assert!(ok && !out.contains("estraneo"), "the stranger did not enter: {out}");
+        drop(node);
+    });
+}
+
+thread_local! {
+    static CODE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
