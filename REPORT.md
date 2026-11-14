@@ -6095,3 +6095,106 @@ reset (prova nel test lockstep a venti frame).
   operazioni (con le prove Merkle): l'istantanea al taglio resta da fare.
 - Il libro degli indirizzi vive di abbinamenti e sessioni riuscite; il
   dial prova un indirizzo alla volta (loopback primo).
+
+---
+
+# Verifica v0.6.1 a metà strada (revisore, 2026-11-14)
+
+Base verificata: `eb4501b`. GLM la dichiara **non chiusa** e la verifica gli
+dà ragione. P0 è chiuso davvero. Il resto ha la sostanza, ma ci sono un buco
+di sicurezza e una promessa dei documenti che il codice non mantiene.
+
+## Provato dal revisore
+
+- **macOS:** fmt e clippy verdi; `cargo test --workspace --no-fail-fast`
+  dà 50 suite verdi e 0 fallite; `cargo deny` dà bans e licenze ok.
+- **Convergenza (P0):** `the_fleet_converges` a **2048 casi** verde (194 s),
+  dopo l'ultima regola delle create concorrenti. Poi **cinque corse** da 512
+  a semi nuovi, tutte verdi. In tutto 4608 casi, nessun fallimento.
+- **Linux:** `scripts/linux.sh` (arm64, `--network none`) dà 50 suite verdi,
+  fmt e clippy verdi. iroh su loopback regge senza rete.
+- **Biglietto vero:** `devices invite` su una radice temporanea stampa gli
+  indirizzi delle interfacce reali (LAN e Tailscale), non loopback.
+- `du -sh target`: 37G. Binario CLI di debug: 151 MiB.
+
+## Da correggere prima della chiusura
+
+1. **SICUREZZA. Un dispositivo rimosso scrive per sempre retrodatando
+   l'orologio** (`arrival.rs`, `signed_checks`).
+   - **Il difetto:** il cancello accetta l'operazione di un rimosso se
+     `op.hlc < remove.hlc`. Ma l'HLC lo sceglie l'autore, e il limite
+     dell'orologio ferma solo il futuro.
+   - **La prova del revisore:** un test temporaneo, non committato. Il
+     dispositivo viene rimosso. Poi un'operazione costruita a mano, con HLC
+     di un giorno prima, `content_hash` ricalcolato e firma della chiave
+     rubata, passa **il cancello e `ingest_op`** (`Ok(())`). Il test di GLM
+     `a_removed_device_outside_its_set_is_refused` non lo vede perché usa
+     l'ora vera.
+   - **La correzione:** la spec chiede «dentro l'insieme accettato della sua
+     `remove`», e `devices remove` calcola già la radice di Merkle
+     (`accepted_root`, `accepted_count`), che però il cancello non legge mai.
+     Un'operazione di un rimosso entra **solo con la prova di appartenenza**
+     a `accepted_root`, la stessa meccanica dell'`adopt` (`merkle_root_with`).
+     L'HLC non conta.
+   - **Test:** l'operazione retrodatata è respinta; un'operazione vera del
+     rimosso, nell'insieme ma non ancora arrivata, entra con la prova.
+2. **Il relay non esiste, e `docs/sync.md` dice il contrario.**
+   - Ogni endpoint nasce con `presets::N0DisableRelay`, e non esiste un flag
+     `--relay <url>`.
+   - La spec v0.6 (e `docs/sync.md` §«Il relay») vuole di base il relay
+     pubblico di n0, `--relay <url>` per uno proprio e `--no-relay`.
+   - **Effetto:** due dispositivi su reti diverse dietro NAT non si parlano
+     mai. Funziona solo sulla stessa LAN, su Tailscale o con un IP pubblico.
+   - Va fatto insieme al giro end-to-end via relay locale (`test-utils`), già
+     dichiarato mancante.
+3. **Costo quadratico sul filo** (`sharedcell.rs`):
+   - `find_op` carica **tutto il log** (`cell.ops()`) per ogni busta;
+   - `envelope_of` per ogni operazione senza firma rifà `adopt_proof`, che
+     rilegge tutti gli hash e ricostruisce l'albero;
+   - `unsigned_checks` all'arrivo carica tutti i `content_hash` per ogni
+     operazione;
+   - `ids()` deserializza ogni operazione con il payload.
+
+   Il bootstrap di 10k note diventa O(n²). Probabilmente è per questo che
+   manca la misura di P5. Servono query per `content_hash` (indice), l'albero
+   dell'`adopt` calcolato una volta per sessione, e `ids()` letto dalle sole
+   colonne `hlc` e `content_hash`.
+4. **Una busta che non si sigilla sparisce in silenzio:** in `envelope_of`
+   ogni errore diventa `.ok()?`, l'operazione non parte e nessuno lo sa.
+   Una mancata convergenza così non lascia traccia. Serve almeno un evento,
+   o una riga del riepilogo di `sync run`.
+
+## Minori
+
+- **L'autore non è nell'identità:** `content_hash` non copre `device`, e il
+  cancello non confronta `device` con `hlc.node`. Una stessa identità può
+  avere firme di autori diversi su copie diverse. Basta richiedere
+  `device == hlc.node` sulle operazioni firmate, oppure dichiararlo.
+- **La forma del censurato è il solo confine:** `censor_shape_ok` controlla
+  i campi ammessi ma non il contenuto delle stringhe (`old_id`, `valid_to`),
+  quindi un dispositivo vivo può nasconderci del testo. Nel modello «miei
+  dispositivi» è accettabile, ma va scritto in «Cosa non promettiamo».
+- **La proprietà «purge, compact e censura non muovono l'identità»** è un
+  `#[test]` su un caso fisso, non una proprietà su operazioni generate come
+  chiede la spec.
+- **Processi lasciati in giro dai test:**
+  - un `mailbox serve` di un test rimasto orfano (3 h e mezza);
+  - un `cargo test --test pairing` appeso dalle 12:04 (oltre 8 ore) a una
+    corsa di GLM. Nella corsa del revisore `pairing` passa, quindi è
+    probabilmente instabile.
+
+  Serve una guardia con `Drop` che uccida i figli anche quando un test va
+  in panico (`sync_serve_cli.rs:323`), e un timeout per i test di rete.
+
+## Resta da fare (già dichiarato da GLM)
+
+- giro via relay locale;
+- rimozione con rotazione end-to-end;
+- codice breve col canale bruciato;
+- misure di bootstrap e latenza;
+- rimisura delle due soglie;
+- JS (`npm test`, build, SHA256);
+- tag.
+
+**Esito:** non chiusa. Il punto 1 è bloccante per la sicurezza, il 2 per
+l'uso reale.
