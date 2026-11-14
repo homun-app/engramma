@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 19] = [
+pub const MIGRATIONS: [&str; 20] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -324,6 +324,23 @@ CREATE TABLE device_acks (device TEXT PRIMARY KEY,
 ALTER TABLE ops ADD COLUMN device TEXT;
 ALTER TABLE ops ADD COLUMN sig TEXT;
 "#,
+    r#"
+-- v20 (v0.6.1, P0): the payload's STATE, beside the identity that never
+-- changes. `payload_state` says which of the three shapes the payload on
+-- THIS disk is in — whole | redacted | censored — while `payload_digest`
+-- (and therefore `content_hash` and `sig`) keeps, forever, the value it was
+-- minted with at birth, over the ORIGINAL payload. The v0.6 censor rewrote
+-- the digest and the identity of what it censored: a copy that had seen an
+-- operation before a purge and a copy that saw it after held two different
+-- identities for it, a `base` pointed at a hash that existed on one copy
+-- only, and convergence depended on the arrival order. From v20 on the
+-- censor replaces the body (deterministic salt, deterministic kept fields)
+-- and marks the row: the identity travels whole, whatever each disk did to
+-- the payload it holds. The index answers "does this base live here?" —
+-- the question every materialization now asks of each arrival.
+ALTER TABLE ops ADD COLUMN payload_state TEXT NOT NULL DEFAULT 'whole';
+CREATE INDEX idx_ops_content_hash ON ops(content_hash);
+"#,
 ];
 
 /// Rust-side migration steps, run right after the SQL of version `v`.
@@ -359,6 +376,34 @@ fn migrate_rust(tx: &rusqlite::Transaction<'_>, v: i64) -> Result<(), crate::err
     if v == 15 {
         migrate_log_v15(tx)?;
     }
+    if v == 20 {
+        migrate_log_v20(tx)?;
+    }
+    Ok(())
+}
+
+/// The Rust side of migration v20 (v0.6.1, P0): backfill the payload state
+/// of what older binaries wrote. A row with no payload is `redacted`; the
+/// v0.6 censor's replacements — a supersede born with `note: null`, a
+/// decide/revert carrying the censor's marker — are `censored` (their
+/// digest was already rewritten by the old rule and stays as it is now:
+/// stable from here on, which is the invariant that matters). Everything
+/// else keeps the default: `whole`.
+fn migrate_log_v20(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
+    tx.execute(
+        "UPDATE ops SET payload_state = 'redacted'
+         WHERE op_id NOT IN (SELECT op_id FROM op_payloads)",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE ops SET payload_state = 'censored'
+         WHERE ops.op_id IN (
+             SELECT p.op_id FROM op_payloads p JOIN ops o ON o.op_id = p.op_id
+             WHERE (o.kind = 'supersede' AND json_extract(p.body, '$.note') IS NULL)
+                OR (o.kind IN ('decide', 'revert_decision')
+                    AND json_extract(p.body, '$.censored') = 1))",
+        [],
+    )?;
     Ok(())
 }
 

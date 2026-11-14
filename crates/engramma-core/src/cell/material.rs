@@ -42,7 +42,7 @@ pub(crate) fn ops_concerning(
     let cut = cut_seq(tx)?;
     let mut stmt = tx.prepare(
         "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.base, o.content_hash,
-                o.payload_digest, p.salt, p.body, o.prev_hash, o.hash, o.device, o.sig
+                o.payload_digest, o.payload_state, p.salt, p.body, o.prev_hash, o.hash, o.device, o.sig
          FROM ops o
          JOIN op_objects oo ON oo.op_id = o.op_id
          LEFT JOIN op_payloads p ON p.op_id = o.op_id
@@ -61,12 +61,13 @@ pub(crate) fn ops_concerning(
                 base: r.get::<_, Option<String>>(6)?.as_deref(),
                 content_hash: &r.get::<_, String>(7)?,
                 payload_digest: &r.get::<_, String>(8)?,
-                salt: r.get::<_, Option<Vec<u8>>>(9)?.as_deref(),
-                body_json: r.get::<_, Option<String>>(10)?.as_deref(),
-                prev_hash: &r.get::<_, String>(11)?,
-                hash: &r.get::<_, String>(12)?,
-                device: r.get::<_, Option<String>>(13)?.as_deref(),
-                sig: r.get::<_, Option<String>>(14)?.as_deref(),
+                payload_state: &r.get::<_, String>(9)?,
+                salt: r.get::<_, Option<Vec<u8>>>(10)?.as_deref(),
+                body_json: r.get::<_, Option<String>>(11)?.as_deref(),
+                prev_hash: &r.get::<_, String>(12)?,
+                hash: &r.get::<_, String>(13)?,
+                device: r.get::<_, Option<String>>(14)?.as_deref(),
+                sig: r.get::<_, Option<String>>(15)?.as_deref(),
             }))
         })?
         .collect::<Result<Result<Vec<_>, _>, _>>()??;
@@ -174,10 +175,23 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
     let objects = ops::objects_of(op);
     let touched_a_note = objects.iter().any(|o| o.starts_with("note:"));
     let mut to_materialize: Vec<String> = Vec::new();
+    // v0.6.1 (P0): an operation whose base is not in the log waits — but
+    // only in the object the base BELONGS to (`op.note_id`'s note: the base
+    // is always an operation of that note). The other halves of a
+    // two-object operation (the NEW note a supersede creates, the target a
+    // decide closes) lean on nothing that is missing: they materialize now,
+    // or their object would sleep until an operation that never concerns it
+    // came to wake it (found by the convergence fleet: the supersede's new
+    // note never materialized on the copy that received it before its base).
+    let park_object = match op.note_id {
+        Some(n) if base_unknown(tx, op)? => Some(format!("note:{n}")),
+        _ => None,
+    };
     for object in &objects {
         if is_pending(tx, object)?
             || !is_newest_of(tx, object, op)?
             || breaks_the_chain(tx, object, op)?
+            || Some(object) == park_object.as_ref()
         {
             to_materialize.push(object.clone());
         }
@@ -217,6 +231,21 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
                         TombstoneOutcome::Wins => continue,
                         TombstoneOutcome::Reopens => ops::reopen_tombstone(tx, &nid)?,
                         TombstoneOutcome::NoTombstone => {}
+                    }
+                    // v0.6.1 (P0): an APPLIED body write on the fast path is
+                    // the note's new FINAL winner — the last body write in
+                    // total order, chained on the head. Its losers are the
+                    // body writes after its base, and there are none between
+                    // the head and itself: the desired conflict set is EMPTY,
+                    // and any copy left by an earlier, smaller set (a winner
+                    // the fleet has since moved past — found by the
+                    // convergence fleet as a stale copy the total-order
+                    // reference kept and the rematerializing copies dropped)
+                    // goes now. A pre-v0.6 write (no base) never takes this
+                    // road: its losers would be every earlier body write,
+                    // which only a materialization can derive.
+                    if op.base.is_some() {
+                        reconcile_conflict_copies(tx, &nid, &[])?;
                     }
                 }
                 match apply_half(tx, op, object) {
@@ -459,6 +488,25 @@ fn materialize_note(
     let mut events: Vec<ReplayEvent> = Vec::new();
     let purged = note_purged_in_set(tx, id)?;
     for op in &all {
+        // v0.6.1 (P0): an operation whose base is nowhere in the log has
+        // not been ordered yet — the author leaned on a past this copy does
+        // not hold. It waits (the object turns pending) and applies when
+        // the base lands. The wait binds only the object the base belongs
+        // to (`op.note_id`'s note): the OTHER halves of a two-object
+        // operation — the new note a supersede creates, the target a decide
+        // closes — materialize here regardless. A purged note's ops lean on
+        // a note that will never materialize and wait for nothing.
+        if !purged && op.note_id.is_some_and(|n| n == *id) && base_unknown(tx, op)? {
+            pending_since = Some(op.op_id.to_string());
+            events.push(ReplayEvent {
+                hash: op.content_hash.clone(),
+                body: None,
+                base: op.base.clone(),
+                op_id: op.op_id,
+                hlc_ms: op.hlc.physical_ms,
+            });
+            continue;
+        }
         // a purge always applies, on an empty object too: its scrub IS the
         // state it carries (the bodies it must forget arrived before it)
         if !note_exists(tx, id)? && !op_creates_note(op, id) && op.kind != OpKind::Purge {
@@ -565,12 +613,15 @@ fn final_losers(events: &[ReplayEvent]) -> Vec<LoserRecord> {
         return Vec::new();
     };
     let winner_base = events[winner_pos].base.clone();
-    // A base that is NOT among the events means "written before the sync
-    // era, or censored by a purge" — sequential by declaration, never a
-    // concurrent past: no losers. (Starting from 0 here manufactured
-    // phantom conflict copies: a purge's censor REWRITES a supersede's
-    // content_hash, so a patch written before the censor points at a hash
-    // that no longer exists — the phantom's tell.)
+    // A base that is not among the events can only be BELOW the compaction
+    // cut: the winner applied (a body write never applies while its base is
+    // unknown — v0.6.1, P0), and an applied base is either above the cut,
+    // in the events, or a redacted skeleton under it. Below the cut the
+    // state is frozen and sequential by the frontier's own promise: no
+    // losers. (When the censor still rewrote content hashes, "absent" also
+    // meant "censored on this copy only", and reading it as sequential
+    // made the conflict set depend on the arrival order — the phantom
+    // copies of the v0.6 review.)
     let start = match &winner_base {
         Some(b) => events
             .iter()
@@ -648,6 +699,71 @@ fn replace_note_state(
     Ok(())
 }
 
+/// Is the operation's `base` KNOWN to this copy — in the log above the cut,
+/// or below it as a skeleton? With the identity immutable (v0.6.1, P0), a
+/// base that is nowhere in `ops` means exactly one thing: it has not
+/// arrived yet. The operation WAITS (`pending_objects`), like a patch
+/// before its put — it applies when the base lands, and never before: an
+/// operation must never take effect over a past its author saw and this
+/// copy does not hold. (Before v0.6.1 the censor rewrote the content_hash
+/// of what it censored, so a base could be missing on one copy and present
+/// on another, and "absent" had to be read as "sequential" — the rule that
+/// made the conflict set depend on the arrival order.)
+fn base_unknown(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<bool, CellError> {
+    let Some(base) = op.base.as_deref() else {
+        return Ok(false);
+    };
+    let known: Option<i64> = tx
+        .query_row("SELECT seq FROM ops WHERE content_hash = ?1", [base], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    Ok(known.is_none())
+}
+
+/// The newest operation of one object strictly before `(hlc, op_id)` —
+/// above the compaction cut when there is one, and otherwise over the WHOLE
+/// log: the below-cut rows are redacted skeletons, but they still carry
+/// their HLC and their content hash, which is all ordering ever asks of
+/// them. Without the whole-log fallback, a sequential operation whose base
+/// sits at or below the cut (the first tail write after a compaction — the
+/// bootstrap's own shape) would look "concurrent with nothing" and force a
+/// materialization its own anchor cannot serve (v0.6.1, P0).
+fn head_hash_before(
+    tx: &rusqlite::Transaction<'_>,
+    object: &str,
+    hlc: &str,
+    op_id: &str,
+) -> Result<Option<String>, CellError> {
+    let cut = cut_seq(tx)?;
+    let above: Option<String> = tx
+        .query_row(
+            "SELECT o.content_hash FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = ?1 AND o.seq > ?2
+               AND (o.hlc < ?3 OR (o.hlc = ?3 AND o.op_id < ?4))
+             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
+            rusqlite::params![object, cut, hlc, op_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if above.is_some() {
+        return Ok(above);
+    }
+    let anywhere: Option<String> = tx
+        .query_row(
+            "SELECT o.content_hash FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = ?1
+               AND (o.hlc < ?2 OR (o.hlc = ?2 AND o.op_id < ?3))
+             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
+            rusqlite::params![object, hlc, op_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(anywhere)
+}
+
 /// Does this arrival BREAK THE CHAIN of its note — did its author lean on
 /// a state this copy has already moved past? A write or a delete whose
 /// `base` is not the newest operation of the note (in total order, before
@@ -660,12 +776,6 @@ fn breaks_the_chain(
     object: &str,
     op: &Op,
 ) -> Result<bool, CellError> {
-    let Some(nid) = object.strip_prefix("note:") else {
-        return Ok(false);
-    };
-    let Ok(nid) = Ulid::from_string(nid) else {
-        return Ok(false);
-    };
     if !matches!(
         op.kind,
         OpKind::PutNote | OpKind::PatchNote | OpKind::DeleteNote
@@ -676,21 +786,7 @@ fn breaks_the_chain(
     let Some(base) = op.base.as_deref() else {
         return Ok(false);
     };
-    let cut = cut_seq(tx)?;
-    let hlc = op.hlc.to_string();
-    let op_id = op.op_id.to_string();
-    let head: Option<String> = tx
-        .query_row(
-            "SELECT o.content_hash FROM ops o
-             JOIN op_objects oo ON oo.op_id = o.op_id
-             WHERE oo.object = ?1 AND o.seq > ?2
-               AND (o.hlc < ?3 OR (o.hlc = ?3 AND o.op_id < ?4))
-             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
-            rusqlite::params![object, cut, hlc, op_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let _ = nid;
+    let head = head_hash_before(tx, object, &op.hlc.to_string(), &op.op_id.to_string())?;
     Ok(head.as_deref() != Some(base))
 }
 
@@ -741,20 +837,15 @@ fn tombstone_rule(
     let Some(base) = op.base.as_deref() else {
         return Ok(TombstoneOutcome::Wins);
     };
-    let cut = cut_seq(tx)?;
-    let hlc = op.hlc.to_string();
-    let op_id = op.op_id.to_string();
-    let head: Option<String> = tx
-        .query_row(
-            "SELECT o.content_hash FROM ops o
-             JOIN op_objects oo ON oo.op_id = o.op_id
-             WHERE oo.object = ?1 AND o.seq > ?2
-               AND (o.hlc < ?3 OR (o.hlc = ?3 AND o.op_id < ?4))
-             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
-            rusqlite::params![format!("note:{id}"), cut, hlc, op_id],
-            |r| r.get(0),
-        )
-        .optional()?;
+    // the head before this write, above the cut or below it as a skeleton
+    // (`head_hash_before`): a writer whose base is the note's newest
+    // operation saw the lapide and reopens the note
+    let head = head_hash_before(
+        tx,
+        &format!("note:{id}"),
+        &op.hlc.to_string(),
+        &op.op_id.to_string(),
+    )?;
     if head.as_deref() == Some(base) {
         Ok(TombstoneOutcome::Reopens)
     } else {

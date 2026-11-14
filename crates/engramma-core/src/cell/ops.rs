@@ -150,6 +150,53 @@ impl OpKind {
     }
 }
 
+/// The state of an operation's payload (v0.6.1, P0). The identity —
+/// `payload_digest`, hence `content_hash` and `sig` — is minted ONCE, at
+/// birth, over the ORIGINAL payload, and never changes: redaction,
+/// censorship and compaction touch the payload, never the identity. The
+/// state says which of the three shapes the payload on THIS disk is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadState {
+    /// The original body and its salt: the digest must still match.
+    Whole,
+    /// The body is gone (a purge forgot it, a compaction cut it): the
+    /// original digest stays, nothing is left to check it against.
+    Redacted,
+    /// The purge's censor replaced the body with the deterministic
+    /// replacement (the shape [`censor_shape_ok`] pins); the salt is the
+    /// deterministic [`censor_salt`]. The original digest stays.
+    Censored,
+}
+
+impl PayloadState {
+    /// Wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Whole => "whole",
+            Self::Redacted => "redacted",
+            Self::Censored => "censored",
+        }
+    }
+
+    /// Parse the wire name (everything unknown is refused).
+    ///
+    /// # Errors
+    /// [`CellError::Invalid`] for unknown states.
+    pub fn parse(s: &str) -> Result<Self, CellError> {
+        Ok(match s {
+            "whole" => Self::Whole,
+            "redacted" => Self::Redacted,
+            "censored" => Self::Censored,
+            other => {
+                return Err(CellError::Invalid(format!(
+                    "unknown payload state `{other}`"
+                )));
+            }
+        })
+    }
+}
+
 /// One row of the change log. The payload body and its salt are `None` for a
 /// redacted operation (forgotten by `purge` or compaction); the skeleton —
 /// columns and hashes — is always whole.
@@ -176,11 +223,16 @@ pub struct Op {
     pub body: Option<Value>,
     /// The 16-byte salt of the digest, when the payload lives on.
     pub salt: Option<Vec<u8>>,
-    /// `blake3(salt ‖ canonical body)`; the chain covers this, not the body.
+    /// Which of the three shapes the payload is in (v0.6.1, P0). The digest
+    /// below is ALWAYS the original one, whatever this says.
+    pub payload_state: PayloadState,
+    /// `blake3(salt ‖ canonical body)` of the ORIGINAL payload; the chain
+    /// covers this, not the body. It never changes after birth.
     pub payload_digest: String,
     /// Identity on the wire (v0.6, P1): `content_hash` of the content — the
     /// same operation, the same identity on every copy, whatever each
-    /// copy's local arrival chain is.
+    /// copy's local arrival chain is. It never changes after birth:
+    /// redaction, censorship and compaction touch the payload, never this.
     pub content_hash: String,
     /// Previous op hash (genesis: 64 `0`s).
     pub prev_hash: String,
@@ -462,6 +514,7 @@ pub fn make_op(parts: OpParts) -> Result<Op, CellError> {
         base,
         body: Some(body),
         salt: Some(salt),
+        payload_state: PayloadState::Whole,
         payload_digest: digest,
         content_hash: ch,
         prev_hash: String::new(),
@@ -561,6 +614,7 @@ pub struct OpRow<'a> {
     pub base: Option<&'a str>,
     pub content_hash: &'a str,
     pub payload_digest: &'a str,
+    pub payload_state: &'a str,
     pub salt: Option<&'a [u8]>,
     pub body_json: Option<&'a str>,
     pub prev_hash: &'a str,
@@ -581,6 +635,7 @@ pub fn op_from_row(r: OpRow<'_>) -> Result<Op, CellError> {
             r.op_id
         )));
     }
+    let payload_state = PayloadState::parse(r.payload_state)?;
     let body = r
         .body_json
         .map(|b| {
@@ -588,6 +643,12 @@ pub fn op_from_row(r: OpRow<'_>) -> Result<Op, CellError> {
                 .map_err(|e| CellError::Invalid(format!("bad payload in op {}: {e}", r.op_id)))
         })
         .transpose()?;
+    if payload_state == PayloadState::Redacted && body.is_some() {
+        return Err(CellError::Invalid(format!(
+            "op {}: a redacted operation carries a payload",
+            r.op_id
+        )));
+    }
     let op_id = Ulid::from_string(r.op_id)
         .map_err(|_| CellError::Invalid(format!("bad op_id `{}`", r.op_id)))?;
     let hlc = crate::hlc::Hlc::parse(r.hlc)?;
@@ -624,6 +685,7 @@ pub fn op_from_row(r: OpRow<'_>) -> Result<Op, CellError> {
         base: r.base.map(str::to_string),
         body,
         salt: r.salt.map(<[u8]>::to_vec),
+        payload_state,
         payload_digest: r.payload_digest.to_string(),
         content_hash: r.content_hash.to_string(),
         prev_hash: r.prev_hash.to_string(),
@@ -669,8 +731,8 @@ impl Scope {
 pub fn store_op(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     tx.execute(
         "INSERT INTO ops (seq, op_id, hlc, actor, kind, note_id, base, content_hash,
-                          payload_digest, prev_hash, hash, device, sig)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                          payload_digest, payload_state, prev_hash, hash, device, sig)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         rusqlite::params![
             op.seq,
             op.op_id.to_string(),
@@ -681,6 +743,7 @@ pub fn store_op(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
             op.base,
             op.content_hash,
             op.payload_digest,
+            op.payload_state.as_str(),
             op.prev_hash,
             op.hash,
             op.device,
@@ -1965,8 +2028,15 @@ impl CensorFilter<'_> {
 /// Forget the payloads of every op about the note (but never the `supersede`
 /// ops, nor the `decide` ops that closed another note over it: they carry
 /// the OTHER note's content — forgetting them would erase the surviving
-/// note from every replay; they are censored instead).
+/// note from every replay; they are censored instead). The rows turn
+/// `redacted`: their identity stays the original one, forever.
 fn forget_note_payloads(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
+    tx.execute(
+        "UPDATE ops SET payload_state = 'redacted'
+         WHERE note_id = ?1
+           AND kind NOT IN ('purge', 'supersede', 'decide', 'revert_decision')",
+        [id.to_string()],
+    )?;
     let mut stmt = tx.prepare(
         "DELETE FROM op_payloads WHERE op_id IN (
              SELECT op_id FROM ops
@@ -2116,160 +2186,147 @@ fn censor_purged_ops(
             .unwrap_or(0);
         censored.push((seq, op_id, Value::Object(kept).to_string()));
     }
-    // the rehash of the tail depends on the order the censored ops are
-    // applied in: seq order, deterministically, on the live log and on the
-    // snapshot alike
+    // v0.6.1 (P0): the censor touches ONLY the payload. The identity —
+    // `payload_digest`, therefore `content_hash` and `sig` — is minted once,
+    // at birth, and never changes: a copy that saw the operation before the
+    // purge and a copy that saw it after hold the SAME identity (the rewrite
+    // of the digest was the convergence bug — a `base` pointing at the
+    // original hash became "unknown" on the censored copy only, and the
+    // conflict rules forked with the arrival order). The local chain keeps
+    // covering the ORIGINAL digest, which is still the column's value: no
+    // rehash, on any copy, ever again.
     censored.sort_by_key(|(seq, _, _)| *seq);
-    for (seq, op_id, censored_body) in &censored {
-        // The censor's salt is DETERMINISTIC (blake3 over the op id): the
-        // live purge and the in-snapshot purge censor the same original body
-        // and must land on the same digest, hence on the same chain — a
-        // fresh random salt would fork the two logs (found by the
-        // in-snapshot censor test). The censored body carries none of the
-        // purged note's content, so the salt has nothing personal left to
-        // decouple.
-        let salt: [u8; 16] = {
-            let h = blake3::hash(format!("censor:{op_id}").as_bytes());
-            let mut s = [0_u8; 16];
-            s.copy_from_slice(&h.as_bytes()[..16]);
-            s
-        };
-        let digest = payload_digest(
-            &salt,
-            &serde_json::from_str::<Value>(censored_body)
-                .map_err(|e| CellError::Db(format!("censored body: {e}")))?,
-        );
-        rewrite_payload(tx, op_id, &salt, &digest, censored_body)?;
-        rehash_tail(tx, *seq)?;
+    for (_seq, op_id, censored_body) in &censored {
+        censor_payload(tx, op_id, censored_body)?;
     }
     for op_id in &plain_deleted {
-        tx.execute("DELETE FROM op_payloads WHERE op_id = ?1", [op_id])?;
+        forget_payload(tx, op_id)?;
     }
     Ok(())
 }
 
-/// Rewrite an op's payload with a precomputed digest (the purge's censor):
-/// the replacement body lands in `op_payloads`, and the CONTENT identity of
-/// the row follows — the censor changes the content, so it changes the
-/// identity, deterministically: the same replacement, the same salt, the
-/// same recomputation, on every copy that applies the purge.
-fn rewrite_payload(
-    tx: &Transaction<'_>,
-    op_id: &str,
-    salt: &[u8],
-    digest: &str,
-    replacement_body: &str,
-) -> Result<(), CellError> {
+/// The censor's DETERMINISTIC salt (blake3 over the op id): the live purge
+/// and the in-snapshot purge censor the same original body and must land on
+/// the same bytes — and so must every copy that applies the purge, whatever
+/// order things arrived in. The censored body carries none of the purged
+/// note's content, so the salt has nothing personal left to decouple.
+#[must_use]
+pub fn censor_salt(op_id: &str) -> [u8; 16] {
+    let h = blake3::hash(format!("censor:{op_id}").as_bytes());
+    let mut s = [0_u8; 16];
+    s.copy_from_slice(&h.as_bytes()[..16]);
+    s
+}
+
+/// Replace an op's payload with the censor's deterministic replacement and
+/// mark the row `censored` (v0.6.1, P0): the body and the salt change, the
+/// identity does not — `payload_digest`, `content_hash` and `sig` keep the
+/// values they were born with, so bases keep resolving and signatures keep
+/// verifying on every copy, censored or not.
+fn censor_payload(tx: &Transaction<'_>, op_id: &str, censored_body: &str) -> Result<(), CellError> {
+    let salt = censor_salt(op_id);
+    // parse once: a censored body that is not canonical JSON is a bug, not
+    // something to paper over
+    serde_json::from_str::<Value>(censored_body)
+        .map_err(|e| CellError::Db(format!("censored body: {e}")))?;
     tx.execute(
         "UPDATE op_payloads SET salt = ?2, body = ?3 WHERE op_id = ?1",
-        rusqlite::params![op_id, salt, replacement_body],
+        rusqlite::params![op_id, salt, censored_body],
     )?;
     tx.execute(
-        "UPDATE ops SET payload_digest = ?2 WHERE op_id = ?1",
-        rusqlite::params![op_id, digest],
-    )?;
-    // the identity over the new content, keeping the row's own envelope
-    let (hlc_s, actor, kind_s, note_id_s, base): (
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-    ) = tx.query_row(
-        "SELECT hlc, actor, kind, note_id, base FROM ops WHERE op_id = ?1",
+        "UPDATE ops SET payload_state = 'censored' WHERE op_id = ?1",
         [op_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-    )?;
-    let op_id_ulid =
-        Ulid::from_string(op_id).map_err(|_| CellError::Invalid(format!("bad op_id `{op_id}`")))?;
-    let hlc = crate::hlc::Hlc::parse(&hlc_s)?;
-    let kind = OpKind::parse(&kind_s)?;
-    let note_id = note_id_s
-        .as_deref()
-        .map(Ulid::from_string)
-        .transpose()
-        .map_err(|_| CellError::Invalid(format!("bad note_id in op {op_id}")))?;
-    let ch = content_hash(
-        &op_id_ulid,
-        &hlc,
-        &actor,
-        kind,
-        note_id,
-        base.as_deref(),
-        digest,
-    );
-    tx.execute(
-        "UPDATE ops SET content_hash = ?2 WHERE op_id = ?1",
-        rusqlite::params![op_id, ch],
     )?;
     Ok(())
 }
 
-/// Recompute the chain from `from_seq` to the head: a censored op changes its
-/// payload digest, and every later hash covers it as `prev_hash`.
-fn rehash_tail(tx: &Transaction<'_>, from_seq: i64) -> Result<(), CellError> {
-    let prev: String = if from_seq <= 1 {
-        GENESIS_HASH.to_string()
-    } else {
-        tx.query_row("SELECT hash FROM ops WHERE seq = ?1", [from_seq - 1], |r| {
-            r.get(0)
-        })
-        .unwrap_or_else(|_| GENESIS_HASH.to_string())
-    };
-    /// One ops row as read for the rehash: the envelope columns (`base`
-    /// included — it is part of the row the chain covers, present only when
-    /// the op carries one, exactly as `Op::envelope_json` writes it).
-    type OpsRow = (
-        i64,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-    );
-    let rows: Vec<OpsRow> = {
-        let mut stmt = tx.prepare(
-            "SELECT seq, op_id, hlc, actor, kind, note_id, base, payload_digest
-             FROM ops WHERE seq >= ?1 ORDER BY seq",
-        )?;
-        stmt.query_map([from_seq], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-    };
-    let mut prev = prev;
-    for (seq, op_id, hlc, actor, kind, note_id, base, digest) in rows {
-        let mut envelope = serde_json::json!({
-            "actor": actor,
-            "hlc": hlc,
-            "kind": kind,
-            "note_id": note_id,
-            "op_id": op_id,
-            "payload_digest": digest,
-        });
-        if let Some(base) = &base {
-            envelope["base"] = Value::String(base.clone());
-        }
-        let envelope = envelope.to_string();
-        let hash = op_hash(&prev, &envelope);
-        tx.execute(
-            "UPDATE ops SET prev_hash = ?2, hash = ?3 WHERE seq = ?1",
-            rusqlite::params![seq, prev, hash],
-        )?;
-        prev = hash;
-    }
+/// Forget one op's payload entirely and mark the row `redacted` (the
+/// censor's plain-delete path, the purge's forget, the compaction cut).
+fn forget_payload(tx: &Transaction<'_>, op_id: &str) -> Result<(), CellError> {
+    tx.execute("DELETE FROM op_payloads WHERE op_id = ?1", [op_id])?;
+    tx.execute(
+        "UPDATE ops SET payload_state = 'redacted' WHERE op_id = ?1",
+        [op_id],
+    )?;
     Ok(())
+}
+
+/// Does this payload hold EXACTLY the shape the censor's deterministic rule
+/// produces? The rule's output is determined by the op and the purge that
+/// covers it modulo the ids and timestamps of OTHER notes (the old note's
+/// id, the closing validity, the target's id — data the purge has no right
+/// to touch), which no re-derivation can recover once the original body is
+/// gone. What CAN be checked — and here is — is that nothing BEYOND the
+/// rule's kept fields survives: an altered "censored" body that smuggles
+/// content in, or claims a field the rule never writes, fails this and the
+/// op is refused. This is the whole point: the identity stopped covering the
+/// payload, so the shape is what bounds what a censored payload may say.
+#[must_use]
+pub fn censor_shape_ok(op: &Op) -> bool {
+    let Some(body) = &op.body else {
+        return false;
+    };
+    let Value::Object(fields) = body else {
+        return false;
+    };
+    let is_str = |v: &Value| v.is_string();
+    match op.kind {
+        OpKind::Supersede => {
+            // {old_id?, valid_to?, old_updated_at?, note: null} — the closing
+            // of the OLD note stays replayable, the new note's content goes
+            fields.get("note") == Some(&Value::Null)
+                && fields.keys().all(|k| {
+                    matches!(
+                        k.as_str(),
+                        "old_id" | "valid_to" | "old_updated_at" | "note"
+                    )
+                })
+                && fields.get("old_id").is_none_or(is_str)
+                && fields.get("valid_to").is_none_or(is_str)
+                && fields.get("old_updated_at").is_none_or(is_str)
+        }
+        OpKind::Decide => {
+            // an accepted supersede proposal: {proposal, decision:
+            // "accept", censored: true, target, target_closing?,
+            // decided_at?}
+            fields.get("decision").and_then(Value::as_str) == Some("accept")
+                && fields.get("censored") == Some(&Value::Bool(true))
+                && fields.get("proposal").is_some_and(is_str)
+                && fields.get("target").is_some_and(is_str)
+                && fields.get("target_closing").is_none_or(is_str)
+                && fields.get("decided_at").is_none_or(is_str)
+                && fields.keys().all(|k| {
+                    matches!(
+                        k.as_str(),
+                        "proposal"
+                            | "decision"
+                            | "censored"
+                            | "target"
+                            | "target_closing"
+                            | "decided_at"
+                    )
+                })
+        }
+        OpKind::RevertDecision => {
+            // {censored: true, decision?, decided_at?, restore_target?} — the
+            // restore_target is the TARGET note's pre-state (another note's
+            // content, which the purge has no right to touch), copied
+            // verbatim: an object, never free-form text
+            fields.get("censored") == Some(&Value::Bool(true))
+                && fields.get("decision").is_none_or(is_str)
+                && fields.get("decided_at").is_none_or(is_str)
+                && fields
+                    .get("restore_target")
+                    .is_none_or(|v| v.is_object() || v.is_null())
+                && fields.keys().all(|k| {
+                    matches!(
+                        k.as_str(),
+                        "censored" | "decision" | "decided_at" | "restore_target"
+                    )
+                })
+        }
+        _ => false,
+    }
 }
 
 fn apply_confirm(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
@@ -2871,7 +2928,7 @@ fn apply_set_policy(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
 pub fn read_ops(conn: &Connection) -> Result<Vec<Op>, CellError> {
     let mut stmt = conn.prepare(
         "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.base, o.content_hash,
-                o.payload_digest, p.salt, p.body, o.prev_hash, o.hash, o.device, o.sig
+                o.payload_digest, o.payload_state, p.salt, p.body, o.prev_hash, o.hash, o.device, o.sig
          FROM ops o LEFT JOIN op_payloads p ON p.op_id = o.op_id
          ORDER BY o.seq",
     )?;
@@ -2887,12 +2944,13 @@ pub fn read_ops(conn: &Connection) -> Result<Vec<Op>, CellError> {
                 base: r.get::<_, Option<String>>(6)?.as_deref(),
                 content_hash: &r.get::<_, String>(7)?,
                 payload_digest: &r.get::<_, String>(8)?,
-                salt: r.get::<_, Option<Vec<u8>>>(9)?.as_deref(),
-                body_json: r.get::<_, Option<String>>(10)?.as_deref(),
-                prev_hash: &r.get::<_, String>(11)?,
-                hash: &r.get::<_, String>(12)?,
-                device: r.get::<_, Option<String>>(13)?.as_deref(),
-                sig: r.get::<_, Option<String>>(14)?.as_deref(),
+                payload_state: &r.get::<_, String>(9)?,
+                salt: r.get::<_, Option<Vec<u8>>>(10)?.as_deref(),
+                body_json: r.get::<_, Option<String>>(11)?.as_deref(),
+                prev_hash: &r.get::<_, String>(12)?,
+                hash: &r.get::<_, String>(13)?,
+                device: r.get::<_, Option<String>>(14)?.as_deref(),
+                sig: r.get::<_, Option<String>>(15)?.as_deref(),
             }))
         })?
         .collect::<Result<Result<Vec<_>, _>, _>>()??;

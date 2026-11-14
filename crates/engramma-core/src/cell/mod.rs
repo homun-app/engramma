@@ -526,6 +526,25 @@ pub(crate) struct Inner {
     /// checkpoint (in-memory only: a crashed process leaves the frames to
     /// the next purge or explicit `checkpoint`, declared in the REPORT).
     pub(crate) pending_scrub: Vec<&'static str>,
+    /// Test-only determinism (v0.6.1, P0): when set, every LOCAL mint — an
+    /// op id, a payload salt, an edge id — comes from here instead of the
+    /// process CSPRNG. The convergence simulator injects one so a saved
+    /// seed writes a byte-for-byte reproducible op set (with the injected
+    /// clock; random ULIDs were half of why a failing seed did not
+    /// reproduce).
+    pub(crate) minter: Option<Minter>,
+}
+
+/// The injectable source of op ids and payload salts (tests only).
+pub type Minter = std::sync::Arc<dyn Fn() -> Result<(Ulid, [u8; 16]), CellError> + Send + Sync>;
+
+/// Mint one id and one salt: the injected minter's when there is one, the
+/// process CSPRNG otherwise.
+fn mint_ids(inner: &Inner) -> Result<(Ulid, [u8; 16]), CellError> {
+    match &inner.minter {
+        Some(mint) => mint(),
+        None => Ok((crate::id::new_ulid()?, crate::id::random_salt()?)),
+    }
 }
 
 impl Drop for Inner {
@@ -821,6 +840,7 @@ impl Cell {
                 query_cache: std::collections::HashMap::new(),
                 query_cache_cap: crate::graph::QUERY_CACHE_CAPACITY,
                 pending_scrub: Vec::new(),
+                minter: None,
             })),
             write_lock: per_cell_lock(path),
         })
@@ -947,6 +967,17 @@ impl Cell {
         Ok(())
     }
 
+    /// Replace the id/salt mint (tests only, v0.6.1, P0): the injected
+    /// minter turns every LOCAL mint deterministic, which — with the
+    /// injected clock — makes a saved proptest seed write the SAME op set,
+    /// byte for byte, on every rerun. See [`Cell::inject_clock`] for the
+    /// other half.
+    pub fn inject_minter(&self, minter: Minter) -> Result<(), CellError> {
+        let mut inner = self.lock()?;
+        inner.minter = Some(minter);
+        Ok(())
+    }
+
     /// Build and append an operation, then apply it, in one transaction.
     /// The caller holds the per-cell write lock.
     fn execute(
@@ -1015,21 +1046,48 @@ impl Cell {
                 op.op_id
             )));
         }
-        match (&op.salt, &op.body) {
-            (Some(salt), Some(body)) => {
-                if ops::payload_digest(salt, body) != op.payload_digest {
+        // v0.6.1 (P0): the identity covers the ORIGINAL payload digest,
+        // whatever state the sender's copy holds the payload in. A `whole`
+        // body must still digest to it; a `censored` body is checked
+        // against the censor's own deterministic rule (shape and salt) —
+        // the identity no longer covers it, the shape bounds what it may
+        // say; a `redacted` op carries no body at all.
+        match op.payload_state {
+            ops::PayloadState::Whole => match (&op.salt, &op.body) {
+                (Some(salt), Some(body)) => {
+                    if ops::payload_digest(salt, body) != op.payload_digest {
+                        return Err(CellError::Invalid(format!(
+                            "op {}: the body does not digest to its salted digest",
+                            op.op_id
+                        )));
+                    }
+                }
+                _ => {
                     return Err(CellError::Invalid(format!(
-                        "op {}: the body does not digest to its salted digest",
+                        "op {}: a whole operation must carry its body and salt",
+                        op.op_id
+                    )));
+                }
+            },
+            ops::PayloadState::Redacted => {
+                if op.salt.is_some() || op.body.is_some() {
+                    return Err(CellError::Invalid(format!(
+                        "op {}: a redacted operation carries no body",
                         op.op_id
                     )));
                 }
             }
-            (None, None) => {}
-            _ => {
-                return Err(CellError::Invalid(format!(
-                    "op {}: body and salt disagree (one forgotten, one present)",
-                    op.op_id
-                )));
+            ops::PayloadState::Censored => {
+                let salt_ok = op
+                    .salt
+                    .as_deref()
+                    .is_some_and(|s| s == ops::censor_salt(&op.op_id.to_string()));
+                if !salt_ok || !ops::censor_shape_ok(op) {
+                    return Err(CellError::Invalid(format!(
+                        "op {}: the censored payload is not what the censor's rule produces",
+                        op.op_id
+                    )));
+                }
             }
         }
         if op.hlc.physical_ms > wall_ms.saturating_add(DRIFT_CAP_MS) {
@@ -1456,7 +1514,12 @@ impl Cell {
     /// # Errors
     /// [`CellError::NoteNotFound`] for unknown `note:` endpoints.
     pub fn link(&self, edge: &EdgeInput, actor: &str) -> Result<String, CellError> {
-        let edge_id = crate::id::new_ulid()?.to_string();
+        // the edge id is minted here (not inside execute_op): it rides in
+        // the payload, so the injected minter must cover it too (v0.6.1, P0)
+        let edge_id = {
+            let inner = self.lock()?;
+            mint_ids(&inner)?.0.to_string()
+        };
         let payload = serde_json::json!({
             "edge": {
                 "id": edge_id,
@@ -2454,6 +2517,10 @@ impl Cell {
                              SELECT op_id FROM ops WHERE seq <= ?1)",
                         [up_to_seq],
                     )?;
+                    tx.execute(
+                        "UPDATE ops SET payload_state = 'redacted' WHERE seq <= ?1",
+                        [up_to_seq],
+                    )?;
                     tx.execute("DELETE FROM note_vectors", [])?;
                     tx.execute("DELETE FROM embedding_models", [])?;
                     tx.execute("DELETE FROM vault_files", [])?;
@@ -2506,6 +2573,13 @@ impl Cell {
         tx.execute(
             "DELETE FROM op_payloads WHERE op_id IN (
                  SELECT op_id FROM ops WHERE seq <= ?1)",
+            [up_to_seq],
+        )?;
+        // v0.6.1 (P0): the cut rows turn `redacted` — their skeletons stay
+        // (the `base` of a later arrival still finds them), their payloads
+        // go, and the state says which is which.
+        tx.execute(
+            "UPDATE ops SET payload_state = 'redacted' WHERE seq <= ?1",
             [up_to_seq],
         )?;
         // For a checkpoint the digest is the LIVE state's after the cut (the
@@ -2711,7 +2785,7 @@ impl Cell {
         let inner = self.lock()?;
         let mut stmt = inner.conn.prepare(
             "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.base, o.content_hash,
-                    o.payload_digest, p.salt, p.body, o.prev_hash, o.hash, o.device, o.sig
+                    o.payload_digest, o.payload_state, p.salt, p.body, o.prev_hash, o.hash, o.device, o.sig
              FROM ops o LEFT JOIN op_payloads p ON p.op_id = o.op_id
              WHERE o.seq > ?1 ORDER BY o.seq",
         )?;
@@ -2726,12 +2800,13 @@ impl Cell {
                 base: r.get::<_, Option<String>>(6)?.as_deref(),
                 content_hash: &r.get::<_, String>(7)?,
                 payload_digest: &r.get::<_, String>(8)?,
-                salt: r.get::<_, Option<Vec<u8>>>(9)?.as_deref(),
-                body_json: r.get::<_, Option<String>>(10)?.as_deref(),
-                prev_hash: &r.get::<_, String>(11)?,
-                hash: &r.get::<_, String>(12)?,
-                device: r.get::<_, Option<String>>(13)?.as_deref(),
-                sig: r.get::<_, Option<String>>(14)?.as_deref(),
+                payload_state: &r.get::<_, String>(9)?,
+                salt: r.get::<_, Option<Vec<u8>>>(10)?.as_deref(),
+                body_json: r.get::<_, Option<String>>(11)?.as_deref(),
+                prev_hash: &r.get::<_, String>(12)?,
+                hash: &r.get::<_, String>(13)?,
+                device: r.get::<_, Option<String>>(14)?.as_deref(),
+                sig: r.get::<_, Option<String>>(15)?.as_deref(),
             }))
         })?;
         let mut out = Vec::new();
@@ -2796,12 +2871,26 @@ impl Cell {
                 chain_ok = false;
                 break;
             }
-            // When the payload lives on, its salted digest must still match
-            // the body: this is what catches a changed byte (with the salt)
-            // under an otherwise intact chain.
-            if let (Some(salt), Some(body)) = (&op.salt, &op.body)
-                && ops::payload_digest(salt, body) != op.payload_digest
-            {
+            // v0.6.1 (P0): the payload check follows the payload's STATE.
+            // `whole` must still digest to the ORIGINAL digest (a changed
+            // byte, with the salt, breaks here); `censored` must be exactly
+            // what the censor's deterministic rule produces (shape and
+            // salt) — the identity no longer covers the body, so the shape
+            // is what bounds it; `redacted` carries nothing to check.
+            let payload_ok = match op.payload_state {
+                ops::PayloadState::Whole => match (&op.salt, &op.body) {
+                    (Some(salt), Some(body)) => {
+                        ops::payload_digest(salt, body) == op.payload_digest
+                    }
+                    _ => false,
+                },
+                ops::PayloadState::Redacted => op.salt.is_none() && op.body.is_none(),
+                ops::PayloadState::Censored => {
+                    op.salt.as_deref() == Some(&ops::censor_salt(&op.op_id.to_string())[..])
+                        && ops::censor_shape_ok(op)
+                }
+            };
+            if !payload_ok {
                 chain_ok = false;
                 break;
             }
@@ -2935,6 +3024,31 @@ impl Cell {
                                          SELECT op_id FROM ops WHERE seq <= ?1)",
                                     [*snap_seq],
                                 )?;
+                                tx.execute(
+                                    "UPDATE ops SET payload_state = 'redacted'
+                                     WHERE seq <= ?1",
+                                    [*snap_seq],
+                                )?;
+                                // v0.6.1 (P0): the rebuilt copy must know the
+                                // CUT the live cell knows — its `snapshots`
+                                // row. The strip empties the table in the
+                                // file, and without the row a rematerialization
+                                // inside the tail replay would replay from
+                                // zero over redacted skeletons and diverge
+                                // from the live cell's own materialization
+                                // (which anchors at the cut state). Mirror
+                                // the live row, verbatim.
+                                tx.execute(
+                                    "INSERT INTO snapshots
+                                         (seq, head_hash, state_digest, file, redacted_by, created_at)
+                                     VALUES (?1, ?2, ?3, NULL, ?4, '')",
+                                    rusqlite::params![
+                                        *snap_seq,
+                                        head_hash,
+                                        digest,
+                                        redacted_by,
+                                    ],
+                                )?;
                                 tx.commit()?;
                             }
                             let from = source_ops
@@ -3058,7 +3172,7 @@ fn execute_op(
     actor: &str,
     payload: Value,
 ) -> Result<Ulid, CellError> {
-    let op_id = crate::id::new_ulid()?;
+    let (op_id, salt) = mint_ids(inner)?;
     let tx = inner
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3114,7 +3228,6 @@ fn execute_op(
     };
     // The salt is minted at creation, like the op id and the HLC: `apply`
     // stays deterministic and the digest can be recomputed forever.
-    let salt = crate::id::random_salt()?;
     let mut op = ops::make_op(ops::OpParts {
         op_id,
         hlc,
@@ -3999,13 +4112,23 @@ mod tests {
         let mut n2 = note(1, "seconda versione [[Milano]]");
         n2.title = Some("v2".into());
         cell.put_note(&n2, "t").unwrap(/* test-only */);
-        // forget the FIRST put: its effect is fully replaced by the second
+        // forget the FIRST put: its effect is fully replaced by the second.
+        // v0.6.1 (P0): forgetting marks the row `redacted` — the state and
+        // the payload must agree.
         {
             let inner = cell.lock().unwrap(/* test-only */);
             inner
                 .conn
                 .execute(
                     "DELETE FROM op_payloads WHERE op_id = (
+                         SELECT op_id FROM ops WHERE kind = 'put_note' ORDER BY seq LIMIT 1)",
+                    [],
+                )
+                .unwrap(/* test-only */);
+            inner
+                .conn
+                .execute(
+                    "UPDATE ops SET payload_state = 'redacted' WHERE op_id = (
                          SELECT op_id FROM ops WHERE kind = 'put_note' ORDER BY seq LIMIT 1)",
                     [],
                 )

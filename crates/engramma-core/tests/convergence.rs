@@ -887,88 +887,16 @@ proptest! {
         devices in 2_u32..=4,
         rounds in 12_u32..=28,
     ) {
-        let mut rng = Rng(seed | 1);
-        let n = devices as usize;
-        let dir0 = tempfile::tempdir().unwrap(/* test-only */);
-        let a = Cell::create(&dir0.path().join("fleet.sqlite"), "conv", "device-0")
-            .unwrap(/* test-only */);
-        std::mem::forget(dir0);
-        a.set_policy(serde_json::json!({ "write": "propose" }), "device-0")
-            .unwrap(/* test-only */);
-        let mut cells = vec![a];
-        for d in 1..n {
-            let dir = tempfile::tempdir().unwrap(/* test-only */);
-            let cell = Cell::open_bare(&dir.path().join(format!("fleet{d}.sqlite")))
-                .unwrap(/* test-only */);
-            std::mem::forget(dir);
-            cells.push(cell);
-        }
-        // deterministic time: each device ticks a fixed clock, so a failing
-        // case reproduces exactly (wall-time HLCs would rewrite the op set
-        // on every run)
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::Arc;
-        // the base is the REAL wall, frozen here: always within the drift
-        // cap, and frozen so every device ticks the same deterministic
-        // sequence
-        let base = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        for (d, cell) in cells.iter().enumerate() {
-            let tick = Arc::new(AtomicU64::new(0));
-            let now = Arc::clone(&tick);
-            let node = format!("d{d:011}x");
-            cell.inject_clock(engramma_core::hlc::HlcClock::new(node, move || {
-                base + now.fetch_add(1, Ordering::SeqCst) * 7 + d as u64 * 3
-            }))
-            .unwrap(/* test-only */);
-        }
-        let mut fleet = Fleet { cells, notes: Vec::new(), edges: Vec::new(), proposals: Vec::new() };
-        for _ in 0..rounds {
-            match rng.below(3) {
-                0 | 1 => {
-                    // a device writes
-                    let dev = rng.below(n as u64) as usize;
-                    let w = match rng.below(9) {
-                        0 | 1 => Write::Put,
-                        2 | 3 => Write::Patch,
-                        4 => Write::Delete,
-                        5 => Write::Supersede,
-                        6 => Write::Link,
-                        _ => Write::Unlink,
-                    };
-                    fleet.write(dev, &w, &mut rng);
-                }
-                _ => {
-                    // a delivery between two devices: sometimes partial
-                    let from = rng.below(n as u64) as usize;
-                    let to = rng.below(n as u64) as usize;
-                    if from != to {
-                        let fraction = rng.below(5);
-                        fleet.deliver(from, to, fraction, &mut rng);
-                    }
-                }
-            }
-        }
-        // occasionally exercise the queue and the right to be forgotten
-        fleet.write(rng.below(n as u64) as usize, &Write::Propose, &mut rng);
-        fleet.settle();
-        fleet.write(rng.below(n as u64) as usize, &Write::Decide, &mut rng);
-        if rng.below(2) == 0 && !fleet.notes.is_empty() {
-            fleet.write(rng.below(n as u64) as usize, &Write::Purge, &mut rng);
-        }
-        fleet.settle();
-
+        let fleet = fleet_run(seed, devices, rounds);
         // every copy holds the same replicated state…
         let digests: Vec<String> = fleet
             .cells
             .iter()
             .map(|c| c.replicated_digest().unwrap(/* test-only */))
             .collect();
-        let first = &digests[0];
+        let first = digests[0].clone();
         prop_assert!(
-            digests.iter().all(|d| d == first),
+            digests.iter().all(|d| *d == first),
             "the fleet did not converge: {digests:?}"
         );
         // …and the same state as a copy that received everything in total
@@ -981,15 +909,219 @@ proptest! {
         }
         let mut by_total: Vec<Op> = union.into_values().collect();
         by_total.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
-        let reference = copy_of("ref", &by_total);
+        // the reference shares the fleet's frozen clock: the drift cap
+        // reads the INJECTED wall, and a bare copy would read the real one
+        // (the fleet base is months ahead of it)
+        let reference = {
+            let dir = tempfile::tempdir().unwrap(/* test-only */);
+            let cell = Cell::open_bare(&dir.path().join("ref.sqlite")).unwrap(/* test-only */);
+            std::mem::forget(dir);
+            cell.inject_clock(engramma_core::hlc::HlcClock::new("ref00000000x", || FLEET_BASE_MS))
+                .unwrap(/* test-only */);
+            for op in &by_total {
+                cell.ingest_op(op).unwrap(/* test-only */);
+            }
+            cell
+        };
         prop_assert_eq!(
             reference.replicated_digest().unwrap(/* test-only */),
-            first.clone(),
+            first,
             "the total-order reference disagrees with the fleet"
         );
         // one copy's own log still verifies against its own replay
         let vr = fleet.cells[0].verify().unwrap(/* test-only */);
         prop_assert!(vr.ok(), "a converged copy fails verify: {vr:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.6.1 (P0): the fleet is DETERMINISTIC from its seed — the clock base is
+// a constant, op ids and salts come from an injected mint keyed on the seed,
+// so a saved case writes byte for byte the same op set on every rerun. (The
+// v0.6 test froze the wall clock AT RUN TIME and minted random ULIDs: a
+// failing seed reran a DIFFERENT case, and that is how a convergence defect
+// passed for green.)
+// ---------------------------------------------------------------------------
+
+/// The fleet's frozen clock base (2027-01-15T00:00:00Z): near enough to now
+/// to be honest, constant so a saved case reproduces. Every clock in the
+/// fleet derives from it, so no real wall time enters any operation.
+const FLEET_BASE_MS: u64 = 1_800_000_000_000;
+
+/// One device's deterministic mint stream: op ids and payload salts, keyed
+/// on the seed and the device, so the same inputs mint the same operations
+/// in the same order, forever.
+struct SeedMint {
+    seed: u64,
+    dev: usize,
+    n: u64,
+}
+
+impl SeedMint {
+    fn next(&mut self) -> (Ulid, [u8; 16]) {
+        self.n += 1;
+        let h =
+            blake3::hash(format!("fleet/{}/mint/{}/{}", self.seed, self.dev, self.n).as_bytes());
+        let b = h.as_bytes();
+        let mut randomness: u128 = 0;
+        for x in &b[..10] {
+            randomness = (randomness << 8) | u128::from(*x);
+        }
+        let op_id = Ulid::from_parts(FLEET_BASE_MS, randomness);
+        let mut salt = [0_u8; 16];
+        salt.copy_from_slice(&b[10..26]);
+        (op_id, salt)
+    }
+}
+
+/// Run one whole fleet from `(seed, devices, rounds)`: the deterministic
+/// twin of the old inline body. A rerun with the same inputs writes the
+/// same op set byte for byte (clock base, mints and picks all keyed on the
+/// seed).
+fn fleet_run(seed: u64, devices: u32, rounds: u32) -> Fleet {
+    let mut rng = Rng(seed | 1);
+    let n = devices as usize;
+    // device 0 is born bare and takes the shared init, minted here — the
+    // init's op id, salt and cell id come from the seed stream like every
+    // other mint (a Cell::create would mint from the process CSPRNG and
+    // break the reproduction)
+    let dir0 = tempfile::tempdir().unwrap(/* test-only */);
+    let a = Cell::open_bare(&dir0.path().join("fleet0.sqlite")).unwrap(/* test-only */);
+    std::mem::forget(dir0);
+    let mut mint0 = SeedMint { seed, dev: 0, n: 0 };
+    let (cell_id, _) = mint0.next();
+    let (op_id, salt) = mint0.next();
+    let node0 = "d0000000000x".to_string();
+    a.inject_clock(engramma_core::hlc::HlcClock::new(
+        node0.clone(),
+        move || FLEET_BASE_MS,
+    ))
+    .unwrap(/* test-only */);
+    let init = engramma_core::cell::ops::make_op(engramma_core::cell::ops::OpParts {
+        op_id,
+        hlc: engramma_core::hlc::Hlc {
+            physical_ms: FLEET_BASE_MS,
+            counter: 0,
+            node: node0,
+        },
+        actor: "device-0".into(),
+        kind: engramma_core::cell::ops::OpKind::Init,
+        note_id: None,
+        base: None,
+        body: serde_json::json!({ "cell_id": cell_id.to_string(), "name": "conv" }),
+        salt: salt.to_vec(),
+        device: None,
+        sig: None,
+    })
+    .unwrap(/* test-only */);
+    a.ingest_op(&init).unwrap(/* test-only */);
+    let mut cells = vec![a];
+    for d in 1..n {
+        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let cell = Cell::open_bare(&dir.path().join(format!("fleet{d}.sqlite")))
+            .unwrap(/* test-only */);
+        std::mem::forget(dir);
+        cells.push(cell);
+    }
+    // deterministic time and deterministic mints, one of each per device
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    for (d, cell) in cells.iter().enumerate() {
+        let tick = Arc::new(AtomicU64::new(0));
+        let now = Arc::clone(&tick);
+        let node = format!("d{d:011}x");
+        cell.inject_clock(engramma_core::hlc::HlcClock::new(node, move || {
+            FLEET_BASE_MS + now.fetch_add(1, Ordering::SeqCst) * 7 + d as u64 * 3
+        }))
+        .unwrap(/* test-only */);
+        let mint = Arc::new(Mutex::new(SeedMint { seed, dev: d, n: 0 }));
+        cell.inject_minter(Arc::new(move || {
+            let (id, salt) = mint.lock().map_err(|_| {
+                engramma_core::CellError::Db("fleet mint poisoned".into())
+            })?.next();
+            Ok((id, salt))
+        }))
+        .unwrap(/* test-only */);
+    }
+    let mut fleet = Fleet {
+        cells,
+        notes: Vec::new(),
+        edges: Vec::new(),
+        proposals: Vec::new(),
+    };
+    fleet
+        .cells[0]
+        .set_policy(serde_json::json!({ "write": "propose" }), "device-0")
+        .unwrap(/* test-only */);
+    for _ in 0..rounds {
+        match rng.below(3) {
+            0 | 1 => {
+                // a device writes
+                let dev = rng.below(n as u64) as usize;
+                let w = match rng.below(9) {
+                    0 | 1 => Write::Put,
+                    2 | 3 => Write::Patch,
+                    4 => Write::Delete,
+                    5 => Write::Supersede,
+                    6 => Write::Link,
+                    _ => Write::Unlink,
+                };
+                fleet.write(dev, &w, &mut rng);
+            }
+            _ => {
+                // a delivery between two devices: sometimes partial
+                let from = rng.below(n as u64) as usize;
+                let to = rng.below(n as u64) as usize;
+                if from != to {
+                    let fraction = rng.below(5);
+                    fleet.deliver(from, to, fraction, &mut rng);
+                }
+            }
+        }
+    }
+    // occasionally exercise the queue and the right to be forgotten
+    fleet.write(rng.below(n as u64) as usize, &Write::Propose, &mut rng);
+    fleet.settle();
+    fleet.write(rng.below(n as u64) as usize, &Write::Decide, &mut rng);
+    if rng.below(2) == 0 && !fleet.notes.is_empty() {
+        fleet.write(rng.below(n as u64) as usize, &Write::Purge, &mut rng);
+    }
+    fleet.settle();
+    fleet
+}
+
+/// The determinism the v0.6 test only claimed (v0.6.1, P0): the same
+/// `(seed, devices, rounds)` writes, byte for byte, the same set of
+/// operations — the serialized log of two independent runs is equal. A seed
+/// saved by a failing run reproduces exactly the case that failed.
+#[test]
+fn a_saved_seed_reproduces_the_same_op_set_byte_for_byte() {
+    for &(seed, devices, rounds) in &[
+        (15951218505961005304_u64, 3_u32, 21_u32),
+        (42, 2, 12),
+        (0xBEED, 4, 28),
+    ] {
+        let dump = |_tag: &str| -> String {
+            let fleet = fleet_run(seed, devices, rounds);
+            let mut out = String::new();
+            for (d, cell) in fleet.cells.iter().enumerate() {
+                out.push_str(&format!("== device {d} ==\n"));
+                for op in cell.ops().unwrap(/* test-only */) {
+                    out.push_str(&serde_json::to_string(&op.payload()).unwrap(/* t */));
+                    out.push('\n');
+                    out.push_str(&op.content_hash);
+                    out.push('\n');
+                }
+            }
+            out
+        };
+        let first = dump("run-1");
+        let second = dump("run-2");
+        assert_eq!(
+            first, second,
+            "the same seed must write byte for byte the same op set"
+        );
     }
 }
 
