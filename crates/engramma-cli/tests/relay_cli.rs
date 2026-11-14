@@ -6,11 +6,25 @@
 //! winning over what is saved.
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_engramma"))
+}
+
+/// A child process that DIES with the test, even on a panic (R5).
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Run the CLI to completion, bounded: a hung command fails the test with
@@ -115,19 +129,32 @@ fn the_relay_flags_exist_and_save_their_choice() {
     ] {
         // serve commands run until the signal: start, read the first json
         // line, stop — the flag must be accepted
-        let mut child = bin()
-            .arg("--root")
-            .arg(if args[1] == "mailbox" { &a.root } else { &b.root })
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect(/* bin */ "spawn serve");
+        let child = ChildGuard {
+            child: Some(
+                bin()
+                    .arg("--root")
+                    .arg(if args[1] == "mailbox" { &a.root } else { &b.root })
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect(/* bin */ "spawn serve"),
+            ),
+        };
+        let mut child = child;
         let mut line = String::new();
         {
             use std::io::BufRead;
-            let mut reader = std::io::BufReader::new(child.stdout.take().expect(/* p */ "stdout"));
+            let mut reader = std::io::BufReader::new(
+                child
+                    .child
+                    .as_mut()
+                    .expect(/* alive */ "serve")
+                    .stdout
+                    .take()
+                    .expect(/* p */ "stdout"),
+            );
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
                 let mut buf = String::new();
@@ -139,14 +166,12 @@ fn the_relay_flags_exist_and_save_their_choice() {
                     break;
                 }
                 if std::time::Instant::now() > deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    drop(child);
                     panic!("`engramma {}` non ha parlato in 30 s", args.join(" "));
                 }
             }
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child);
         assert!(
             !line.contains("error:") && !line.to_lowercase().contains("unexpected argument"),
             "`engramma {}` deve accettare il flag: {line}",
@@ -158,18 +183,30 @@ fn the_relay_flags_exist_and_save_their_choice() {
     // devices invite / join / code carry the flags too: the invite with
     // --no-relay must print a ticket (bounded by the spawn-and-read below)
     let c = Root::new("relay-c");
-    let mut child = bin()
-        .arg("--root")
-        .arg(&c.root)
-        .args(["devices", "invite", "--no-relay"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect(/* bin */ "spawn invite");
+    let mut child = ChildGuard {
+        child: Some(
+            bin()
+                .arg("--root")
+                .arg(&c.root)
+                .args(["devices", "invite", "--no-relay"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect(/* bin */ "spawn invite"),
+        ),
+    };
     {
         use std::io::BufRead;
-        let mut reader = std::io::BufReader::new(child.stdout.take().expect(/* p */ "stdout"));
+        let mut reader = std::io::BufReader::new(
+            child
+                .child
+                .as_mut()
+                .expect(/* alive */ "invite")
+                .stdout
+                .take()
+                .expect(/* p */ "stdout"),
+        );
         let mut got = String::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -180,8 +217,7 @@ fn the_relay_flags_exist_and_save_their_choice() {
                 break;
             }
             if std::time::Instant::now() > deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                drop(child);
                 panic!("`devices invite --no-relay` non ha stampato il biglietto in 30 s");
             }
         }
@@ -189,11 +225,16 @@ fn the_relay_flags_exist_and_save_their_choice() {
             got.contains("engramma-invite-v1."),
             "`devices invite --no-relay` deve stampare un biglietto: {got}"
         );
-        if let Some(stdin) = child.stdin.as_mut() {
+        if let Some(stdin) = child
+            .child
+            .as_mut()
+            .expect(/* alive */ "invite")
+            .stdin
+            .as_mut()
+        {
             let _ = stdin.write_all(b"\n");
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     assert_eq!(saved_choice(&c.root).as_deref(), Some("none"));
 }

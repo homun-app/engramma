@@ -39,14 +39,70 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_engramma"))
 }
 
+/// Run a test body with a DEADLINE (R5): a hung network dance fails the
+/// test with a clear line instead of hanging the whole run.
+fn bounded<F>(name: &str, secs: u64, body: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let name = name.to_string();
+    let handle = std::thread::spawn(body);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while !handle.is_finished() {
+        if std::time::Instant::now() > deadline {
+            panic!("il test «{name}» non è finito in {secs} s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A child process that DIES with the test, even on a panic (R5): a leaked
+/// `mailbox serve` once lived three hours and a half.
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Wait for a child WITH a deadline: the child is consumed and its output
+/// returned; a hung child is killed and the test fails with a clear line.
+fn wait_bounded(mut child: Child, name: &str, secs: u64) -> std::process::Output {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        match child.try_wait().expect(/* child */ "wait") {
+            Some(_) => return child.wait_with_output().expect(/* t */ "the output"),
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("«{name}» non è finito in {secs} s");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
 fn run(root: &std::path::Path, args: &[&str]) -> (bool, String, String) {
-    let out = bin()
+    let mut child = bin()
         .env("ENGRAMMA_TRACE", "1")
         .arg("--root")
         .arg(root)
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap(/* t */);
+    let out = wait_bounded(child, &args.join(" "), 120);
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -102,9 +158,13 @@ impl Daemon {
         serde_json::from_str(&text).expect(/* balanced */ "the daemon's json")
     }
 
-    fn stop(mut self) {
-        self.child.kill().ok();
-        self.child.wait().ok();
+}
+
+impl Drop for Daemon {
+    /// the daemon dies with the test, even on a panic (R5)
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -129,12 +189,8 @@ impl Root {
 
 /// The pairing helper: A invites (waiting), B joins, both SAS confirmed.
 fn pair(a: &Root, b: &Root, b_name: &str) {
-    let mut inviter = Daemon::spawn(&a.root, &["devices", "invite", "--no-relay"]);
-    // feed the inviter's stdin: not piped here — the invite reads one line
-    // at its prompt, so run it through `yes s`-style piping instead
-    inviter.child.kill().ok();
-    drop(inviter);
-    // the honest way: spawn with stdin fed
+    // the honest way: spawn with stdin fed, both children guarded (R5:
+    // a leaked invite waits its ten minutes, a leaked serve its life)
     let mut child = bin()
         .arg("--root")
         .arg(&a.root)
@@ -159,6 +215,8 @@ fn pair(a: &Root, b: &Root, b_name: &str) {
     let ticket = rx
         .recv_timeout(Duration::from_secs(30))
         .expect(/* printed */ "the ticket");
+    // the invite lives until the pairing ends: guarded (R5)
+    let mut child = ChildGuard { child: Some(child) };
     let join = bin()
         .arg("--root")
         .arg(&b.root)
@@ -168,27 +226,36 @@ fn pair(a: &Root, b: &Root, b_name: &str) {
         .stderr(Stdio::piped())
         .spawn()
         .expect(/* bin */ "spawn join");
-    let mut join = join;
+    let mut join = ChildGuard { child: Some(join) };
     // feed both confirms
     child
+        .child
+        .as_mut()
+        .expect(/* piped */ "invite stdin")
         .stdin
         .as_mut()
         .expect(/* piped */ "invite stdin")
         .write_all(b"s\n")
         .expect(/* pipe */ "invite confirm");
-    let mut join_stdin = join.stdin.take().expect(/* piped */ "join stdin");
+    let mut join_stdin = join
+        .child
+        .as_mut()
+        .expect(/* alive */ "join")
+        .stdin
+        .take()
+        .expect(/* piped */ "join stdin");
     join_stdin
         .write_all(b"s\n")
         .expect(/* pipe */ "join confirm");
     drop(join_stdin);
-    let out = join.wait_with_output().expect(/* t */ "join done");
+    let out = wait_bounded(join.child.take().expect(/* alive */ "join"), "join", 120);
     assert!(
         out.status.success(),
         "join: {} {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    let out = child.wait_with_output().expect(/* t */ "invite done");
+    let out = wait_bounded(child.child.take().expect(/* alive */ "invite"), "invite", 120);
     assert!(
         out.status.success(),
         "invite: {} {}",
@@ -228,6 +295,7 @@ fn remember_all(root: &std::path::Path, device_hex: &str, node_hex: &str, addrs:
 /// three copies of the truth agree and verify.
 #[test]
 fn serve_receives_and_converges_beside_a_second_writer() {
+    bounded("serve_beside_writer", 600, || {
     let a = Root::new("srv-a");
     let b = Root::new("srv-b");
     // a cell on A, shared
@@ -289,7 +357,8 @@ fn serve_receives_and_converges_beside_a_second_writer() {
     );
     assert!(ca.verify().unwrap(/* t */).ok());
     assert!(cb.verify().unwrap(/* t */).ok());
-    serve.stop();
+    drop(serve);
+    });
 }
 
 /// P4: A writes and goes away; B converges from the blind node alone; a
@@ -297,6 +366,7 @@ fn serve_receives_and_converges_beside_a_second_writer() {
 /// the node's file; the node's file never holds note text.
 #[test]
 fn the_blind_node_carries_and_forgets() {
+    bounded("the_blind_node", 600, || {
     let a = Root::new("mbx-a");
     let b = Root::new("mbx-b");
     let node_dir = tempfile::tempdir().unwrap(/* t */);
@@ -332,6 +402,8 @@ fn the_blind_node_carries_and_forgets() {
             }
         });
     }
+    // the node dies with the test, even on a panic (R5 — a leaked node
+    // once lived three hours and a half)
     let node = Daemon { child, lines: rx };
     let v = node.first_json();
     let ticket = v["ticket"]
@@ -369,7 +441,8 @@ fn the_blind_node_carries_and_forgets() {
         "the node never saw the secret"
     );
     assert!(!text.contains("nota pubblica"), "no note text at the node");
-    node.stop();
+    drop(node);
+    });
 }
 
 /// One note written through the real CLI (armed with the device signer).
@@ -401,6 +474,7 @@ fn add_note(root: &std::path::Path, who: &str) {
 /// verify green everywhere.
 #[test]
 fn three_devices_concurrent_and_one_returns() {
+    bounded("three_devices", 900, || {
     let a = Root::new("tri-a");
     let b = Root::new("tri-b");
     let c = Root::new("tri-c");
@@ -504,5 +578,6 @@ fn three_devices_concurrent_and_one_returns() {
             .ok()
         );
     }
-    serve.stop();
+    drop(serve);
+    });
 }

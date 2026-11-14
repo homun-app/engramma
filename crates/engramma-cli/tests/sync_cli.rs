@@ -72,7 +72,7 @@ fn run(root: &std::path::Path, args: &[&str], stdin: &[u8]) -> (bool, String, St
             .write_all(stdin)
             .expect(/* pipe */ "stdin write");
     }
-    let out = child.wait_with_output().unwrap(/* t */);
+    let out = wait_bounded(child, &args.join(" "), 60);
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -80,11 +80,29 @@ fn run(root: &std::path::Path, args: &[&str], stdin: &[u8]) -> (bool, String, St
     )
 }
 
+/// Wait for a child WITH a deadline (R5): a hung command fails the test
+/// with a clear line instead of hanging the run.
+fn wait_bounded(mut child: Child, name: &str, secs: u64) -> std::process::Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        match child.try_wait().expect(/* child */ "wait") {
+            Some(_) => return child.wait_with_output().expect(/* t */ "the output"),
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("«{name}» non è finito in {secs} s");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+}
+
 /// Spawn a command whose stdin we feed and whose stdout we read while it
 /// runs (the invite waits for the joiner).
 struct Running {
-    child: Child,
+    child: Option<Child>,
 }
+
 
 impl Running {
     /// Spawn with stdin fed and stdout watched: the ticket line (if any)
@@ -106,8 +124,9 @@ impl Running {
             .expect(/* piped */ "stdin")
             .write_all(stdin)
             .expect(/* pipe */ "stdin write");
+        let mut child = Some(child);
         let (tx, rx) = std::sync::mpsc::channel();
-        if let Some(out) = child.stdout.take() {
+        if let Some(out) = child.as_mut().expect(/* alive */ "spawn").stdout.take() {
             std::thread::spawn(move || {
                 use std::io::BufRead;
                 for line in std::io::BufReader::new(out).lines() {
@@ -123,8 +142,8 @@ impl Running {
         (Self { child }, rx)
     }
 
-    fn wait(self) -> (bool, String, String) {
-        let out = self.child.wait_with_output().unwrap(/* t */);
+    fn wait(mut self) -> (bool, String, String) {
+        let out = wait_bounded(self.child.take().expect(/* alive */ "running"), "running", 120);
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).to_string(),
@@ -296,7 +315,9 @@ fn a_stolen_ticket_fails_the_mac() {
     // the victim's invite never sees a joiner: kill it (it would wait its
     // ten minutes); the other side failed its own key confirmation
     let mut victim = inviter;
-    kill(&mut victim.child);
+    if let Some(mut child) = victim.child.take() {
+        kill(&mut child);
+    }
     let (ok, _, _) = other_inviter.wait();
     assert!(!ok, "the other inviter fails its own confirmation");
 }

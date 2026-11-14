@@ -116,6 +116,14 @@ fn the_inviter_proves_itself_over_the_transcript_not_in_the_clear() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn the_wire_carries_many_frames_in_lockstep() {
+    // a bounded test (R5): a wedged exchange fails, never hangs
+    let bound = tokio::time::timeout(std::time::Duration::from_secs(60), the_wire_carries_many_frames_in_lockstep_inner());
+    bound
+        .await
+        .expect("il lockstep non è finito in 60 s");
+}
+
+async fn the_wire_carries_many_frames_in_lockstep_inner() {
     use engramma_sync::device::DeviceKey;
     use engramma_sync::protocol::{bind_endpoint, connect};
     let key_a = DeviceKey::from_seed([1; 32]);

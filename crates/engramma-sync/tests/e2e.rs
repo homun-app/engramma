@@ -163,11 +163,12 @@ fn envelope_of_op(cell: &SharedCell, op: &Op) -> (u64, [u8; 32], Vec<u8>, Vec<u8
         .expect(/* armed */ "the epoch key");
     let id = unhex32(&op.content_hash);
     let aad = op_aad(cell.sync_id(), epoch, &id);
-    // an unsigned op travels with its adopt proof, exactly as the adapter
-    // seals it
+    // an unsigned op travels with its adopt proof when one can be built
+    // (before the sharer adopted, none exists — the op travels bare and
+    // the receiver's gate refuses it, which is the point of the test)
     let plaintext = if op.sig.is_none() {
-        let proof = engramma_sync::arrival::adopt_proof(cell.cell(), op).unwrap(/* t */);
-        wire::envelope_wire(op, Some(&proof))
+        let proof = engramma_sync::arrival::adopt_proof(cell.cell(), op).ok();
+        wire::envelope_wire(op, proof.as_deref())
     } else {
         wire::envelope_wire(op, None)
     };
@@ -181,6 +182,9 @@ fn envelope_of_op(cell: &SharedCell, op: &Op) -> (u64, [u8; 32], Vec<u8>, Vec<u8
 /// copies converge at the same replicated digest.
 #[tokio::test(flavor = "current_thread")]
 async fn two_devices_converge_over_loopback() {
+    // a bounded test (R5): a wedged session fails the test with a clear
+    // line, never a hung run
+    let bound = tokio::time::timeout(std::time::Duration::from_secs(120), async {
     let fx = Fixture::new();
     let a = fx.side_a();
     // the share: the adopt covers the pre-era set; from here on, signed
@@ -274,6 +278,9 @@ async fn two_devices_converge_over_loopback() {
         b.cell().get(&note(9, "").id).unwrap(/* t */).body,
         "la nota dell'era firmata"
     );
+    })
+    .await;
+    bound.expect("la convergenza su loopback non è finita in 120 s");
 }
 
 /// The gate at acceptance: a caller whose transport key is not a live
