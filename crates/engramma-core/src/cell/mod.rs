@@ -955,6 +955,46 @@ impl Cell {
         Ok(n > 0)
     }
 
+    /// The operation of one `content_hash` (the wire identity), when this
+    /// copy holds it — a point query over the v20 index, never a walk of
+    /// the log (the envelope road asks it once per missing id).
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure; [`CellError::Invalid`] on a
+    /// malformed row.
+    pub fn op_of_hash(&self, content_hash: &str) -> Result<Option<ops::Op>, CellError> {
+        let inner = self.lock()?;
+        let mut stmt = inner.conn.prepare(
+            "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.base, o.content_hash,
+                    o.payload_digest, o.payload_state, p.salt, p.body, o.prev_hash, o.hash,
+                    o.device, o.sig
+             FROM ops o LEFT JOIN op_payloads p ON p.op_id = o.op_id
+             WHERE o.content_hash = ?1",
+        )?;
+        let mut rows = stmt.query([content_hash])?;
+        let Some(row) = rows.next().map_err(CellError::from)? else {
+            return Ok(None);
+        };
+        Ok(Some(ops::op_from_row(ops::OpRow {
+            seq: row.get(0)?,
+            op_id: &row.get::<_, String>(1)?,
+            hlc: &row.get::<_, String>(2)?,
+            actor: &row.get::<_, String>(3)?,
+            kind: &row.get::<_, String>(4)?,
+            note_id: row.get::<_, Option<String>>(5)?.as_deref(),
+            base: row.get::<_, Option<String>>(6)?.as_deref(),
+            content_hash: &row.get::<_, String>(7)?,
+            payload_digest: &row.get::<_, String>(8)?,
+            payload_state: &row.get::<_, String>(9)?,
+            salt: row.get::<_, Option<Vec<u8>>>(10)?.as_deref(),
+            body_json: row.get::<_, Option<String>>(11)?.as_deref(),
+            prev_hash: &row.get::<_, String>(12)?,
+            hash: &row.get::<_, String>(13)?,
+            device: row.get::<_, Option<String>>(14)?.as_deref(),
+            sig: row.get::<_, Option<String>>(15)?.as_deref(),
+        })?))
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>, CellError> {
         self.inner
             .lock()

@@ -52,6 +52,15 @@ pub struct SharedCell {
     /// (a test-only counter: the regression test of the bootstrap wants
     /// them LINEAR — a fixed number per envelope, never one per op).
     whole_log_reads: std::sync::atomic::AtomicU64,
+    /// The adopt tree over the pre-era set, built ONCE per session (R3):
+    /// every unsigned envelope's proof comes out of it without re-reading
+    /// the log or rebuilding the tree.
+    adopt_tree: std::sync::OnceLock<arrival::MerkleIndex>,
+    /// The membership trees of the REMOVED devices' sets (R1), one per
+    /// device, built once per session over the whole tree of cells.
+    removal_trees: std::sync::Mutex<
+        std::collections::HashMap<String, Option<std::sync::Arc<arrival::MerkleIndex>>>,
+    >,
 }
 
 impl SharedCell {
@@ -73,6 +82,8 @@ impl SharedCell {
             sync_id,
             root: root.to_path_buf(),
             whole_log_reads: std::sync::atomic::AtomicU64::new(0),
+            adopt_tree: std::sync::OnceLock::new(),
+            removal_trees: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -129,6 +140,8 @@ impl SharedCell {
                 sync_id,
                 root: root.to_path_buf(),
                 whole_log_reads: std::sync::atomic::AtomicU64::new(0),
+                adopt_tree: std::sync::OnceLock::new(),
+                removal_trees: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
         }
         Ok(out)
@@ -202,14 +215,19 @@ impl SyncedCell for SharedCell {
     }
 
     fn ids(&self) -> Vec<(u64, [u8; 32])> {
+        // only `hlc` and `content_hash` — no payload is deserialized for
+        // an identity list (R3: the whole log was parsed per bootstrap)
         self.count_log_read();
         self.cell
-            .ops()
+            .debug_column("SELECT hlc || ' ' || content_hash FROM ops")
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|op| {
-                let id = unhex32(&op.content_hash)?;
-                Some((op.hlc.physical_ms, id))
+            .filter_map(|row| {
+                let (hlc, content_hash) = row.split_once(' ')?;
+                // the physical part is the fixed-width 12-hex prefix
+                let physical_ms = u64::from_str_radix(&hlc[..12], 16).ok()?;
+                let id = unhex32(content_hash)?;
+                Some((physical_ms, id))
             })
             .collect()
     }
@@ -223,8 +241,7 @@ impl SyncedCell for SharedCell {
         // (R1) — whoever sends it must be able to prove it sits inside a
         // root its remove recorded; everything else travels alone
         let plaintext = if op.sig.is_none() && op.kind != engramma_core::cell::ops::OpKind::Adopt {
-            self.count_log_read(); // adopt_proof walks the whole log
-            let proof = arrival::adopt_proof(&self.cell, &op).ok()?;
+            let proof = self.adopt_tree().prove(&op.content_hash)?;
             wire::envelope_wire(&op, Some(&proof))
         } else if let Some(device) = op.device.as_deref()
             && op.sig.is_some()
@@ -284,13 +301,16 @@ impl SyncedCell for SharedCell {
 
 impl SharedCell {
     fn find_op(&self, id32: &[u8; 32]) -> Option<Op> {
-        self.count_log_read();
         let wanted = crate::device::hex(id32);
-        self.cell
-            .ops()
-            .ok()?
-            .into_iter()
-            .find(|op| op.content_hash == wanted)
+        self.cell.op_of_hash(&wanted).ok().flatten()
+    }
+
+    /// The adopt tree, built on first use and kept for the session (R3).
+    fn adopt_tree(&self) -> &arrival::MerkleIndex {
+        self.adopt_tree.get_or_init(|| {
+            self.count_log_read(); // one whole-log read, once per session
+            arrival::MerkleIndex::new(arrival::adopt_hashes(&self.cell))
+        })
     }
 
     /// Is this device REMOVED in the list this root holds? (Live devices
@@ -322,24 +342,35 @@ impl SharedCell {
         if removes.is_empty() {
             return None;
         }
-        let mut hashes: Vec<String> = Vec::new();
-        for shared in SharedCell::all_of(&self.root).ok()? {
-            self.count_log_read(); // one whole-log scan per cell of the tree
-            hashes.extend(
-                shared
-                    .cell()
-                    .debug_column(&format!(
-                        "SELECT o.content_hash FROM ops o WHERE o.device = '{}'",
-                        device.replace('\'', "''")
-                    ))
-                    .ok()?
-            );
-        }
-        let root = engramma_core::cell::ops::merkle_root(&mut hashes.clone());
-        if !removes.iter().any(|(recorded, _)| *recorded == root) {
+        // the tree of this device's set, built once per session and kept
+        // (R3): every envelope's proof comes out of the cached levels
+        let cached = {
+            let mut trees = self.removal_trees.lock().expect(/* never poisoned */ "trees");
+            trees
+                .entry(device.to_string())
+                .or_insert_with(|| {
+                    let mut hashes: Vec<String> = Vec::new();
+                    for shared in SharedCell::all_of(&self.root).ok()? {
+                        self.count_log_read(); // one scan per cell, once
+                        hashes.extend(
+                            shared
+                                .cell()
+                                .debug_column(&format!(
+                                    "SELECT o.content_hash FROM ops o WHERE o.device = '{}'",
+                                    device.replace('\'', "''")
+                                ))
+                                .ok()?,
+                        );
+                    }
+                    Some(std::sync::Arc::new(arrival::MerkleIndex::new(hashes)))
+                })
+                .clone()
+        };
+        let tree = cached?;
+        if !removes.iter().any(|(recorded, _)| *recorded == tree.root()) {
             return None; // our set is not any remove's set: no proof exists
         }
-        engramma_core::cell::ops::merkle_prove(&mut hashes, target_hash).ok()
+        tree.prove(target_hash)
     }
 
     /// The operation of one content-hash id.

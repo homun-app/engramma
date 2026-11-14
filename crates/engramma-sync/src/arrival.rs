@@ -167,14 +167,144 @@ fn unsigned_checks(cell: &Cell, op: &Op, proof: Option<&[MerkleStep]>) -> Result
 /// [`Error::Registry`] when the operation is not part of that set (it was
 /// written after the adopt, or belongs to no era at all).
 pub fn adopt_proof(cell: &Cell, op: &Op) -> Result<Vec<MerkleStep>> {
-    let mut hashes: Vec<String> = cell
-        .debug_column(
-            "SELECT o.content_hash FROM ops o
-             WHERE o.sig IS NULL AND o.kind != 'adopt'",
-        )
-        .unwrap_or_default();
-    ops::merkle_prove(&mut hashes, &op.content_hash)
+    let hashes = adopt_hashes(cell);
+    ops::merkle_prove(&mut hashes.clone(), &op.content_hash)
         .map_err(|e| Error::Registry(Rejection::UnsignedUncovered.with(&e)))
+}
+
+/// The content hashes of the cell's pre-era set — the leaves of the adopt
+/// tree. One whole-log read; the session's cache pays it once.
+pub fn adopt_hashes(cell: &Cell) -> Vec<String> {
+    cell.debug_column(
+        "SELECT o.content_hash FROM ops o
+         WHERE o.sig IS NULL AND o.kind != 'adopt'",
+    )
+    .unwrap_or_default()
+}
+
+/// A Merkle tree over a FIXED set of content hashes, built ONCE per
+/// session and kept in memory (R3): the root and every leaf's proof come
+/// out of the cached levels — no re-read of the log, no rebuild of the
+/// tree, per envelope. Byte order over the hashes equals the hex-string
+/// order of [`ops::merkle_root`], and the pairing rule (the odd trailing
+/// leaf duplicated as its own right operand) is the same one
+/// [`ops::merkle_prove`] walks.
+pub struct MerkleIndex {
+    /// The sorted leaves.
+    leaves: Vec<[u8; 32]>,
+    /// levels[0] is the leaves; the last level is the single root.
+    levels: Vec<Vec<[u8; 32]>>,
+}
+
+impl MerkleIndex {
+    /// Build over the set (the hashes may come in any order).
+    #[must_use]
+    pub fn new(hashes: Vec<String>) -> Self {
+        let mut leaves: Vec<[u8; 32]> = hashes.iter().filter_map(|h| hash_bytes32(h)).collect();
+        leaves.sort_unstable();
+        let mut levels = vec![leaves.clone()];
+        while levels.last().is_some_and(|level| level.len() > 1) {
+            let level = levels.last().expect(/* just checked */ "the level");
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            let mut i = 0;
+            while i < level.len() {
+                let a = level[i];
+                let b = if i + 1 < level.len() { level[i + 1] } else { level[i] };
+                let mut h = blake3::Hasher::new();
+                h.update(&a);
+                h.update(&b);
+                let mut out = [0_u8; 32];
+                out.copy_from_slice(h.finalize().as_bytes());
+                next.push(out);
+                i += 2;
+            }
+            levels.push(next);
+        }
+        Self { leaves, levels }
+    }
+
+    /// The root of the tree — exactly what [`ops::merkle_root`] computes
+    /// over the same set.
+    #[must_use]
+    pub fn root(&self) -> String {
+        match (self.levels.last(), self.leaves.is_empty()) {
+            (Some(top), false) => blake3::Hash::from_bytes(top[0]).to_hex().to_string(),
+            // the empty set's root, as `merkle_root` defines it
+            _ => blake3::Hasher::new().finalize().to_hex().to_string(),
+        }
+    }
+
+    /// The proof that one content hash is a leaf of the tree, with the
+    /// same shape [`ops::merkle_prove`] produces.
+    #[must_use]
+    pub fn prove(&self, target: &str) -> Option<Vec<MerkleStep>> {
+        let leaf = hash_bytes32(target)?;
+        let mut idx = self.leaves.partition_point(|x| *x < leaf);
+        if self.leaves.get(idx) != Some(&leaf) {
+            return None; // not a leaf of this set
+        }
+        let mut path = Vec::new();
+        for level in &self.levels[..self.levels.len() - 1] {
+            let sibling_idx = if idx % 2 == 0 {
+                (idx + 1).min(level.len() - 1)
+            } else {
+                idx - 1
+            };
+            path.push(MerkleStep {
+                sibling: level[sibling_idx],
+                right: sibling_idx >= idx,
+            });
+            idx /= 2;
+        }
+        Some(path)
+    }
+}
+
+fn hash_bytes32(hex: &str) -> Option<[u8; 32]> {
+    let parsed = blake3::Hash::from_hex(hex).ok()?;
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(parsed.as_bytes());
+    Some(out)
+}
+
+#[cfg(test)]
+mod merkle_index_tests {
+    use super::MerkleIndex;
+    use engramma_core::cell::ops::{merkle_prove, merkle_root, merkle_root_with};
+
+    /// The cached tree IS the root-and-proof pair the core computes: same
+    /// root, same path, for every set size around the powers of two.
+    #[test]
+    fn the_cached_tree_equals_merkle_root_and_prove() {
+        for n in [0_usize, 1, 2, 3, 5, 8, 9, 16, 17, 100, 1000] {
+            let hashes: Vec<String> = (0..n)
+                .map(|i| blake3::hash(&(i as u64).to_le_bytes()).to_hex().to_string())
+                .collect();
+            let index = MerkleIndex::new(hashes.clone());
+            let mut reference = hashes.clone();
+            let root = merkle_root(&mut reference);
+            assert_eq!(index.root(), root, "n={n}: the root must be the same");
+            for target in &hashes {
+                let fast = index.prove(target);
+                let slow = merkle_prove(&mut hashes.clone(), target);
+                assert_eq!(fast.is_some(), slow.is_ok(), "n={n}: membership agrees");
+                let (fast, slow) = (fast.unwrap_or_default(), slow.unwrap_or_default());
+                assert_eq!(fast.len(), slow.len(), "n={n}: the path length");
+                for (f, s) in fast.iter().zip(slow.iter()) {
+                    assert_eq!(f.sibling, s.sibling, "n={n}: the sibling");
+                    assert_eq!(f.right, s.right, "n={n}: the side");
+                }
+                assert_eq!(
+                    merkle_root_with(target, &fast).as_deref(),
+                    Some(root.as_str()),
+                    "n={n}: the fast proof walks to the root"
+                );
+            }
+            // and an outsider is no leaf of the set
+            let outsider = blake3::hash(&[255_u8; 8]).to_hex().to_string();
+            assert!(index.prove(&outsider).is_none(), "n={n}: the outsider");
+        }
+    }
 }
 
 impl Rejection {
