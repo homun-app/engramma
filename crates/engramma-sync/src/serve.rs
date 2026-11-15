@@ -69,6 +69,23 @@ impl PeerAddr {
                 Ok(Err(e)) => last = format!("{socket}: {e}"),
             }
         }
+        // the relay the book knows (a relay-only endpoint has NO direct
+        // addresses at all — the whole point of the relay road)
+        if !self.relay.is_empty()
+            && let Ok(url) = self.relay.parse()
+        {
+            let addr = EndpointAddr::new(node).with_relay_url(url);
+            let tried = tokio::time::timeout(
+                Duration::from_secs(10),
+                endpoint.connect(addr, protocol::ALPN),
+            )
+            .await;
+            match tried {
+                Err(_) => last = format!("{}: timeout", self.relay),
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(e)) => last = format!("{}: {e}", self.relay),
+            }
+        }
         Err(Error::Io(std::io::Error::other(last)))
     }
 
