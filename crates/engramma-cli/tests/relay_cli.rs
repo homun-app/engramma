@@ -282,12 +282,9 @@ fn local_relay() -> String {
 /// binary must not carry it, and this build lives in its own target dir.
 /// Built here, incrementally, once per machine.
 fn test_relay_bin() -> std::path::PathBuf {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let repo = std::path::Path::new(manifest)
-        .ancestors()
-        .nth(1)
-        .expect(/* repo */ "repo");
-    let target = repo.join("target").join("cli-relay");
+    // OUTSIDE the repo: the Linux round mounts the source read-only, and
+    // a target dir inside it cannot even be created there
+    let target = std::env::temp_dir().join("engramma-cli-relay");
     let status = Command::new(env!("CARGO"))
         .arg("build")
         .arg("-p")
@@ -553,12 +550,10 @@ fn no_relay_does_not_wait() {
 /// reviewer's verification stays true after this change.
 #[test]
 fn the_production_binary_has_no_test_utils() {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let repo = std::path::Path::new(manifest)
-        .ancestors()
-        .nth(1)
-        .expect(/* repo */ "repo");
-    let plain = repo.join("target").join("debug").join("engramma");
+    let plain = std::env::temp_dir()
+        .join("engramma-cli-relay")
+        .join("debug")
+        .join("engramma");
     if !plain.exists() {
         return; // the plain debug binary is not built in this session
     }
