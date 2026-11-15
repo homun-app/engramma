@@ -5876,12 +5876,26 @@ stabile.
 
 ## P7 — la CLI
 
+> **Corretto dalla v0.6.1:** al momento della verifica questa sezione
+> descriveva comandi dichiarati e non fatti — `sync run`, `sync serve`,
+> `devices join`, `mailbox add/remove/status` rispondevano «arriva più
+> avanti». La v0.6.1 li ha implementati e provati dal binario vero (vedi
+> «REPORT — Engramma v0.6.1 (chiusura)»); il testo qui sotto vale come
+> l'elenco finale, non come la verità del 2026-11-13.
+
 `engramma devices` (init, invite, code, join, list, remove con il
 riassunto, log), `engramma sync` (share, unshare, run/serve, status,
 conflicts), `engramma mailbox` (serve, add, remove, status). Ogni comando
 `--json`; gli errori non contengono testo di note.
 
 ## P8 — Homun
+
+> **Corretto dalla v0.6.1:** «il demone gira accanto a `engramma sync
+> serve`» era, alla verifica, una sessione di test della crate — non la
+> convivenza di due processi veri sulla stessa radice. La v0.6.1 l'ha
+> provata dal binario (un secondo processo che scrive mentre il servizio
+> riceve); lo schema è salito alla **v20** (payload_state). Vedi il
+> REPORT v0.6.1.
 
 Il contratto JS **non cambia**; i 29 test Node passano identici (e i 29
 `test:electron`, e `electron-main`), senza cambiare le attese — la prova
