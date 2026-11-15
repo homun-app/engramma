@@ -191,9 +191,13 @@ rompe la catena — estesa all'identità di rete.
   `{old_id?, valid_to?, old_updated_at?, note: null}`; per `decide`
   accetta: `{proposal, decision: "accept", censored: true, target,
   target_closing?, decided_at?}`; per `revert_decision`: `{censored:
-  true, decision?, decided_at?, restore_target?}`) — l'identità non
-  copre più il corpo, la forma è ciò che lo limita. `redacted`: nessun
-  corpo, nulla da controllare.
+  true, decision?, decided_at?, restore_target?}`) — e le stringhe
+  tenute sono ciò che dicono di essere (v0.6.1, R6: gli id `old_id`,
+  `proposal`, `target` sono ULID; le chiusure `valid_to`,
+  `target_closing` parsano come `Validity`; gli istanti
+  `old_updated_at`, `decided_at` come `At` RFC 3339) — l'identità non
+  copre più il corpo, la forma e il contenuto delle stringhe sono ciò
+  che lo limita. `redacted`: nessun corpo, nulla da controllare.
 - **`base` assente = non ancora arrivata.** Con l'identità immutabile,
   una `base` che non è da nessuna parte nel log significa una cosa
   sola: l'operazione aspetta in `pending_objects` — come una patch
