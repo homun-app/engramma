@@ -165,7 +165,10 @@ async fn send_frame(conn: &Connection, msg: &Value) -> Result<()> {
     }
     let mut frame = (body.len() as u32).to_be_bytes().to_vec();
     frame.extend_from_slice(body);
-    let (mut send, _recv) = conn.open_bi().await.map_err(io_err)?;
+    // one UNIDIRECTIONAL stream per frame, finished at once: the frame
+    // travels with its FIN (the transport flushes the data with it), and
+    // no unused halves exist to reset in-flight data
+    let mut send = conn.open_uni().await.map_err(io_err)?;
     send.write_all(&frame)
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e)))?;
@@ -175,10 +178,9 @@ async fn send_frame(conn: &Connection, msg: &Value) -> Result<()> {
 }
 
 async fn recv_frame(conn: &Connection) -> Result<Value> {
-    let (send, mut recv) = conn.accept_bi().await.map_err(io_err)?;
-    drop(send);
+    let mut recv = conn.accept_uni().await.map_err(io_err)?;
     if std::env::var("ENGRAMMA_TRACE").is_ok() {
-        eprintln!("< (bi)");
+        eprintln!("< (uni)");
     }
     let mut len_buf = [0_u8; 4];
     recv.read_exact(&mut len_buf)
@@ -192,7 +194,16 @@ async fn recv_frame(conn: &Connection) -> Result<Value> {
     recv.read_exact(&mut buf)
         .await
         .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    // consume the FIN: only a stream the receiver saw closed frees the
+    // sender's open-stream budget — without this the second session of a
+    // daemon wedges forever on `accept` (found by the C4 measure, which
+    // waits for the SECOND write)
+    let _ = recv.read_to_end(1).await;
     serde_json::from_slice(&buf).map_err(|e| Error::Malformed(format!("bad frame: {e}")))
+}
+
+fn trace() -> bool {
+    std::env::var("ENGRAMMA_TRACE").is_ok()
 }
 
 fn io_err(e: impl std::fmt::Display) -> Error {
@@ -214,9 +225,15 @@ pub async fn run_initiator(conn: Connection, ctx: &SessionCtx<'_>) -> Result<Ses
         }),
     )
     .await?;
+    if trace() {
+        eprintln!("I: hello mandato");
+    }
     // 2. their registry rows (the answerer validates nothing of ours: every
     //    row carries its signature) and their device id
     let answer = recv_frame(&conn).await?;
+    if trace() {
+        eprintln!("I: registry ricevuta");
+    }
     if answer.get("kind").and_then(Value::as_str) != Some("registry") {
         return Err(Error::Malformed("expected the registry answer".into()));
     }
@@ -226,7 +243,13 @@ pub async fn run_initiator(conn: Connection, ctx: &SessionCtx<'_>) -> Result<Ses
     // through the sessions: the remover wraps for every live device)
     if let Some(peer) = answer.get("device").and_then(Value::as_str) {
         send_wraps(&conn, ctx, peer).await?;
+        if trace() {
+            eprintln!("I: wraps mandati");
+        }
         recv_wraps(&conn, ctx).await?;
+        if trace() {
+            eprintln!("I: wraps ricevuti");
+        }
     }
     // 3. every shared cell: offer, reconcile, exchange envelopes
     let mut report = SessionReport::default();
@@ -267,6 +290,9 @@ pub async fn run_answerer(conn: Connection, ctx: &SessionCtx<'_>) -> Result<Sess
             "protocol version {version} is not {PROTOCOL_VERSION}"
         )));
     }
+    if trace() {
+        eprintln!("A: hello ricevuto");
+    }
     ctx.registry
         .arrive_rows(hello["registry"].as_array().unwrap_or(&Vec::new()))?;
     send_frame(
@@ -304,6 +330,9 @@ pub async fn run_answerer(conn: Connection, ctx: &SessionCtx<'_>) -> Result<Sess
 
 async fn cell_exchange_initiator(conn: &Connection, cell: &dyn SyncedCell) -> Result<CellReport> {
     let mut_cell = cell; // one exchange, one driver
+    if trace() {
+        eprintln!("I: i miei id {}", mut_cell.ids().len());
+    }
     let mut neg = Reconciler::initiator(mut_cell.ids())?;
     let query = neg.initiate()?;
     send_frame(
@@ -313,8 +342,18 @@ async fn cell_exchange_initiator(conn: &Connection, cell: &dyn SyncedCell) -> Re
     )
     .await?;
     let answer = recv_frame(conn).await?;
+    if trace() {
+        eprintln!("I: cell_answer ricevuta");
+    }
     let reply = unb64(answer["reply"].as_str().unwrap_or(""))?;
     let outcome = neg.reconcile_as_initiator(&reply)?;
+    if trace() {
+        eprintln!(
+            "I: riconciliazione — have {} need {}",
+            outcome.have.len(),
+            outcome.need.len()
+        );
+    }
     let second = outcome.second;
     let mut have = outcome.have;
     let mut my_need = outcome.need;
@@ -356,6 +395,9 @@ async fn finish_initiator_exchange(
         )
         .await?;
         let lot = recv_frame(conn).await?;
+        if trace() {
+            eprintln!("I: lotto ricevuto");
+        }
         if let Some(envs) = lot["envs"].as_array() {
             for env in envs {
                 let epoch = env["epoch"].as_u64().unwrap_or(0);
@@ -427,10 +469,16 @@ async fn cell_exchange_answerer(conn: &Connection, cell: &dyn SyncedCell) -> Res
     if offer.get("kind").and_then(Value::as_str) != Some("cell_offer") {
         return Err(Error::Malformed("expected a cell offer".into()));
     }
+    if trace() {
+        eprintln!("A: cell_offer ricevuto");
+    }
     let query = unb64(offer["query"].as_str().unwrap_or(""))?;
     // the honest RBSR answer: negentropy's reply over OUR items — the
     // initiator's math on it decides who sends what
     let mut neg = Reconciler::responder(mut_cell.ids())?;
+    if trace() {
+        eprintln!("A: ids letti ({})", mut_cell.ids().len());
+    }
     let reply = neg.reconcile_as_responder(&query)?;
     send_frame(
         conn,
@@ -442,43 +490,59 @@ async fn cell_exchange_answerer(conn: &Connection, cell: &dyn SyncedCell) -> Res
     let mut refused = 0_usize;
     let mut unsent = 0_usize;
     let mut sent = 0_usize;
-    // the initiator may run a second round
+    // the initiator may run a second round — or close at once: when the
+    // reconciliation found nothing to exchange (have and need both empty)
+    // the initiator's ONLY next frame is the ack. Consuming it here and
+    // then waiting for another frame deadlocked the pair: the answerer
+    // parked forever on a connection the initiator would close only after
+    // the answerer's own ack, which the parked loop could never send
+    // (found by the C4 measure — every fully-synced session wedged for
+    // the whole 90 s bound).
+    let mut closed = false;
     if let Ok(next) = recv_frame(conn).await {
-        if next.get("kind").and_then(Value::as_str) == Some("cell_query") {
-            let q2 = unb64(next["query"].as_str().unwrap_or(""))?;
-            let r2 = neg.reconcile_as_responder(&q2)?;
-            send_frame(
-                conn,
-                &json!({"kind": "cell_answer", "sync_id": sync_id_of(&offer)?,
-                         "reply": b64(&r2)}),
-            )
-            .await?;
-        } else if next.get("kind").and_then(Value::as_str) == Some("need") {
-            let (n, u) = serve_need(conn, mut_cell, &next).await?;
-            sent += n;
-            unsent += u;
-        } else if next.get("kind").and_then(Value::as_str) == Some("envelopes") {
-            let (n, r) = ingest_envelopes(conn, mut_cell, &next).await?;
-            received = n;
-            refused = r;
-        }
-    }
-    loop {
-        let Ok(msg) = recv_frame(conn).await else {
-            break;
-        };
-        match msg.get("kind").and_then(Value::as_str) {
+        match next.get("kind").and_then(Value::as_str) {
+            Some("cell_query") => {
+                let q2 = unb64(next["query"].as_str().unwrap_or(""))?;
+                let r2 = neg.reconcile_as_responder(&q2)?;
+                send_frame(
+                    conn,
+                    &json!({"kind": "cell_answer", "sync_id": sync_id_of(&offer)?,
+                             "reply": b64(&r2)}),
+                )
+                .await?;
+            }
             Some("need") => {
-                let (n, u) = serve_need(conn, mut_cell, &msg).await?;
+                let (n, u) = serve_need(conn, mut_cell, &next).await?;
                 sent += n;
                 unsent += u;
             }
             Some("envelopes") => {
-                let (n, r) = ingest_envelopes(conn, mut_cell, &msg).await?;
-                received += n;
-                refused += r;
+                let (n, r) = ingest_envelopes(conn, mut_cell, &next).await?;
+                received = n;
+                refused = r;
             }
-            _ => break, // the ack closes the session
+            // the ack closes the session
+            _ => closed = true,
+        }
+    }
+    if !closed {
+        loop {
+            let Ok(msg) = recv_frame(conn).await else {
+                break;
+            };
+            match msg.get("kind").and_then(Value::as_str) {
+                Some("need") => {
+                    let (n, u) = serve_need(conn, mut_cell, &msg).await?;
+                    sent += n;
+                    unsent += u;
+                }
+                Some("envelopes") => {
+                    let (n, r) = ingest_envelopes(conn, mut_cell, &msg).await?;
+                    received += n;
+                    refused += r;
+                }
+                _ => break, // the ack closes the session
+            }
         }
     }
     Ok(CellReport {

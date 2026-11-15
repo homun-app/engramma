@@ -167,20 +167,33 @@ impl Daemon {
         Self { child, lines: rx }
     }
 
-    /// The daemon's first JSON object (pretty-printed over several lines).
+    /// The daemon's first JSON object (pretty-printed over several lines,
+    /// with NESTED objects inside since C1: the ticket is one — so the
+    /// balance is counted, not guessed from a lone `}` line).
     fn first_json(&self) -> serde_json::Value {
         let mut text = String::new();
+        let mut depth = 0_i32;
         loop {
             let line = self
                 .lines
                 .recv_timeout(Duration::from_secs(30))
                 .expect(/* prints at start */ "the daemon spoke");
+            text.push('\n');
             text.push_str(&line);
-            if line.trim() == "}" || line.trim_start().starts_with('}') {
-                break;
+            for c in line.chars() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return serde_json::from_str(&text)
+                                .expect(/* balanced */ "the daemon's json");
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-        serde_json::from_str(&text).expect(/* balanced */ "the daemon's json")
     }
 }
 
@@ -434,10 +447,9 @@ fn the_blind_node_carries_and_forgets() {
         // once lived three hours and a half)
         let node = Daemon { child, lines: rx };
         let v = node.first_json();
-        let ticket = v["ticket"]
-            .as_str()
-            .expect(/* printed */ "node ticket")
-            .to_string();
+        // the ticket travels as a nested JSON object (C1): back to the
+        // textual form `mailbox add` takes
+        let ticket = v["ticket"].to_string();
         // both devices register with the node
         let (ok, _, err) = run(&a.root, &["mailbox", "add", &ticket]);
         assert!(ok, "A registers: {err}");
@@ -822,10 +834,7 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
             Daemon { child, lines: rx }
         };
         let v = node.first_json();
-        let ticket = v["ticket"]
-            .as_str()
-            .expect(/* printed */ "ticket")
-            .to_string();
+        let ticket = v["ticket"].to_string();
         let (ok, _, err) = run(&a.root, &["mailbox", "add", &ticket]);
         assert!(ok, "A registers: {err}");
         let (ok, _, err) = run(&b.root, &["mailbox", "add", &ticket]);
@@ -950,4 +959,220 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
 
 thread_local! {
     static CODE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+// ---------------------------------------------------------------------------
+// C4 (v0.6.1, la chiusura vera): the latency the spec asks for — from a
+// WRITE on A to the note READABLE on B, with B (and A) running the REAL
+// `sync serve` cycle: `data_version` + the 2 s debounce. The debounce is
+// IN the number; the no-debounce view is reported beside it. A
+// measurement, not a test:
+//
+// ```text
+// cargo test --release -p engramma-cli --test sync_serve_cli \
+//   the_write_to_read_latency -- --ignored --nocapture
+// ```
+// ---------------------------------------------------------------------------
+
+/// Poll B's cell (read-only) until the note with this body is readable.
+fn b_has_note(b_root: &std::path::Path, body: &str) -> bool {
+    let conn = rusqlite::Connection::open_with_flags(
+        b_root.join("cells").join("memoria.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect(/* exists */ "B's cell");
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM notes WHERE body = ?1", [body], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+    n > 0
+}
+
+#[test]
+#[ignore = "una misura, non un test: cargo test --release -- --ignored --nocapture"]
+fn the_write_to_read_latency() {
+    let a = Root::new("lat-a");
+    let b = Root::new("lat-b");
+    // the shared cell, paired the real way
+    let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
+    cell.put_note(&note(1, "la base"), "cli").unwrap(/* t */);
+    drop(cell);
+    run(&a.root, &["sync", "share", "memoria"]);
+    pair(&a, &b, "mac");
+    // B serves (the receiving side); its address reaches A's book. On
+    // loopback without a relay the first contact after the pairing needs
+    // the live address (the pairing's own endpoints die with the join) —
+    // in production the relay carries the first contact with the node id
+    // alone, and every successful session refreshes the row. The key is
+    // B's DEVICE id as A's registry knows it (the member «mac»).
+    let serve_b = Daemon::spawn(&b.root, &["--json", "sync", "serve", "--no-relay"]);
+    let vb = serve_b.first_json();
+    let addrs: Vec<String> = vb["addrs"]
+        .as_array()
+        .map(|x| {
+            x.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let node = vb["node"].as_str().expect(/* printed */ "node").to_string();
+    let reg = rusqlite::Connection::open(a.root.join("devices.db")).unwrap(/* t */);
+    let b_device: String = reg
+        .query_row(
+            "SELECT device FROM members WHERE name = 'mac'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap(/* t */);
+    drop(reg);
+    remember_all(&a.root, &b_device, &node, &addrs);
+    // A serves too: the WRITE side of the cycle (its watcher sees the
+    // write, debounces, and runs the pass that pushes to B)
+    let serve_a = Daemon::spawn(&a.root, &["--json", "sync", "serve", "--no-relay"]);
+    let _ = serve_a.first_json();
+    // let both daemons settle their watchers
+    std::thread::sleep(Duration::from_secs(2));
+
+    // the fifty writes, each one timed to READABLE on B, spaced 3 s so
+    // each pays its own debounce
+    let mut latencies: Vec<std::time::Duration> = Vec::with_capacity(50);
+    let started_all = std::time::Instant::now();
+    for i in 0..50_u32 {
+        let body = format!("la nota misurata numero {i}");
+        // the write is SIGNED, as every local write of the sync era (the
+        // CLI arms the signer; an unsigned write would be refused by B's
+        // gate — and rightly so)
+        let cell = Cell::open(&a.cell_path("memoria")).unwrap(/* t */);
+        cell.set_signer(std::sync::Arc::new(engramma_sync::arrival::DeviceSigner::new(
+            &engramma_sync::device::DeviceKey::load_or_create(&a.root).unwrap(/* t */),
+        )))
+        .unwrap(/* t */);
+        let mut n = note((10 + i) as u16, "segnaposto");
+        n.body = body.clone();
+        cell.put_note(&n, "cli").unwrap(/* t */);
+        drop(cell);
+        let t0 = std::time::Instant::now();
+        loop {
+            if b_has_note(&b.root, &body) {
+                break;
+            }
+            if t0.elapsed() > Duration::from_secs(30) {
+                panic!("la nota {i} non è mai arrivata su B in 30 s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        latencies.push(t0.elapsed());
+        // distanziate: the next write starts its own debounce cycle
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    drop(serve_a);
+    drop(serve_b);
+
+    // mediana e p95 (with the debounce in, and the no-debounce view)
+    let mut ms: Vec<f64> = latencies.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+    ms.sort_by(|x, y| x.partial_cmp(y).expect(/* finite */ "cmp"));
+    let pick =
+        |q: f64| -> f64 { ms[((q * (ms.len() - 1) as f64).round() as usize).min(ms.len() - 1)] };
+    let median = pick(0.5);
+    let p95 = pick(0.95);
+    let debounce_ms = 2000.0_f64;
+    eprintln!(
+        "latenza scritta→leggibile (50 scritture distanziate 3 s, ciclo reale):\n  \
+         mediana {median:.0} ms, p95 {p95:.0} ms (il rimbalzo di 2 s è dentro)\n  \
+         senza rimbalzo: mediana {:.0} ms, p95 {:.0} ms\n  \
+         totale del giro: {:?}",
+        (median - debounce_ms).max(0.0),
+        (p95 - debounce_ms).max(0.0),
+        started_all.elapsed(),
+    );
+}
+
+/// C4 (v0.6.1): the serve cycle PUSHES a write made by a SECOND process on
+/// the same root (the Homun shape) — nobody pulls. `PRAGMA data_version`
+/// polled on FRESH connections never sees another process's commit (the
+/// counter is per-connection), so the daemon's watcher was blind to
+/// cross-process writes: the cycle must watch on PERSISTENT connections.
+#[test]
+fn the_serve_cycle_pushes_a_second_process_write() {
+    let a = Root::new("push-a");
+    let b = Root::new("push-b");
+    let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
+    cell.put_note(&note(1, "la base"), "cli").unwrap(/* t */);
+    drop(cell);
+    run(&a.root, &["sync", "share", "memoria"]);
+    pair(&a, &b, "mac");
+    // B serves (the receiving side); A's book gets B's live address
+    let serve_b = Daemon::spawn(&b.root, &["--json", "sync", "serve", "--no-relay"]);
+    let vb = serve_b.first_json();
+    let addrs: Vec<String> = vb["addrs"]
+        .as_array()
+        .map(|x| {
+            x.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let node = vb["node"].as_str().expect(/* printed */ "node").to_string();
+    let reg = rusqlite::Connection::open(a.root.join("devices.db")).unwrap(/* t */);
+    let b_device: String = reg
+        .query_row("SELECT device FROM members WHERE name = 'mac'", [], |r| {
+            r.get(0)
+        })
+        .unwrap(/* t */);
+    drop(reg);
+    remember_all(&a.root, &b_device, &node, &addrs);
+    // A serves: ITS cycle must see the write and push — nobody pulls
+    let serve_a = Daemon::spawn(&a.root, &["--json", "sync", "serve", "--no-relay"]);
+    let _ = serve_a.first_json();
+    std::thread::sleep(Duration::from_secs(2));
+    // the write, from a SECOND process on A's root (the CLI itself)
+    let file = tempfile::tempdir().unwrap(/* t */);
+    let path = file.path().join("nota.md");
+    std::fs::write(&path, "la nota scritta da un altro processo").unwrap(/* t */);
+    let (ok, _, err) = run(
+        &a.root,
+        &[
+            "--cell",
+            "memoria",
+            "add",
+            path.to_str().expect(/* utf8 */ "path"),
+            "--source",
+            "user",
+            "--confidence",
+            "stated",
+        ],
+    );
+    assert!(ok, "add: {err}");
+    std::mem::forget(file);
+    // B receives WITHOUT ever pulling: the watch (≤250 ms) + debounce
+    // (2 s) + the pass — 20 s is the bound of shame
+    let mut arrived = false;
+    for _ in 0..900 {
+        std::thread::sleep(Duration::from_millis(100));
+        let conn = rusqlite::Connection::open_with_flags(
+            b.root.join("cells").join("memoria.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap(/* t */);
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes WHERE body = 'la nota scritta da un altro processo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if n > 0 {
+            arrived = true;
+            break;
+        }
+    }
+    drop(serve_a);
+    drop(serve_b);
+    assert!(
+        arrived,
+        "il ciclo di serve doveva spingere la scrittura di un secondo processo fino a B"
+    );
 }

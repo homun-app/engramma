@@ -23,9 +23,7 @@ use serde_json::json;
 
 use crate::device::{DeviceKey, hex};
 use crate::keystore::KeyStore;
-use crate::protocol::{
-    self, SessionCtx, SyncedCell, bind_endpoint, connect, run_answerer, run_initiator,
-};
+use crate::protocol::{self, SessionCtx, SyncedCell, bind_endpoint, run_answerer, run_initiator};
 use crate::registry::DeviceRegistry;
 use crate::sharedcell::SharedCell;
 use crate::{Error, Result};
@@ -44,6 +42,36 @@ pub struct PeerAddr {
 }
 
 impl PeerAddr {
+    /// Dial the peer, one address at a time (loopback first): the
+    /// transport's own address race stalls behind a virtual interface
+    /// that does not answer its own address — a book row with several
+    /// addresses must not die on the first of them.
+    ///
+    /// # Errors
+    /// [`Error::Io`] when no address answers.
+    pub async fn dial(&self, endpoint: &Endpoint) -> Result<Connection> {
+        let node = iroh::PublicKey::from_bytes(&self.node_id)
+            .map_err(|e| Error::Malformed(format!("bad node id: {e}")))?;
+        let mut addrs: Vec<std::net::SocketAddr> =
+            self.addrs.iter().filter_map(|a| a.parse().ok()).collect();
+        addrs.sort_by_key(|a| !a.ip().is_loopback());
+        let mut last = "nessun indirizzo noto".to_string();
+        for socket in &addrs {
+            let addr = EndpointAddr::from_parts(node, [iroh::TransportAddr::Ip(*socket)]);
+            let tried = tokio::time::timeout(
+                Duration::from_secs(5),
+                endpoint.connect(addr, protocol::ALPN),
+            )
+            .await;
+            match tried {
+                Err(_) => last = format!("{socket}: timeout"),
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(e)) => last = format!("{socket}: {e}"),
+            }
+        }
+        Err(Error::Io(std::io::Error::other(last)))
+    }
+
     /// The iroh address to connect to.
     ///
     /// # Errors
@@ -351,31 +379,15 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
             });
             continue;
         };
-        let endpoint_addr = match addr.endpoint_addr() {
-            Ok(a) => a,
-            Err(e) => {
-                report.peers.push(PeerOutcome {
-                    name: member.name.clone(),
-                    device: member.device.clone(),
-                    reached: false,
-                    why_not: Some(format!("indirizzo inutilizzabile: {e}")),
-                    via: None,
-                });
-                continue;
-            }
-        };
-        // a bounded dial: an unreachable device must not stall the pass
-        // (the serve loop is one thread — a hanging dial would freeze the
-        // accepts too)
-        let dialed = tokio::time::timeout(
-            Duration::from_secs(10),
-            connect(endpoint, endpoint_addr.clone()),
-        )
-        .await;
+        let endpoint_addr = addr.endpoint_addr()?;
+        // one address at a time (loopback first), each bounded: an
+        // unreachable device must not stall the pass (the serve loop is
+        // one thread — a hanging dial would freeze the accepts too)
+        let dialed = addr.dial(endpoint).await;
         let mut via = None;
         let outcome = match dialed {
-            Err(_) => Err("timeout della connessione (10 s)".to_string()),
-            Ok(Ok(conn)) => match session_with(root, conn, &member.device, &endpoint_addr).await {
+            Err(e) => Err(e.to_string()),
+            Ok(conn) => match session_with(root, conn, &member.device, &endpoint_addr).await {
                 Ok(session) => {
                     for cell in &session.report.cells {
                         let entry = per_cell.entry(cell.sync_id.clone()).or_insert((0, 0, 0, 0));
@@ -389,7 +401,6 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
                 }
                 Err(e) => Err(e.to_string()),
             },
-            Ok(Err(e)) => Err(e.to_string()),
         };
         report.peers.push(PeerOutcome {
             name: member.name.clone(),
@@ -452,22 +463,111 @@ fn conflict_counts(root: &Path) -> Result<Vec<(String, usize)>> {
     Ok(out)
 }
 
-/// The cells' `PRAGMA data_version` (moves on every committed write — ours
-/// or another process's on the same file): the serve loop's write trigger.
+/// The cells' `PRAGMA data_version`, read on PERSISTENT connections: the
+/// serve loop's write trigger (C4). The counter is PER-CONNECTION — it
+/// only moves for commits made by OTHER connections while THIS one stays
+/// open — so a watch that opens a fresh connection per poll never sees
+/// another process's write (the Homun daemon, the CLI beside the serve:
+/// found by the C4 measure, which waited forever). The handles stay open
+/// for the watch's whole life; `refresh` re-opens them (a cell shared
+/// after the serve started gets watched at the next refresh).
+pub struct DataVersionWatch {
+    root: std::path::PathBuf,
+    cells: Vec<SharedCell>,
+    last: Vec<(String, i64)>,
+}
+
+impl DataVersionWatch {
+    /// Open every shared cell of a root and read the counters once.
+    ///
+    /// # Errors
+    /// [`Error::Db`] on SQL failure.
+    pub fn new(root: &Path) -> Result<Self> {
+        let cells = SharedCell::all_of(root)?;
+        let last = Self::read(&cells, root)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            cells,
+            last,
+        })
+    }
+
+    /// An empty watch (the degraded start path: it never fires, the
+    /// periodic pass still runs, the next start retries).
+    #[must_use]
+    pub fn empty(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            cells: Vec::new(),
+            last: Vec::new(),
+        }
+    }
+
+    fn read(cells: &[SharedCell], root: &Path) -> Result<Vec<(String, i64)>> {
+        let mut out = Vec::new();
+        for shared in cells {
+            out.push((
+                cell_name(root, shared.sync_id())?,
+                shared
+                    .cell()
+                    .data_version()
+                    .map_err(|e| Error::Cell(e.to_string()))?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Read again on the SAME connections: `true` when something moved
+    /// (another process's commit included — that is the point). The
+    /// baseline does NOT move here — the counter never goes back, so the
+    /// caller must `ack()` when it has acted, or the settle check after
+    /// the debounce would compare against a baseline that already
+    /// includes the write.
+    ///
+    /// # Errors
+    /// [`Error::Db`] on SQL failure.
+    pub fn moved(&self) -> Result<bool> {
+        let now = Self::read(&self.cells, &self.root)?;
+        Ok(now != self.last)
+    }
+
+    /// Take the current counters as the new baseline (the pass has been
+    /// triggered: what moved is now seen).
+    ///
+    /// # Errors
+    /// [`Error::Db`] on SQL failure.
+    pub fn ack(&mut self) -> Result<()> {
+        self.last = Self::read(&self.cells, &self.root)?;
+        Ok(())
+    }
+
+    /// Re-open the handles (a newly shared cell joins the watch).
+    ///
+    /// # Errors
+    /// [`Error::Db`] on SQL failure.
+    pub fn refresh(&mut self) -> Result<()> {
+        let watch = Self::new(&self.root)?;
+        self.cells = watch.cells;
+        self.last = watch.last;
+        Ok(())
+    }
+}
+
+/// One-shot read on FRESH connections (diagnostics; a persistent
+/// [`DataVersionWatch`] is what the serve loop needs).
 ///
 /// # Errors
 /// [`Error::Db`] on SQL failure.
 pub fn data_versions(root: &Path) -> Result<Vec<(String, i64)>> {
     let mut out = Vec::new();
     for shared in SharedCell::all_of(root)? {
-        let v = shared
-            .cell()
-            .debug_column("PRAGMA data_version")
-            .unwrap_or_default()
-            .first()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(0);
-        out.push((cell_name(root, shared.sync_id())?, v));
+        out.push((
+            cell_name(root, shared.sync_id())?,
+            shared
+                .cell()
+                .data_version()
+                .map_err(|e| Error::Cell(e.to_string()))?,
+        ));
     }
     Ok(out)
 }
@@ -497,7 +597,7 @@ fn unhex32(hex: &str) -> Option<[u8; 32]> {
 /// DIALABLE, and `0.0.0.0` is not.
 #[must_use]
 pub fn direct_addresses(endpoint: &Endpoint) -> Vec<String> {
-    endpoint
+    let mut out: Vec<String> = endpoint
         .addr()
         .addrs
         .iter()
@@ -517,7 +617,24 @@ pub fn direct_addresses(endpoint: &Endpoint) -> Vec<String> {
             }
             _ => None,
         })
-        .collect()
+        .collect();
+    // a wildcard bind answers on loopback too: publish it when the
+    // interface list does not (iroh reports the concrete interfaces it
+    // found, and some of them — a VPN's 100.64/10 — do not answer their
+    // own address from the same machine)
+    if !out.iter().any(|a| a.starts_with("127.0.0.1"))
+        && let Some(port) = out
+            .first()
+            .and_then(|a| a.rsplit(':').next())
+            .and_then(|p| p.parse::<u16>().ok())
+    {
+        out.push(format!("127.0.0.1:{port}"));
+    }
+    // loopback first: a peer on the same machine (the tests, a daemon
+    // beside the CLI) must not get stuck behind a virtual interface that
+    // does not answer its own address
+    out.sort_by_key(|a| !a.starts_with("127.0.0.1"));
+    out
 }
 
 /// The endpoint's node id (its transport public key), raw.

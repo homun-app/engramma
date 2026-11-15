@@ -290,26 +290,46 @@ pub fn sync_serve_cmd(
                 }
                 // the pass worker: one pass at a time, over the ticks
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
-                // the write watcher: data_version moves → debounce → tick
+                // the write watcher: data_version moves → debounce → tick.
+                // The counters are read on PERSISTENT connections (C4):
+                // PRAGMA data_version is per-connection, and a fresh
+                // connection per poll never sees another process's write
+                // — the Homun daemon beside the serve was invisible
                 {
                     let root = root.clone();
                     let tx = tx.clone();
                     tokio::task::spawn_local(async move {
-                        let mut last = serve::data_versions(&root).unwrap_or_default();
+                        let mut watch = serve::DataVersionWatch::new(&root).unwrap_or_else(|e| {
+                            eprintln!("sync serve: data_version: {e}");
+                            // an empty watch never fires: the periodic pass
+                            // still runs, and the next start retries
+                            serve::DataVersionWatch::empty(&root)
+                        });
+                        let mut opened = std::time::Instant::now();
                         loop {
                             tokio::time::sleep(serve::WATCH_TICK).await;
-                            let now = serve::data_versions(&root).unwrap_or_default();
-                            if now != last {
+                            // cells shared after the start join at the
+                            // periodic refresh
+                            if opened.elapsed() >= serve::PERIODIC {
+                                opened = std::time::Instant::now();
+                                let _ = watch.refresh();
+                                continue;
+                            }
+                            let Ok(moved) = watch.moved() else {
+                                continue;
+                            };
+                            if moved {
                                 // let the writes settle, then look again:
-                                // still moved → a pass
+                                // still moved → a pass, and the baseline
+                                // takes what it has seen
                                 tokio::time::sleep(serve::DEBOUNCE).await;
-                                let after = serve::data_versions(&root).unwrap_or_default();
-                                if after != last {
-                                    last = after;
+                                if watch.moved().unwrap_or(false) {
+                                    if std::env::var("ENGRAMMA_TRACE").is_ok() {
+                                        eprintln!("watch: tick write");
+                                    }
                                     tx.send("write").ok();
+                                    let _ = watch.ack();
                                 }
-                            } else {
-                                last = now;
                             }
                         }
                     });
@@ -318,7 +338,16 @@ pub fn sync_serve_cmd(
                 {
                     let tx = tx.clone();
                     tokio::task::spawn_local(async move {
-                        let mut tick = tokio::time::interval(serve::PERIODIC);
+                        // the first tick comes AFTER the period: a pass at
+                        // t=0 would dial a book that is almost always
+                        // stale right after the start (the pairing-era
+                        // addresses die with the join) and pile a dead
+                        // wait on top of the startup — the write watcher
+                        // is the real trigger, the clock is the safety net
+                        let mut tick = tokio::time::interval_at(
+                            tokio::time::Instant::now() + serve::PERIODIC,
+                            serve::PERIODIC,
+                        );
                         loop {
                             tick.tick().await;
                             tx.send("clock").ok();
@@ -337,8 +366,23 @@ pub fn sync_serve_cmd(
                                 _ = stop.cancelled() => break,
                                 what = rx.recv() => {
                                     let Some(what) = what else { break };
-                                    let _ = serve::run_pass(&root, &endpoint).await;
-                                    let _ = what;
+                                    if std::env::var("ENGRAMMA_TRACE").is_ok() {
+                                        eprintln!("worker: passo {what}");
+                                    }
+                                    match serve::run_pass(&root, &endpoint).await {
+                                        Ok(report) if std::env::var("ENGRAMMA_TRACE").is_ok() => {
+                                            for p in &report.peers {
+                                                eprintln!(
+                                                    "passo ({what}): {} reached={} via={:?} why={:?}",
+                                                    p.name, p.reached, p.via, p.why_not
+                                                );
+                                            }
+                                        }
+                                        Err(e) if std::env::var("ENGRAMMA_TRACE").is_ok() => {
+                                            eprintln!("passo ({what}): errore {e}");
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                         }

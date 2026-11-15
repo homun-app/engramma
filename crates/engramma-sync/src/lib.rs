@@ -41,6 +41,9 @@ pub enum Error {
     /// A registry operation refused by the rules.
     #[error("registry: {0}")]
     Registry(String),
+    /// The cell engine refused or failed.
+    #[error("cella: {0}")]
+    Cell(String),
     /// Malformed data on the wire.
     #[error("malformed: {0}")]
     Malformed(String),

@@ -894,6 +894,21 @@ impl Cell {
         Ok((started.elapsed().as_secs_f64() * 1000.0, stats))
     }
 
+    /// This cell's `PRAGMA data_version` — the counter that moves when
+    /// ANOTHER connection commits to the file (v0.6.1, C4). The serve
+    /// loop's write trigger: read it on a PERSISTENT connection (the
+    /// counter is per-connection) and cross-process writes appear.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn data_version(&self) -> Result<i64, CellError> {
+        let inner = self.lock()?;
+        inner
+            .conn
+            .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+            .map_err(CellError::from)
+    }
+
     /// Run a **read-only** query returning one TEXT column per row. Meant for
     /// tests and tooling that need to compare states; not part of the public
     /// contract (statements that are not read-only are refused).

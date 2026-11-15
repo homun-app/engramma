@@ -252,7 +252,6 @@ fn the_relay_flags_exist_and_save_their_choice() {
 // ---------------------------------------------------------------------------
 
 use std::io::BufRead;
-use std::sync::Arc;
 
 /// Run iroh's LOCAL relay (loopback, self-signed certificate) on a thread
 /// of its own, alive for the whole test: a current-thread runtime parks
@@ -312,6 +311,8 @@ fn test_relay_bin() -> std::path::PathBuf {
 /// Spawn the variant with stdin fed, watch stdout until a balanced JSON
 /// object lands, bounded; the child DIES with the test.
 struct JsonChild {
+    /// dies with the test (R5): read by Drop, never by hand
+    #[allow(dead_code)]
     guard: ChildGuard,
     stdout: std::process::ChildStdout,
 }
@@ -456,7 +457,7 @@ fn the_node_ticket_carries_the_relay_from_the_binary() {
 fn an_unreachable_relay_gives_the_ticket_within_the_wait_and_says_it() {
     let a = Root::new("c1-dead");
     let started = std::time::Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_engramma"))
+    let child = Command::new(env!("CARGO_BIN_EXE_engramma"))
         .arg("--root")
         .arg(&a.root)
         .args([
@@ -519,7 +520,7 @@ fn an_unreachable_relay_gives_the_ticket_within_the_wait_and_says_it() {
 fn no_relay_does_not_wait() {
     let a = Root::new("c1-fast");
     let started = std::time::Instant::now();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_engramma"))
+    let child = Command::new(env!("CARGO_BIN_EXE_engramma"))
         .arg("--root")
         .arg(&a.root)
         .args(["--json", "devices", "invite", "--no-relay"])
