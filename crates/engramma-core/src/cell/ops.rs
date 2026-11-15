@@ -811,49 +811,76 @@ impl Scope {
 }
 
 /// Store the LOG side of one operation: the `ops` row (the local chain of
-/// arrival), the payload with its salt, the object index. No state.
+/// arrival), the payload with its salt, the object index. No state. Every
+/// statement is CACHED (v0.6.1-ciclo, K4): a `put_note` pays this whole
+/// function per note, and a fresh `prepare` per call was measurable at
+/// 10k — the object index lands in ONE multi-row insert, never one
+/// statement per object.
 ///
 /// # Errors
 /// [`CellError::Db`] on SQL failure.
 pub fn store_op(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO ops (seq, op_id, hlc, actor, kind, note_id, base, content_hash,
                           payload_digest, payload_state, prev_hash, hash, device, sig)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        rusqlite::params![
-            op.seq,
-            op.op_id.to_string(),
-            op.hlc.to_string(),
-            op.actor,
-            op.kind.as_str(),
-            op.note_id.map(|u| u.to_string()),
-            op.base,
-            op.content_hash,
-            op.payload_digest,
-            op.payload_state.as_str(),
-            op.prev_hash,
-            op.hash,
-            op.device,
-            op.sig,
-        ],
-    )?;
+    )?
+    .execute(rusqlite::params![
+        op.seq,
+        op.op_id.to_string(),
+        op.hlc.to_string(),
+        op.actor,
+        op.kind.as_str(),
+        op.note_id.map(|u| u.to_string()),
+        op.base,
+        op.content_hash,
+        op.payload_digest,
+        op.payload_state.as_str(),
+        op.prev_hash,
+        op.hash,
+        op.device,
+        op.sig,
+    ])?;
     if let (Some(salt), Some(body)) = (&op.salt, &op.body) {
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO op_payloads (op_id, salt, body) VALUES (?1, ?2, ?3)
              ON CONFLICT(op_id) DO UPDATE SET salt = ?2, body = ?3",
-            rusqlite::params![op.op_id.to_string(), salt, canonical_json(body)],
-        )?;
+        )?
+        .execute(rusqlite::params![
+            op.op_id.to_string(),
+            salt,
+            canonical_json(body)
+        ])?;
     }
     // v0.6 (P1): the object index of the operation — ids only, written from
-    // the payload at apply time, alive after any redaction.
-    let op_id = op.op_id.to_string();
-    for object in objects_of(op) {
-        tx.execute(
-            "INSERT INTO op_objects (op_id, object) VALUES (?1, ?2)
-             ON CONFLICT(op_id, object) DO NOTHING",
-            rusqlite::params![op_id, object],
-        )?;
+    // the payload at apply time, alive after any redaction. One multi-row
+    // insert for them all: a supersede or a decide concerns two objects,
+    // and one statement per object doubled the index's cost.
+    let objects = objects_of(op);
+    if objects.is_empty() {
+        return Ok(());
     }
+    let op_id = op.op_id.to_string();
+    // `(?1, ?2), (?1, ?3), …` — the op id once, one parameter per object;
+    // the arity is in the SQL string, so each arity caches its own
+    // statement (a handful, at most, per cell)
+    let values = objects
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("(?1, ?{})", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "INSERT INTO op_objects (op_id, object) VALUES {values}
+         ON CONFLICT(op_id, object) DO NOTHING"
+    );
+    let mut params = Vec::with_capacity(objects.len() + 1);
+    params.push(rusqlite::types::Value::Text(op_id));
+    for object in &objects {
+        params.push(rusqlite::types::Value::Text(object.clone()));
+    }
+    tx.prepare_cached(&sql)?
+        .execute(rusqlite::params_from_iter(params))?;
     Ok(())
 }
 
@@ -888,11 +915,11 @@ pub fn apply_scoped(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), C
         }
     }
     // The cell HLC always advances to the op's HLC (ops apply in order).
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO meta (key, value) VALUES ('hlc', ?1)
          ON CONFLICT(key) DO UPDATE SET value = ?1",
-        [op.hlc.to_string()],
-    )?;
+    )?
+    .execute([op.hlc.to_string()])?;
     Ok(())
 }
 
@@ -979,7 +1006,7 @@ pub(crate) fn read_note_row(tx: &Transaction<'_>, id: &Ulid) -> Result<Option<No
 
 fn read_note(tx: &Transaction<'_>, id: &Ulid) -> Result<Option<NoteRow>, CellError> {
     let sql = format!("SELECT rowid, {NOTE_COLS} FROM notes WHERE id = ?1");
-    let mut stmt = tx.prepare(&sql)?;
+    let mut stmt = tx.prepare_cached(&sql)?;
     let mut rows = stmt.query([id.to_string()])?;
     let Some(row) = rows.next().map_err(CellError::from)? else {
         return Ok(None);
@@ -1053,13 +1080,11 @@ fn fts_delete(
     tags_text: &str,
 ) -> Result<(), CellError> {
     let table = idx.table();
-    tx.execute(
-        &format!(
-            "INSERT INTO {table}({table}, rowid, title, body_norm, tags_text)
-             VALUES ('delete', ?1, ?2, ?3, ?4)"
-        ),
-        rusqlite::params![rowid, title, body_norm, tags_text],
-    )?;
+    tx.prepare_cached(&format!(
+        "INSERT INTO {table}({table}, rowid, title, body_norm, tags_text)
+         VALUES ('delete', ?1, ?2, ?3, ?4)"
+    ))?
+    .execute(rusqlite::params![rowid, title, body_norm, tags_text])?;
     Ok(())
 }
 
@@ -1084,10 +1109,10 @@ fn fts_insert(
     tags_text: &str,
 ) -> Result<(), CellError> {
     let table = idx.table();
-    tx.execute(
-        &format!("INSERT INTO {table}(rowid, title, body_norm, tags_text) VALUES (?1, ?2, ?3, ?4)"),
-        rusqlite::params![rowid, title, body_norm, tags_text],
-    )?;
+    tx.prepare_cached(&format!(
+        "INSERT INTO {table}(rowid, title, body_norm, tags_text) VALUES (?1, ?2, ?3, ?4)"
+    ))?
+    .execute(rusqlite::params![rowid, title, body_norm, tags_text])?;
     Ok(())
 }
 
@@ -1139,10 +1164,8 @@ fn write_note(
     // Manual edges that cite this note follow its status in the same
     // operation (deterministic, replayed like the rest): a quarantined or
     // deleted note must not keep its manual edges visible.
-    tx.execute(
-        "UPDATE edges SET status = ?2 WHERE note_id = ?1 AND id NOT LIKE 'd%'",
-        rusqlite::params![note.id.to_string(), note.status.as_str()],
-    )?;
+    tx.prepare_cached("UPDATE edges SET status = ?2 WHERE note_id = ?1 AND id NOT LIKE 'd%'")?
+        .execute(rusqlite::params![note.id.to_string(), note.status.as_str()])?;
     let lang = note
         .lang
         .or_else(|| text::detect_lang(&format!("{}\n{}", note.display_title(), note.body)));
@@ -1180,30 +1203,36 @@ fn write_note(
         )?;
         Ok((rowid, version + 1))
     } else {
-        tx.execute(
-            "INSERT INTO notes (id, type, title, body, frontmatter_json, scope, source,
-                                confidence, status, valid_from, valid_to, created_at,
-                                updated_at, version, body_norm)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14)",
-            rusqlite::params![
-                id,
-                note.note_type.as_str(),
-                note.title,
-                note.body,
-                header,
-                note.scope,
-                note.source,
-                note.confidence.as_str(),
-                note.status.as_str(),
-                valid_to_db(&note.valid_from),
-                valid_to_db(&note.valid_to),
-                note.created_at.to_db_string(),
-                note.updated_at.to_db_string(),
-                body_norm,
-            ],
-        )?;
-        let rowid: i64 =
-            tx.query_row("SELECT rowid FROM notes WHERE id = ?1", [&id], |r| r.get(0))?;
+        // RETURNING, not a second read: the rowid comes back with the
+        // insert itself (K4 — one statement less per fresh note, and the
+        // statement is cached like the rest of the write path)
+        let rowid: i64 = tx
+            .prepare_cached(
+                "INSERT INTO notes (id, type, title, body, frontmatter_json, scope, source,
+                                    confidence, status, valid_from, valid_to, created_at,
+                                    updated_at, version, body_norm)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14)
+                 RETURNING rowid",
+            )?
+            .query_row(
+                rusqlite::params![
+                    id,
+                    note.note_type.as_str(),
+                    note.title,
+                    note.body,
+                    header,
+                    note.scope,
+                    note.source,
+                    note.confidence.as_str(),
+                    note.status.as_str(),
+                    valid_to_db(&note.valid_from),
+                    valid_to_db(&note.valid_to),
+                    note.created_at.to_db_string(),
+                    note.updated_at.to_db_string(),
+                    body_norm,
+                ],
+                |r| r.get(0),
+            )?;
         Ok((rowid, 1))
     }
 }
@@ -1311,11 +1340,11 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
         && let Some(idx) = index_for(old.note.status)
     {
         let table = idx.table();
-        let in_index: i64 = tx.query_row(
-            &format!("SELECT COUNT(*) FROM {table}_docsize WHERE id = ?1"),
-            [old.rowid],
-            |r| r.get(0),
-        )?;
+        let in_index: i64 = tx
+            .prepare_cached(&format!(
+                "SELECT COUNT(*) FROM {table}_docsize WHERE id = ?1"
+            ))?
+            .query_row([old.rowid], |r| r.get(0))?;
         if in_index > 0 {
             fts_delete(
                 tx,
@@ -1328,7 +1357,8 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
         }
     }
     // --- tags tables
-    tx.execute("DELETE FROM note_tags WHERE note_id = ?1", [id.to_string()])?;
+    tx.prepare_cached("DELETE FROM note_tags WHERE note_id = ?1")?
+        .execute([id.to_string()])?;
     let mut all_tags = row.note.tags.clone();
     for t in &analysis.tags {
         if !all_tags.contains(t) {
@@ -1336,10 +1366,8 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
         }
     }
     for tag in &all_tags {
-        tx.execute(
-            "INSERT INTO note_tags (note_id, tag) VALUES (?1, ?2)",
-            rusqlite::params![id.to_string(), tag],
-        )?;
+        tx.prepare_cached("INSERT INTO note_tags (note_id, tag) VALUES (?1, ?2)")?
+            .execute(rusqlite::params![id.to_string(), tag])?;
         // Ancestor chain: casa/milano/duomo -> casa, casa/milano.
         let mut prefix = String::new();
         let segments: Vec<&str> = tag.split('/').collect();
@@ -1353,19 +1381,17 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
             } else {
                 Some(segments[..i].join("/"))
             };
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO tags (name, parent) VALUES (?1, ?2)
                  ON CONFLICT(name) DO NOTHING",
-                rusqlite::params![prefix, parent],
-            )?;
+            )?
+            .execute(rusqlite::params![prefix, parent])?;
         }
     }
     // --- tags_text twin + FTS insert with the same deterministic value.
     let tags_text = fts_tags_value(&all_tags);
-    tx.execute(
-        "UPDATE notes SET tags_text = ?2 WHERE id = ?1",
-        rusqlite::params![id.to_string(), tags_text],
-    )?;
+    tx.prepare_cached("UPDATE notes SET tags_text = ?2 WHERE id = ?1")?
+        .execute(rusqlite::params![id.to_string(), tags_text])?;
     if let Some(idx) = index_for(row.note.status) {
         fts_insert(
             tx,
@@ -1378,10 +1404,8 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
     }
 
     // --- entities and edges
-    tx.execute(
-        "DELETE FROM edges WHERE note_id = ?1 AND id LIKE 'd%'",
-        [id.to_string()],
-    )?;
+    tx.prepare_cached("DELETE FROM edges WHERE note_id = ?1 AND id LIKE 'd%'")?
+        .execute([id.to_string()])?;
     let mut names: Vec<String> = analysis.links.clone();
     for r in &analysis.relations {
         if !names.contains(&r.dst) {
@@ -1397,29 +1421,27 @@ fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Resul
         ensure_entity(tx, name)?;
     }
     if let Some(subject) = row.note.subject_entity() {
-        tx.execute(
-            "UPDATE entities SET note_id = ?1 WHERE name = ?2 COLLATE NOCASE",
-            rusqlite::params![id.to_string(), subject],
-        )?;
+        tx.prepare_cached("UPDATE entities SET note_id = ?1 WHERE name = ?2 COLLATE NOCASE")?
+            .execute(rusqlite::params![id.to_string(), subject])?;
     }
     // the derived edges, from the one source of truth (v0.3.2, P0.2: the
     // same function verify re-derives them with, chain-only)
     for e in derived_edges_of(&row.note)? {
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO edges (id, src, rel, dst, note_id, valid_from, valid_to, confidence, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            rusqlite::params![
-                e.id,
-                e.src,
-                e.rel,
-                e.dst,
-                id.to_string(),
-                e.valid_from,
-                e.valid_to,
-                e.confidence,
-                e.status,
-            ],
-        )?;
+        )?
+        .execute(rusqlite::params![
+            e.id,
+            e.src,
+            e.rel,
+            e.dst,
+            id.to_string(),
+            e.valid_from,
+            e.valid_to,
+            e.confidence,
+            e.status,
+        ])?;
     }
     Ok(())
 }
@@ -1509,11 +1531,11 @@ pub fn entity_id(name: &str) -> String {
 }
 
 fn ensure_entity(tx: &Transaction<'_>, name: &str) -> Result<(), CellError> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO entities (id, name) VALUES (?1, ?2)
          ON CONFLICT(name) DO NOTHING",
-        rusqlite::params![entity_id(name), name],
-    )?;
+    )?
+    .execute(rusqlite::params![entity_id(name), name])?;
     Ok(())
 }
 

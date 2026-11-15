@@ -3287,7 +3287,8 @@ fn execute_op(
     // (the daemon and the CLI share a cell); without this, an operation
     // could receive an HLC lower than its predecessor's in the log.
     let logged: Option<String> = tx
-        .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
+        .prepare_cached("SELECT value FROM meta WHERE key = 'hlc'")?
+        .query_row([], |r| r.get(0))
         .optional()?;
     if let Some(s) = logged
         && let Ok(h) = Hlc::parse(&s)
@@ -3304,11 +3305,8 @@ fn execute_op(
         hlc.node = signer.device_id();
     }
     let (prev_seq, prev_hash): (i64, String) = tx
-        .query_row(
-            "SELECT seq, hash FROM ops ORDER BY seq DESC LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        .prepare_cached("SELECT seq, hash FROM ops ORDER BY seq DESC LIMIT 1")?
+        .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap_or((0, ops::GENESIS_HASH.to_string()));
     // v0.6 (P1): an operation that modifies a note carries `base` — the
     // wire identity of the last operation of that note this author had
@@ -3319,22 +3317,19 @@ fn execute_op(
         // indexed probe skips the join for every fresh note (the common
         // write, and the whole cost of a bulk import — the join alone cost
         // 13% of the insert rate at 10k)
-        let exists: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM notes WHERE id = ?1",
-            [id.to_string()],
-            |r| r.get(0),
-        )?;
+        let exists: i64 = tx
+            .prepare_cached("SELECT COUNT(*) FROM notes WHERE id = ?1")?
+            .query_row([id.to_string()], |r| r.get(0))?;
         if exists == 0 {
             None
         } else {
-            tx.query_row(
+            tx.prepare_cached(
                 "SELECT o.content_hash FROM ops o
                  JOIN op_objects oo ON oo.op_id = o.op_id
                  WHERE oo.object = ?1
                  ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
-                [format!("note:{id}")],
-                |r| r.get(0),
-            )
+            )?
+            .query_row([format!("note:{id}")], |r| r.get(0))
             .optional()?
         }
     } else {

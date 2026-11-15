@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 
 fn note(i: u64, t: time::OffsetDateTime) -> Note {
     Note {
-        id: ulid::Ulid::from_parts(1_800_000_000_000, i + 1),
+        id: ulid::Ulid::from_parts(1_800_000_000_000, u128::from(i) + 1),
         note_type: NoteType::Fact,
         title: Some(format!("nota {i}")),
         body: format!(
@@ -57,7 +57,7 @@ fn main() {
     for (label, signed) in [("senza firma", false), ("con firma", true)] {
         let db = dir
             .path()
-            .join(format!("prof-{label.replace(' ', '-')}.sqlite"));
+            .join(format!("prof-{}.sqlite", label.replace(' ', "-")));
         let cell = Cell::create(&db, "prof", "bench").expect(/* fresh */ "create");
         if signed {
             let root = tempfile::tempdir().expect(/* t */ "tempdir");
@@ -83,7 +83,7 @@ fn main() {
         if signed {
             // the sustained signed phase: the sampler's window (re-put of
             // the whole corpus, round-robin)
-            let deadline = Instant::new() + std::time::Duration::from_secs(20);
+            let deadline = Instant::now() + std::time::Duration::from_secs(20);
             let mut done: usize = 0;
             let mut i: usize = 0;
             while Instant::now() < deadline {
