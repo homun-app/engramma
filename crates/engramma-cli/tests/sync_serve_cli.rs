@@ -1185,6 +1185,15 @@ fn the_write_to_read_latency() {
         (p95 - debounce_ms).max(0.0),
         started_all.elapsed(),
     );
+    // K1 (v0.6.1-ciclo): a median BELOW the debounce would not be latency
+    // — it would be the cycle's PHASE (the write catching a pass that was
+    // already running for another reason). The measure fails rather than
+    // lie: the expected shape is debounce + one watch tick + one session.
+    assert!(
+        median >= debounce_ms,
+        "la mediana {median:.0} ms è sotto il rimbalzo di {debounce_ms:.0} ms: \
+         la misura non sta misurando la latenza, ma la fase del ciclo"
+    );
 }
 
 /// C4 (v0.6.1): the serve cycle PUSHES a write made by a SECOND process on

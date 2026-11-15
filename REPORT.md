@@ -6659,3 +6659,191 @@ Convergenza a 2048 casi, suite macOS e Linux: si rifanno sul commit che
 chiude K1–K4, perché K1 e K2 toccano di nuovo il ciclo e il dial.
 `du -sh target`: 8,3 G all'inizio, 8,4 G alla fine (worktree e target
 della base cancellati).
+
+# REPORT — Engramma v0.6.1 (la chiusura del ciclo: K1–K4)
+
+Data: 2026-11-15. Base: `main` @ `76ba41c` (il commit di verifica del
+revisore). Tutto costruito e provato su macOS arm64, Rust 1.95.0. Il
+primo commit di ogni punto è il test rosso; le misure della fase sono
+state buttate e rifatte a coppie alternate (K4).
+
+## K1 — il ciclo di `sync serve` si ferma quando non c'è nulla da fare
+
+**Il difetto, confermato dal test rosso.** Due demoni `sync serve`
+già sincronizzati, una scrittura, poi trenta secondi di silenzio: il
+test contava le passate sulla traccia del demone e ne trovava **14 in
+30 s** — una passata ogni ~2 s, il ritmo esatto di sondaggio (250 ms) +
+rimbalzo (2 s). E una scrittura sola su A produceva **3 passate** entro
+la finestra di misura. Le due scritture che riaccendevano il ciclo:
+
+1. `record_session_ack` scriveva `device_acks` a **ogni** sessione,
+   sempre, con il timestamp `at` nuovo — una sessione che non scambia
+   nulla sporca la cella lo stesso, `data_version` si muove, e il
+   guardiano la prende per una scrittura locale;
+2. il guardiano faceva `ack()` **subito dopo il tick**, prima che la
+   passata giri: qualunque cosa la passata scrivesse era, al giro dopo,
+   una «scrittura locale» mai vista.
+
+**La correzione, in quattro pezzi.**
+
+1. *Una sessione che non scambia nulla non scrive nulla*:
+   `record_session_ack` scrive la riga solo quando la testa che conferma
+   è diversa da quella già confermata — il timestamp da solo non sporca
+   più la cella (e il test unitario `a_file_that_moved_without_rows…`
+   lo pinna: la seconda conferma della stessa testa non muove nemmeno
+   `data_version`).
+2. *Il grilletto è il registro*: il sondaggio economico resta su
+   `PRAGMA data_version` (connessioni persistenti, C4), ma quando il
+   contatore si muove il guardiano confronta il **segnaposto del
+   registro** — `(COUNT(*), MAX(rowid))` di `ops`, per cella — e toglie
+   le righe che le sessioni del demone stesso hanno portato (il
+   registro delle fonti, per dispositivo: `note_session`). Le righe che
+   restano sono scritture locali → passata verso **tutti**; righe tutte
+   delle sessioni → passata verso **gli altri**, mai di nuovo verso le
+   fonti (su due dispositivi: nessuna passata affatto); nessuna riga →
+   contabilità, non operazioni: nessuna passata, e le basi si
+   assestano lì.
+3. *L'ack dopo la passata*: le basi si muovono a passata finita
+   (`settle`/`finish_pass`), mai prima — le scritture della passata
+   stessa non sono notizia. E una scrittura locale che arriva **durante**
+   la passata non muore nel settle: `finish_pass` la riconosce (righe
+   oltre il lavoro delle sessioni da quando la passata è partita) e la
+   passa alla successiva.
+4. *Mai di rimbalzo verso la sorgente*: la passata innescata dalle righe
+   ricevute da X salta X (la riga del libro che una sessione in ingresso
+   aggiornava a **nodo nudo** — indirizzabile da nessuno — ora nasce
+   solo quando manca, `INSERT OR IGNORE`; il dial riuscito la rinfresca
+   com'è sempre stato).
+
+**Le prove.** I due test rossi sono verdi: **0 passate write** in 30 s
+di silenzio (dopo che una scrittura ha attraversato: il riposo che
+conta è quello che segue il lavoro), e **una scrittura = una passata su
+A, zero su B**. I test unitari del guardiano (`guard.rs`) pinnano le
+decisioni: righe locali → `All`; righe di sessione → `Others([fonte])`;
+niente righe → `None`; scrittura a metà passata → ancora. La misura C4
+rifatta sta in fondo («Poi»).
+
+**Un difetto trovato strada facendo, e lasciato fuori dal dial.** Il
+`sync run` del CLI e il demone della stessa radice condividono la
+chiave di trasporto: il magicsock di chi riceve la sessione del run
+ricorda la porta effimera del run (morto con lui) e la sessione
+successiva **del demone** — stesso node id — scade sui 5 s contro la
+rotta morta (iroh 1.4.1). È il comportamento che il dial uno-alla-volta
+mascherava col loopback primo. Riproduzione minima nel test K1 (le due
+`sync run` di setup, ora tolte col commento che lo spiega): la correzione
+sta nei test (niente run del CLI fra due demoni), non nel dial — la
+strada giusta è quella di K2: una gara sola, dove una rotta morta perde
+tempo zero.
+
+## K2 — il dial è la gara di iroh, non la nostra
+
+**Il difetto, confermato dal test rosso.** Un pari il cui libro porta
+tre strade dirette morte (le reti di prova RFC 5737) più il relay
+locale: il dial ci metteva **15,0 s** — cinque secondi per ogni strada
+morta, una alla volta, il relay per ultimo.
+
+**La correzione.** `PeerAddr::dial` e `NodeAddr::dial` sono una sola
+`endpoint.connect` con **tutti** gli indirizzi del libro più il relay,
+limite complessivo **10 s**: la gara la fa iroh (R2.3), le strade
+dirette vincono quando rispondono, il relay copre chi sta dietro NAT.
+Il test rosso adesso gira in **0,3 s** (bind, attesa del relay e dial
+compressi): la strada morta perde la gara senza costare un secondo.
+
+**Niente `127.0.0.1` per gli altri.** `direct_addresses` pubblica solo
+le interfacce vere che iroh ha scoperto: niente `0.0.0.0` (non
+componibile) e niente loopback inventato (serve solo alla stessa
+macchina, e pubblicarlo agli altri consegna una strada che muore a una
+macchina di distanza). I test che girano in loopback si scrivono da sé
+indirizzi di solo loopback nel libro (`to_loopback`).
+
+**Lo «stallo del 100.64».** Su questa macchina l'interfaccia
+punto-punto 100.64.0.194 c'è davvero. Con una connect sola, la strada
+morta non ha mai stallato nulla: perde la gara contro chi risponde —
+lo prova la misura C4 di fondo, che pubblica gli indirizzi **veri**
+del demone (192.168.x e 100.64.x in gara) e consegna le note in
+tempi regolari. Lo stallo vero era un altro ed è quello raccontato in
+K1: la rotta morta che resta appiccicata nel magicsock quando il run
+del CLI e il demone condividono la chiave di trasporto. Non è un
+difetto del dial di produzione e lì non è stato corretto.
+
+## K3 — le minori
+
+1. `docs/sync.md`: «il relay c'è ancora non» → «il relay non c'è
+   ancora».
+2. `Daemon::spawn` nei test: lo stderr del figlio è drenato in un thread
+   e tenuto (serve ai test K1, che contano le passate sulla traccia):
+   una pipe piena non blocca più il demone con la traccia accesa.
+3. **Uno stream unidirezionale per frame: resta com'è, e perché.** Il
+   trasporto apre uno stream uni per frame con la FIN attaccata: il
+   frame viaggia col proprio confine nel trasporto, non ci sono metà
+   inutilizzate da resettare, e quinn consegna gli stream in ordine di
+   id — l'ordine dei frame è preservato senza contatori. Il difetto
+   trovato da C4 (il budget degli stream del pari che non si libera se
+   la FIN non è consumata) è pagato e coperto: `read_to_end(1)` su ogni
+   frame ricevuto. Con questi conteggi — decine di frame a sessione,
+   ricevute comprese — l'overhead per frame è sotto il microsecondo e
+   il limite di stream di quinn non è nemmeno sfiorato. Uno stream
+   bidirezionale per sessione risparmierebbe qualifica ma toglierebbe
+   il confine libero dal payload, chiedendo di nuovo la macchina a
+   lunghezza prefissata che la FIN dà gratis. Non vale il rischio in
+   questa fase; il trasporto è `wire.rs`/`protocol.rs` e la forma è
+   documentata qui.
+
+## K4 — la soglia d'inserimento
+
+**La misura del revisore, e la mia.** Il revisore ha misurato +15%/+27%
+di tempo (due coppie, ordine inverso) e la mia base del REPORT era una
+corsa rallentata: da lì il «raggiunta». Questa chiusura profila, riduce
+ciò che si può ridurre, e misura a coppie alternate.
+
+**Il profilo** (`bench/examples/profile_put`, 10k note, samply +
+`sample`, con e senza la firma armata; esempio che resta nel banco):
+
+- *la firma non è il collo*: **+5…+12 µs/nota** (3–4%) su questa
+  macchina, come la spec anticipava (~20 µs è il costo su hardware
+  più lento);
+- *il collo è il commit*: in sostenimento su cella piena il **67% del
+  tempo di un `put_note` è `Transaction::commit`**, di cui ~31% sono i
+  `pwrite` dei frame WAL. La scrittura v0.6.1 sporca **più pagine per
+  transazione** della v0.5.3: la riga `ops` è più larga (`content_hash`,
+  `base`, `payload_state`, `device`, `sig` ≈ 280 caratteri in più), e
+  ogni operazione allarga **due** indici in più
+  (`idx_ops_content_hash`, `idx_op_objects_object` + la riga
+  `op_objects`);
+- *il secondo costo era gli statement*: `RunParser`/`yy_reduce` ~4% del
+  profilo — un `prepare` fresco per ogni istruzione della strada calda.
+
+**Le riduzioni fatte.** `prepare_cached` su tutto il percorso di
+scrittura (`store_op`, `execute_op`, `write_note`, `reindex_note`, gli
+aiutanti FTS/tag/entità, i probe della `base`); la nota nuova porta a
+casa il `rowid` con `INSERT … RETURNING` (una lettura in meno per
+nota); `op_objects` è **un** insert multiriga, non uno per oggetto. La
+quota del parser nel campionatore scende sotto il 2%. Non si tocca il
+lato pagine senza cambiare schema (il `content_hash` esiste per la
+`base` e per le buste; i due indici servono al probe e alle ricerche):
+è il prezzo in disco della convergenza, ed è qui che il tempo va.
+
+**Le coppie alternate** (`--notes 10000 --runs 5`, release,
+`ENGRAMMA_SKIP_MODEL_TESTS=1`, cartelle di lavoro separate e cancellate
+alla fine, macchina ferma ma ~30% più lenta del giro del revisore — i
+valori assoluti non si confrontano tra i giri, i rapporti sì):
+
+| corsa | inserimento viva | inserimento uniform | p95 testo+grafo viva / uniform |
+|---|---|---|---|
+| base v0.5.3 (1ª) | 2699 note/s | 2718 | 3,0 / 2,9 ms |
+| v0.6.1 (1ª) | 2298 | 2131 | 2,7 / 2,6 |
+| base v0.5.3 (2ª) | 2768 | 2654 | 2,8 / 3,4 |
+| v0.6.1 (2ª) | 2116 | 2328 | 3,2 / 3,0 |
+
+- **Inserimento, media delle due coppie: viva +24% di tempo, uniform
+  +20%. Il tetto è +10%: NON raggiunta.**
+- **p95 testo+grafo: fra −10% e +7%**, dentro il rumore di un passo di
+  0,1 ms su una macchina già calda. Regge.
+
+**La scomposizione del costo** (per nota, dal profilo, ~370 µs sul
+corpo di questa macchina lenta): il grosso è il **commit** — più
+pagine sporche per transazione (riga `ops` più larga, due indici e una
+tabella in più per operazione) — poi le istruzioni in più (ora in
+cache), e per ultima la firma, 5–12 µs. Sarà l'utente a decidere se
+accettare il costo come prezzo della convergenza: la soglia della spec
+resta non raggiunta e dichiarata.
