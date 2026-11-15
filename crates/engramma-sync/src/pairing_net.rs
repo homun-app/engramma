@@ -104,27 +104,45 @@ pub async fn bind_pairing(
     crate::relay::bind(key, bind, PAIRING_ALPN, choice).await
 }
 
+/// What minting a ticket for someone else found out about the relay
+/// (C1, v0.6.1).
+#[derive(Debug)]
+pub struct TicketOf {
+    /// The ticket.
+    pub ticket: Ticket,
+    /// The relay URL the ticket carries, when there is one.
+    pub relay: Option<String>,
+    /// The relay wait ran out: the ticket carries NO relay and the
+    /// caller must say so — never in silence.
+    pub relay_timed_out: bool,
+}
+
 /// The ticket an inviter mints from its LIVE endpoint: node id, direct
 /// addresses, and the RELAY the endpoint actually rides (R2) — the own
 /// relay's URL when `--relay` chose one, one of n0's when the default
 /// rules, none with `--no-relay`. The endpoint knows which: its address
 /// carries the relay it is connected to.
-pub fn ticket_of(endpoint: &Endpoint) -> Result<Ticket> {
+///
+/// **The wait comes first** (C1): with a relay configured the endpoint
+/// connects to it asynchronously after the bind, and a ticket minted
+/// before carries no relay — whoever is behind a NAT finds nobody. The
+/// wait is bounded ([`crate::relay::RELAY_WAIT`]); when it runs out the
+/// ticket goes out WITHOUT the relay and `relay_timed_out` says why.
+pub async fn ticket_of(
+    endpoint: &Endpoint,
+    choice: &crate::relay::RelayChoice,
+) -> Result<TicketOf> {
+    let wait = crate::relay::wait_relay(endpoint, choice).await;
+    let relay = match &wait {
+        crate::relay::RelayWait::Connected(url) => url.clone(),
+        _ => String::new(),
+    };
     let addrs = crate::serve::direct_addresses(endpoint);
-    let relay = endpoint
-        .addr()
-        .addrs
-        .iter()
-        .find_map(|a| match a {
-            iroh::TransportAddr::Relay(url) => Some(url.to_string()),
-            _ => None,
-        })
-        .unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default();
-    Ticket::mint(
+    let ticket = Ticket::mint(
         endpoint
             .secret_key()
             .public()
@@ -135,7 +153,12 @@ pub fn ticket_of(endpoint: &Endpoint) -> Result<Ticket> {
         &relay,
         &addrs,
         now,
-    )
+    )?;
+    Ok(TicketOf {
+        relay: (!relay.is_empty()).then_some(relay),
+        relay_timed_out: wait == crate::relay::RelayWait::TimedOut,
+        ticket,
+    })
 }
 
 /// What a completed join did, for the CLI's summary.

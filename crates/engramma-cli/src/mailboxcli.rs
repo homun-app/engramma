@@ -48,14 +48,33 @@ pub fn serve(json: bool, dir: &Path, flag: Option<RelayChoice>) -> Result<(), Cl
                 let endpoint = mailbox_net::bind_node(&key, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
-                let ticket = mailbox_net::node_ticket(&endpoint);
+                // the node's ticket must be reachable from whoever needs
+                // the node most — the devices behind a NAT: the relay
+                // wait comes first (C1)
+                let minted = mailbox_net::node_ticket(&endpoint, &choice).await;
+                if minted.relay_timed_out {
+                    eprintln!(
+                        "avviso: il relay non si è collegato in {} s — il \
+                         biglietto esce senza relay (chi è dietro NAT non troverà il nodo)",
+                        engramma_sync::relay::RELAY_WAIT.as_secs()
+                    );
+                }
+                let ticket = minted.json;
                 if json {
-                    print_json(&serde_json::json!({
+                    let mut out = serde_json::json!({
                         "serving": dir.display().to_string(),
-                        "ticket": ticket,
+                        "ticket": serde_json::from_str::<serde_json::Value>(&ticket)
+                            .unwrap_or(serde_json::Value::Null),
                         "alpn": "engramma/mailbox/1",
                         "retention_days": engramma_sync::mailbox::RETENTION_DAYS,
-                    }));
+                        "relay": minted.relay,
+                    });
+                    if minted.relay_timed_out {
+                        out["relay_warning"] = serde_json::json!(
+                            "il relay non si è collegato: il biglietto esce senza relay"
+                        );
+                    }
+                    print_json(&out);
                 } else {
                     println!(
                         "casella postale cieca in {} (ALPN engramma/mailbox/1, \
@@ -65,6 +84,9 @@ pub fn serve(json: bool, dir: &Path, flag: Option<RelayChoice>) -> Result<(), Cl
                     );
                     println!("biglietto del nodo:");
                     println!("{ticket}");
+                    if let Some(relay) = &minted.relay {
+                        println!("relay: {relay}");
+                    }
                     println!("in ascolto…");
                 }
                 let stop = tokio_util::sync::CancellationToken::new();
@@ -316,8 +338,17 @@ pub fn devices_code(root: &Path, json: bool, flag: Option<RelayChoice>) -> Resul
                 let pair_endpoint = pairing_net::bind_pairing(&dk, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
-                let ticket = pairing_net::ticket_of(&pair_endpoint)
+                let minted = pairing_net::ticket_of(&pair_endpoint, &choice)
+                    .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
+                if minted.relay_timed_out {
+                    eprintln!(
+                        "avviso: il relay non si è collegato in {} s — il \
+                         biglietto del codice esce senza relay",
+                        engramma_sync::relay::RELAY_WAIT.as_secs()
+                    );
+                }
+                let ticket = minted.ticket;
                 let blob = mailbox_net::relay_seal(&rkey, ticket.encode().as_bytes())
                     .map_err(|e| CliError::internal(e.to_string()))?;
                 relay

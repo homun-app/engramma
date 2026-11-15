@@ -39,5 +39,17 @@ mimalloc.workspace = true
 tempfile.workspace = true
 # v0.6.1 (P3): the sync tests write a root's address book by hand
 rusqlite.workspace = true
+# v0.6.1 (C1): the relay-ticket tests run iroh's LOCAL relay and decode
+# the ticket — the binary variant that trusts it is built by the test
+# itself with the `test-relay` feature (never default)
+engramma-sync.workspace = true
+iroh = { workspace = true, features = ["test-utils"] }
 # v0.5 (P5): the review-page tests speak HTTP; ureq is already in the lock
 ureq.workspace = true
+
+[features]
+# v0.6.1 (C1): ONLY the relay-ticket tests build the binary with this —
+# it lets the CLI trust iroh's LOCAL relay (self-signed certificate).
+# Never default, never in the production binary (the reviewer verified
+# test-utils stays out; a test asserts the default build does not have it).
+test-relay = ["engramma-sync/test-utils"]

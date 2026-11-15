@@ -68,6 +68,53 @@ impl RelayChoice {
     }
 }
 
+/// How long an endpoint that must serve SOMEONE ELSE waits for its relay
+/// to connect before printing an address (C1, v0.6.1): after the bind the
+/// relay connection is still being made — a ticket minted too early
+/// carries no relay, and whoever is behind a NAT finds nobody. Exactly
+/// the case the default relay exists for.
+pub const RELAY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the wait found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayWait {
+    /// The relay is connected: the URL the endpoint rides.
+    Connected(String),
+    /// No relay was asked for (`--no-relay`): nothing to wait for.
+    NotNeeded,
+    /// The wait ran out. Whatever is printed next carries NO relay — and
+    /// the caller must SAY so, never in silence.
+    TimedOut,
+}
+
+/// Wait for the endpoint's relay before an address that must serve
+/// another is printed (C1): the one place the wait lives, so every road —
+/// the invite ticket, the short code's fresh ticket, the node's ticket,
+/// the serve's published address — waits the same. `--no-relay` does not
+/// wait at all.
+#[must_use]
+pub async fn wait_relay(endpoint: &Endpoint, choice: &RelayChoice) -> RelayWait {
+    if *choice == RelayChoice::Disabled {
+        return RelayWait::NotNeeded;
+    }
+    match tokio::time::timeout(RELAY_WAIT, endpoint.online()).await {
+        Ok(()) => {
+            let url = endpoint.addr().addrs.iter().find_map(|a| match a {
+                iroh::TransportAddr::Relay(url) => Some(url.to_string()),
+                _ => None,
+            });
+            match url {
+                Some(url) => RelayWait::Connected(url),
+                // connected but the address carries no relay yet (it can
+                // while the home relay settles): the printed address must
+                // not promise what it does not carry
+                None => RelayWait::TimedOut,
+            }
+        }
+        Err(_) => RelayWait::TimedOut,
+    }
+}
+
 /// Read the root's saved choice; the default when nothing is saved.
 ///
 /// # Errors

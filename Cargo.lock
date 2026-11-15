@@ -1299,6 +1299,7 @@ dependencies = [
  "engramma-mcp",
  "engramma-sync",
  "engramma-vault",
+ "iroh",
  "mimalloc",
  "ring",
  "rusqlite",

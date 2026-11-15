@@ -130,13 +130,24 @@ async fn pairing_and_sync_ride_the_relay_and_the_summary_says_so() {
                 let ep_a = relay::bind_relay_only(&p.key_a, "0.0.0.0:0", PAIRING_ALPN, &choice)
                     .await
                     .unwrap(/* t */);
-                ep_a.online().await;
                 let reg = engramma_sync::registry::DeviceRegistry::open(p.dir_a.path())
                     .unwrap(/* t */);
-                let ticket = pairing_net::ticket_of(&ep_a).unwrap(/* t */);
-                assert!(
-                    !ticket.relay.is_empty(),
+                // the PRODUCTION wait lives in ticket_of (C1): the test
+                // does not call online() — that was the hole the reviewer
+                // found, production never waited
+                let minted = pairing_net::ticket_of(&ep_a, &choice)
+                    .await
+                    .unwrap(/* t */);
+                let ticket = minted.ticket;
+                assert_eq!(
+                    minted.relay.as_deref(),
+                    Some(relay_url.as_str()),
                     "the ticket must carry the relay's URL"
+                );
+                assert!(
+                    ticket.relay == relay_url.to_string(),
+                    "the ticket carries the relay it rides: {:?}",
+                    ticket.relay
                 );
                 assert!(
                     ticket.addrs.is_empty(),
@@ -156,7 +167,6 @@ async fn pairing_and_sync_ride_the_relay_and_the_summary_says_so() {
                 let ep_b = relay::bind_relay_only(&p.key_b, "0.0.0.0:0", PAIRING_ALPN, &choice)
                     .await
                     .unwrap(/* t */);
-                ep_b.online().await;
                 let join = {
                     let ep = ep_b.clone();
                     let ticket = ticket.clone();
@@ -183,7 +193,6 @@ async fn pairing_and_sync_ride_the_relay_and_the_summary_says_so() {
                 )
                 .await
                 .unwrap(/* t */);
-                sync_ep_a.online().await;
                 let answerer = {
                     let ep = sync_ep_a.clone();
                     let dir = p.dir_a.path().to_path_buf();
@@ -219,7 +228,6 @@ async fn pairing_and_sync_ride_the_relay_and_the_summary_says_so() {
                 )
                 .await
                 .unwrap(/* t */);
-                sync_ep_b.online().await;
                 let mut report = serve::run_pass(p.dir_b.path(), &sync_ep_b)
                     .await
                     .expect(/* a pass */ "the pass");
@@ -306,8 +314,24 @@ async fn no_relay_fails_the_same_round_cleanly() {
                 )
                 .await
                 .unwrap(/* t */);
-                ep_a.online().await;
-                let addr = ep_a.addr();
+                // the book learns from the TICKET, exactly as the join
+                // does (the production wait is in ticket_of)
+                let minted = pairing_net::ticket_of(&ep_a, &RelayChoice::Own(relay_url.to_string()))
+                    .await
+                    .unwrap(/* t */);
+                let t = &minted.ticket;
+                let mut addr = iroh::EndpointAddr::new(
+                    iroh::PublicKey::from_bytes(&t.node_id)
+                        .expect(/* just minted */ "node id"),
+                );
+                for a in &t.addrs {
+                    if let Ok(socket) = a.parse() {
+                        addr = addr.with_ip_addr(socket);
+                    }
+                }
+                if let Ok(url) = t.relay.parse() {
+                    addr = addr.with_relay_url(url);
+                }
                 let a_device = p.key_a.device_id();
                 serve::remember_addr(p.dir_b.path(), &a_device, &addr).unwrap(/* t */);
                 // B: --no-relay — the same round, without the relay (a

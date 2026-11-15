@@ -346,6 +346,8 @@ pub struct NodeAddr {
     pub node_id: [u8; 32],
     /// Direct addresses.
     pub addrs: Vec<String>,
+    /// The relay the node rides, when the ticket carried one (C1).
+    pub relay: Option<String>,
 }
 
 impl NodeAddr {
@@ -356,14 +358,20 @@ impl NodeAddr {
     pub fn endpoint_addr(&self) -> Result<EndpointAddr> {
         let node = iroh::PublicKey::from_bytes(&self.node_id)
             .map_err(|e| Error::Malformed(format!("bad node id: {e}")))?;
-        Ok(EndpointAddr::from_parts(
+        let mut addr = EndpointAddr::from_parts(
             node,
             self.addrs
                 .iter()
                 .filter_map(|a| a.parse().ok())
                 .map(iroh::TransportAddr::Ip)
                 .collect::<Vec<_>>(),
-        ))
+        );
+        if let Some(relay) = &self.relay
+            && let Ok(url) = relay.parse()
+        {
+            addr = addr.with_relay_url(url);
+        }
+        Ok(addr)
     }
 
     /// Dial the node, one address at a time (loopback first): the
@@ -392,21 +400,63 @@ impl NodeAddr {
                 Ok(Err(e)) => last = format!("{socket}: {e}"),
             }
         }
+        // the node behind a NAT: the relay the ticket carried (C1)
+        if let Some(relay) = &self.relay
+            && let Ok(url) = relay.parse()
+        {
+            let addr = EndpointAddr::new(node).with_relay_url(url);
+            let tried = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                endpoint.connect(addr, MAILBOX_NET_ALPN),
+            )
+            .await;
+            match tried {
+                Err(_) => last = format!("{relay}: timeout"),
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(e)) => last = format!("{relay}: {e}"),
+            }
+        }
         Err(Error::Io(std::io::Error::other(last)))
     }
 }
 
-/// The mailbox ticket: `engramma-mailbox-v1.base32(payload)` — the node's
-/// id, its addresses, no secret (the node is registered, not paired).
-#[must_use]
-pub fn node_ticket(endpoint: &Endpoint) -> String {
+/// What minting the node's ticket found out about the relay (C1).
+#[derive(Debug)]
+pub struct NodeTicket {
+    /// The ticket's JSON (as ever: the node's id, its addresses, and now
+    /// the relay it rides).
+    pub json: String,
+    /// The relay URL the ticket carries, when there is one.
+    pub relay: Option<String>,
+    /// The relay wait ran out: the ticket carries NO relay and the
+    /// caller must say so — never in silence.
+    pub relay_timed_out: bool,
+}
+
+/// The mailbox ticket: the node's id, its addresses, and the relay it
+/// rides — no secret (the node is registered, not paired). **The relay
+/// wait comes first** (C1): the devices that need the node most are the
+/// ones behind a NAT, and a ticket without the relay is a ticket they
+/// cannot use.
+pub async fn node_ticket(endpoint: &Endpoint, choice: &crate::relay::RelayChoice) -> NodeTicket {
+    let wait = crate::relay::wait_relay(endpoint, choice).await;
+    let relay_url = match &wait {
+        crate::relay::RelayWait::Connected(url) => Some(url.clone()),
+        _ => None,
+    };
     let addrs = crate::serve::direct_addresses(endpoint);
-    json!({
+    let json = json!({
         "v": 1,
         "node": crate::device::hex(endpoint.secret_key().public().as_bytes()),
         "addrs": addrs,
+        "relay": relay_url,
     })
-    .to_string()
+    .to_string();
+    NodeTicket {
+        json,
+        relay: relay_url,
+        relay_timed_out: wait == crate::relay::RelayWait::TimedOut,
+    }
 }
 
 /// Parse a mailbox ticket.
@@ -443,6 +493,7 @@ pub fn node_ticket_parse(text: &str) -> Result<NodeAddr> {
                     .collect()
             })
             .unwrap_or_default(),
+        relay: v["relay"].as_str().map(str::to_string),
     })
 }
 
@@ -469,6 +520,7 @@ pub fn remember_node(root: &Path, ticket: &str, addr: &NodeAddr) -> Result<()> {
             serde_json::to_string(&json!({
                 "node": crate::device::hex(&addr.node_id),
                 "addrs": addr.addrs,
+                "relay": addr.relay,
             }))
             .unwrap_or_default()
         ],
@@ -536,6 +588,7 @@ pub fn node_of(root: &Path) -> Result<Option<NodeAddr>> {
                     .collect()
             })
             .unwrap_or_default(),
+        relay: v["relay"].as_str().map(str::to_string),
     }))
 }
 

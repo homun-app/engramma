@@ -49,6 +49,17 @@ Un endpoint iroh (ALPN `engramma/mailbox/1`) che resta in esecuzione fino al seg
 - uno proprio: `--relay <url>`;
 - nessuno: `--no-relay`, solo connessione diretta.
 
+**Il biglietto porta il relay, e il relay si aspetta.** Prima di stampare
+un indirizzo che deve servire a un altro — il biglietto di `devices
+invite`, quello fresco del codice breve, il biglietto del nodo cieco,
+l'indirizzo che `sync serve` pubblica — l'endpoint aspetta fino a **10
+secondi** che il proprio relay si colleghi: subito dopo il bind il relay
+c'è ancora non, e un biglietto senza relay è un biglietto che chi è dietro
+NAT non può usare. Se il tempo scade il biglietto esce **senza** relay e
+la CLI **lo dice**: una riga sullo stderr e, nel JSON, `"relay": null`
+con un `relay_warning`. Mai in silenzio. Con `--no-relay` non si aspetta
+nulla.
+
 La pubblicazione dell'indirizzo su DNS (pkarr) è **facoltativa e spenta di base**: manderebbe a terzi l'id e il relay del dispositivo. Il relay attraversa il NAT dentro QUIC e vede solo dati cifrati (le buste sono sigillate anche per lui, non solo per QUIC).
 
 ## Cosa vede chi

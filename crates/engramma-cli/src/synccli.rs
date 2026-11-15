@@ -66,19 +66,40 @@ pub fn devices_invite(
                 let endpoint = pairing_net::bind_pairing(&dk, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
-                let ticket = pairing_net::ticket_of(&endpoint)
+                let minted = pairing_net::ticket_of(&endpoint, &choice)
+                    .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
+                let ticket = minted.ticket;
+                // a relay that never connected must be SAID, never silent
+                // (C1): behind a NAT the ticket would be unusable
+                if minted.relay_timed_out {
+                    eprintln!(
+                        "avviso: il relay non si è collegato in {} s — il \
+                         biglietto esce senza relay (chi è dietro NAT non ti troverà)",
+                        engramma_sync::relay::RELAY_WAIT.as_secs()
+                    );
+                }
                 let addrs = serve::direct_addresses(&endpoint);
                 if json {
-                    print_json(&serde_json::json!({
+                    let mut out = serde_json::json!({
                         "ticket": ticket.encode(),
-                        "node": hex(&serve::node_id_of(&endpoint)),
+                        "node": hex(serve::node_id_of(&endpoint).as_slice()),
                         "addrs": addrs,
                         "expires_at": ticket.expires_at,
-                    }));
+                        "relay": minted.relay,
+                    });
+                    if minted.relay_timed_out {
+                        out["relay_warning"] = serde_json::json!(
+                            "il relay non si è collegato: il biglietto esce senza relay"
+                        );
+                    }
+                    print_json(&out);
                 } else {
                     println!("biglietto (dieci minuti, un uso):");
                     println!("{}", ticket.encode());
+                    if let Some(relay) = &minted.relay {
+                        println!("relay: {relay}");
+                    }
                     println!("in attesa del dispositivo che entra…");
                 }
                 let root2 = root.clone();
@@ -233,13 +254,34 @@ pub fn sync_serve_cmd(
                 let endpoint = serve::bind(&dk, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
+                // the address this daemon PUBLISHES must be reachable from
+                // whoever reads it: the relay comes first (C1)
+                let wait = engramma_sync::relay::wait_relay(&endpoint, &choice).await;
+                let relay = match &wait {
+                    engramma_sync::relay::RelayWait::Connected(url) => Some(url.clone()),
+                    _ => None,
+                };
+                if wait == engramma_sync::relay::RelayWait::TimedOut {
+                    eprintln!(
+                        "avviso: il relay non si è collegato in {} s — chi è \
+                         dietro NAT non raggiungerà questo servizio",
+                        engramma_sync::relay::RELAY_WAIT.as_secs()
+                    );
+                }
                 let addrs = serve::direct_addresses(&endpoint);
                 if json {
-                    print_json(&serde_json::json!({
+                    let mut out = serde_json::json!({
                         "serving": true,
                         "node": hex(serve::node_id_of(&endpoint).as_slice()),
                         "addrs": addrs,
-                    }));
+                        "relay": relay,
+                    });
+                    if wait == engramma_sync::relay::RelayWait::TimedOut {
+                        out["relay_warning"] = serde_json::json!(
+                            "il relay non si è collegato: l'indirizzo esce senza relay"
+                        );
+                    }
+                    print_json(&out);
                 } else {
                     println!(
                         "sync serve in ascolto ({})",
