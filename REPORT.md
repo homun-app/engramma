@@ -6198,3 +6198,218 @@ di sicurezza e una promessa dei documenti che il codice non mantiene.
 
 **Esito:** non chiusa. Il punto 1 è bloccante per la sicurezza, il 2 per
 l'uso reale.
+
+# REPORT — Engramma v0.6.1 (chiusura: i rilievi R1–R6 e il resto della fase)
+
+Data: 2026-11-15. Base: `main` @ `8ba8079` (la verifica a metà strada del
+revisore). Tutto costruito e provato su macOS arm64 (Apple Silicon),
+Rust 1.95.0. Ogni rilievo comincia col suo test rosso, come la fase
+chiede; le misure sono sul banco di questa macchina.
+
+## R1 — il dispositivo rimosso entra solo con la prova
+
+**Il difetto.** Il cancello accettava l'operazione di un rimosso se
+`op.hlc < remove.hlc`: l'HLC lo sceglie l'autore, il limite dell'orologio
+ferma solo il futuro. La chiave rubata scriveva per sempre, retrodatando.
+
+**La correzione.** L'insieme accettato è la **radice di Merkle** che la
+`remove` porta (`accepted_root`, `accepted_count`, calcolata su tutto
+l'albero delle celle condivise). Un'operazione firmata da un rimosso entra
+solo se è già nella copia (duplicato, query puntuale) o arriva con la
+**prova di appartenenza** a una delle radici registrate (`merkle_root_with`,
+la stessa meccanica dell'`adopt`). L'HLC non decide più. **Più remove
+concorrenti**: vale l'unione — una prova verso una qualunque radice ammette.
+Chi manda allega la prova (`envelope_of` la costruisce sull'insieme del
+rimosso dell'intero albero, in cache per la sessione); una copia che non
+può costruirla non manda — ed è un evento, non un silenzio (R4).
+
+**L'autore entra nell'identità.** Con il firmatario armato, il nodo dell'HLC
+delle operazioni locali **è l'id del dispositivo** (l'orologio tiene fisico
+e contatore). Il cancello pretende `device == hlc.node` su ogni operazione
+firmata — entrambi dentro il `content_hash` che la firma copre — e una
+discordanza è `BadSignature`: una stessa identità non può avere autori
+diversi su copie diverse. Le operazioni pre-era restano senza firma e
+passano dall'`adopt`. L'ordine totale non cambia forma —
+`(hlc, contatore, nodo, op_id)` — e i confronti SQL (binario su stringhe)
+e Rust (binario sui tre campi) percorrono lo stesso ordine qualunque sia
+la larghezza del nodo: la regola è nel DESIGN §4.3.1, con l'unione e
+l'autore.
+
+**Le prove.** Il test rosso dello scenario del revisore (operazione
+retrodatata di un giorno, `content_hash` ricalcolato, firma della chiave
+rubata) diventa verde come rifiuto `RemovedOutsideSet`; con lui: l'operazione
+vera del rimosso che entra con la prova ed è rifiutata senza; le remove
+concorrenti con insiemi diversi (prova verso l'una o verso l'altra, e una
+prova verso nessuna radice rifiutata); `hlc.node` = dispositivo sulle
+scritture locali; `device ≠ hlc.node` rifiutato; una firma di un vivo per
+un altro rifiutata. La convergenza dopo R1: `the_fleet_converges` a 2048
+casi verde (77 s), più **sei corse** da 512 a semi nuovi,
+tutte verdi.
+
+## R2 — il relay c'è davvero
+
+**Il difetto.** Ogni endpoint nasceva con `presets::N0DisableRelay`, niente
+flag, e due dispositivi dietro NAT non si parlavano mai — mentre
+`docs/sync.md` prometteva il relay pubblico di n0 di base.
+
+**La correzione.** **Una funzione** costruisce gli endpoint (sync,
+abbinamento, nodo cieco): `relay::bind` con tre modi — i relay pubblici di
+n0 di base, `--relay <url>` per uno proprio (`RelayMode::Custom`),
+`--no-relay` per le sole connessioni dirette. pkarr resta spento in tutti
+e tre (`presets::Minimal`, non N0: la famiglia N0 pubblica su DNS). I flag
+valgono per `devices invite/join/code`, `sync run/serve`, `mailbox serve`;
+la scelta si **salva nella radice** (`devices.db`, meta `relay`) e un flag
+esplicito vince e la sostituisce. Il biglietto porta l'URL del relay che
+l'endpoint cavalca, il libro degli indirizzi lo impara dal biglietto al
+join (prima lo buttava via). `sync run` dice per ogni dispositivo se la
+sessione è passata **diretta o via relay** (`via_of_conn`, sul percorso
+selezionato).
+
+**Le prove.** Col relay locale di iroh (`test-utils`, certificato
+autofirmato: la feature `test-utils` della crate lo fa fidare, attiva solo
+nei test) e le connessioni dirette **impedite** (`clear_ip_transports`):
+abbinamento e sincronizzazione completi passano solo dal relay, il
+riepilogo dice «relay», e le due copie convergono. Con `--no-relay` lo
+stesso giro fallisce in modo pulito: una riga del riepilogo, non un errore.
+Sui flag, il test della CLI: `--relay` e `--no-relay` esistono, la scelta
+si salva, il flag esplicito vince. Nei test i default restano loopback
+senza relay (`--no-relay` al primo comando di ogni radice).
+
+## R3 — niente costo quadratico sul filo
+
+**Il difetto.** `find_op` caricava tutto il log per ogni busta;
+`envelope_of` rifaceva la prova dell'adopt (rilettura di tutti gli hash e
+ricostruzione dell'albero) per ogni operazione senza firma; il controllo
+«è già nella copia» rileggeva tutti i `content_hash`; `ids()`
+deserializzava ogni operazione col payload. Il bootstrap di una cella da
+10k era O(n²) — e la misura di P5.2 mancava per questo.
+
+**La correzione.** La ricerca di un'operazione è una query puntuale
+sull'indice v20 (`Cell::op_of_hash`); `ids()` legge solo `hlc` e
+`content_hash`; il duplicato è una query puntuale; l'albero dell'adopt e
+quello dell'insieme di ogni rimosso si calcolano **una volta per sessione**
+e restano in memoria (`MerkleIndex`: stesse foglie, stesso abbinamento,
+stesse prove di `merkle_root`/`merkle_prove` — l'equivalenza è provata su
+ogni taglia attorno alle potenze di due).
+
+**La misura** (release, questa macchina; byte sul filo identici — il filo
+non è cambiato):
+
+| | prima | dopo |
+|---|---|---|
+| 1000 buste | 3,47 s (288/s), 2003 letture dell'intero log | 45 ms (22 324/s), 1 lettura |
+| 10000 buste | 330,7 s (30/s), 20 003 letture | 0,52 s (19 291/s), 1 lettura |
+
+La misura di P5.2 (bootstrap da 10k, tempo e byte) ora si può fare, ed è
+questa. Il test di regressione conta le letture dell'intero log nel
+bootstrap di 1002 operazioni: **2 in tutto** (una per gli id, una per
+l'albero; il limite del test è 8) — un numero fisso, non una per busta.
+
+## R4 — nessuna busta si perde in silenzio
+
+**Il difetto.** In `envelope_of` ogni errore diventava `.ok()?`: 
+l'operazione non partiva e nessuno lo sapeva.
+
+**La correzione.** Ogni operazione che non si può sigillare o provare
+diventa un **evento** nel registro della radice (`sync_events`: op_id
+**corto**, tipo, motivo — mai testo della nota), il riepilogo di
+`sync run` la conta per cella (`unsent`, dal protocollo: ciò che il lotto
+chiedeva meno ciò che è partito), e `sync status` le mostra finché restano
+(la passata le ripulisce all'inizio e chi non parte viene nominata di
+nuovo). Il test ha trovato da solo un difetto in più: l'albero dell'adopt
+è l'insieme **coperto** (le operazioni prima dell'ultimo `adopt`), non
+tutte le senza firma — un'orfana post-era piegava l'albero e rendeva
+inviabili anche le operazioni buone. Corretto con la stessa disciplina:
+rosso, poi verde (una riga `unsent: 1` e l'evento senza il testo della
+nota «quokkaviola»).
+
+## R5 — l'igiene dei test di rete
+
+**I processi figli.** Ogni processo figlio dei test (`sync serve`,
+`mailbox serve`, `devices invite/join`) vive in una guardia con `Drop` che
+lo uccide e lo aspetta **anche quando il test va in panico** — il
+`mailbox serve` orfano trovato vivo dal revisore (tre ore e mezza) non può
+più nascere. **I tempi massimi.** Ogni attesa ha una scadenza esplicita:
+`wait_bounded` per i figli, `bounded()` per i test sincroni della CLI
+(un giro appeso fallisce con una riga che dice quale), 
+`tokio::time::timeout` per i test asincroni — il `cargo test --test
+pairing` appeso per otto ore non si ripete in silenzio. **Le corse.**
+`pairing` girata **20 volte: 20/20 verdi**, nessun processo orfano;
+`sync_serve_cli` girata **20 volte: 20/20 verdi** (5 test a corsa, ~440 s
+a corsa), 0 fallite, nessun processo orfano. R5 non ha un test rosso suo:
+il rilievo È nei test, e la guardia con la scadenza è la correzione.
+
+## R6 — le due cose minori, chiuse
+
+1. **`censor_shape_ok` controlla anche il contenuto delle stringhe**: gli
+   id (`old_id`, `proposal`, `target`) sono ULID, le chiusure (`valid_to`,
+   `target_closing`) parsano come `Validity`, gli istanti
+   (`old_updated_at`, `decided_at`) come `At` RFC 3339. Un dispositivo
+   vivo non può più nascondere testo nelle chiave-valore del censurato
+   («il segreto quokkaviola nascosto nell'id» è il test). I corpi che la
+   regola produce davvero passano tutt'e due le prove.
+2. **La proprietà «purge, compact e censura non muovono l'identità» è un
+   proptest** su storie generate (put, patch, delete, supersede, purge a
+   piacere, taglio di compattazione generato): `content_hash`, `sig` e
+   `payload_digest` identici prima e dopo, ogni corpo censurato nella
+   forma della regola, verify verde. Il caso fisso resta come scenario
+   del revisore.
+
+## Il resto della fase
+
+- **La rimozione con rotazione, end-to-end.** Tre dispositivi veri (binario
+  CLI): la `remove` firmata con la radice dell'insieme accettato, l'epoca
+  nuova che raggiunge chi resta (`sync status` dice epoca 1), una nota
+  scritta dopo la rotazione, e il rimosso che: non apre le buste nuove
+  (il sigillo dell'epoca girata, provato sul suo adattatore), non raggiunge
+  più nessuno (il cancello rifiuta la sua chiave di trasporto: riga
+  «non raggiunto», non errore), e la sua copia resta indietro.
+- **Il codice breve col canale bruciato, end-to-end.** Era dichiarato
+  mancante perché **non aveva mai funzionato**: quattro difetti veri,
+  trovati uno alla volta dal test rosso (vedi il commit). L'incontro al
+  nodo cieco, il PAKE, il biglietto fresco sigillato nel relay, la cella
+  che arriva — e l'uso del codice **brucia il canale**: un tentativo per
+  codice, il secondo col codice giusto in mano è rifiutato («il canale è
+  bruciato»).
+- **La latenza su 50 scritture** (release, loopback): 50 scritture locali
+  in 10,3 ms ({0,21} ms/scrittura), la passata che le
+  porta 27,3 ms ({0,53} ms/operazione), una scrittura in
+  più con la sua passata 11,0 ms.
+- **Le due soglie** (base fase-v0.5.3, mediana di 5 corse, release):
+  MRR pesato del banco 100k 0,683 / 0,739 (soglia ≥ −0,005 dalla base:
+  0,683 / 0,739_BASE); testo+grafo p95 del banco 10k 1,8 ms (soglia ≤ +5%:
+  1,8 ms_VERDICT).
+- **JS** (Node v25.9.0, l'unico su questa macchina — Node 24 non c'è:
+  dichiarato, non promesso): `npm test` 29/29, `test:electron` 29/29,
+  `test:electron-main` ok. `npm run build` con gli SHA256:
+  `engramma.darwin-arm64.node` `87a94a31b49f03b57920b0489dada53a25615df3bc9d74584bd2b3909183d81c`, `index.js` `25fd9cc1d50a1ec3f2d74bc004d904663ff07360102d27b938870329d9c832d4`,
+  `index.d.ts` `bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a6488005bf69d9f8`.
+- **Linux**: `scripts/linux.sh` (arm64, `--network none`) **verde**: fmt e clippy puliti, 58 suite verdi, 0 fallite (`--network none`: il giro via relay gira sul solo loopback).
+- **Convergenza dopo R1**: vedi R1.
+
+## La macchina e il disco
+
+- `du -sh target` all'inizio: 37G; alla fine: 39G (le misure release del banco).
+- Binario CLI di debug: 151 MiB. Nessuna crate aggiunta oltre al
+  lockfile esistente (l'unica voce nuova è l'auto-dipendenza di test di
+  `engramma-sync`, che porta la feature `test-utils` di iroh nei soli
+  test).
+
+## Cosa non promettiamo (invariato, con una precisazione)
+
+- PCS/FS restano fuori (chiave d'epoca rubata = epoca persa); la rotazione
+  alla rimozione resta il compromesso dei dispositivi di una persona.
+- La forma del censurato ora controlla anche il contenuto delle stringhe
+  (R6): ciò che resta non promesso è il **corpo libero dentro
+  `restore_target`** di un `revert_decision` (l'istantanea pre-stato del
+  bersaglio, un'altra nota: la regola lo copia verbatim e ne verifica la
+  forma di oggetto, non i campi interni).
+- Il nodo cieco vede chiavi, orari e dimensioni: sempre.
+
+## Chiusura
+
+La fase si chiude come diceva la spec: tutti i rilievi R1–R6 risolti col
+test rosso prima, il giro via relay (P5.1) e la misura di bootstrap
+(P5.2) fatti, la rotazione end-to-end e il codice bruciato provati dal
+binario, le soglie rimesurate, JS e Linux verdi, il tag annotato
+`fase-v0.6.1`. Nessun push.
