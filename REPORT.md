@@ -6582,3 +6582,80 @@ spinta fino a B, nessuno che tira) sta in suite, verde.
   la variante test-relay e le cartelle del banco cancellate.
 - **Tag**: `fase-v0.6.1` spostato sul commit finale, annotato, solo
   locale, nessun push. Nessun processo lasciato acceso.
+
+
+# Verifica v0.6.1 dopo la chiusura C1–C4 (revisore, 2026-11-15)
+
+Commit verificato: `b71161f` (tag `fase-v0.6.1`). Esito: **la fase non si
+chiude ancora.** C1 e C2 reggono; C4 misura un ciclo che non va mai a
+riposo; la soglia d'inserimento di C3 non è raggiunta. Spec delle
+correzioni: `engramma-v0.6.1-ciclo.md` (K1–K4).
+
+## Regge
+
+- **C1.** Tre `devices invite` dal binario, col relay di base, su radici
+  temporanee: tutti e tre i biglietti portano
+  `https://euc1-1.relay.n0.iroh.link./`, sia nel campo `relay` del JSON sia
+  dentro il base32 decodificato. `wait_relay` sta in un posto solo e i test
+  di `tests/relay.rs` non chiamano più `online()` da sé.
+- **C2.** La corsa del banco di questa fase non lascia cartelle in
+  `$TMPDIR`.
+- I quattro difetti trovati da GLM in C4 sono veri e corretti bene:
+  `data_version` intero su connessioni aperte, deadlock della sessione già
+  sincronizzata, FIN consumato, primo tick dell'orologio.
+
+## K1 — il ciclo di `sync serve` si riaccende da solo (bloccante)
+
+La misura C4 rifatta con 8 scritture, `ENGRAMMA_TRACE=1` e 30 s di
+silenzio in coda: su A **29 passate «write» per 8 scritture**, che
+continuano anche nel silenzio. Il guardiano fa `ack()` subito dopo aver
+mandato il tick, prima che la passata giri; la passata scrive nella cella,
+`data_version` si muove e il guardiano la prende per una scrittura locale.
+Una sessione ogni ~3 s per sempre, verso ogni dispositivo.
+
+Il numero di C4 (mediana 1506 ms) è **sotto il rimbalzo di 2 s**, cosa
+impossibile per costruzione: la scrittura arriva con la passata che il
+ciclo aveva già in corsa. È la fase del ciclo, non la latenza.
+
+## K2 — il dial reinventato (contro R2.3)
+
+`PeerAddr::dial` e `NodeAddr::dial` provano un indirizzo alla volta, 5 s
+ciascuno, loopback primo, relay ultimo; `direct_addresses` pubblica anche
+`127.0.0.1` agli altri. Su due macchine vere dietro NAT ogni passata può
+pagare ~20 s per dispositivo prima del relay, col ciclo di serve fermo.
+R2.3 chiedeva di lasciare la gara degli indirizzi a iroh.
+
+## K4 — le soglie, misurate dal revisore
+
+`engramma-bench --notes 10000 --runs 5`, release, base `fase-v0.5.3` in un
+worktree con target suo, `TMPDIR` separati, nessun altro banco o build.
+Due coppie, la seconda in ordine inverso:
+
+| corsa | inserimento viva (note/s) | inserimento uniform | p95 testo+grafo viva / uniform (ms) |
+|---|---|---|---|
+| base v0.5.3, 1ª | 3553 | 3532 | 1,8 / 1,9 |
+| v0.6.1, 1ª | 2787 | 2794 | 2,0 / 1,9 |
+| v0.6.1, 2ª | 2801 | 2806 | 1,9 / 2,0 |
+| base v0.5.3, 2ª | 3223 | 3237 | 2,2 / 2,2 |
+
+- **Inserimento: +15% / +27% di tempo** nei due ordini, tetto +10% —
+  **NON raggiunta.**
+- **p95 testo+grafo:** fra −14% e +11%, dentro il rumore (un passo di
+  risoluzione è 0,1 ms) — regge.
+- La base del REPORT di chiusura (3013 note/s, p95 3,1 ms) era una corsa
+  rallentata: da lì il «raggiunta».
+
+## Minori
+
+- `docs/sync.md`: «il relay c'è ancora non».
+- `Daemon::spawn` nei test: lo stderr del figlio è in pipe e nessuno lo
+  legge; con la traccia accesa la pipe si riempie e il demone si blocca.
+- Uno stream unidirezionale per frame: corretto (quinn accetta in ordine di
+  id), ma lo stato dell'arte è uno stream per sessione.
+
+## Non rifatto
+
+Convergenza a 2048 casi, suite macOS e Linux: si rifanno sul commit che
+chiude K1–K4, perché K1 e K2 toccano di nuovo il ciclo e il dial.
+`du -sh target`: 8,3 G all'inizio, 8,4 G alla fine (worktree e target
+della base cancellati).
