@@ -20,9 +20,9 @@ Due modi, un esito.
 
 ## Il servizio: `sync run` e `sync serve`
 
-- **`engramma sync run`**: una passata con ogni dispositivo vivo raggiungibile (e col nodo cieco configurato). Il riepilogo JSON dice, per cella, operazioni inviate e ricevute, rifiuti al cancello, conflitti e frontiera; per dispositivo, se la sessione è avvenuta e perché no. **Un irraggiungibile non è un errore**: è una riga.
+- **`engramma sync run`**: una passata con ogni dispositivo vivo raggiungibile (e col nodo cieco configurato). Il riepilogo JSON dice, per cella, operazioni inviate e ricevute, rifiuti al cancello, conflitti, **non speditibili** e frontiera; per dispositivo, se la sessione è avvenuta, per quale strada (diretta o via relay) e perché no. **Un irraggiungibile non è un errore**: è una riga.
 - **`engramma sync serve`**: ascolta (ALPN `engramma/sync/1`), applica il cancello a ogni accettazione, e sincronizza a ogni scrittura locale (`PRAGMA data_version`, rimbalzo 2 s) e ogni 5 minuti. Si ferma pulito su SIGINT/SIGTERM. Il demone gira **accanto** a Homun sulla stessa radice: due processi, un registro, la sessione che li attraversa è provata.
-- **Gli indirizzi**: ogni radice ricorda l'ultimo indirizzo noto di ogni dispositivo (il libro degli indirizzi, aggiornato a ogni sessione e all'abbinamento). `--relay <url>` e `--no-relay` come nel biglietto; pkarr spento. Una radice che vuole essere raggiunta senza inviti tiene `sync serve` acceso.
+- **Gli indirizzi**: ogni radice ricorda l'ultimo indirizzo noto di ogni dispositivo (il libro degli indirizzi, aggiornato a ogni sessione e all'abbinamento; il biglietto dell'abbinamento gli consegna anche il relay, quando c'è). `--relay <url>` e `--no-relay` come nel biglietto; pkarr spento. La scelta si **salva nella radice** (un flag esplicito vince e la sostituisce): `sync serve` non la chiede a ogni avvio. Una radice che vuole essere raggiunta senza inviti tiene `sync serve` acceso.
 
 ## Come si condivide una cella
 
