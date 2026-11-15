@@ -137,15 +137,33 @@ fn run(root: &std::path::Path, args: &[&str]) -> (bool, String, String) {
 
 /// A long-running child whose stdout lines arrive on a channel while it
 /// runs (the serve daemon publishes its address as the FIRST json line).
+/// The STDERR is drained in its own thread and kept (K3, v0.6.1-ciclo): a
+/// piped-but-unread stderr fills its pipe and the daemon blocks — with
+/// the trace on, in seconds.
 struct Daemon {
     child: Child,
     lines: std::sync::mpsc::Receiver<String>,
+    err: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl Daemon {
     fn spawn(root: &std::path::Path, args: &[&str]) -> Self {
+        Self::spawn_opt(root, args, false)
+    }
+
+    /// The traced way (K1, v0.6.1-ciclo): `ENGRAMMA_TRACE=1`, so the
+    /// daemon's own lines name every pass — the drained stderr keeps
+    /// them for the test to count.
+    fn spawn_traced(root: &std::path::Path, args: &[&str]) -> Self {
+        Self::spawn_opt(root, args, true)
+    }
+
+    fn spawn_opt(root: &std::path::Path, args: &[&str], trace: bool) -> Self {
         let mut cmd = bin();
         cmd.arg("--root").arg(root).args(args);
+        if trace {
+            cmd.env("ENGRAMMA_TRACE", "1");
+        }
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -164,7 +182,49 @@ impl Daemon {
                 }
             });
         }
-        Self { child, lines: rx }
+        let err = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(se) = child.stderr.take() {
+            let sink = std::sync::Arc::clone(&err);
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(se).lines() {
+                    let Ok(line) = line else {
+                        break;
+                    };
+                    let mut buf = sink.lock().expect(/* test */ "stderr buf");
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            });
+        }
+        Self {
+            child,
+            lines: rx,
+            err,
+        }
+    }
+
+    /// How many passes of one kind the daemon ran («write» or «clock»):
+    /// the trace's own `worker: passo <kind>` lines, one per pass.
+    fn passes(&self, kind: &str) -> usize {
+        self.err
+            .lock()
+            .expect(/* test */ "stderr buf")
+            .matches(&format!("worker: passo {kind}"))
+            .count()
+    }
+
+    /// The last lines of the drained stderr (a failure's evidence).
+    fn trace_tail(&self) -> String {
+        let buf = self.err.lock().expect(/* test */ "stderr buf");
+        buf.lines()
+            .rev()
+            .take(30)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// The daemon's first JSON object (pretty-printed over several lines,
@@ -443,9 +503,28 @@ fn the_blind_node_carries_and_forgets() {
                 }
             });
         }
+        // the stderr is drained too (K3): a piped-but-unread pipe fills
+        // and the node blocks
+        let err_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(se) = child.stderr.take() {
+            let sink = std::sync::Arc::clone(&err_buf);
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(se).lines() {
+                    let Ok(line) = line else { break };
+                    let mut buf = sink.lock().expect(/* test */ "stderr buf");
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            });
+        }
         // the node dies with the test, even on a panic (R5 — a leaked node
         // once lived three hours and a half)
-        let node = Daemon { child, lines: rx };
+        let node = Daemon {
+            child,
+            lines: rx,
+            err: err_buf,
+        };
         let v = node.first_json();
         // the ticket travels as a nested JSON object (C1): back to the
         // textual form `mailbox add` takes
@@ -831,7 +910,26 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
                     }
                 });
             }
-            Daemon { child, lines: rx }
+            // the stderr is drained too (K3): a piped-but-unread pipe
+            // fills and the node blocks
+            let err_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            if let Some(se) = child.stderr.take() {
+                let sink = std::sync::Arc::clone(&err_buf);
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(se).lines() {
+                        let Ok(line) = line else { break };
+                        let mut buf = sink.lock().expect(/* test */ "stderr buf");
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                });
+            }
+            Daemon {
+                child,
+                lines: rx,
+                err: err_buf,
+            }
         };
         let v = node.first_json();
         let ticket = v["ticket"].to_string();
@@ -1175,4 +1273,199 @@ fn the_serve_cycle_pushes_a_second_process_write() {
         arrived,
         "il ciclo di serve doveva spingere la scrittura di un secondo processo fino a B"
     );
+}
+
+// ---------------------------------------------------------------------------
+// K1 (v0.6.1-ciclo): the cycle RESTS. Two daemons already synced, thirty
+// seconds of silence: ZERO «write» passes — the daemon works for nobody
+// when nothing moved. And ONE write on A is ONE write pass on A, none on
+// B: the operations that came FROM A never bounce back to A (the pass
+// they trigger goes toward the OTHERS; with none, it does not go).
+// ---------------------------------------------------------------------------
+
+/// A device id as the root's registry holds it (`members` by name).
+fn device_of(root: &std::path::Path, name: &str) -> String {
+    let reg = rusqlite::Connection::open(root.join("devices.db")).unwrap(/* t */);
+    reg.query_row("SELECT device FROM members WHERE name = ?1", [name], |r| r.get(0))
+        .unwrap(/* t */)
+}
+
+/// Loopback-only addresses for a loopback test (K2): the daemon binds
+/// `0.0.0.0`, so every published port answers on 127.0.0.1 — and a test
+/// that runs on one machine must not lean on the machine's real
+/// interfaces (a VPN's 100.64/10 among them).
+fn to_loopback(addrs: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in addrs {
+        let Some(port) = a.rsplit(':').next() else { continue };
+        let lb = format!("127.0.0.1:{port}");
+        if !out.contains(&lb) {
+            out.push(lb);
+        }
+    }
+    out
+}
+
+/// Two roots, one shared cell, both daemons traced and already synced:
+/// the scene the K1 measures rest on.
+struct ServedPair {
+    a: Root,
+    b: Root,
+    serve_a: Daemon,
+    serve_b: Daemon,
+}
+
+impl ServedPair {
+    fn new(tag_a: &str, tag_b: &str) -> Self {
+        let a = Root::new(tag_a);
+        let b = Root::new(tag_b);
+        let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
+        cell.put_note(&note(1, "la base"), "cli").unwrap(/* t */);
+        drop(cell);
+        run(&a.root, &["sync", "share", "memoria"]);
+        pair(&a, &b, "mac");
+        let serve_a = Daemon::spawn_traced(&a.root, &["--json", "sync", "serve", "--no-relay"]);
+        let serve_b = Daemon::spawn_traced(&b.root, &["--json", "sync", "serve", "--no-relay"]);
+        let va = serve_a.first_json();
+        let vb = serve_b.first_json();
+        let addrs_of = |v: &serde_json::Value| -> Vec<String> {
+            let published: Vec<String> = v["addrs"]
+                .as_array()
+                .map(|x| {
+                    x.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            to_loopback(&published)
+        };
+        let node_of = |v: &serde_json::Value| -> String {
+            v["node"]
+                .as_str()
+                .expect(/* printed */ "the node id")
+                .to_string()
+        };
+        // each book learns the other daemon's live address (loopback only:
+        // same machine, same test)
+        remember_all(
+            &a.root,
+            &device_of(&a.root, "mac"),
+            &node_of(&vb),
+            &addrs_of(&vb),
+        );
+        remember_all(
+            &b.root,
+            &device_of(&b.root, "portatile"),
+            &node_of(&va),
+            &addrs_of(&va),
+        );
+        // NOTE: no `sync run` here on purpose. The run's endpoint shares
+        // the root's transport KEY with the daemon: the peer's magicsock
+        // would stick to the run's ephemeral port, which dies with the
+        // run — the daemon's later dial to the same node id times out
+        // against the dead route. The pair is already synced (the join
+        // carried the cell); the books are set by hand above.
+        // the watchers settle (their baselines take whatever the setup
+        // wrote): the count starts from the quiet
+        std::thread::sleep(Duration::from_secs(4));
+        Self {
+            a,
+            b,
+            serve_a,
+            serve_b,
+        }
+    }
+}
+
+/// K1: after a write has crossed (the cycle is HOT), thirty seconds of
+/// silence: zero «write» passes on both sides. The rest state is the one
+/// that matters — a cycle that only stops when nothing ever happened is
+/// not a cycle that rests.
+#[test]
+fn the_serve_cycle_rests_when_idle() {
+    bounded("rests_when_idle", 420, || {
+        let scene = ServedPair::new("rest-a", "rest-b");
+        // one write first: it crosses, the cycle runs — and then it must
+        // STOP. The silence is measured from the quiet after the crossing.
+        add_note(&scene.a.root, "A");
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            if b_has_note(&scene.b.root, "scritta concorrente di A") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                let tail_a = scene.serve_a.trace_tail();
+                panic!("la nota di A non è mai arrivata su B:\n{tail_a}");
+            }
+        }
+        // let the last pass of the crossing finish
+        std::thread::sleep(Duration::from_secs(4));
+        let before = (scene.serve_a.passes("write"), scene.serve_b.passes("write"));
+        std::thread::sleep(Duration::from_secs(30));
+        let after = (scene.serve_a.passes("write"), scene.serve_b.passes("write"));
+        let tail_a = scene.serve_a.trace_tail();
+        let tail_b = scene.serve_b.trace_tail();
+        drop(scene);
+        assert_eq!(
+            after.0 - before.0,
+            0,
+            "A ha fatto {} passate write in 30 s di silenzio:\n{tail_a}",
+            after.0 - before.0
+        );
+        assert_eq!(
+            after.1 - before.1,
+            0,
+            "B ha fatto {} passate write in 30 s di silenzio:\n{tail_b}",
+            after.1 - before.1
+        );
+    });
+}
+
+/// K1: one write on A is ONE write pass on A — and NONE on B: what came
+/// from A never bounces back to A.
+#[test]
+fn one_write_is_one_pass_and_none_back() {
+    bounded("one_write_one_pass", 420, || {
+        let scene = ServedPair::new("one-a", "one-b");
+        let before = (scene.serve_a.passes("write"), scene.serve_b.passes("write"));
+        // the write, from a SECOND process on A's root (the CLI)
+        add_note(&scene.a.root, "A");
+        // it must reach B with nobody pulling: the cycle pushes it
+        let arrived = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(25);
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if b_has_note(&scene.b.root, "scritta concorrente di A") {
+                    break true;
+                }
+                if std::time::Instant::now() > deadline {
+                    break false;
+                }
+            }
+        };
+        // any spurious re-trigger shows in the next seconds
+        std::thread::sleep(Duration::from_secs(6));
+        let after = (scene.serve_a.passes("write"), scene.serve_b.passes("write"));
+        let tail_a = scene.serve_a.trace_tail();
+        let tail_b = scene.serve_b.trace_tail();
+        drop(scene);
+        assert!(
+            arrived,
+            "la nota di A non è mai arrivata su B\n— traccia di A:\n{tail_a}\n— traccia di B:\n{tail_b}"
+        );
+        assert_eq!(
+            after.0 - before.0,
+            1,
+            "A doveva fare UNA passata write, non {}:\n{tail_a}",
+            after.0 - before.0
+        );
+        assert_eq!(
+            after.1 - before.1,
+            0,
+            "B non doveva fare passate write (niente rimbalzo verso A), non {}:\n{tail_b}",
+            after.1 - before.1
+        );
+    });
 }
