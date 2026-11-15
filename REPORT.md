@@ -6550,13 +6550,35 @@ spinta fino a B, nessuno che tira) sta in suite, verde.
 
 ## La chiusura
 
-- `the_fleet_converges` a **2048 casi** sul commit finale, più **cinque
-  corse** da 512 a semi nuovi: tutte verdi (i numeri in fondo).
-- macOS: fmt e clippy verdi; la suite completa verde.
-- Linux (`scripts/linux.sh`), JS (`npm test`, `test:electron`,
-  `test:electron-main`), `npm run build` con gli SHA256: i giri di
-  sotto, i numeri nel REPORT di chiusura.
-- Tag `fase-v0.6.1` spostato sul commit finale, annotato, solo locale.
-- `du -sh target` all'inizio 5,0 G (dopo la pulizia profonda), alla
-  fine il numero di sotto; il worktree e il target della base
-  cancellati; nessun processo lasciato acceso.
+- **La convergenza sul commit finale**: `the_fleet_converges` a **2048
+  casi** verde (215 s), più **cinque corse** da 512 a semi nuovi —
+  58 s, 109 s, 82 s, 116 s, 110 s — tutte verdi.
+- **macOS**: fmt e clippy verdi su tutta l'area di lavoro; la suite
+  verde (fra cui i sei binari di rete della CLI, la misura ignorata a
+  parte).
+- **Linux**: `scripts/linux.sh` (arm64, `--network none`, sorgente in
+  sola lettura) **verde**: fmt e clippy puliti, **58 suite verdi, 0
+  fallite**. Ha preteso due correzioni vere: la variante `test-relay`
+  del binario si costruisce **fuori dal repo** (il sorgente è montato
+  in sola lettura) e il dial della passata prova **anche il relay del
+  libro** (un endpoint solo-relay non ha indirizzi diretti: senza, il
+  giro via relay muore con «nessun indirizzo noto»).
+- **JS** (Node v25.9.0 — Node 24 non è su questa macchina, dichiarato
+  come nella chiusura precedente): `npm test` **29/29**,
+  `test:electron` **29/29**, `test:electron-main` ok. `npm run build`
+  con gli SHA256 (il binario non cambia: il motore è quello della
+  chiusura, solo il layer di sincronizzazione si è mosso — e nessun
+  file del binding è cambiato):
+  `engramma.darwin-arm64.node`
+  `87a94a31b49f03b57920b0489dada53a25615df3bc9d74584bd2b3909183d81c`,
+  `index.js`
+  `25fd9cc1d50a1ec3f2d74bc004d904663ff07360102d27b938870329d9c832d4`,
+  `index.d.ts`
+  `bf9381f18911d1fba6269eb745c2825c57f5ed643461d4c2a6488005bf69d9f8`.
+- **Binario CLI di debug**: 151 MiB.
+- **Disco**: `du -sh target` 5,0 G all'inizio del giro (dopo la
+  pulizia profonda), 29 G alla fine (le build release delle misure e il
+  volume Linux); il worktree e il target della base v0.5.3 cancellati,
+  la variante test-relay e le cartelle del banco cancellate.
+- **Tag**: `fase-v0.6.1` spostato sul commit finale, annotato, solo
+  locale, nessun push. Nessun processo lasciato acceso.
