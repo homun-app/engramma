@@ -410,17 +410,10 @@ pub fn sync_serve_cmd(
                                     // no others there is NO pass at all —
                                     // the rows that came from the sources
                                     // never bounce back to them (K1)
-                                    let (label, skip) = match &what {
-                                        Tick::Clock => ("clock", Vec::new()),
-                                        _ => ("write", match &what {
-                                            Tick::Others(skip) => skip.clone(),
-                                            _ => Vec::new(),
-                                        }),
-                                    };
-                                    let has_targets = match &what {
+                                    let (label, skip, has_targets) = match &what {
                                         Tick::Others(skip) => {
                                             let self_dev = serve::self_device(&root);
-                                            DeviceRegistry::open(&root)
+                                            let has = DeviceRegistry::open(&root)
                                                 .ok()
                                                 .and_then(|r| r.live_members().ok())
                                                 .map(|ms| {
@@ -429,35 +422,68 @@ pub fn sync_serve_cmd(
                                                             && !skip.contains(&m.device)
                                                     })
                                                 })
-                                                .unwrap_or(false)
+                                                .unwrap_or(false);
+                                            ("write", skip.clone(), has)
                                         }
-                                        _ => true,
+                                        Tick::Clock => ("clock", Vec::new(), true),
+                                        Tick::Write => ("write", Vec::new(), true),
                                     };
-                                    if has_targets {
-                                        if std::env::var("ENGRAMMA_TRACE").is_ok() {
-                                            eprintln!("worker: passo {label}");
-                                        }
-                                        match serve::run_pass(&root, &endpoint, &skip).await {
-                                            Ok(report) if std::env::var("ENGRAMMA_TRACE").is_ok() => {
-                                                for p in &report.peers {
-                                                    eprintln!(
-                                                        "passo ({label}): {} reached={} via={:?} why={:?}",
-                                                        p.name, p.reached, p.via, p.why_not
-                                                    );
+                                    let mut received;
+                                    let mut first = true;
+                                    loop {
+                                        // the first round obeys the tick
+                                        // (the others-only exclusions, or
+                                        // none at all); a RETRIGGERED round
+                                        // carries local rows — it goes to
+                                        // every live device
+                                        let (run, skip_now) = if first {
+                                            (has_targets, skip.clone())
+                                        } else {
+                                            (true, Vec::new())
+                                        };
+                                        received = 0;
+                                        if run {
+                                            if std::env::var("ENGRAMMA_TRACE").is_ok() {
+                                                eprintln!("worker: passo {label}");
+                                            }
+                                            match serve::run_pass(&root, &endpoint, &skip_now).await {
+                                                Ok(report) => {
+                                                    received = report
+                                                        .cells
+                                                        .iter()
+                                                        .map(|c| c.received)
+                                                        .sum();
+                                                    if std::env::var("ENGRAMMA_TRACE").is_ok() {
+                                                        for p in &report.peers {
+                                                            eprintln!(
+                                                                "passo ({label}): {} reached={} via={:?} why={:?}",
+                                                                p.name, p.reached, p.via, p.why_not
+                                                            );
+                                                        }
+                                                    }
                                                 }
+                                                Err(e) if std::env::var("ENGRAMMA_TRACE").is_ok() => {
+                                                    eprintln!("passo ({label}): errore {e}");
+                                                }
+                                                Err(_) => {}
                                             }
-                                            Err(e) if std::env::var("ENGRAMMA_TRACE").is_ok() => {
-                                                eprintln!("passo ({label}): errore {e}");
-                                            }
-                                            _ => {}
                                         }
-                                    }
-                                    // the ack comes AFTER the pass (K1):
-                                    // the baselines take what the pass
-                                    // itself wrote, or its own writes
-                                    // would re-light the cycle
-                                    if let Ok(mut w) = watch.lock() {
-                                        let _ = w.settle();
+                                        // the ack comes AFTER the pass (K1):
+                                        // the baselines take what the pass
+                                        // itself wrote, or its own writes
+                                        // would re-light the cycle. And a
+                                        // local write that landed MID-PASS
+                                        // is handed to another pass — the
+                                        // settle must not swallow it
+                                        let again = if let Ok(mut w) = watch.lock() {
+                                            w.finish_pass(received).unwrap_or(false)
+                                        } else {
+                                            false
+                                        };
+                                        first = false;
+                                        if !again {
+                                            break;
+                                        }
                                     }
                                 }
                             }

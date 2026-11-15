@@ -518,6 +518,10 @@ pub struct DataVersionWatch {
     fed: std::collections::HashMap<String, usize>,
     /// A pass is armed or running: the baselines settle when it ends.
     busy: bool,
+    /// The log's marker as the armed pass BEGAN: what the pass may count
+    /// as its own, and the line beyond which rows that arrived mid-pass
+    /// are NEW local work the settled baselines must not swallow.
+    pass_start: Option<Vec<(String, (i64, i64))>>,
 }
 
 /// What the guard decided when the file's counter moved.
@@ -550,6 +554,7 @@ impl DataVersionWatch {
             marker,
             fed: std::collections::HashMap::new(),
             busy: false,
+            pass_start: None,
         })
     }
 
@@ -564,6 +569,7 @@ impl DataVersionWatch {
             marker: Vec::new(),
             fed: std::collections::HashMap::new(),
             busy: false,
+            pass_start: None,
         }
     }
 
@@ -650,7 +656,13 @@ impl DataVersionWatch {
         };
         match decision {
             PassDecision::None => self.settle()?,
-            _ => self.busy = true,
+            _ => {
+                self.busy = true;
+                // where the pass begins: rows beyond this line that are
+                // not the sessions' own work arrived MID-PASS, and the
+                // settle must hand them to the next pass, not swallow
+                self.pass_start = Some(now);
+            }
         }
         Ok(decision)
     }
@@ -666,7 +678,32 @@ impl DataVersionWatch {
         self.marker = Self::read_markers(&self.cells, &self.root)?;
         self.fed.clear();
         self.busy = false;
+        self.pass_start = None;
         Ok(())
+    }
+
+    /// Close an armed pass (K1): settle the baselines, and say whether
+    /// rows that are NOT the sessions' own work arrived WHILE the pass
+    /// ran — a local write that lands mid-pass must not be swallowed by
+    /// the settle (its baseline would take it as already seen). The
+    /// caller answers `true` with another pass.
+    ///
+    /// # Errors
+    /// [`Error::Db`] on SQL failure.
+    pub fn finish_pass(&mut self, pass_received: usize) -> Result<bool> {
+        let now = Self::read_markers(&self.cells, &self.root)?;
+        let start = self.pass_start.clone().unwrap_or_else(|| now.clone());
+        let delta: i64 = now.iter().zip(&start).map(|(a, b)| a.1.0 - b.1.0).sum();
+        // the sessions' own work during the pass: what the inbound
+        // sessions noted in the ledger, and what the pass itself ingested
+        let sessions: i64 = self.fed.values().sum::<usize>() as i64 + pass_received as i64;
+        let again = delta > sessions;
+        self.last = Self::read(&self.cells, &self.root)?;
+        self.marker = now;
+        self.fed.clear();
+        self.busy = false;
+        self.pass_start = None;
+        Ok(again)
     }
 
     /// Re-open the handles (a newly shared cell joins the watch). Never

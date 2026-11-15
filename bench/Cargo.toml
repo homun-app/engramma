@@ -26,3 +26,6 @@ serde.workspace = true
 # the longmemeval example builds its one-cell-per-question tree in a
 # tempdir, gone at the end of the run
 tempfile.workspace = true
+# the profile_put example arms the REAL device signer (K4): the sync era's
+# Ed25519 cost, not a mock of it
+engramma-sync.workspace = true
