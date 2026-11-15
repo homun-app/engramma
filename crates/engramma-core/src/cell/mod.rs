@@ -909,6 +909,26 @@ impl Cell {
             .map_err(CellError::from)
     }
 
+    /// The ops log's own marker `(count, max rowid)` (v0.6.1-ciclo, K1):
+    /// `data_version` moves for ANY commit, this moves only when
+    /// OPERATIONS arrive — the serve loop's cheap poll stays on the file,
+    /// but the pass is armed by the log, never by the file alone (an
+    /// idle session's bookkeeping must not re-light the cycle).
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn ops_marker(&self) -> Result<(i64, i64), CellError> {
+        let inner = self.lock()?;
+        inner
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM ops",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(CellError::from)
+    }
+
     /// Run a **read-only** query returning one TEXT column per row. Meant for
     /// tests and tooling that need to compare states; not part of the public
     /// contract (statements that are not read-only are refused).
@@ -2424,7 +2444,11 @@ impl Cell {
 
     /// Record that a sync session with `device` ended with both sides
     /// holding the same set: this copy's head, as it stands now, is
-    /// confirmed there (v0.6, P1.5).
+    /// confirmed there (v0.6, P1.5). A session that exchanged NOTHING
+    /// writes NOTHING (v0.6.1-ciclo, K1): the row moves only when the
+    /// head it confirms moved — the timestamp alone must never dirty the
+    /// cell, or every idle pass would bump `data_version` and re-light
+    /// the serve cycle for a sync that changed nothing.
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failure.
@@ -2438,6 +2462,17 @@ impl Cell {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let head: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM ops", [], |r| r.get(0))?;
+        let held: Option<i64> = tx
+            .query_row(
+                "SELECT ack_seq FROM device_acks WHERE device = ?1",
+                [device],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if held == Some(head) {
+            // nothing changed: no commit, no dirty page, no data_version
+            return Ok(head);
+        }
         let at = OffsetDateTime::now_utc()
             .replace_millisecond(0)
             .unwrap_or(OffsetDateTime::now_utc())
