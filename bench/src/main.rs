@@ -4,7 +4,7 @@
 //! insert / search / open / recall measurements (§11). Run in `--release`.
 //!
 //! ```text
-//! engramma-bench [--notes 10000] [--notes 100000] [--out PATH.md] [--runs 3]
+//! engramma-bench [--notes 10000] [--notes 100000] [--out PATH.md] [--runs 3] [--work-dir DIR]
 //!                [--fake-embedder]
 //! ```
 //!
@@ -1722,6 +1722,9 @@ struct Args {
     /// `None` = default location (`bench/RESULTS.md`).
     out: Option<PathBuf>,
     runs: usize,
+    /// An explicit work directory (`--work-dir`); without it each run
+    /// gets its own unique one, removed at the end (C2, v0.6.1).
+    work_dir: Option<PathBuf>,
     /// Run the profiling probe (fake embedder, no model) instead of the
     /// full benchmark.
     fake_embedder: bool,
@@ -1748,6 +1751,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Args {
         targets: Vec::new(),
         out: None,
         runs: 3,
+        work_dir: None,
         fake_embedder: false,
         multihop_debug: false,
         profile_insert: false,
@@ -1764,6 +1768,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Args {
                 }
             }
             "--out" => a.out = it.next().map(PathBuf::from),
+            "--work-dir" => a.work_dir = it.next().map(PathBuf::from),
             "--runs" => {
                 if let Some(r) = it.next().and_then(|v| v.parse::<usize>().ok()) {
                     a.runs = r.clamp(1, 9);
@@ -2311,12 +2316,53 @@ fn calibrate(sizes: &[usize], runs10k: usize, runs100k: usize, dir: &std::path::
     }
 }
 
+/// The bench's work directory (C2, v0.6.1): either the explicit
+/// `--work-dir`, or a UNIQUE one per run under the system temp — the old
+/// fixed `$TMPDIR/engramma-bench` let two concurrent runs delete each
+/// other's cells mid-measure (a review run did exactly that). Removed at
+/// the end unless it was given explicitly.
+fn work_dir(explicit: Option<&PathBuf>) -> std::path::PathBuf {
+    match explicit {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).expect(/* explicit */ "mkdir");
+            dir.clone()
+        }
+        None => {
+            let dir = std::env::temp_dir().join(format!(
+                "engramma-bench-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect(/* temp */ "mkdir");
+            dir
+        }
+    }
+}
+
+/// Drops the bench's work directory on every way out of `main` — even a
+/// panicked measure leaves nothing behind (C2).
+struct WorkDirGuard {
+    dir: PathBuf,
+    owned: bool,
+}
+
+impl Drop for WorkDirGuard {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
 fn main() {
     if std::env::var("ENGRAMMA_GRAPH_PROBE").is_ok() {
-        let dir = std::env::temp_dir().join("engramma-bench");
-        std::fs::create_dir_all(&dir).expect(/* temp */ "mkdir");
+        let dir = work_dir(None);
+        let _work = WorkDirGuard {
+            dir: dir.clone(),
+            owned: true,
+        };
         graph_probe(100_000, &dir);
         graph_probe(10_000, &dir);
+        drop(_work);
         return;
     }
     let args = parse_args(std::env::args().skip(1));
@@ -2324,8 +2370,13 @@ fn main() {
     if targets.is_empty() {
         targets = vec![10_000, 100_000];
     }
-    let dir = std::env::temp_dir().join("engramma-bench");
-    std::fs::create_dir_all(&dir).expect(/* temp dir */ "mkdir");
+    let dir = work_dir(args.work_dir.as_ref());
+    // the unique work dir goes with the run on EVERY way out — the guard
+    // drops even on a panic; an explicit --work-dir stays
+    let _work = WorkDirGuard {
+        dir: dir.clone(),
+        owned: args.work_dir.is_none(),
+    };
     if args.multihop_debug {
         let mut sizes = targets.clone();
         if sizes.is_empty() {
@@ -2501,6 +2552,18 @@ mod tests {
         assert!(f.calibrate);
         assert_eq!(f.targets, vec![100_000]);
         assert_eq!(f.runs, 3);
+
+        // C2: the explicit work dir parses
+        let g = parse_args(
+            ["--work-dir", "/tmp/mio-banco", "--notes", "1000"]
+                .map(String::from)
+                .into_iter(),
+        );
+        assert_eq!(
+            g.work_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/mio-banco"))
+        );
+        assert_eq!(g.targets, vec![1000]);
     }
 
     #[test]
