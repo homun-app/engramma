@@ -228,7 +228,7 @@ async fn pairing_and_sync_ride_the_relay_and_the_summary_says_so() {
                 )
                 .await
                 .unwrap(/* t */);
-                let mut report = serve::run_pass(p.dir_b.path(), &sync_ep_b)
+                let mut report = serve::run_pass(p.dir_b.path(), &sync_ep_b, &[])
                     .await
                     .expect(/* a pass */ "the pass");
                 for _ in 0..3 {
@@ -237,7 +237,7 @@ async fn pairing_and_sync_ride_the_relay_and_the_summary_says_so() {
                     {
                         break;
                     }
-                    report = serve::run_pass(p.dir_b.path(), &sync_ep_b)
+                    report = serve::run_pass(p.dir_b.path(), &sync_ep_b, &[])
                         .await
                         .expect(/* a pass */ "the pass");
                 }
@@ -344,7 +344,7 @@ async fn no_relay_fails_the_same_round_cleanly() {
                 )
                 .await
                 .unwrap_or_else(|e| panic!("bind senza relay: {e}"));
-                let report = serve::run_pass(p.dir_b.path(), &ep_b)
+                let report = serve::run_pass(p.dir_b.path(), &ep_b, &[])
                     .await
                     .expect(/* a pass never fails on a peer */ "the pass");
                 let peer = report
@@ -363,4 +363,89 @@ async fn no_relay_fails_the_same_round_cleanly() {
     })
     .await;
     bound.expect("il giro senza relay non è finito in 120 s");
+}
+
+// ---------------------------------------------------------------------------
+// K2 (v0.6.1-ciclo): the dial is iroh's own race, not ours. A book row
+// with THREE dead direct roads (the RFC 5737 test nets — they answer
+// nobody) and the local relay must still reach the peer WITHIN TEN
+// SECONDS, through the relay: one `connect` with every address and the
+// relay in it, the transport races them (R2.3 — «prima le strade
+// dirette, poi il relay: è il comportamento di iroh, non va reinventato»).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_peer_with_dead_direct_roads_is_reached_through_the_relay_within_ten_seconds() {
+    let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+        // the local relay (loopback only, self-signed certificate)
+        let (_relay_map, relay_url, _server) = iroh::test_utils::run_relay_server()
+            .await
+            .expect(/* loopback */ "the local relay");
+        let choice = RelayChoice::Own(relay_url.to_string());
+        let dir_a = tempfile::tempdir().unwrap(/* t */);
+        let dir_b = tempfile::tempdir().unwrap(/* t */);
+        std::fs::create_dir_all(dir_a.path().join("cells")).unwrap(/* t */);
+        std::fs::create_dir_all(dir_b.path().join("cells")).unwrap(/* t */);
+        let key_a = DeviceKey::load_or_create(dir_a.path()).unwrap(/* t */);
+        let key_b = DeviceKey::load_or_create(dir_b.path()).unwrap(/* t */);
+        tokio::task::LocalSet::new()
+            .run_until(async move {
+                // B serves on the relay only: the direct roads do not
+                // exist, the relay is the only way in — exactly the peer
+                // behind a NAT
+                let ep_b = relay::bind_relay_only(&key_b, "0.0.0.0:0", protocol::ALPN, &choice)
+                    .await
+                    .unwrap(/* t */);
+                let wait = relay::wait_relay(&ep_b, &choice).await;
+                assert!(
+                    matches!(wait, relay::RelayWait::Connected(_)),
+                    "the local relay must connect: {wait:?}"
+                );
+                let server = {
+                    let ep = ep_b.clone();
+                    tokio::task::spawn_local(async move {
+                        // hold every accepted connection open: the dial
+                        // under test only needs the road to EXIST
+                        let mut held = Vec::new();
+                        while let Some(incoming) = ep.accept().await {
+                            if let Ok(conn) = incoming.await {
+                                held.push(conn);
+                            }
+                        }
+                    })
+                };
+                // A dials the book row: three DEAD direct roads plus the
+                // relay. The dead ones must not be paid one by one.
+                let ep_a = relay::bind(&key_a, "0.0.0.0:0", protocol::ALPN, &choice)
+                    .await
+                    .unwrap(/* t */);
+                let peer = serve::PeerAddr {
+                    device: "mac".into(),
+                    node_id: *ep_b.secret_key().public().as_bytes(),
+                    relay: relay_url.to_string(),
+                    addrs: vec![
+                        "192.0.2.1:9999".into(),   // RFC 5737 TEST-NET-1
+                        "198.51.100.1:9999".into(), // RFC 5737 TEST-NET-2
+                        "203.0.113.1:9999".into(),  // RFC 5737 TEST-NET-3
+                    ],
+                };
+                let t0 = std::time::Instant::now();
+                let conn = peer
+                    .dial(&ep_a)
+                    .await
+                    .expect(/* the relay road */ "the dial reaches the peer");
+                let elapsed = t0.elapsed();
+                let via = serve::via_of_conn(&conn);
+                server.abort();
+                assert!(
+                    elapsed < Duration::from_secs(10),
+                    "tre strade dirette morte + relay: raggiunto in {elapsed:?} — \
+                     la gara la fa iroh, non si paga una strada morta alla volta"
+                );
+                assert_eq!(via, "relay", "the road that answered is the relay");
+            })
+            .await;
+    })
+    .await;
+    outcome.expect("il dial con strade morte non è finito in 90 s");
 }
