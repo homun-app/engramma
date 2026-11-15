@@ -623,10 +623,7 @@ impl DeviceRegistry {
              WHERE kind = 'remove' AND json_extract(payload_json, '$.device') = ?1
              ORDER BY hlc, op_id",
         )?;
-        let rows: Vec<String> = stmt
-            .query_map([device], |r| r.get(0))?
-            .flatten()
-            .collect();
+        let rows: Vec<String> = stmt.query_map([device], |r| r.get(0))?.flatten().collect();
         let mut out = Vec::with_capacity(rows.len());
         for payload in rows {
             let v: Value = serde_json::from_str(&payload)

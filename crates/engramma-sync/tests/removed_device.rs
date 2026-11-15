@@ -6,7 +6,7 @@
 //! as the wire would carry them, and every refusal must name the gate that
 //! refused, never any note text.
 
-use engramma_core::cell::ops::{self, MerkleStep, Op, OpParts, OpKind};
+use engramma_core::cell::ops::{self, MerkleStep, Op, OpKind, OpParts};
 use engramma_core::format::{Note, NoteType};
 use engramma_core::hlc::Hlc;
 use engramma_core::{Cell, Confidence, Status};
@@ -144,12 +144,7 @@ impl Fixture {
 /// Build one SIGNED put by hand: the HLC is the caller's (the author
 /// chooses it — the whole point of R1), the identity is minted over the
 /// content, the signature is the named device's.
-fn hand_signed_put(
-    key: &DeviceKey,
-    n: u32,
-    body: &str,
-    hlc: Hlc,
-) -> Op {
+fn hand_signed_put(key: &DeviceKey, n: u32, body: &str, hlc: Hlc) -> Op {
     let mut op = ops::make_op(OpParts {
         op_id: Ulid::from_string(&format!("01HANDMADE{:016}", n)).unwrap(/* t */),
         hlc,
@@ -294,11 +289,15 @@ fn a_true_op_of_a_removed_device_needs_its_proof() {
     };
     let base_ms = OffsetDateTime::now_utc().unix_timestamp() as u64 * 1000 - 60_000;
     for (i, off) in [10_000_u64, 20_000].into_iter().enumerate() {
-        let op = hand_signed_put(&doomed, 50 + i as u32, "la nota vera del rimosso", hlc_of(base_ms + off));
+        let op = hand_signed_put(
+            &doomed,
+            50 + i as u32,
+            "la nota vera del rimosso",
+            hlc_of(base_ms + off),
+        );
         let (epoch, id, nonce, ct) = sealed(&a, &op, None);
-        a.ingest(epoch, &id, &nonce, &ct).unwrap_or_else(|e| {
-            panic!("the live device's op {} must enter A: {e}", op.op_id)
-        });
+        a.ingest(epoch, &id, &nonce, &ct)
+            .unwrap_or_else(|e| panic!("the live device's op {} must enter A: {e}", op.op_id));
     }
     let (root, count) = accepted_root_of(fx.dir_a.path(), &doomed.device_id());
     reg_a
@@ -342,7 +341,11 @@ fn a_true_op_of_a_removed_device_needs_its_proof() {
                     && &o.content_hash == h)
         })
         .collect();
-    assert_eq!(ops::merkle_root(&mut set), root, "the set rebuilds the root");
+    assert_eq!(
+        ops::merkle_root(&mut set),
+        root,
+        "the set rebuilds the root"
+    );
     let proof = ops::merkle_prove(&mut set.clone(), &target.content_hash).unwrap(/* t */);
     assert_eq!(
         ops::merkle_root_with(&target.content_hash, &proof).as_deref(),
@@ -382,7 +385,12 @@ fn concurrent_removes_admit_a_proof_toward_either_root() {
     let base_ms = OffsetDateTime::now_utc().unix_timestamp() as u64 * 1000 - 60_000;
     let mut held: Vec<Op> = Vec::new();
     for (i, off) in [10_000_u64, 20_000, 30_000].into_iter().enumerate() {
-        let op = hand_signed_put(&doomed, 60 + i as u32, "la nota del rimosso", hlc_of(base_ms + off));
+        let op = hand_signed_put(
+            &doomed,
+            60 + i as u32,
+            "la nota del rimosso",
+            hlc_of(base_ms + off),
+        );
         let (epoch, id, nonce, ct) = sealed(&a, &op, None);
         a.ingest(epoch, &id, &nonce, &ct).unwrap(/* live */);
         held.push(op);

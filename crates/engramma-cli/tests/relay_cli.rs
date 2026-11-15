@@ -78,8 +78,10 @@ fn run(root: &std::path::Path, args: &[&str]) -> (bool, String, String) {
 /// The saved relay choice of a root (`devices.db`, meta `relay`).
 fn saved_choice(root: &std::path::Path) -> Option<String> {
     let reg = rusqlite::Connection::open(root.join("devices.db")).ok()?;
-    reg.query_row("SELECT value FROM meta WHERE key = 'relay'", [], |r| r.get(0))
-        .ok()
+    reg.query_row("SELECT value FROM meta WHERE key = 'relay'", [], |r| {
+        r.get(0)
+    })
+    .ok()
 }
 
 struct Root {
@@ -133,7 +135,11 @@ fn the_relay_flags_exist_and_save_their_choice() {
             child: Some(
                 bin()
                     .arg("--root")
-                    .arg(if args[1] == "mailbox" { &a.root } else { &b.root })
+                    .arg(if args[1] == "mailbox" {
+                        &a.root
+                    } else {
+                        &b.root
+                    })
                     .args(&args)
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -158,9 +164,7 @@ fn the_relay_flags_exist_and_save_their_choice() {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             loop {
                 let mut buf = String::new();
-                let n = reader
-                    .read_line(&mut buf)
-                    .expect(/* pipe */ "read");
+                let n = reader.read_line(&mut buf).expect(/* pipe */ "read");
                 line.push_str(&buf);
                 if n == 0 || line.contains('}') {
                     break;

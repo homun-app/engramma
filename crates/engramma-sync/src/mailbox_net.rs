@@ -921,9 +921,7 @@ pub async fn meet_code(
                 ));
             }
             _ => {
-                return Err(Error::Malformed(
-                    "the node did not pair the channel".into(),
-                ));
+                return Err(Error::Malformed("the node did not pair the channel".into()));
             }
         }
     }
@@ -1087,7 +1085,6 @@ async fn relay_between(
     theirs: &Connection,
     channel: u16,
 ) -> Result<()> {
-
     // relay until either side closes; `burn` is the only other frame
     loop {
         tokio::select! {
@@ -1095,17 +1092,17 @@ async fn relay_between(
                 match msg {
                     Ok(v) if v.get("kind").and_then(Value::as_str) == Some("burn") => {
                         state.burn_channel(channel)?;
-                        let _ = send_frame(&mine, &json!({"kind": "ok"})).await;
-                        let _ = send_frame(&theirs, &json!({"kind": "peer-closed"})).await;
+                        let _ = send_frame(mine, &json!({"kind": "ok"})).await;
+                        let _ = send_frame(theirs, &json!({"kind": "peer-closed"})).await;
                         return Ok(());
                     }
                     Ok(v) if v.get("kind").and_then(Value::as_str) == Some("relay") => {
-                        if send_frame(&theirs, &v).await.is_err() {
+                        if send_frame(theirs, &v).await.is_err() {
                             return Ok(());
                         }
                     }
                     _ => {
-                        let _ = send_frame(&theirs, &json!({"kind": "peer-closed"})).await;
+                        let _ = send_frame(theirs, &json!({"kind": "peer-closed"})).await;
                         return Ok(());
                     }
                 }
@@ -1114,17 +1111,17 @@ async fn relay_between(
                 match msg {
                     Ok(v) if v.get("kind").and_then(Value::as_str) == Some("burn") => {
                         state.burn_channel(channel)?;
-                        let _ = send_frame(&theirs, &json!({"kind": "ok"})).await;
-                        let _ = send_frame(&mine, &json!({"kind": "peer-closed"})).await;
+                        let _ = send_frame(theirs, &json!({"kind": "ok"})).await;
+                        let _ = send_frame(mine, &json!({"kind": "peer-closed"})).await;
                         return Ok(());
                     }
                     Ok(v) if v.get("kind").and_then(Value::as_str) == Some("relay") => {
-                        if send_frame(&mine, &v).await.is_err() {
+                        if send_frame(mine, &v).await.is_err() {
                             return Ok(());
                         }
                     }
                     _ => {
-                        let _ = send_frame(&mine, &json!({"kind": "peer-closed"})).await;
+                        let _ = send_frame(mine, &json!({"kind": "peer-closed"})).await;
                         return Ok(());
                     }
                 }

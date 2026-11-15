@@ -3449,10 +3449,10 @@ fn devices_run(cli: &Cli, action: &DevicesAction) -> Result<(), CliError> {
             }
             Ok(())
         }
-        DevicesAction::Invite { relay } => {
-            synccli::devices_invite(&r, cli.json, relay_flag(relay))
+        DevicesAction::Invite { relay } => synccli::devices_invite(&r, cli.json, relay_flag(relay)),
+        DevicesAction::Code { relay } => {
+            crate::mailboxcli::devices_code(&r, cli.json, relay_flag(relay))
         }
-        DevicesAction::Code { relay } => crate::mailboxcli::devices_code(&r, cli.json, relay_flag(relay)),
         DevicesAction::Join {
             ticket_or_code,
             name,
@@ -3549,8 +3549,8 @@ fn sync_run(cli: &Cli, action: &SyncAction) -> Result<(), CliError> {
                         let head = engramma_sync::protocol::SyncedCell::head_seq(c);
                         let frontier = c.cell().stable_frontier().unwrap_or(0);
                         let epoch = c.current_epoch().unwrap_or(0);
-                        let name = engramma_sync::serve::cell_name(
-                            &r, c.sync_id()).unwrap_or_default();
+                        let name =
+                            engramma_sync::serve::cell_name(&r, c.sync_id()).unwrap_or_default();
                         serde_json::json!({
                             "cell": name,
                             "head": head, "frontier": frontier,
@@ -3563,11 +3563,15 @@ fn sync_run(cli: &Cli, action: &SyncAction) -> Result<(), CliError> {
                     .collect();
                 let mut v = serde_json::json!({ "devices": devices, "cells": rows });
                 if !unsent.is_empty() {
-                    v["unsent_events"] = serde_json::json!(unsent.iter()
-                        .map(|(cell, at, op_id, kind, reason)| serde_json::json!({
-                            "cell": cell, "at": at, "op": op_id,
-                            "kind": kind, "why": reason,
-                        })).collect::<Vec<_>>());
+                    v["unsent_events"] = serde_json::json!(
+                        unsent
+                            .iter()
+                            .map(|(cell, at, op_id, kind, reason)| serde_json::json!({
+                                "cell": cell, "at": at, "op": op_id,
+                                "kind": kind, "why": reason,
+                            }))
+                            .collect::<Vec<_>>()
+                    );
                 }
                 print_json(&v);
             } else {

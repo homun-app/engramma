@@ -378,9 +378,7 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
             Ok(Ok(conn)) => match session_with(root, conn, &member.device, &endpoint_addr).await {
                 Ok(session) => {
                     for cell in &session.report.cells {
-                        let entry = per_cell
-                            .entry(cell.sync_id.clone())
-                            .or_insert((0, 0, 0, 0));
+                        let entry = per_cell.entry(cell.sync_id.clone()).or_insert((0, 0, 0, 0));
                         entry.0 += cell.sent;
                         entry.1 += cell.received;
                         entry.2 += cell.refused;

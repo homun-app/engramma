@@ -7,7 +7,7 @@
 //! in the root that carries the op id (short), the kind and the reason,
 //! and NOTHING of the note's text.
 
-use engramma_core::cell::ops::{self, OpParts, OpKind};
+use engramma_core::cell::ops::{self, OpKind, OpParts};
 use engramma_core::format::{Note, NoteType};
 use engramma_core::hlc::Hlc;
 use engramma_core::{Cell, Confidence, Status};
@@ -15,8 +15,8 @@ use engramma_sync::arrival::DeviceSigner;
 use engramma_sync::device::{DeviceKey, hex};
 use engramma_sync::keystore::KeyStore;
 use engramma_sync::protocol::{self, SyncedCell, authorize};
-use engramma_sync::relay::RelayChoice;
 use engramma_sync::registry::DeviceRegistry;
+use engramma_sync::relay::RelayChoice;
 use engramma_sync::serve;
 use engramma_sync::sharedcell::{SharedCell, share_cell};
 use time::OffsetDateTime;
@@ -201,7 +201,9 @@ async fn an_unsendable_op_is_a_summary_row_and_an_event_without_note_text() {
                         cells: vec![&b as &dyn SyncedCell],
                     };
                     let _ = protocol::run_initiator(conn, &ctx_b).await;
-                    let held = b.cell().debug_column("SELECT op_id FROM ops")
+                    let held = b
+                        .cell()
+                        .debug_column("SELECT op_id FROM ops")
                         .unwrap_or_default()
                         .len();
                     if held >= 5 {
@@ -285,7 +287,12 @@ async fn an_unsendable_op_is_a_summary_row_and_an_event_without_note_text() {
                 // the orphan itself is still held (it is not lost — it is
                 // named, and the next pass will say it again)
                 let a_again = SharedCell::all_of(dir_a.path()).unwrap(/* t */);
-                assert!(a_again[0].cell().holds_content_hash(&orphan.content_hash).unwrap_or(false));
+                assert!(
+                    a_again[0]
+                        .cell()
+                        .holds_content_hash(&orphan.content_hash)
+                        .unwrap_or(false)
+                );
                 let _ = orphan_id;
             })
             .await;

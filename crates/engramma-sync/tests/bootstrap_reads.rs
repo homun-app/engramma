@@ -9,7 +9,7 @@
 use engramma_core::format::{Note, NoteType};
 use engramma_core::{Cell, Confidence, Status};
 use engramma_sync::arrival::DeviceSigner;
-use engramma_sync::device::{DeviceKey, hex};
+use engramma_sync::device::DeviceKey;
 use engramma_sync::protocol::SyncedCell;
 use engramma_sync::registry::DeviceRegistry;
 use engramma_sync::sharedcell::{SharedCell, share_cell};

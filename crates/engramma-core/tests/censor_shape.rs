@@ -48,7 +48,10 @@ fn the_censors_own_shapes_pass() {
             "note": null,
         }),
     );
-    assert!(ops::censor_shape_ok(&a), "a date-only valid_to is a Validity");
+    assert!(
+        ops::censor_shape_ok(&a),
+        "a date-only valid_to is a Validity"
+    );
     let b = op_of_kind(
         OpKind::Supersede,
         serde_json::json!({
@@ -56,7 +59,10 @@ fn the_censors_own_shapes_pass() {
             "note": null,
         }),
     );
-    assert!(ops::censor_shape_ok(&b), "a datetime valid_to is a Validity");
+    assert!(
+        ops::censor_shape_ok(&b),
+        "a datetime valid_to is a Validity"
+    );
     let c = op_of_kind(
         OpKind::Decide,
         serde_json::json!({

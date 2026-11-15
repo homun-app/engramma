@@ -236,19 +236,31 @@ impl SyncedCell for SharedCell {
         let op = match self.find_op(id32) {
             Some(op) => op,
             None => {
-                self.record_unsent(&crate::device::hex(id32)[..16], "?", "non trovata in questa copia");
+                self.record_unsent(
+                    &crate::device::hex(id32)[..16],
+                    "?",
+                    "non trovata in questa copia",
+                );
                 return None;
             }
         };
         let epoch = match self.current_epoch() {
             Ok(epoch) => epoch,
             Err(_) => {
-                self.record_unsent(&op.op_id.to_string()[..16], op.kind.as_str(), "nessuna epoca");
+                self.record_unsent(
+                    &op.op_id.to_string()[..16],
+                    op.kind.as_str(),
+                    "nessuna epoca",
+                );
                 return None;
             }
         };
         let Ok(key) = self.key_of(epoch) else {
-            self.record_unsent(&op.op_id.to_string()[..16], op.kind.as_str(), "chiave dell'epoca assente");
+            self.record_unsent(
+                &op.op_id.to_string()[..16],
+                op.kind.as_str(),
+                "chiave dell'epoca assente",
+            );
             return None;
         };
         // an unsigned operation travels with its adopt proof; a SIGNED
@@ -293,7 +305,11 @@ impl SyncedCell for SharedCell {
         let env = match crypto::seal_op(&key, &aad, plaintext.as_bytes()) {
             Ok(env) => env,
             Err(_) => {
-                self.record_unsent(&op.op_id.to_string()[..16], op.kind.as_str(), "sigillatura fallita");
+                self.record_unsent(
+                    &op.op_id.to_string()[..16],
+                    op.kind.as_str(),
+                    "sigillatura fallita",
+                );
                 return None;
             }
         };
@@ -387,7 +403,7 @@ impl SharedCell {
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        live == 0 && reg.accepted_sets_of(device).map_or(false, |r| !r.is_empty())
+        live == 0 && reg.accepted_sets_of(device).is_ok_and(|r| !r.is_empty())
     }
 
     /// The membership proof of one operation of a REMOVED device (R1): the
@@ -407,7 +423,10 @@ impl SharedCell {
         // the tree of this device's set, built once per session and kept
         // (R3): every envelope's proof comes out of the cached levels
         let cached = {
-            let mut trees = self.removal_trees.lock().expect(/* never poisoned */ "trees");
+            let mut trees = self
+                .removal_trees
+                .lock()
+                .expect(/* never poisoned */ "trees");
             trees
                 .entry(device.to_string())
                 .or_insert_with(|| {
@@ -586,13 +605,18 @@ pub fn unshare_cell(root: &std::path::Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// R4: the unsent events a root still holds — `(cell, at, op_id short,
-/// kind, reason)`, no note text by construction. `sync status` shows them
-/// until a pass can send what they name.
+/// One unsent event, as `sync status` shows it: `(cell, at, op_id short,
+/// kind, reason)` — no note text by construction.
+pub type UnsentEvent = (String, String, String, String, String);
+
+/// R4: the unsent events a root still holds, no note text by construction.
+/// `sync status` shows them until a pass can send what they name.
 ///
 /// # Errors
 /// [`Error::Db`] on SQL failure.
-pub fn unsent_events(root: &std::path::Path) -> Result<Vec<(String, String, String, String, String)>> {
+pub fn unsent_events(
+    root: &std::path::Path,
+) -> Result<Vec<UnsentEvent>> {
     let reg = DeviceRegistry::open(root)?;
     let mut stmt = reg
         .conn()

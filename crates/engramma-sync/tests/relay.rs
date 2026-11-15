@@ -89,39 +89,41 @@ impl Pair {
 /// says «relay».
 #[tokio::test(flavor = "current_thread")]
 async fn pairing_and_sync_ride_the_relay_and_the_summary_says_so() {
-    let bound = tokio::time::timeout(Duration::from_secs(180), async {
-        // the local relay (loopback only, self-signed certificate)
-        let (_relay_map, relay_url, _server) = iroh::test_utils::run_relay_server()
-            .await
-            .expect(/* loopback */ "the local relay");
-        let choice = RelayChoice::Own(relay_url.to_string());
-        let p = Pair::new();
-        // A's side: registry, cell, notes, share, adopt
-        {
-            let reg = engramma_sync::registry::DeviceRegistry::open(p.dir_a.path()).unwrap(/* t */);
-            reg.create_first(&p.key_a, "portatile").unwrap(/* t */);
-            let cell = Cell::create(
+    let bound =
+        tokio::time::timeout(Duration::from_secs(180), async {
+            // the local relay (loopback only, self-signed certificate)
+            let (_relay_map, relay_url, _server) = iroh::test_utils::run_relay_server()
+                .await
+                .expect(/* loopback */ "the local relay");
+            let choice = RelayChoice::Own(relay_url.to_string());
+            let p = Pair::new();
+            // A's side: registry, cell, notes, share, adopt
+            {
+                let reg =
+                    engramma_sync::registry::DeviceRegistry::open(p.dir_a.path()).unwrap(/* t */);
+                reg.create_first(&p.key_a, "portatile").unwrap(/* t */);
+                let cell = Cell::create(
                 &p.dir_a.path().join("cells").join("memoria.sqlite"),
                 "conv",
                 "cli",
             )
             .unwrap(/* t */);
-            for i in 1..=3_u32 {
-                cell.put_note(&note(i, &format!("nota {i} di A")), "cli").unwrap(/* t */);
-            }
-            drop(cell);
-            share_cell(p.dir_a.path(), "memoria").unwrap(/* t */);
-            let cell = p.cell_of_a();
-            // the signer is armed BEFORE the adopt, as `sync share` does:
-            // the adopt itself must be signed, or it could never enter
-            cell.set_signer(std::sync::Arc::new(
+                for i in 1..=3_u32 {
+                    cell.put_note(&note(i, &format!("nota {i} di A")), "cli").unwrap(/* t */);
+                }
+                drop(cell);
+                share_cell(p.dir_a.path(), "memoria").unwrap(/* t */);
+                let cell = p.cell_of_a();
+                // the signer is armed BEFORE the adopt, as `sync share` does:
+                // the adopt itself must be signed, or it could never enter
+                cell.set_signer(std::sync::Arc::new(
                 engramma_sync::arrival::DeviceSigner::new(&p.key_a),
             ))
             .unwrap(/* t */);
-            cell.adopt_log("cli").unwrap(/* t */);
-            cell.mark_shared().unwrap(/* t */);
-        }
-        tokio::task::LocalSet::new()
+                cell.adopt_log("cli").unwrap(/* t */);
+                cell.mark_shared().unwrap(/* t */);
+            }
+            tokio::task::LocalSet::new()
             .run_until(async {
                 // both endpoints: the relay is the ONLY road (no IP
                 // transports bound at all)
@@ -252,8 +254,8 @@ async fn pairing_and_sync_ride_the_relay_and_the_summary_says_so() {
                 );
             })
             .await;
-    })
-    .await;
+        })
+        .await;
     bound.expect("il giro via relay non è finito in 180 s");
 }
 
@@ -310,9 +312,14 @@ async fn no_relay_fails_the_same_round_cleanly() {
                 serve::remember_addr(p.dir_b.path(), &a_device, &addr).unwrap(/* t */);
                 // B: --no-relay — the same round, without the relay (a
                 // normal endpoint, direct transports, no relay configured)
-                let ep_b = relay::bind(&p.key_b, "0.0.0.0:0", protocol::ALPN, &RelayChoice::Disabled)
-                    .await
-                    .unwrap_or_else(|e| panic!("bind senza relay: {e}"));
+                let ep_b = relay::bind(
+                    &p.key_b,
+                    "0.0.0.0:0",
+                    protocol::ALPN,
+                    &RelayChoice::Disabled,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("bind senza relay: {e}"));
                 let report = serve::run_pass(p.dir_b.path(), &ep_b)
                     .await
                     .expect(/* a pass never fails on a peer */ "the pass");

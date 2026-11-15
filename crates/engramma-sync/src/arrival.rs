@@ -213,7 +213,11 @@ impl MerkleIndex {
             let mut i = 0;
             while i < level.len() {
                 let a = level[i];
-                let b = if i + 1 < level.len() { level[i + 1] } else { level[i] };
+                let b = if i + 1 < level.len() {
+                    level[i + 1]
+                } else {
+                    level[i]
+                };
                 let mut h = blake3::Hasher::new();
                 h.update(&a);
                 h.update(&b);
@@ -269,46 +273,6 @@ fn hash_bytes32(hex: &str) -> Option<[u8; 32]> {
     let mut out = [0_u8; 32];
     out.copy_from_slice(parsed.as_bytes());
     Some(out)
-}
-
-#[cfg(test)]
-mod merkle_index_tests {
-    use super::MerkleIndex;
-    use engramma_core::cell::ops::{merkle_prove, merkle_root, merkle_root_with};
-
-    /// The cached tree IS the root-and-proof pair the core computes: same
-    /// root, same path, for every set size around the powers of two.
-    #[test]
-    fn the_cached_tree_equals_merkle_root_and_prove() {
-        for n in [0_usize, 1, 2, 3, 5, 8, 9, 16, 17, 100, 1000] {
-            let hashes: Vec<String> = (0..n)
-                .map(|i| blake3::hash(&(i as u64).to_le_bytes()).to_hex().to_string())
-                .collect();
-            let index = MerkleIndex::new(hashes.clone());
-            let mut reference = hashes.clone();
-            let root = merkle_root(&mut reference);
-            assert_eq!(index.root(), root, "n={n}: the root must be the same");
-            for target in &hashes {
-                let fast = index.prove(target);
-                let slow = merkle_prove(&mut hashes.clone(), target);
-                assert_eq!(fast.is_some(), slow.is_ok(), "n={n}: membership agrees");
-                let (fast, slow) = (fast.unwrap_or_default(), slow.unwrap_or_default());
-                assert_eq!(fast.len(), slow.len(), "n={n}: the path length");
-                for (f, s) in fast.iter().zip(slow.iter()) {
-                    assert_eq!(f.sibling, s.sibling, "n={n}: the sibling");
-                    assert_eq!(f.right, s.right, "n={n}: the side");
-                }
-                assert_eq!(
-                    merkle_root_with(target, &fast).as_deref(),
-                    Some(root.as_str()),
-                    "n={n}: the fast proof walks to the root"
-                );
-            }
-            // and an outsider is no leaf of the set
-            let outsider = blake3::hash(&[255_u8; 8]).to_hex().to_string();
-            assert!(index.prove(&outsider).is_none(), "n={n}: the outsider");
-        }
-    }
 }
 
 impl Rejection {
@@ -372,5 +336,45 @@ impl ops::Signer for DeviceSigner {
             return false;
         };
         hex_into(device, &mut key) && DeviceKey::verify(&key, msg, &sig_bytes).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod merkle_index_tests {
+    use super::MerkleIndex;
+    use engramma_core::cell::ops::{merkle_prove, merkle_root, merkle_root_with};
+
+    /// The cached tree IS the root-and-proof pair the core computes: same
+    /// root, same path, for every set size around the powers of two.
+    #[test]
+    fn the_cached_tree_equals_merkle_root_and_prove() {
+        for n in [0_usize, 1, 2, 3, 5, 8, 9, 16, 17, 100, 1000] {
+            let hashes: Vec<String> = (0..n)
+                .map(|i| blake3::hash(&(i as u64).to_le_bytes()).to_hex().to_string())
+                .collect();
+            let index = MerkleIndex::new(hashes.clone());
+            let mut reference = hashes.clone();
+            let root = merkle_root(&mut reference);
+            assert_eq!(index.root(), root, "n={n}: the root must be the same");
+            for target in &hashes {
+                let fast = index.prove(target);
+                let slow = merkle_prove(&mut hashes.clone(), target);
+                assert_eq!(fast.is_some(), slow.is_ok(), "n={n}: membership agrees");
+                let (fast, slow) = (fast.unwrap_or_default(), slow.unwrap_or_default());
+                assert_eq!(fast.len(), slow.len(), "n={n}: the path length");
+                for (f, s) in fast.iter().zip(slow.iter()) {
+                    assert_eq!(f.sibling, s.sibling, "n={n}: the sibling");
+                    assert_eq!(f.right, s.right, "n={n}: the side");
+                }
+                assert_eq!(
+                    merkle_root_with(target, &fast).as_deref(),
+                    Some(root.as_str()),
+                    "n={n}: the fast proof walks to the root"
+                );
+            }
+            // and an outsider is no leaf of the set
+            let outsider = blake3::hash(&[255_u8; 8]).to_hex().to_string();
+            assert!(index.prove(&outsider).is_none(), "n={n}: the outsider");
+        }
     }
 }

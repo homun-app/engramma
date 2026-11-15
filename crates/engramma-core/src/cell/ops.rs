@@ -2362,10 +2362,14 @@ pub fn censor_shape_ok(op: &Op) -> bool {
     };
     let is_str = |v: &Value| v.is_string();
     let is_ulid = |v: &Value| v.as_str().is_some_and(|s| Ulid::from_string(s).is_ok());
-    let is_validity =
-        |v: &Value| v.as_str().is_some_and(|s| crate::format::Validity::parse(s).is_ok());
-    let is_at =
-        |v: &Value| v.as_str().is_some_and(|s| crate::format::At::parse(s).is_ok());
+    let is_validity = |v: &Value| {
+        v.as_str()
+            .is_some_and(|s| crate::format::Validity::parse(s).is_ok())
+    };
+    let is_at = |v: &Value| {
+        v.as_str()
+            .is_some_and(|s| crate::format::At::parse(s).is_ok())
+    };
     match op.kind {
         OpKind::Supersede => {
             // {old_id?, valid_to?, old_updated_at?, note: null} — the closing

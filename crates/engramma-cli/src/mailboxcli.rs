@@ -35,8 +35,8 @@ fn confirm_line(sas: &str) -> bool {
 pub fn serve(json: bool, dir: &Path, flag: Option<RelayChoice>) -> Result<(), CliError> {
     let dir = dir.to_path_buf();
     let key = DeviceKey::load_or_create(&dir).map_err(|e| CliError::internal(e.to_string()))?;
-    let choice =
-        relay_choice_mod::resolve(&dir, flag.as_ref()).map_err(|e| CliError::internal(e.to_string()))?;
+    let choice = relay_choice_mod::resolve(&dir, flag.as_ref())
+        .map_err(|e| CliError::internal(e.to_string()))?;
     // the node opens its state again per connection, inside the loop
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -268,8 +268,8 @@ pub fn devices_code(root: &Path, json: bool, flag: Option<RelayChoice>) -> Resul
         println!("codice breve (dieci minuti, un tentativo):");
         println!("{}", code.encode());
     }
-    let choice =
-        relay_choice_mod::resolve(&root, flag.as_ref()).map_err(|e| CliError::internal(e.to_string()))?;
+    let choice = relay_choice_mod::resolve(&root, flag.as_ref())
+        .map_err(|e| CliError::internal(e.to_string()))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -366,8 +366,8 @@ pub fn join_with_code(
     let code = pairing::ShortCode::decode(code_text)
         .map_err(|e| CliError::usage(format!("codice non valido: {e}")))?;
     let dk = DeviceKey::load_or_create(&root).map_err(|e| CliError::internal(e.to_string()))?;
-    let choice =
-        relay_choice_mod::resolve(&root, flag.as_ref()).map_err(|e| CliError::internal(e.to_string()))?;
+    let choice = relay_choice_mod::resolve(&root, flag.as_ref())
+        .map_err(|e| CliError::internal(e.to_string()))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

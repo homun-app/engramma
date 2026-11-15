@@ -103,7 +103,6 @@ struct Running {
     child: Option<Child>,
 }
 
-
 impl Running {
     /// Spawn with stdin fed and stdout watched: the ticket line (if any)
     /// arrives on the channel while the command runs.
@@ -143,7 +142,11 @@ impl Running {
     }
 
     fn wait(mut self) -> (bool, String, String) {
-        let out = wait_bounded(self.child.take().expect(/* alive */ "running"), "running", 120);
+        let out = wait_bounded(
+            self.child.take().expect(/* alive */ "running"),
+            "running",
+            120,
+        );
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).to_string(),
@@ -245,7 +248,14 @@ fn an_expired_ticket_is_refused() {
     };
     let (ok, _, err) = run(
         &b.root,
-        &["devices", "join", "--no-relay", &ticket.encode(), "--name", "mac"],
+        &[
+            "devices",
+            "join",
+            "--no-relay",
+            &ticket.encode(),
+            "--name",
+            "mac",
+        ],
         b"s\n",
     );
     assert!(!ok, "an expired ticket must be refused: {err}");
@@ -307,7 +317,14 @@ fn a_stolen_ticket_fails_the_mac() {
     ticket.addrs = other_ticket.addrs;
     let (ok, _, err) = run(
         &b.root,
-        &["devices", "join", "--no-relay", &ticket.encode(), "--name", "mac"],
+        &[
+            "devices",
+            "join",
+            "--no-relay",
+            &ticket.encode(),
+            "--name",
+            "mac",
+        ],
         b"s\n",
     );
     assert!(!ok, "a stolen ticket must fail the MAC: {err}");

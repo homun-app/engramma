@@ -418,7 +418,7 @@ use proptest::prelude::*;
 /// One generated step of a history: what to write, and on which note.
 #[derive(Debug, Clone)]
 enum Step {
-    Put(u16),
+    Put,
     Patch(u16),
     Delete(u16),
     Supersede(u16),
@@ -427,7 +427,7 @@ enum Step {
 
 fn step_strategy() -> impl Strategy<Value = Step> {
     prop_oneof![
-        (0u16..6).prop_map(Step::Put),
+        Just(Step::Put),
         any::<u16>().prop_map(Step::Patch),
         any::<u16>().prop_map(Step::Delete),
         any::<u16>().prop_map(Step::Supersede),
@@ -436,11 +436,8 @@ fn step_strategy() -> impl Strategy<Value = Step> {
 }
 
 fn word() -> impl Strategy<Value = String> {
-    prop::collection::vec(any::<u16>(), 1..8).prop_map(|v| {
-        v.iter()
-            .map(|i| (b'a' + (i % 26) as u8) as char)
-            .collect()
-    })
+    prop::collection::vec(any::<u16>(), 1..8)
+        .prop_map(|v| v.iter().map(|i| (b'a' + (i % 26) as u8) as char).collect())
 }
 
 fn body() -> impl Strategy<Value = String> {
@@ -475,7 +472,7 @@ proptest! {
             let text = bodies[i % bodies.len()].clone();
             let pick = |living: &[Ulid], i: usize| living[i % living.len()];
             match step {
-                Step::Put(_) => {
+                Step::Put => {
                     let n = note(next_id, &text);
                     next_id += 1;
                     if cell.put_note(&n, "device-a").is_ok() {

@@ -92,11 +92,7 @@ fn wait_bounded(mut child: Child, name: &str, secs: u64) -> std::process::Output
 }
 
 /// Run to completion feeding stdin first (the SAS confirms).
-fn run_with_stdin(
-    root: &std::path::Path,
-    args: &[&str],
-    stdin: &[u8],
-) -> (bool, String, String) {
+fn run_with_stdin(root: &std::path::Path, args: &[&str], stdin: &[u8]) -> (bool, String, String) {
     let mut child = bin()
         .arg("--root")
         .arg(root)
@@ -121,7 +117,7 @@ fn run_with_stdin(
 }
 
 fn run(root: &std::path::Path, args: &[&str]) -> (bool, String, String) {
-    let mut child = bin()
+    let child = bin()
         .env("ENGRAMMA_TRACE", "1")
         .arg("--root")
         .arg(root)
@@ -186,7 +182,6 @@ impl Daemon {
         }
         serde_json::from_str(&text).expect(/* balanced */ "the daemon's json")
     }
-
 }
 
 impl Drop for Daemon {
@@ -284,7 +279,11 @@ fn pair(a: &Root, b: &Root, b_name: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    let out = wait_bounded(child.child.take().expect(/* alive */ "invite"), "invite", 120);
+    let out = wait_bounded(
+        child.child.take().expect(/* alive */ "invite"),
+        "invite",
+        120,
+    );
     assert!(
         out.status.success(),
         "invite: {} {}",
@@ -325,68 +324,68 @@ fn remember_all(root: &std::path::Path, device_hex: &str, node_hex: &str, addrs:
 #[test]
 fn serve_receives_and_converges_beside_a_second_writer() {
     bounded("serve_beside_writer", 600, || {
-    let a = Root::new("srv-a");
-    let b = Root::new("srv-b");
-    // a cell on A, shared
-    let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
-    for i in 1..=3_u16 {
-        cell.put_note(&note(i, &format!("corpo {i}")), "cli").unwrap(/* t */);
-    }
-    drop(cell);
-    let (ok, _, err) = run(&a.root, &["sync", "share", "memoria"]);
-    assert!(ok, "share: {err}");
-    pair(&a, &b, "mac");
-    // A serves; its address reaches B's book
-    let serve = Daemon::spawn(&a.root, &["--json", "sync", "serve", "--no-relay"]);
-    let v = serve.first_json();
-    let addrs: Vec<String> = v["addrs"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let node = v["node"]
-        .as_str()
-        .expect(/* printed */ "the node id")
-        .to_string();
-    // A's device id from its registry (the create row's device)
-    let reg = rusqlite::Connection::open(a.root.join("devices.db")).unwrap(/* t */);
-    let a_device: String = reg
+        let a = Root::new("srv-a");
+        let b = Root::new("srv-b");
+        // a cell on A, shared
+        let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
+        for i in 1..=3_u16 {
+            cell.put_note(&note(i, &format!("corpo {i}")), "cli").unwrap(/* t */);
+        }
+        drop(cell);
+        let (ok, _, err) = run(&a.root, &["sync", "share", "memoria"]);
+        assert!(ok, "share: {err}");
+        pair(&a, &b, "mac");
+        // A serves; its address reaches B's book
+        let serve = Daemon::spawn(&a.root, &["--json", "sync", "serve", "--no-relay"]);
+        let v = serve.first_json();
+        let addrs: Vec<String> = v["addrs"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let node = v["node"]
+            .as_str()
+            .expect(/* printed */ "the node id")
+            .to_string();
+        // A's device id from its registry (the create row's device)
+        let reg = rusqlite::Connection::open(a.root.join("devices.db")).unwrap(/* t */);
+        let a_device: String = reg
         .query_row(
             "SELECT json_extract(payload_json, '$.device') FROM registry WHERE kind='create'",
             [],
             |r| r.get(0),
         )
         .unwrap(/* t */);
-    remember_all(&b.root, &a_device, &node, &addrs);
-    // a second process writes on A's root WHILE serve runs (Homun)
-    let (ok, _, err) = run(
-        &a.root,
-        &["--cell", "memoria", "purge", "0001", "--reason", "oblio"],
-    );
-    let _ = (ok, err);
-    // B's one pass reaches A
-    let (ok, out, err) = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
-    assert!(ok, "run: {err}");
-    assert!(out.contains("memoria"), "the summary names the cell: {out}");
-    // a second pass settles whatever arrived between the purge and the
-    // session (the daemon synced it on its own trigger)
-    std::thread::sleep(Duration::from_secs(4));
-    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
-    // the three copies of the truth agree: A, B, and A's own verify
-    let ca = Cell::open(&a.cell_path("memoria")).unwrap(/* t */);
-    let cb = Cell::open(&b.cell_path("memoria")).unwrap(/* t */);
-    assert_eq!(
-        ca.replicated_digest().unwrap(/* t */),
-        cb.replicated_digest().unwrap(/* t */),
-        "serve and run converge"
-    );
-    assert!(ca.verify().unwrap(/* t */).ok());
-    assert!(cb.verify().unwrap(/* t */).ok());
-    drop(serve);
+        remember_all(&b.root, &a_device, &node, &addrs);
+        // a second process writes on A's root WHILE serve runs (Homun)
+        let (ok, _, err) = run(
+            &a.root,
+            &["--cell", "memoria", "purge", "0001", "--reason", "oblio"],
+        );
+        let _ = (ok, err);
+        // B's one pass reaches A
+        let (ok, out, err) = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        assert!(ok, "run: {err}");
+        assert!(out.contains("memoria"), "the summary names the cell: {out}");
+        // a second pass settles whatever arrived between the purge and the
+        // session (the daemon synced it on its own trigger)
+        std::thread::sleep(Duration::from_secs(4));
+        let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        // the three copies of the truth agree: A, B, and A's own verify
+        let ca = Cell::open(&a.cell_path("memoria")).unwrap(/* t */);
+        let cb = Cell::open(&b.cell_path("memoria")).unwrap(/* t */);
+        assert_eq!(
+            ca.replicated_digest().unwrap(/* t */),
+            cb.replicated_digest().unwrap(/* t */),
+            "serve and run converge"
+        );
+        assert!(ca.verify().unwrap(/* t */).ok());
+        assert!(cb.verify().unwrap(/* t */).ok());
+        drop(serve);
     });
 }
 
@@ -396,81 +395,81 @@ fn serve_receives_and_converges_beside_a_second_writer() {
 #[test]
 fn the_blind_node_carries_and_forgets() {
     bounded("the_blind_node", 600, || {
-    let a = Root::new("mbx-a");
-    let b = Root::new("mbx-b");
-    let node_dir = tempfile::tempdir().unwrap(/* t */);
-    let node_root = node_dir.path().join("node");
-    std::fs::create_dir_all(&node_root).unwrap(/* t */);
-    // the cell with a SECRET body (the needle the node must never hold)
-    let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
-    let secret = note(7, "il segreto quokkaviola del nodo cieco");
-    let secret_id = secret.id;
-    for n in [note(5, "nota pubblica"), secret, note(9, "altra nota")] {
-        cell.put_note(&n, "cli").unwrap(/* t */);
-    }
-    drop(cell);
-    run(&a.root, &["sync", "share", "memoria"]);
-    pair(&a, &b, "mac");
-    // the node serves
-    let mut node_cmd = bin();
-    node_cmd
-        .args(["--json", "mailbox", "serve", "--no-relay", "--root"])
-        .arg(&node_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = node_cmd.spawn().expect(/* bin */ "node spawn");
-    let (tx, rx) = std::sync::mpsc::channel();
-    {
-        let out = child.stdout.take().expect(/* piped */ "node stdout");
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(out).lines() {
-                let Ok(line) = line else { break };
-                tx.send(line).ok();
-            }
-        });
-    }
-    // the node dies with the test, even on a panic (R5 — a leaked node
-    // once lived three hours and a half)
-    let node = Daemon { child, lines: rx };
-    let v = node.first_json();
-    let ticket = v["ticket"]
-        .as_str()
-        .expect(/* printed */ "node ticket")
-        .to_string();
-    // both devices register with the node
-    let (ok, _, err) = run(&a.root, &["mailbox", "add", &ticket]);
-    assert!(ok, "A registers: {err}");
-    let (ok, _, err) = run(&b.root, &["mailbox", "add", &ticket]);
-    assert!(ok, "B registers: {err}");
-    // A goes away (no serve daemon): B pushes to and pulls from the node
-    let (ok, _out, err) = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
-    assert!(ok, "B's pass (node only): {err}");
-    // B purges the secret note, then tells the node at the next pass
-    let (ok, _, err) = run(
-        &b.root,
-        &[
-            "--cell",
-            "memoria",
-            "purge",
-            &secret_id.to_string(),
-            "--reason",
-            "oblio",
-        ],
-    );
-    assert!(ok, "B purges: {err}");
-    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
-    // the node's file holds no note text and no op id — ciphertext only
-    let bytes = std::fs::read(node_root.join("mailbox.db"))
-        .expect(/* the node's store */ "mailbox.db");
-    let text = String::from_utf8_lossy(&bytes);
-    assert!(
-        !text.contains("quokkaviola"),
-        "the node never saw the secret"
-    );
-    assert!(!text.contains("nota pubblica"), "no note text at the node");
-    drop(node);
+        let a = Root::new("mbx-a");
+        let b = Root::new("mbx-b");
+        let node_dir = tempfile::tempdir().unwrap(/* t */);
+        let node_root = node_dir.path().join("node");
+        std::fs::create_dir_all(&node_root).unwrap(/* t */);
+        // the cell with a SECRET body (the needle the node must never hold)
+        let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
+        let secret = note(7, "il segreto quokkaviola del nodo cieco");
+        let secret_id = secret.id;
+        for n in [note(5, "nota pubblica"), secret, note(9, "altra nota")] {
+            cell.put_note(&n, "cli").unwrap(/* t */);
+        }
+        drop(cell);
+        run(&a.root, &["sync", "share", "memoria"]);
+        pair(&a, &b, "mac");
+        // the node serves
+        let mut node_cmd = bin();
+        node_cmd
+            .args(["--json", "mailbox", "serve", "--no-relay", "--root"])
+            .arg(&node_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = node_cmd.spawn().expect(/* bin */ "node spawn");
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let out = child.stdout.take().expect(/* piped */ "node stdout");
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(out).lines() {
+                    let Ok(line) = line else { break };
+                    tx.send(line).ok();
+                }
+            });
+        }
+        // the node dies with the test, even on a panic (R5 — a leaked node
+        // once lived three hours and a half)
+        let node = Daemon { child, lines: rx };
+        let v = node.first_json();
+        let ticket = v["ticket"]
+            .as_str()
+            .expect(/* printed */ "node ticket")
+            .to_string();
+        // both devices register with the node
+        let (ok, _, err) = run(&a.root, &["mailbox", "add", &ticket]);
+        assert!(ok, "A registers: {err}");
+        let (ok, _, err) = run(&b.root, &["mailbox", "add", &ticket]);
+        assert!(ok, "B registers: {err}");
+        // A goes away (no serve daemon): B pushes to and pulls from the node
+        let (ok, _out, err) = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        assert!(ok, "B's pass (node only): {err}");
+        // B purges the secret note, then tells the node at the next pass
+        let (ok, _, err) = run(
+            &b.root,
+            &[
+                "--cell",
+                "memoria",
+                "purge",
+                &secret_id.to_string(),
+                "--reason",
+                "oblio",
+            ],
+        );
+        assert!(ok, "B purges: {err}");
+        let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        // the node's file holds no note text and no op id — ciphertext only
+        let bytes = std::fs::read(node_root.join("mailbox.db"))
+            .expect(/* the node's store */ "mailbox.db");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("quokkaviola"),
+            "the node never saw the secret"
+        );
+        assert!(!text.contains("nota pubblica"), "no note text at the node");
+        drop(node);
     });
 }
 
@@ -504,110 +503,110 @@ fn add_note(root: &std::path::Path, who: &str) {
 #[test]
 fn three_devices_concurrent_and_one_returns() {
     bounded("three_devices", 900, || {
-    let a = Root::new("tri-a");
-    let b = Root::new("tri-b");
-    let c = Root::new("tri-c");
-    let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
-    cell.put_note(&note(1, "la base comune"), "cli").unwrap(/* t */);
-    drop(cell);
-    run(&a.root, &["sync", "share", "memoria"]);
-    pair(&a, &b, "mac");
-    pair(&a, &c, "telefono");
-    // A serves; B and C know its address and run passes
-    let serve = Daemon::spawn(&a.root, &["--json", "sync", "serve", "--no-relay"]);
-    let v = serve.first_json();
-    let addrs: Vec<String> = v["addrs"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let node = v["node"].as_str().expect(/* printed */ "node").to_string();
-    let reg = rusqlite::Connection::open(a.root.join("devices.db")).unwrap(/* t */);
-    let a_device: String = reg
+        let a = Root::new("tri-a");
+        let b = Root::new("tri-b");
+        let c = Root::new("tri-c");
+        let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
+        cell.put_note(&note(1, "la base comune"), "cli").unwrap(/* t */);
+        drop(cell);
+        run(&a.root, &["sync", "share", "memoria"]);
+        pair(&a, &b, "mac");
+        pair(&a, &c, "telefono");
+        // A serves; B and C know its address and run passes
+        let serve = Daemon::spawn(&a.root, &["--json", "sync", "serve", "--no-relay"]);
+        let v = serve.first_json();
+        let addrs: Vec<String> = v["addrs"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let node = v["node"].as_str().expect(/* printed */ "node").to_string();
+        let reg = rusqlite::Connection::open(a.root.join("devices.db")).unwrap(/* t */);
+        let a_device: String = reg
         .query_row(
             "SELECT json_extract(payload_json, '$.device') FROM registry WHERE kind='create'",
             [],
             |r| r.get(0),
         )
         .unwrap(/* t */);
-    for r in [&b.root, &c.root] {
-        remember_all(r, &a_device, &node, &addrs);
-    }
-    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
-    let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
-    // concurrent writes on all three, through the CLI: every local write
-    // of the sync era carries its device and signature, or the peers'
-    // gate refuses it
-    for (root, who) in [(&a.root, "A"), (&b.root, "B"), (&c.root, "C")] {
-        add_note(root, who);
-    }
-    // the passes cross: A's daemon syncs on its own writes, B and C run
-    std::thread::sleep(Duration::from_secs(4));
-    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
-    let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
-    std::thread::sleep(Duration::from_secs(4));
-    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
-    let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
-    // C goes away; A and B keep writing
-    for (root, who) in [(&a.root, "A2"), (&b.root, "B2")] {
-        add_note(root, who);
-    }
-    std::thread::sleep(Duration::from_secs(4));
-    let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
-    // C comes back; the pull-only topology settles in rounds (each run
-    // pulls what the peer had, the daemon pushes nothing — rounds until
-    // the three digests agree, as many passes as the truth needs)
-    let digests: Vec<String>;
-    let mut rounds = 0;
-    loop {
+        for r in [&b.root, &c.root] {
+            remember_all(r, &a_device, &node, &addrs);
+        }
+        let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
         let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
-        let (ok, out, err) = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
-        eprintln!("B RUN ok={ok} err={err} out={out}");
-        std::thread::sleep(Duration::from_secs(2));
-        let d: Vec<String> = [&a, &b, &c]
-            .iter()
-            .map(|r| {
-                Cell::open(&r.cell_path("memoria"))
+        // concurrent writes on all three, through the CLI: every local write
+        // of the sync era carries its device and signature, or the peers'
+        // gate refuses it
+        for (root, who) in [(&a.root, "A"), (&b.root, "B"), (&c.root, "C")] {
+            add_note(root, who);
+        }
+        // the passes cross: A's daemon syncs on its own writes, B and C run
+        std::thread::sleep(Duration::from_secs(4));
+        let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
+        std::thread::sleep(Duration::from_secs(4));
+        let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
+        // C goes away; A and B keep writing
+        for (root, who) in [(&a.root, "A2"), (&b.root, "B2")] {
+            add_note(root, who);
+        }
+        std::thread::sleep(Duration::from_secs(4));
+        let _ = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        // C comes back; the pull-only topology settles in rounds (each run
+        // pulls what the peer had, the daemon pushes nothing — rounds until
+        // the three digests agree, as many passes as the truth needs)
+        let digests: Vec<String>;
+        let mut rounds = 0;
+        loop {
+            let _ = run(&c.root, &["--json", "sync", "run", "--no-relay"]);
+            let (ok, out, err) = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+            eprintln!("B RUN ok={ok} err={err} out={out}");
+            std::thread::sleep(Duration::from_secs(2));
+            let d: Vec<String> = [&a, &b, &c]
+                .iter()
+                .map(|r| {
+                    Cell::open(&r.cell_path("memoria"))
                     .unwrap(/* t */)
                     .replicated_digest()
                     .unwrap(/* t */)
-            })
-            .collect();
-        rounds += 1;
-        if (d[0] == d[1] && d[1] == d[2]) || rounds > 6 {
-            digests = d;
-            break;
+                })
+                .collect();
+            rounds += 1;
+            if (d[0] == d[1] && d[1] == d[2]) || rounds > 6 {
+                digests = d;
+                break;
+            }
         }
-    }
-    if digests[0] != digests[1] {
-        use std::collections::BTreeSet;
-        let ids_of = |root: &std::path::PathBuf| -> BTreeSet<String> {
-            let c = Cell::open(&root.join("cells").join("memoria.sqlite")).unwrap(/* t */);
-            c.debug_column("SELECT op_id FROM ops")
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
-        };
-        let (ia, ib) = (ids_of(&a.root), ids_of(&b.root));
-        eprintln!("A-only: {:?}", ia.difference(&ib).collect::<Vec<_>>());
-        eprintln!("B-only: {:?}", ib.difference(&ia).collect::<Vec<_>>());
-    }
-    assert_eq!(digests[0], digests[1], "A and B agree (rounds {rounds})");
-    assert_eq!(digests[1], digests[2], "C caught up (rounds {rounds})");
-    for r in [&a, &b, &c] {
-        assert!(
-            Cell::open(&r.cell_path("memoria"))
+        if digests[0] != digests[1] {
+            use std::collections::BTreeSet;
+            let ids_of = |root: &std::path::PathBuf| -> BTreeSet<String> {
+                let c = Cell::open(&root.join("cells").join("memoria.sqlite")).unwrap(/* t */);
+                c.debug_column("SELECT op_id FROM ops")
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect()
+            };
+            let (ia, ib) = (ids_of(&a.root), ids_of(&b.root));
+            eprintln!("A-only: {:?}", ia.difference(&ib).collect::<Vec<_>>());
+            eprintln!("B-only: {:?}", ib.difference(&ia).collect::<Vec<_>>());
+        }
+        assert_eq!(digests[0], digests[1], "A and B agree (rounds {rounds})");
+        assert_eq!(digests[1], digests[2], "C caught up (rounds {rounds})");
+        for r in [&a, &b, &c] {
+            assert!(
+                Cell::open(&r.cell_path("memoria"))
             .unwrap(/* t */)
             .verify()
             .unwrap(/* t */)
             .ok()
-        );
-    }
-    drop(serve);
+            );
+        }
+        drop(serve);
     });
 }
 
@@ -684,7 +683,10 @@ fn the_removal_rotates_and_the_removed_stays_out() {
                 break;
             }
         }
-        assert_eq!(digests[0], digests[2], "C's note reached everyone (rounds {rounds})");
+        assert_eq!(
+            digests[0], digests[2],
+            "C's note reached everyone (rounds {rounds})"
+        );
 
         // --- A removes C: the signed remove with the accepted set, the new
         // epoch of every shared cell, the wraps for the survivors
@@ -764,8 +766,9 @@ fn the_removal_rotates_and_the_removed_stays_out() {
             let lo = (chunk[1] as char).to_digit(16).unwrap_or(0) as u8;
             id32[i] = (hi << 4) | lo;
         }
-        let (epoch, nonce, ct) =
-            a_shared.envelope_of(&id32).expect(/* A seals */ "A's envelope");
+        let (epoch, nonce, ct) = a_shared
+            .envelope_of(&id32)
+            .expect(/* A seals */ "A's envelope");
         assert!(epoch >= 1, "the new note is sealed under the rotated epoch");
         let opened = c_shared.ingest(epoch, &id32, &nonce, &ct);
         assert!(
@@ -819,7 +822,10 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
             Daemon { child, lines: rx }
         };
         let v = node.first_json();
-        let ticket = v["ticket"].as_str().expect(/* printed */ "ticket").to_string();
+        let ticket = v["ticket"]
+            .as_str()
+            .expect(/* printed */ "ticket")
+            .to_string();
         let (ok, _, err) = run(&a.root, &["mailbox", "add", &ticket]);
         assert!(ok, "A registers: {err}");
         let (ok, _, err) = run(&b.root, &["mailbox", "add", &ticket]);
@@ -860,7 +866,8 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
                 let trimmed = line.trim();
                 let parts: Vec<&str> = trimmed.split('-').collect();
                 let word_ok = |w: &str| {
-                    w.chars().all(|c| c.is_alphanumeric() && !c.is_ascii_uppercase())
+                    w.chars()
+                        .all(|c| c.is_alphanumeric() && !c.is_ascii_uppercase())
                 };
                 if parts.len() == 3
                     && parts[0].len() <= 4
@@ -933,7 +940,10 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
             "the refusal names the burnt channel: {all}"
         );
         let (ok, out, _) = run(&a.root, &["--json", "devices", "list"]);
-        assert!(ok && !out.contains("estraneo"), "the stranger did not enter: {out}");
+        assert!(
+            ok && !out.contains("estraneo"),
+            "the stranger did not enter: {out}"
+        );
         drop(node);
     });
 }
@@ -941,4 +951,3 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
 thread_local! {
     static CODE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
-
