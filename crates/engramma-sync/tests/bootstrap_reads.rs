@@ -88,7 +88,11 @@ fn the_bootstrap_of_a_thousand_ops_reads_the_log_a_fixed_number_of_times() {
     let reads = shared.log_reads() - reads_before;
     // a FIXED budget: the whole session may read the whole log a handful
     // of times (the id list, the tree), never once per envelope
-    eprintln!("bootstrap of {} envelopes: {} whole-log reads", ids.len(), reads);
+    eprintln!(
+        "bootstrap of {} envelopes: {} whole-log reads",
+        ids.len(),
+        reads
+    );
     assert!(
         reads <= 8,
         "the bootstrap of {} envelopes did {} whole-log reads: \

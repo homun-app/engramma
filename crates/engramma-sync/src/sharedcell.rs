@@ -614,9 +614,7 @@ pub type UnsentEvent = (String, String, String, String, String);
 ///
 /// # Errors
 /// [`Error::Db`] on SQL failure.
-pub fn unsent_events(
-    root: &std::path::Path,
-) -> Result<Vec<UnsentEvent>> {
+pub fn unsent_events(root: &std::path::Path) -> Result<Vec<UnsentEvent>> {
     let reg = DeviceRegistry::open(root)?;
     let mut stmt = reg
         .conn()
