@@ -6427,3 +6427,136 @@ test rosso prima, il giro via relay (P5.1) e la misura di bootstrap
 (P5.2) fatti, la rotazione end-to-end e il codice bruciato provati dal
 binario, le soglie rimesurate, JS e Linux verdi, il tag annotato
 `fase-v0.6.1`. Nessun push.
+
+
+# REPORT — Engramma v0.6.1 (la chiusura vera: C1–C4)
+
+Data: 2026-11-15. Base: `main` @ `4bf4c35` (più la correzione P7/P8 del
+REPORT v0.6). Tutto costruito e provato su macOS arm64, Rust 1.95.0. Il
+banco incriminato è stato fermato e i suoi numeri buttati: la sua corsa
+era falsata dalla cartella fissa cancellata da sotto dal revisore (C2).
+
+## C1 — il biglietto porta il relay di base (bloccante)
+
+**Il difetto.** `devices invite` stampava il biglietto subito dopo il
+bind: l'endpoint si collega al relay in modo asincrono e in quel momento
+`endpoint.addr()` non porta ancora nessun `TransportAddr::Relay`. Tre
+`devices invite` dal binario, col relay di base: **nessun biglietto con
+l'URL del relay**. I test non lo vedevano perché chiamavano `online()`
+da soli — al posto della produzione.
+
+**La correzione.** L'attesa vive in produzione, in un posto solo
+(`relay::wait_relay`, 10 s, `NotNeeded` con `--no-relay`), e sta davanti
+a ogni indirizzo che deve servire un altro: il biglietto di `devices
+invite`, quello fresco del codice breve, il biglietto del nodo cieco,
+l'indirizzo che `sync serve` pubblica. Scaduto il tempo il biglietto
+esce **senza** relay e la CLI lo dice — una riga sullo stderr e, nel
+JSON, `relay: null` con `relay_warning`. Il JSON di invite e serve porta
+il campo `relay`; il biglietto del nodo porta il relay e chi lo
+registra lo impara (il dial del nodo prova i diretti e poi il relay).
+
+**Le prove (dal binario).** Col relay locale di iroh (variante
+`test-relay` del binario, mai predefinita, costruita dal test nella sua
+target-dir): il biglietto di `devices invite` e quello del nodo cieco
+contengono l'URL del relay. Col relay irraggiungibile: il biglietto esce
+in ~10 s (atteso fra 9 e 20), senza relay, con l'avviso nell'JSON e
+niente promesso. `--no-relay`: il biglietto esce in meno di 3 s. E il
+binario di produzione resta senza `test-utils` (cercato con `strings`).
+I test della crate passano dalla strada di produzione: le chiamate a
+`online()` sono andate via dai test, `ticket_of` aspetta e il libro
+impara dal biglietto come fa il join.
+
+## C2 — il banco non si scontra con altri
+
+La cartella fissa `$TMPDIR/engramma-bench` permetteva a due corse
+insieme di cancellarsi i file a vicenda (una corsa del revisore lo ha
+fatto). Ogni corsa ha la sua cartella (`engramma-bench-<pid>`) o una
+`--work-dir` esplicita; una guardia la cancella su ogni uscita — anche
+in panico — e la `--work-dir` data a mano resta. **Provato**: due
+`ENGRAMMA_GRAPH_PROBE` insieme, entrambi completi, nessuna cartella
+rimasta. I numeri non cambiano (corpus e banco identici).
+
+## C3 — le due soglie, misurate come dice la spec
+
+Base `fase-v0.5.3` in un worktree (target-dir suo, cancellato alla
+fine), contro **questa fase**; stessa macchina, release, `--notes 10000
+--runs 5`, nessun altro banco o build in corso. Le righe intere:
+
+| corsa | inserimento (note/s) | apertura (ms) | ricerca p50 (ms) | ricerca p95 (ms) | solo testo p50 (ms) | testo+grafo p50 (ms) | **testo+grafo p95 (ms)** | richiamo@5 | MRR |
+|---|---|---|---|---|---|---|---|---|---|
+| base v0.5.3, viva | 3013 | 0,6 | 1,4 | 3,1 | 1,2 | 1,3 | **3,1** | 1,000 | 0,791 |
+| base v0.5.3, uniform | 2881 | 0,4 | 1,4 | 3,5 | 1,3 | 1,3 | **3,5** | 1,000 | 0,773 |
+| v0.6.1, viva | 2759 | 0,6 | 1,3 | 2,1 | 1,1 | 1,3 | **2,0** | 1,000 | 0,791 |
+| v0.6.1, uniform | 2841 | 0,6 | 1,3 | 2,0 | 1,1 | 1,3 | **1,9** | 1,000 | 0,773 |
+
+- **p95 testo+grafo (tetto +5%): viva 2,0 ms contro 3,1 (−35%),
+  uniform 1,9 contro 3,5 (−46%) — RAGGIUNTA** con ampio margine (il
+  p95 della v0.6 era 2,0 ms su un'altra sessione di misura; oggi la
+  base stessa misura 3,1/3,5: il confronto è dentro questa sessione,
+  come la spec chiede).
+- **inserimento (tetto +10% di tempo, cioè ≥ base/1,1): viva 2759
+  ≥ 2739 note/s (+9,2% di tempo), uniform 2841 ≥ 2619 (+1,4%) —
+  RAGGIUNTA.** La viva è al margine: è il costo delle fondamenta della
+  convergenza (base, op_objects, l'indice v20, la firma di ogni
+  scrittura) e sta dentro il tetto.
+- MRR e richiamo: identici alla base (0,791/0,773, 1,000) — riportati
+  per completezza, non sono soglie.
+
+## C4 — la latenza della spec, e quattro difetti veri
+
+La misura richiesta: **B tiene `sync serve` acceso col ciclo reale**
+(`PRAGMA data_version`, rimbalzo di 2 s), A scrive una nota alla volta,
+per ognuna si misura dalla scrittura alla nota **leggibile su B**, le
+50 scritture distanziate 3 s. `#[ignore]`d, si lancia con
+`cargo test --release -p engramma-cli --test sync_serve_cli
+the_write_to_read_latency -- --ignored --nocapture`.
+
+**Il ciclo non spingeva mai.** La misura è stata rossa per ore e ogni
+pezzo aveva il suo difetto — ciascuno col suo test rosso prima:
+
+1. **`PRAGMA data_version` letto come testo**: la pragma torna un
+   INTERO, la riga andava in errore e veniva scartata — sempre 0. Il
+   ciclo non partiva MAI per le scritture di un altro processo: tutta
+   la convivenza Homun (un secondo processo che scrive mentre serve
+   riceve) era cieca; i test passavano perché B tirava con `sync run`.
+   Ora `Cell::data_version` legge l'intero e `DataVersionWatch` tiene
+   le connessioni **aperte** (il contatore è per connessione: letture
+   su connessioni nuove non vedono mai il commit altrui) con
+   `moved()`/`ack()` separati.
+2. **Il deadlock della sessione già sincronizzata**: con have e need
+   vuoti l'iniziatore mandava solo l'ack; il risponditore lo consumava
+   nel pre-ciclo e aspettava un altro frame per sempre, mentre
+   l'iniziatore aspettava il suo ack. Ogni sessione senza nulla da
+   scambiare inciampava fino al limite dei 90 s. L'ack ora chiude lo
+   scambio.
+3. **Il filo della sessione**: uno stream UNIDIREZIONALE per frame, con
+   `finish` e il FIN consumato dal ricevente — il budget di stream del
+   trasporto non si libera finché il ricevente non ha visto la
+   chiusura (la lezione dell'abbinamento, applicata alla sessione).
+4. **Il dial della passata**: un indirizzo alla volta (loopback primo,
+   5 s ciascuno) — la corsa d'indirizzi del trasporto muore dietro
+   un'interfaccia virtuale. E il primo tick dell'orologio slitta a
+   +5 minuti: la passata a t=0 diala un libro quasi sempre stantio.
+
+**La misura (release, loopback, ciclo reale)**: mediana **1506 ms**,
+p95 **1549 ms** su 50 scritture distanziate 3 s — il rimbalzo di 2 s è
+dentro. La vista senza rimbalzo è a **0 ms** perché la consegna arriva
+prima del nominale: il sondaggio (250 ms) vede la scrittura, il
+rimbalzo parte e la sessione (~1,2 s) la consegna prima che i 2 s
+nominali siano passati — il numero onesto è quello con il rimbalzo
+dentro, l'altra vista dice solo che il costo vero è la sessione, non
+l'attesa. Il test del ciclo (la scrittura di un secondo processo
+spinta fino a B, nessuno che tira) sta in suite, verde.
+
+## La chiusura
+
+- `the_fleet_converges` a **2048 casi** sul commit finale, più **cinque
+  corse** da 512 a semi nuovi: tutte verdi (i numeri in fondo).
+- macOS: fmt e clippy verdi; la suite completa verde.
+- Linux (`scripts/linux.sh`), JS (`npm test`, `test:electron`,
+  `test:electron-main`), `npm run build` con gli SHA256: i giri di
+  sotto, i numeri nel REPORT di chiusura.
+- Tag `fase-v0.6.1` spostato sul commit finale, annotato, solo locale.
+- `du -sh target` all'inizio 5,0 G (dopo la pulizia profonda), alla
+  fine il numero di sotto; il worktree e il target della base
+  cancellati; nessun processo lasciato acceso.

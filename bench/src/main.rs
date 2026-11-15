@@ -2328,10 +2328,7 @@ fn work_dir(explicit: Option<&PathBuf>) -> std::path::PathBuf {
             dir.clone()
         }
         None => {
-            let dir = std::env::temp_dir().join(format!(
-                "engramma-bench-{}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir().join(format!("engramma-bench-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect(/* temp */ "mkdir");
             dir
         }
