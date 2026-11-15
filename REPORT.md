@@ -6847,3 +6847,46 @@ tabella in più per operazione) — poi le istruzioni in più (ora in
 cache), e per ultima la firma, 5–12 µs. Sarà l'utente a decidere se
 accettare il costo come prezzo della convergenza: la soglia della spec
 resta non raggiunta e dichiarata.
+
+## La chiusura (K1–K4, sul commit finale)
+
+- **La misura C4 rifatta** (50 scritture distanziate 3 s, ciclo reale di
+  due `sync serve`, release): **mediana 2291 ms, p95 2322 ms** — sopra il
+  rimbalzo di 2 s, come una misura di latenza deve essere (il test ora
+  FALLISCE se la mediana scende sotto il rimbalzo: vorrebbe dire che
+  misura la fase del ciclo). **Senza rimbalzo: mediana 291 ms, p95
+  322 ms** — la riga che col ciclo che non riposava non voleva dire
+  niente, e adesso è il tempo vero di grilletto + gara + sessione. Il
+  giro intero: 263 s. La misura pubblica gli indirizzi **veri** del
+  demone (192.168.x e il 100.64 punto-punto in gara): le note arrivano
+  regolarmente — la strada morta non ha mai stallato la gara (K2.3).
+- **La convergenza**: `the_fleet_converges` a **2048 casi** verde
+  (release, 82 s), più **cinque corse** a semi nuovi — 24 s, 22 s, 22 s,
+  23 s, 25 s — tutte verdi.
+- **macOS**: fmt e clippy (`-D warnings`) verdi; la suite di tutta
+  l'area di lavoro verde — **501 test ok, 0 falliti** (fra cui i due
+  nuovi del ciclo a riposo e i cinque del guardiano).
+- **Linux**: `scripts/linux.sh` (arm64, `--network none`, sorgente in
+  sola lettura) **verde due volte**: fmt e clippy puliti, **59 suite
+  verdi, 501 test ok, 0 falliti**.
+- **JS** (Node v25.9.0): il motore è cambiato (K4 tocca il percorso di
+  scrittura), il binding è stato ricostruito e ritestato: `npm test`
+  **29/29**, `test:electron` **29/29**, `test:electron-main` ok. Il
+  binario cambia:
+  `engramma.darwin-arm64.node`
+  `bdb32610c11ca2909881e4f767cbda0c01aeb120c2cd8461a38b3b26e4fee0c9`
+  (index.js `25fd9cc1…` e index.d.ts `bf9381f1…` immutati).
+- **Binario CLI di debug**: 151 MiB.
+- **Disco**: `du -sh target` 8,4 G all'inizio del giro, 15 G alla fine
+  (le build release delle misure, del binding e del volume Linux);
+  worktree e target della base v0.5.3 cancellati, i temporanei delle
+  misure (`/tmp/k4*`, i profili) cancellati, il volume Docker
+  `engramma-linux-target` rimosso.
+- **Tag**: `fase-v0.6.1` spostato sul commit finale, annotato, solo
+  locale, nessun push. Nessun processo lasciato acceso.
+
+**Il conto che resta aperto è uno**: la soglia d'inserimento (K4) —
+**NON raggiunta**, +24%/+20% di tempo (media delle coppie) contro il
+tetto del +10%, con la scomposizione che dice dove va: il commit, non
+la CPU. Sarà l'utente a decidere se accettarla come prezzo della
+convergenza.
