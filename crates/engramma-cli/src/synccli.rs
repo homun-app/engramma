@@ -192,7 +192,7 @@ pub fn sync_run_cmd(
                 let endpoint = serve::bind(&dk, "0.0.0.0:0", &choice)
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))?;
-                serve::run_pass(&root, &endpoint)
+                serve::run_pass(&root, &endpoint, &[])
                     .await
                     .map_err(|e| CliError::internal(e.to_string()))
             })
@@ -289,47 +289,86 @@ pub fn sync_serve_cmd(
                     );
                 }
                 // the pass worker: one pass at a time, over the ticks
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
-                // the write watcher: data_version moves → debounce → tick.
-                // The counters are read on PERSISTENT connections (C4):
-                // PRAGMA data_version is per-connection, and a fresh
-                // connection per poll never sees another process's write
-                // — the Homun daemon beside the serve was invisible
+                enum Tick {
+                    /// rows that are NOT the sessions' own work (a local
+                    /// write): a pass toward every live device
+                    Write,
+                    /// only rows the sessions brought: a pass toward the
+                    /// others — never back to these sources (K1)
+                    Others(Vec<String>),
+                    /// the five-minute safety net
+                    Clock,
+                }
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Tick>();
+                // the write guard, shared by the watcher (it polls), the
+                // worker (it settles after every pass) and the accept loop
+                // (it notes what each inbound session ingested). All the
+                // tasks live on this one LocalSet thread: the mutex is
+                // held for short sync spans only, never across an await.
+                let watch = std::sync::Arc::new(std::sync::Mutex::new(
+                    serve::DataVersionWatch::new(&root).unwrap_or_else(|e| {
+                        eprintln!("sync serve: data_version: {e}");
+                        // an empty watch never fires: the periodic pass
+                        // still runs, and the next start retries
+                        serve::DataVersionWatch::empty(&root)
+                    }),
+                ));
                 {
-                    let root = root.clone();
                     let tx = tx.clone();
+                    let watch = std::sync::Arc::clone(&watch);
                     tokio::task::spawn_local(async move {
-                        let mut watch = serve::DataVersionWatch::new(&root).unwrap_or_else(|e| {
-                            eprintln!("sync serve: data_version: {e}");
-                            // an empty watch never fires: the periodic pass
-                            // still runs, and the next start retries
-                            serve::DataVersionWatch::empty(&root)
-                        });
                         let mut opened = std::time::Instant::now();
                         loop {
                             tokio::time::sleep(serve::WATCH_TICK).await;
+                            if !watch
+                                .lock()
+                                .map(|w| !w.busy())
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
                             // cells shared after the start join at the
                             // periodic refresh
                             if opened.elapsed() >= serve::PERIODIC {
                                 opened = std::time::Instant::now();
-                                let _ = watch.refresh();
+                                if let Ok(mut w) = watch.lock() {
+                                    let _ = w.refresh();
+                                }
                                 continue;
                             }
-                            let Ok(moved) = watch.moved() else {
+                            let moved = watch
+                                .lock()
+                                .ok()
+                                .and_then(|w| w.moved().ok())
+                                .unwrap_or(false);
+                            if !moved {
                                 continue;
-                            };
-                            if moved {
-                                // let the writes settle, then look again:
-                                // still moved → a pass, and the baseline
-                                // takes what it has seen
-                                tokio::time::sleep(serve::DEBOUNCE).await;
-                                if watch.moved().unwrap_or(false) {
+                            }
+                            // let the writes settle, then decide: the
+                            // cheap poll stays on the file's counters, the
+                            // PASS is armed by the log's marker (K1)
+                            tokio::time::sleep(serve::DEBOUNCE).await;
+                            let decision = watch.lock().ok().and_then(|mut w| {
+                                if w.busy() || !w.moved().unwrap_or(false) {
+                                    None
+                                } else {
+                                    w.evaluate().ok()
+                                }
+                            });
+                            match decision {
+                                Some(serve::PassDecision::All) => {
                                     if std::env::var("ENGRAMMA_TRACE").is_ok() {
                                         eprintln!("watch: tick write");
                                     }
-                                    tx.send("write").ok();
-                                    let _ = watch.ack();
+                                    tx.send(Tick::Write).ok();
                                 }
+                                Some(serve::PassDecision::Others(skip)) => {
+                                    if std::env::var("ENGRAMMA_TRACE").is_ok() {
+                                        eprintln!("watch: tick write (verso gli altri)");
+                                    }
+                                    tx.send(Tick::Others(skip)).ok();
+                                }
+                                _ => {}
                             }
                         }
                     });
@@ -350,7 +389,7 @@ pub fn sync_serve_cmd(
                         );
                         loop {
                             tick.tick().await;
-                            tx.send("clock").ok();
+                            tx.send(Tick::Clock).ok();
                         }
                     });
                 }
@@ -360,28 +399,65 @@ pub fn sync_serve_cmd(
                     let root = root.clone();
                     let endpoint = endpoint.clone();
                     let stop = stop.clone();
+                    let watch = std::sync::Arc::clone(&watch);
                     tokio::task::spawn_local(async move {
                         loop {
                             tokio::select! {
                                 _ = stop.cancelled() => break,
                                 what = rx.recv() => {
                                     let Some(what) = what else { break };
-                                    if std::env::var("ENGRAMMA_TRACE").is_ok() {
-                                        eprintln!("worker: passo {what}");
-                                    }
-                                    match serve::run_pass(&root, &endpoint).await {
-                                        Ok(report) if std::env::var("ENGRAMMA_TRACE").is_ok() => {
-                                            for p in &report.peers {
-                                                eprintln!(
-                                                    "passo ({what}): {} reached={} via={:?} why={:?}",
-                                                    p.name, p.reached, p.via, p.why_not
-                                                );
+                                    // the pass toward the OTHERS only: with
+                                    // no others there is NO pass at all —
+                                    // the rows that came from the sources
+                                    // never bounce back to them (K1)
+                                    let (label, skip) = match &what {
+                                        Tick::Clock => ("clock", Vec::new()),
+                                        _ => ("write", match &what {
+                                            Tick::Others(skip) => skip.clone(),
+                                            _ => Vec::new(),
+                                        }),
+                                    };
+                                    let has_targets = match &what {
+                                        Tick::Others(skip) => {
+                                            let self_dev = serve::self_device(&root);
+                                            DeviceRegistry::open(&root)
+                                                .ok()
+                                                .and_then(|r| r.live_members().ok())
+                                                .map(|ms| {
+                                                    ms.iter().any(|m| {
+                                                        m.device != self_dev
+                                                            && !skip.contains(&m.device)
+                                                    })
+                                                })
+                                                .unwrap_or(false)
+                                        }
+                                        _ => true,
+                                    };
+                                    if has_targets {
+                                        if std::env::var("ENGRAMMA_TRACE").is_ok() {
+                                            eprintln!("worker: passo {label}");
+                                        }
+                                        match serve::run_pass(&root, &endpoint, &skip).await {
+                                            Ok(report) if std::env::var("ENGRAMMA_TRACE").is_ok() => {
+                                                for p in &report.peers {
+                                                    eprintln!(
+                                                        "passo ({label}): {} reached={} via={:?} why={:?}",
+                                                        p.name, p.reached, p.via, p.why_not
+                                                    );
+                                                }
                                             }
+                                            Err(e) if std::env::var("ENGRAMMA_TRACE").is_ok() => {
+                                                eprintln!("passo ({label}): errore {e}");
+                                            }
+                                            _ => {}
                                         }
-                                        Err(e) if std::env::var("ENGRAMMA_TRACE").is_ok() => {
-                                            eprintln!("passo ({what}): errore {e}");
-                                        }
-                                        _ => {}
+                                    }
+                                    // the ack comes AFTER the pass (K1):
+                                    // the baselines take what the pass
+                                    // itself wrote, or its own writes
+                                    // would re-light the cycle
+                                    if let Ok(mut w) = watch.lock() {
+                                        let _ = w.settle();
                                     }
                                 }
                             }
@@ -392,6 +468,7 @@ pub fn sync_serve_cmd(
                 {
                     let root = root.clone();
                     let stop = stop.clone();
+                    let watch = std::sync::Arc::clone(&watch);
                     tokio::task::spawn_local(async move {
                         loop {
                             let incoming = tokio::select! {
@@ -406,6 +483,7 @@ pub fn sync_serve_cmd(
                             };
                             let caller = conn.remote_id();
                             let root = root.clone();
+                            let watch = std::sync::Arc::clone(&watch);
                             tokio::task::spawn_local(async move {
                                 let reg = match DeviceRegistry::open(&root) {
                                     Ok(r) => r,
@@ -420,12 +498,23 @@ pub fn sync_serve_cmd(
                                     return;
                                 };
                                 let book = serve::peer_addr_of_conn(&conn).ok();
-                                if serve::answer_session(&root, conn).await.is_ok()
-                                    && let Some(book) = book
-                                {
-                                    // the address book learns what it can
-                                    // (a later successful dial refreshes it)
-                                    serve::remember_addr(&root, &device, &book).ok();
+                                if let Ok(report) = serve::answer_session(&root, conn).await {
+                                    // the guard learns what this session
+                                    // ingested and from WHOM (K1): those
+                                    // rows are the sessions' own work, and
+                                    // the pass they may trigger goes toward
+                                    // the others, never back to this device
+                                    let rows: usize =
+                                        report.cells.iter().map(|c| c.received).sum();
+                                    if let Ok(mut w) = watch.lock() {
+                                        w.note_session(&device, rows);
+                                    }
+                                    // the book keeps only what it has: the
+                                    // minimal row when none exists
+                                    if let Some(book) = book {
+                                        serve::remember_addr_if_absent(&root, &device, &book)
+                                            .ok();
+                                    }
                                 }
                             });
                         }

@@ -424,7 +424,7 @@ async fn a_peer_with_dead_direct_roads_is_reached_through_the_relay_within_ten_s
                     node_id: *ep_b.secret_key().public().as_bytes(),
                     relay: relay_url.to_string(),
                     addrs: vec![
-                        "192.0.2.1:9999".into(),   // RFC 5737 TEST-NET-1
+                        "192.0.2.1:9999".into(),    // RFC 5737 TEST-NET-1
                         "198.51.100.1:9999".into(), // RFC 5737 TEST-NET-2
                         "203.0.113.1:9999".into(),  // RFC 5737 TEST-NET-3
                     ],

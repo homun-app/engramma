@@ -1297,7 +1297,9 @@ fn device_of(root: &std::path::Path, name: &str) -> String {
 fn to_loopback(addrs: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for a in addrs {
-        let Some(port) = a.rsplit(':').next() else { continue };
+        let Some(port) = a.rsplit(':').next() else {
+            continue;
+        };
         let lb = format!("127.0.0.1:{port}");
         if !out.contains(&lb) {
             out.push(lb);

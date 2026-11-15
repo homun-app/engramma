@@ -233,7 +233,7 @@ async fn an_unsendable_op_is_a_summary_row_and_an_event_without_note_text() {
                 };
                 // A's own pass: the only op B lacks is the orphan — the
                 // one A cannot seal. The summary must SAY it.
-                let report = serve::run_pass(dir_a.path(), &ep_a)
+                let report = serve::run_pass(dir_a.path(), &ep_a, &[])
                     .await
                     .expect(/* a pass */ "the pass");
                 answerer.abort();

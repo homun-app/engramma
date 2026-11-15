@@ -374,49 +374,28 @@ impl NodeAddr {
         Ok(addr)
     }
 
-    /// Dial the node, one address at a time (loopback first): the
-    /// transport's own address race stalls on a virtual interface that
-    /// does not answer its own address.
+    /// Dial the node the way iroh dials (R2.3, K2): ONE `connect` with
+    /// every direct address AND the relay the ticket carried, bounded at
+    /// 10 s in all — the transport races the roads itself. Paying each
+    /// dead road one at a time cost the mailbox push up to a minute
+    /// against a node behind a NAT.
     ///
     /// # Errors
-    /// [`Error::Io`] when no address answers.
+    /// [`Error::Io`] when no road answers within the bound.
     pub async fn dial(&self, endpoint: &Endpoint) -> Result<Connection> {
-        let node = iroh::PublicKey::from_bytes(&self.node_id)
-            .map_err(|e| Error::Malformed(format!("bad node id: {e}")))?;
-        let mut addrs: Vec<std::net::SocketAddr> =
-            self.addrs.iter().filter_map(|a| a.parse().ok()).collect();
-        addrs.sort_by_key(|a| !a.ip().is_loopback());
-        let mut last = "nessun indirizzo noto".to_string();
-        for socket in addrs {
-            let addr = EndpointAddr::from_parts(node, [iroh::TransportAddr::Ip(socket)]);
-            let tried = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                endpoint.connect(addr, MAILBOX_NET_ALPN),
-            )
-            .await;
-            match tried {
-                Err(_) => last = format!("{socket}: timeout"),
-                Ok(Ok(conn)) => return Ok(conn),
-                Ok(Err(e)) => last = format!("{socket}: {e}"),
-            }
+        let addr = self.endpoint_addr()?;
+        let tried = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            endpoint.connect(addr, MAILBOX_NET_ALPN),
+        )
+        .await;
+        match tried {
+            Err(_) => Err(Error::Io(std::io::Error::other(
+                "nessuna strada ha risposto in 10 s",
+            ))),
+            Ok(Ok(conn)) => Ok(conn),
+            Ok(Err(e)) => Err(Error::Io(std::io::Error::other(e.to_string()))),
         }
-        // the node behind a NAT: the relay the ticket carried (C1)
-        if let Some(relay) = &self.relay
-            && let Ok(url) = relay.parse()
-        {
-            let addr = EndpointAddr::new(node).with_relay_url(url);
-            let tried = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                endpoint.connect(addr, MAILBOX_NET_ALPN),
-            )
-            .await;
-            match tried {
-                Err(_) => last = format!("{relay}: timeout"),
-                Ok(Ok(conn)) => return Ok(conn),
-                Ok(Err(e)) => last = format!("{relay}: {e}"),
-            }
-        }
-        Err(Error::Io(std::io::Error::other(last)))
     }
 }
 

@@ -176,7 +176,7 @@ async fn the_fifty_writes_latency() {
                 let writes = t0.elapsed();
                 // --- the pass that carries all fifty
                 let t1 = std::time::Instant::now();
-                let report = serve::run_pass(dir_b.path(), &ep_b)
+                let report = serve::run_pass(dir_b.path(), &ep_b, &[])
                     .await
                     .expect(/* a pass */ "the pass");
                 let pass = t1.elapsed();
@@ -184,7 +184,7 @@ async fn the_fifty_writes_latency() {
                 // --- the steady state: ONE write, one pass
                 cell.put_note(&note(200, "una in più"), "cli").unwrap(/* t */);
                 let t2 = std::time::Instant::now();
-                let _ = serve::run_pass(dir_b.path(), &ep_b).await;
+                let _ = serve::run_pass(dir_b.path(), &ep_b, &[]).await;
                 let one = t2.elapsed();
                 answerer.abort();
                 let per_write = writes.as_millis() as f64 / 50.0;

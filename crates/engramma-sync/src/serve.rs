@@ -42,51 +42,30 @@ pub struct PeerAddr {
 }
 
 impl PeerAddr {
-    /// Dial the peer, one address at a time (loopback first): the
-    /// transport's own address race stalls behind a virtual interface
-    /// that does not answer its own address — a book row with several
-    /// addresses must not die on the first of them.
+    /// Dial the peer the way iroh dials (R2.3, K2): ONE `connect` with
+    /// every direct address the book knows AND the relay, bounded at 10 s
+    /// in all — the transport races the roads itself, direct first and
+    /// the relay beside them. Paying each dead road one at a time (5 s
+    /// each, the loopback and the VPN before the relay) cost a device
+    /// behind a NAT up to twenty seconds PER PEER, with the serve loop
+    /// (one thread) frozen solid.
     ///
     /// # Errors
-    /// [`Error::Io`] when no address answers.
+    /// [`Error::Io`] when no road answers within the bound.
     pub async fn dial(&self, endpoint: &Endpoint) -> Result<Connection> {
-        let node = iroh::PublicKey::from_bytes(&self.node_id)
-            .map_err(|e| Error::Malformed(format!("bad node id: {e}")))?;
-        let mut addrs: Vec<std::net::SocketAddr> =
-            self.addrs.iter().filter_map(|a| a.parse().ok()).collect();
-        addrs.sort_by_key(|a| !a.ip().is_loopback());
-        let mut last = "nessun indirizzo noto".to_string();
-        for socket in &addrs {
-            let addr = EndpointAddr::from_parts(node, [iroh::TransportAddr::Ip(*socket)]);
-            let tried = tokio::time::timeout(
-                Duration::from_secs(5),
-                endpoint.connect(addr, protocol::ALPN),
-            )
-            .await;
-            match tried {
-                Err(_) => last = format!("{socket}: timeout"),
-                Ok(Ok(conn)) => return Ok(conn),
-                Ok(Err(e)) => last = format!("{socket}: {e}"),
-            }
+        let addr = self.endpoint_addr()?;
+        let tried = tokio::time::timeout(
+            Duration::from_secs(10),
+            endpoint.connect(addr, protocol::ALPN),
+        )
+        .await;
+        match tried {
+            Err(_) => Err(Error::Io(std::io::Error::other(
+                "nessuna strada ha risposto in 10 s",
+            ))),
+            Ok(Ok(conn)) => Ok(conn),
+            Ok(Err(e)) => Err(Error::Io(std::io::Error::other(e.to_string()))),
         }
-        // the relay the book knows (a relay-only endpoint has NO direct
-        // addresses at all — the whole point of the relay road)
-        if !self.relay.is_empty()
-            && let Ok(url) = self.relay.parse()
-        {
-            let addr = EndpointAddr::new(node).with_relay_url(url);
-            let tried = tokio::time::timeout(
-                Duration::from_secs(10),
-                endpoint.connect(addr, protocol::ALPN),
-            )
-            .await;
-            match tried {
-                Err(_) => last = format!("{}: timeout", self.relay),
-                Ok(Ok(conn)) => return Ok(conn),
-                Ok(Err(e)) => last = format!("{}: {e}", self.relay),
-            }
-        }
-        Err(Error::Io(std::io::Error::other(last)))
     }
 
     /// The iroh address to connect to.
@@ -191,6 +170,29 @@ fn now_iso() -> String {
         .unwrap_or(time::OffsetDateTime::now_utc())
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
+}
+
+/// Seed the book with a minimal row when the device has NONE (K1): an
+/// inbound session proves the node id is alive but shows only the
+/// caller's source port — dead the moment the caller is a one-shot `sync
+/// run` — so it must never OVERWRITE a richer row (the overwrite once
+/// left every daemon-side book undialable: a bare node id has no road).
+/// A later successful DIAL refreshes the row with what actually worked.
+///
+/// # Errors
+/// [`Error::Db`] on SQL failure.
+pub fn remember_addr_if_absent(root: &Path, device: &str, addr: &EndpointAddr) -> Result<()> {
+    let row = json!({
+        "node_id": hex(addr.id.as_bytes()),
+        "relay": String::new(),
+        "addrs": Vec::<String>::new(),
+    });
+    let reg = DeviceRegistry::open(root)?;
+    reg.conn().execute(
+        "INSERT OR IGNORE INTO device_addrs (device, addrs, seen_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![device, row.to_string(), now_iso()],
+    )?;
+    Ok(())
 }
 
 /// One device's row of the pass summary.
@@ -356,11 +358,13 @@ pub fn self_device(root: &Path) -> String {
 /// One pass with every live device the book can reach: an unreachable
 /// device is a row, never an error. The summary carries the per-device
 /// outcomes and the per-cell deltas of the pass (operations, refusals,
-/// conflicts now, frontier).
+/// conflicts, frontier). `skip` names devices this pass must not dial
+/// (K1: the rows that came FROM them never bounce back to them — the
+/// clock pass skips nobody).
 ///
 /// # Errors
 /// Only infrastructure failures (a broken root), never a peer.
-pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
+pub async fn run_pass(root: &Path, endpoint: &Endpoint, skip: &[String]) -> Result<PassReport> {
     let dk = DeviceKey::load_or_create(root)?;
     let registry = DeviceRegistry::open(root)?;
     let mut report = PassReport::default();
@@ -383,7 +387,7 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint) -> Result<PassReport> {
         eprintln!("mailbox push: {e}");
     }
     for member in registry.live_members()? {
-        if member.device == dk.device_id() {
+        if member.device == dk.device_id() || skip.contains(&member.device) {
             continue;
         }
         let Some(addr) = addr_of(root, &member.device)? else {
@@ -481,17 +485,53 @@ fn conflict_counts(root: &Path) -> Result<Vec<(String, usize)>> {
 }
 
 /// The cells' `PRAGMA data_version`, read on PERSISTENT connections: the
-/// serve loop's write trigger (C4). The counter is PER-CONNECTION — it
-/// only moves for commits made by OTHER connections while THIS one stays
-/// open — so a watch that opens a fresh connection per poll never sees
-/// another process's write (the Homun daemon, the CLI beside the serve:
-/// found by the C4 measure, which waited forever). The handles stay open
-/// for the watch's whole life; `refresh` re-opens them (a cell shared
-/// after the serve started gets watched at the next refresh).
+/// serve loop's CHEAP poll (C4). The counter is PER-CONNECTION — it only
+/// moves for commits made by OTHER connections while THIS one stays open
+/// — so a watch that opens a fresh connection per poll never sees another
+/// process's write (the Homun daemon, the CLI beside the serve: found by
+/// the C4 measure, which waited forever). The handles stay open for the
+/// watch's whole life; `refresh` re-opens them (a cell shared after the
+/// serve started gets watched at the next refresh).
+///
+/// But the FILE's counter is only the doorbell: when it moves, the guard
+/// compares the LOG's marker — `(count, max rowid)` of `ops`, per cell —
+/// with its baseline, and the rows our own sessions ingested with what
+/// the sessions' reports say (v0.6.1-ciclo, K1):
+///
+/// - rows beyond the sessions' own work are LOCAL writes (another
+///   process committed): a pass toward EVERY live device;
+/// - rows that are all the sessions' work came FROM their devices: a
+///   pass toward the OTHERS, never back to the sources alone;
+/// - no rows at all: the file moved for bookkeeping that is not
+///   operations — no pass, and the baselines settle.
+///
+/// The baselines settle AFTER the pass (`settle`), never before: the
+/// pass's own writes are not news. A watch with a pass armed or running
+/// is `busy` and answers no poll until that pass settles.
 pub struct DataVersionWatch {
     root: std::path::PathBuf,
     cells: Vec<SharedCell>,
     last: Vec<(String, i64)>,
+    marker: Vec<(String, (i64, i64))>,
+    /// The rows the serve's own sessions ingested since the last settle,
+    /// per device that fed them — the sources a triggered pass must skip.
+    fed: std::collections::HashMap<String, usize>,
+    /// A pass is armed or running: the baselines settle when it ends.
+    busy: bool,
+}
+
+/// What the guard decided when the file's counter moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PassDecision {
+    /// Local rows (another process wrote): a pass toward every live
+    /// device — the sources included, they have not seen these rows.
+    All,
+    /// Only rows the sessions brought: a pass toward the others, never
+    /// again toward these devices alone — they hold what they sent.
+    Others(Vec<String>),
+    /// The file moved, the log did not: bookkeeping, not operations.
+    /// No pass; the baselines have already settled.
+    None,
 }
 
 impl DataVersionWatch {
@@ -502,10 +542,14 @@ impl DataVersionWatch {
     pub fn new(root: &Path) -> Result<Self> {
         let cells = SharedCell::all_of(root)?;
         let last = Self::read(&cells, root)?;
+        let marker = Self::read_markers(&cells, root)?;
         Ok(Self {
             root: root.to_path_buf(),
             cells,
             last,
+            marker,
+            fed: std::collections::HashMap::new(),
+            busy: false,
         })
     }
 
@@ -517,6 +561,9 @@ impl DataVersionWatch {
             root: root.to_path_buf(),
             cells: Vec::new(),
             last: Vec::new(),
+            marker: Vec::new(),
+            fed: std::collections::HashMap::new(),
+            busy: false,
         }
     }
 
@@ -534,12 +581,23 @@ impl DataVersionWatch {
         Ok(out)
     }
 
-    /// Read again on the SAME connections: `true` when something moved
-    /// (another process's commit included — that is the point). The
-    /// baseline does NOT move here — the counter never goes back, so the
-    /// caller must `ack()` when it has acted, or the settle check after
-    /// the debounce would compare against a baseline that already
-    /// includes the write.
+    fn read_markers(cells: &[SharedCell], root: &Path) -> Result<Vec<(String, (i64, i64))>> {
+        let mut out = Vec::new();
+        for shared in cells {
+            out.push((
+                cell_name(root, shared.sync_id())?,
+                shared
+                    .cell()
+                    .ops_marker()
+                    .map_err(|e| Error::Cell(e.to_string()))?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// The cheap poll on the SAME connections: `true` when any file's
+    /// counter moved (another process's commit included — that is the
+    /// point). The baselines do NOT move here.
     ///
     /// # Errors
     /// [`Error::Db`] on SQL failure.
@@ -548,24 +606,84 @@ impl DataVersionWatch {
         Ok(now != self.last)
     }
 
-    /// Take the current counters as the new baseline (the pass has been
-    /// triggered: what moved is now seen).
+    /// Is a pass armed or running? While it is, the guard answers no
+    /// poll: its own writes are not news, and the baselines settle when
+    /// the pass ends.
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+
+    /// Note what one of the serve's own sessions ingested (K1): the rows
+    /// the session's report counts, and the device that fed them. The
+    /// next evaluation subtracts them from the log's delta — what is left
+    /// is local work, and the sources are the pass's exclusions.
+    pub fn note_session(&mut self, device: &str, rows: usize) {
+        if rows > 0 {
+            *self.fed.entry(device.to_string()).or_insert(0) += rows;
+        }
+    }
+
+    /// Decide, now that the file's counter moved and the debounce is
+    /// over: compare the LOG's marker with its baseline and the sessions'
+    /// ledger. When the answer is a pass, the baselines stay where they
+    /// are — `settle` moves them when the pass is done (K1: the ack comes
+    /// AFTER the pass, never before, or the pass's own writes re-light
+    /// the cycle). When the answer is nothing, the baselines settle here.
     ///
     /// # Errors
     /// [`Error::Db`] on SQL failure.
-    pub fn ack(&mut self) -> Result<()> {
+    pub fn evaluate(&mut self) -> Result<PassDecision> {
+        let now = Self::read_markers(&self.cells, &self.root)?;
+        let delta: i64 = now
+            .iter()
+            .zip(&self.marker)
+            .map(|(a, b)| a.1.0 - b.1.0)
+            .sum();
+        let sessions: i64 = self.fed.values().sum::<usize>() as i64;
+        let decision = if delta <= 0 {
+            PassDecision::None
+        } else if delta > sessions {
+            PassDecision::All
+        } else {
+            PassDecision::Others(self.fed.keys().cloned().collect())
+        };
+        match decision {
+            PassDecision::None => self.settle()?,
+            _ => self.busy = true,
+        }
+        Ok(decision)
+    }
+
+    /// Take the current counters as the new baselines, forget the
+    /// sessions' ledger, and lower the busy flag: the pass (if any) is
+    /// done, and what it wrote is not news anymore.
+    ///
+    /// # Errors
+    /// [`Error::Db`] on SQL failure.
+    pub fn settle(&mut self) -> Result<()> {
         self.last = Self::read(&self.cells, &self.root)?;
+        self.marker = Self::read_markers(&self.cells, &self.root)?;
+        self.fed.clear();
+        self.busy = false;
         Ok(())
     }
 
-    /// Re-open the handles (a newly shared cell joins the watch).
+    /// Re-open the handles (a newly shared cell joins the watch). Never
+    /// while a pass is armed or running: the re-ack would swallow the
+    /// pass's own writes mid-flight.
     ///
     /// # Errors
     /// [`Error::Db`] on SQL failure.
     pub fn refresh(&mut self) -> Result<()> {
+        if self.busy {
+            return Ok(());
+        }
         let watch = Self::new(&self.root)?;
         self.cells = watch.cells;
         self.last = watch.last;
+        self.marker = watch.marker;
+        self.fed.clear();
         Ok(())
     }
 }
@@ -610,48 +728,26 @@ fn unhex32(hex: &str) -> Option<[u8; 32]> {
 }
 
 /// The endpoint's direct socket addresses (what a ticket or a summary
-/// shows). A wildcard bind publishes as loopback: the address must be
-/// DIALABLE, and `0.0.0.0` is not.
+/// shows): the CONCRETE interfaces iroh discovered, and nothing else (K2)
+/// — no `0.0.0.0` (not dialable) and no invented `127.0.0.1` (loopback
+/// serves the same machine only: publishing it to other devices hands
+/// them a road that dies one machine away). A peer on this same machine
+/// reaches the endpoint through the real interfaces, which answer
+/// loopback traffic too; a test that runs on one machine writes the
+/// loopback addresses in the book by hand.
 #[must_use]
 pub fn direct_addresses(endpoint: &Endpoint) -> Vec<String> {
-    let mut out: Vec<String> = endpoint
+    endpoint
         .addr()
         .addrs
         .iter()
         .filter_map(|a| match a {
-            iroh::TransportAddr::Ip(socket) => {
-                if socket.ip().is_unspecified() {
-                    Some(
-                        std::net::SocketAddr::new(
-                            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                            socket.port(),
-                        )
-                        .to_string(),
-                    )
-                } else {
-                    Some(socket.to_string())
-                }
+            iroh::TransportAddr::Ip(socket) if !socket.ip().is_unspecified() => {
+                Some(socket.to_string())
             }
             _ => None,
         })
-        .collect();
-    // a wildcard bind answers on loopback too: publish it when the
-    // interface list does not (iroh reports the concrete interfaces it
-    // found, and some of them — a VPN's 100.64/10 — do not answer their
-    // own address from the same machine)
-    if !out.iter().any(|a| a.starts_with("127.0.0.1"))
-        && let Some(port) = out
-            .first()
-            .and_then(|a| a.rsplit(':').next())
-            .and_then(|p| p.parse::<u16>().ok())
-    {
-        out.push(format!("127.0.0.1:{port}"));
-    }
-    // loopback first: a peer on the same machine (the tests, a daemon
-    // beside the CLI) must not get stuck behind a virtual interface that
-    // does not answer its own address
-    out.sort_by_key(|a| !a.starts_with("127.0.0.1"));
-    out
+        .collect()
 }
 
 /// The endpoint's node id (its transport public key), raw.
