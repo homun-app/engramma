@@ -7745,6 +7745,20 @@ cambia lo **stato derivato** (copie diverse, in più o in meno), non la
    replay e arrivo — divergevano. La regola della lapide vince anche
    sulla durabilità: è ciò che la fase chiede («la regola della
    lapide resta quella di oggi»).
+   E la lapide ha una **seconda faccia**, trovata dalla proprietà di
+   monotonia (seme `8148618087815055854`): quando batte una punta,
+   l'insieme delle punte si stringe e il vincitore può cambiare — la
+   copia del perdente di prima, ora vincitore, chiude senza testimone.
+   E una **terza**, trovata dallo stesso seme: l'arrivo fuori ordine
+   di un'operazione mancante può **completare il grafo** e fare del
+   perdente il vincitore (la sua catena di `base` passa per
+   l'operazione arrivata: non era concorrente, era solo incompleta) —
+   la copia chiude perché l'insieme non la merita più, e il testo vive
+   nel corpo della nota. La proprietà di monotonia ammette le forme
+   che non passano da D1.6 — purga, lapide, i due filtri del punto 3,
+   e il grafo completato (il giudice `deserved_for_test` lo riconosce)
+   — e fallisce dove una copia ancora meritata sparisce senza
+   testimone: quello è il difetto che cerca.
 2. **Il testimone (b) si allarga di un caso: il discendente.** Una
    scrittura del corpo **che discende dal perdente** (la sua catena di
    `base` passa per lui) lo ha *visto per costruzione*: è un testimone

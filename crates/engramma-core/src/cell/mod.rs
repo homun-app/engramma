@@ -2190,6 +2190,21 @@ impl Cell {
         Ok((digest, dump))
     }
 
+    /// (v0.6.4, tests only) Does the current set still DESERVE a copy
+    /// for this loser? (the monotonicity judge's other half)
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn conflict_deserved_for_test(
+        &self,
+        original: &Ulid,
+        loser_op: &Ulid,
+    ) -> Result<bool, CellError> {
+        let inner = self.lock()?;
+        let tx = inner.conn.unchecked_transaction()?;
+        conflicts::deserved_for_test(&tx, original, loser_op)
+    }
+
     /// (v0.6.4, tests only) The monotonicity judge: does the SET hold a
     /// closure witness for the conflict copy born of one loser op?
     ///

@@ -969,6 +969,99 @@ pub fn conflicts(tx: &Transaction<'_>) -> Result<Vec<ConflictInfo>, CellError> {
     Ok(with_status)
 }
 
+/// (v0.6.4, tests only) Does the SET hold a closure witness for the
+/// conflict copy of one loser op — recomputed from the log alone, the
+/// same predicate the derivation applies? The monotonicity property
+/// uses this as its judge: a copy that was open and is no longer must
+/// have one.
+///
+/// # Errors
+/// [`CellError::Db`] on SQL failure; [`CellError::NoteNotFound`] when
+/// the op is no loser of any derivation.
+pub fn witness_for_test(
+    tx: &Transaction<'_>,
+    original: &Ulid,
+    loser_op: &Ulid,
+) -> Result<bool, CellError> {
+    let rows = scan(tx, original)?;
+    let loser = rows
+        .iter()
+        .position(|r| r.op_id == *loser_op)
+        .ok_or_else(|| CellError::NoteNotFound(loser_op.to_string()))?;
+    let applied: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.body.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    let (winner, _) = winner_and_candidates(&rows, &applied);
+    let Some(winner) = winner else {
+        return Ok(false);
+    };
+    let copy_id = material::conflict_copy_id(&rows[loser].hash, hlc_ms_of(&rows[loser].hlc));
+    has_witness(tx, &rows, loser, &applied, &copy_id, winner)
+}
+
+/// (v0.6.4, tests only) Does the CURRENT set still DESERVE a copy for
+/// this loser — is it an applied body write that is neither the winner
+/// nor one of its ancestors, with its filters passing? The monotonicity
+/// property's judge: a copy that goes may close unwitnessed when the
+/// set no longer deserves it (the purge, the lapide, a graph an
+/// out-of-order arrival completed — the loser became the winner); a
+/// DESERVED copy that goes without a witness is a defect.
+///
+/// # Errors
+/// [`CellError::Db`] on SQL failure; [`CellError::NoteNotFound`] when
+/// the op belongs to no derivation of the note.
+pub fn deserved_for_test(
+    tx: &Transaction<'_>,
+    original: &Ulid,
+    loser_op: &Ulid,
+) -> Result<bool, CellError> {
+    let rows = scan(tx, original)?;
+    let loser = rows
+        .iter()
+        .position(|r| r.op_id == *loser_op)
+        .ok_or_else(|| CellError::NoteNotFound(loser_op.to_string()))?;
+    let Some(facts) = rows[loser].body.as_ref() else {
+        // held by the lapide, or its payload is gone: not a tip at all
+        return Ok(false);
+    };
+    let applied: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.body.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    let (winner, _) = winner_and_candidates(&rows, &applied);
+    let Some(winner) = winner else {
+        return Ok(false);
+    };
+    if loser == winner {
+        return Ok(false);
+    }
+    let winner_past: std::collections::HashSet<usize> =
+        ancestors_of(&rows, winner).into_iter().collect();
+    if winner_past.contains(&loser) {
+        // the winner's author had seen it: no copy, the text lives on
+        return Ok(false);
+    }
+    // the filters (D1.5)
+    if rows[winner]
+        .body
+        .as_ref()
+        .is_some_and(|w| w.text == facts.text)
+    {
+        return Ok(false);
+    }
+    if let Some(fork) = nearest_common_ancestor(&rows, loser, winner)
+        && body_at_fork(&rows, Some(fork)).as_deref() == Some(facts.text.as_str())
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,37 +1130,4 @@ mod tests {
         );
         assert!(human > agent, "the class outranks the clock");
     }
-}
-
-/// (v0.6.4, tests only) Does the SET hold a closure witness for the
-/// conflict copy of one loser op — recomputed from the log alone, the
-/// same predicate the derivation applies? The monotonicity property
-/// uses this as its judge: a copy that was open and is no longer must
-/// have one.
-///
-/// # Errors
-/// [`CellError::Db`] on SQL failure; [`CellError::NoteNotFound`] when
-/// the op is no loser of any derivation.
-pub fn witness_for_test(
-    tx: &Transaction<'_>,
-    original: &Ulid,
-    loser_op: &Ulid,
-) -> Result<bool, CellError> {
-    let rows = scan(tx, original)?;
-    let loser = rows
-        .iter()
-        .position(|r| r.op_id == *loser_op)
-        .ok_or_else(|| CellError::NoteNotFound(loser_op.to_string()))?;
-    let applied: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.body.is_some())
-        .map(|(i, _)| i)
-        .collect();
-    let (winner, _) = winner_and_candidates(&rows, &applied);
-    let Some(winner) = winner else {
-        return Ok(false);
-    };
-    let copy_id = material::conflict_copy_id(&rows[loser].hash, hlc_ms_of(&rows[loser].hlc));
-    has_witness(tx, &rows, loser, &applied, &copy_id, winner)
 }

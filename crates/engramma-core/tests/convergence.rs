@@ -764,19 +764,19 @@ impl Fleet {
                 // that CONTAINS the loser, the diff3 closes the copy
                 if rng.below(3) == 0 {
                     let seen = open_copies_of(cell);
-                    if let Some((copy, _)) = seen.iter().find(|(_, orig)| *orig == id) {
-                        if let Ok(note) = cell.get(copy) {
-                            let merged = format!("{}\nfuso da {dev}", note.body);
-                            let _ = cell.patch_note(
-                                &id,
-                                &NotePatch {
-                                    body: Some(merged),
-                                    ..Default::default()
-                                },
-                                &actor_of(dev, rng),
-                            );
-                            return;
-                        }
+                    if let Some((copy, _)) = seen.iter().find(|(_, orig)| *orig == id)
+                        && let Ok(note) = cell.get(copy)
+                    {
+                        let merged = format!("{}\nfuso da {dev}", note.body);
+                        let _ = cell.patch_note(
+                            &id,
+                            &NotePatch {
+                                body: Some(merged),
+                                ..Default::default()
+                            },
+                            &actor_of(dev, rng),
+                        );
+                        return;
                     }
                 }
                 // a header-only patch in one write of four: the title
@@ -1074,7 +1074,7 @@ struct FleetRunner {
 
 impl FleetRunner {
     fn new(seed: u64, devices: u32) -> Self {
-        let mut rng = Rng(seed | 1);
+        let rng = Rng(seed | 1);
         let n = devices as usize;
         // device 0 is born bare and takes the shared init, minted here — the
         // init's op id, salt and cell id come from the seed stream like every
@@ -1139,7 +1139,7 @@ impl FleetRunner {
             }))
             .unwrap(/* test-only */);
         }
-        let mut fleet = Fleet {
+        let fleet = Fleet {
             cells,
             notes: Vec::new(),
             edges: Vec::new(),
@@ -1742,16 +1742,20 @@ proptest! {
                     if held.contains(copy) {
                         continue;
                     }
-                    // the two documented FILTER closures (REPORT, «prima
-                    // della correzione», point 3): the winner moved onto
-                    // the loser's own body, or the fork's body caught up.
-                    // The generator writes distinct bodies, so these
-                    // never fire here — anything else is a defect
+                    // admitted without a D1.6 witness: the purge and the
+                    // lapide (their own rules), and a set that no longer
+                    // DESERVES the copy (a graph an out-of-order arrival
+                    // completed made the loser the winner, or an ancestor
+                    // of it — the text lives in the note itself)
                     prop_assert!(
                         runner.fleet.cells[dev]
                             .conflict_witness_for_test(original, loser)
                             .unwrap_or(false)
-                            || original_purged(&runner.fleet.cells[dev], original),
+                            || original_purged(&runner.fleet.cells[dev], original)
+                            || lapide_active(&runner.fleet.cells[dev], original)
+                            || !runner.fleet.cells[dev]
+                                .conflict_deserved_for_test(original, loser)
+                                .unwrap_or(true),
                         "seed {seed}: copy {copy} closed without a witness"
                     );
                 }
@@ -1774,11 +1778,15 @@ proptest! {
                         .conflict_witness_for_test(original, loser)
                         .unwrap_or(false)
                         || original_purged(&runner.fleet.cells[dev], original)
-                        || lapide_active(&runner.fleet.cells[dev], original),
+                        || lapide_active(&runner.fleet.cells[dev], original)
+                        || !runner.fleet.cells[dev]
+                            .conflict_deserved_for_test(original, loser)
+                            .unwrap_or(true),
                     "seed {seed}: copy {copy} closed in the tail without a witness"
                 );
             }
         }
     }
 }
+
 
