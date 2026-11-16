@@ -1017,19 +1017,41 @@ pub(crate) fn purge_conflict_copies(
     tx: &rusqlite::Transaction<'_>,
     original: &Ulid,
 ) -> Result<(), CellError> {
-    let copies: Vec<String> = {
-        let mut stmt = tx.prepare("SELECT copy_id FROM conflict_copies WHERE original_id = ?1")?;
-        let rows = stmt.query_map([original.to_string()], |r| r.get::<_, String>(0))?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
-    for copy_id in copies {
-        let Ok(cid) = Ulid::from_string(&copy_id) else {
+    // v0.6.4: the purge reaches TRANSITIVELY — a copy that lived its own
+    // life (edited, resolved) carries copies of ITS conflicts, and the
+    // right to be forgotten reaches everything the text produced (found
+    // by the 20 000-case hunt, seed 4946564889653177402: the sub-copy
+    // lingered in the incremental state while the rebuild, whose base
+    // row the purge had taken, could no longer derive it)
+    let mut frontier = vec![format!("note:{original}")];
+    let mut seen: std::collections::HashSet<String> = frontier.iter().cloned().collect();
+    while let Some(object) = frontier.pop() {
+        let Some(id) = object.strip_prefix("note:") else {
+            continue;
+        };
+        let Ok(cid) = Ulid::from_string(id) else {
             continue;
         };
         delete_note_state(tx, &cid)?;
         super::vectors::delete_note_vectors(tx, &cid)?;
-        tx.execute("DELETE FROM conflict_copies WHERE copy_id = ?1", [copy_id])?;
-        clear_pending(tx, &format!("note:{cid}"))?;
+        let next: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT copy_id FROM conflict_copies WHERE original_id = ?1")?;
+            let rows = stmt.query_map([id.to_string()], |r| r.get::<_, String>(0))?;
+            rows.flatten().collect()
+        };
+        for copy_id in next {
+            tx.execute("DELETE FROM conflict_copies WHERE copy_id = ?1", [&copy_id])?;
+            tx.execute(
+                "DELETE FROM proposals WHERE note_id = ?1 AND state = 'pending'",
+                [&copy_id],
+            )?;
+            clear_pending(tx, &format!("note:{copy_id}"))?;
+            let object = format!("note:{copy_id}");
+            if seen.insert(object.clone()) {
+                frontier.push(object);
+            }
+        }
     }
     Ok(())
 }

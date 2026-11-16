@@ -1773,6 +1773,28 @@ fn original_purged(cell: &Cell, original: &Ulid) -> bool {
 /// with it. Wherever the original holds a delete, the conflict set
 /// follows the lapide, not the witnesses — the property hunts the
 /// derivation on the notes the lapide never touched.
+/// The original's derivation row is GONE. Only the purge ever removes
+/// the row of a copy that carries operations (every other path keeps it
+/// as the note's replay base): its absence says the purge took it — and
+/// the purge reaches the copies of copies, transitively.
+fn original_row_gone(cell: &Cell, original: &Ulid) -> bool {
+    cell.debug_column(&format!(
+        "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE original_id = '{original}'"
+    ))
+    .unwrap_or_default()
+    .first()
+    .is_some_and(|n| n == "0")
+        && cell
+            .debug_column(&format!(
+                "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
+                 JOIN op_objects oo ON oo.op_id = o.op_id
+                 WHERE oo.object = 'note:{original}'"
+            ))
+            .unwrap_or_default()
+            .first()
+            .is_some_and(|n| n != "0")
+}
+
 fn lapide_active(cell: &Cell, original: &Ulid) -> bool {
     cell.debug_column(&format!(
         "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
@@ -1842,6 +1864,7 @@ proptest! {
                         .conflict_witness_for_test(original, loser)
                         .unwrap_or(false)
                         || original_purged(&runner.fleet.cells[dev], original)
+                        || original_row_gone(&runner.fleet.cells[dev], original)
                         || lapide_active(&runner.fleet.cells[dev], original)
                         || !runner.fleet.cells[dev]
                             .conflict_deserved_for_test(original, loser)

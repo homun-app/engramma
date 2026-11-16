@@ -395,3 +395,63 @@ fn resolve_conflict_in_the_three_ways_and_concurrent_equal_resolutions() {
             .is_err()
     );
 }
+
+/// A note born from `propose`, patched concurrently (two baseless
+/// patches — the note never had a body write before): the copy must
+/// derive identically from the set. Found by the 20 000-case hunt.
+#[test]
+fn a_proposal_note_patch_concurrently_derives_the_copy() {
+    let init = shared_init("prop");
+    let (a, wa) = cell_with("a");
+    let (b, wb) = cell_with("b");
+    a.ingest_op(&init).unwrap(/* t */);
+    a.set_policy(serde_json::json!({ "write": "propose" }), "device-0")
+        .unwrap(/* t */);
+    // A proposes: the note is born quarantined, in the queue
+    let out = a
+        .propose(
+            &engramma_core::cell::proposals::ProposalInput {
+                note: base_note(81, "prima riga\nil corpo proposto\nterza riga"),
+                mode: engramma_core::cell::proposals::ProposalMode::New,
+                client: Some("test".into()),
+                reason: Some("perché".into()),
+            },
+            "device-0",
+            &engramma_core::cell::proposals::ProposeContext::default(),
+        )
+        .unwrap(/* t */);
+    let c0 = out.id.expect(/* mode new */ "the proposal note");
+    let ops_a: Vec<Op> =
+        a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "propose").collect();
+    b.ingest_op(&init).unwrap(/* t */);
+    b.ingest_op(&ops_a[0]).unwrap(/* t */);
+
+    // both patch the proposal note CONCURRENTLY (baseless: no op of that
+    // note existed before)
+    wa.store(K + 2, Ordering::SeqCst);
+    a.patch_note(
+        &c0,
+        &NotePatch { body: Some("prima riga\nla mano di A\nterza riga".into()), ..Default::default() },
+        "user",
+    )
+    .unwrap(/* t */);
+    wb.store(K + 9, Ordering::SeqCst);
+    b.patch_note(
+        &c0,
+        &NotePatch { body: Some("prima riga\nla mano di B\nterza riga".into()), ..Default::default() },
+        "homun:bot-1",
+    )
+    .unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    for cell in [&a, &b] {
+        let copies = open_copies(cell, &c0);
+        assert_eq!(copies.len(), 1, "one copy on the proposal note: {copies:?}");
+        assert_eq!(copies[0].2, "quarantined", "the agent's copy");
+        let (live, _) = (cell.replicated_digest().unwrap(/* t */), ());
+        let (rebuilt, _) = cell.rematerialize_for_test().unwrap(/* t */);
+        assert_eq!(live, rebuilt, "the oracle agrees");
+    }
+}

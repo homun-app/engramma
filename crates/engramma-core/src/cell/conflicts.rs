@@ -899,6 +899,40 @@ pub(crate) fn after_body_write(
     original: &Ulid,
     arriving: &Op,
 ) -> Result<(), CellError> {
+    // the snapshot this op just wrote holds the PRE-arrival body — the
+    // state a sequential replay would have snapshot only when the
+    // correction was NOT in effect. Compare THAT (the post-apply body
+    // can coincide with the newest write even when the pre-body was
+    // the corrected one, and the wrong snapshot would stay — found by
+    // the hunt, seed 3806138527623646080)
+    if arriving.kind == OpKind::PatchNote {
+        let pre_body: Option<String> = tx
+            .query_row(
+                "SELECT json_extract(snapshot_json, '$.body') FROM note_versions
+                 WHERE note_id = ?1 AND op_id = ?2",
+                rusqlite::params![original.to_string(), arriving.op_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(pre) = pre_body {
+            let rows = scan(tx, original)?;
+            if let Some(newest) = rows
+                .iter()
+                .filter(|r| {
+                    r.body.is_some()
+                        && Some(r.hash.as_str()) != Some(arriving.content_hash.as_str())
+                })
+                .max_by(|a, b| {
+                    (a.hlc.as_str(), a.op_id.to_string())
+                        .cmp(&(b.hlc.as_str(), b.op_id.to_string()))
+                })
+                && let Some(facts) = newest.body.as_ref()
+                && facts.text != pre
+            {
+                return material::materialize(tx, &format!("note:{original}"));
+            }
+        }
+    }
     if needs_replay(tx, original, Some(&arriving.content_hash))? {
         return material::materialize(tx, &format!("note:{original}"));
     }
