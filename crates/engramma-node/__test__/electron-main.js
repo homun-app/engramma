@@ -4,6 +4,9 @@
 // a Node run (`ELECTRON_RUN_AS_NODE`). This is the proof the module loads
 // and works in a real MAIN process: it opens an engine, writes, searches,
 // closes, checks CLOSED and exits 0 — `npm run test:electron-main`.
+// v0.6.2 (S4): the sync service too — started, then `app.quit()` with the
+// service ON: the process must END (a daemon that exits does not hang on
+// a thread of ours).
 
 const { app } = require('electron');
 const fs = require('node:fs');
@@ -48,6 +51,18 @@ app.whenReady().then(async () => {
     }
     if (!closed) throw new Error('get dopo close non ha risposto CLOSED');
 
+    // v0.6.2 (S4): the sync service in the main process — start it, then
+    // quit with it ON: the process ends within the harness's bound
+    const e2 = await Engine.open({
+      root: path.join(tmp, 'root-sync'),
+      embedder: 'none',
+      actor: 'homun',
+    });
+    const sync = await e2.sync({ deviceName: 'portatile', relay: 'none' });
+    const info = await sync.start();
+    if (!info.node) throw new Error('il servizio non ha pubblicato il nodo');
+    // app.quit() fires below with the service still on: if a thread of
+    // ours held the process, the 10 s bound of the runner would catch it
     console.log(`electron-main ok — engramma-node ${version()}`);
   } catch (err) {
     console.error('electron-main FAILED:', err);

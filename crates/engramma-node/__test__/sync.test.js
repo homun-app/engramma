@@ -144,6 +144,23 @@ test('after close, sync answers CLOSED', async () => {
   await e.close();
 });
 
+test('S4: stop() during a pass concludes within 5 s', async () => {
+  const e = await engine();
+  const sync = await e.sync({ relay: 'none' });
+  await sync.start();
+  const cell = await e.cell('memoria');
+  await cell.put({ body: 'scritta che parte', source: 'homun', confidence: 'stated' });
+  // a pass fires ~2.5 s after the write (watch + debounce): stop right
+  // in the middle of it — it must conclude well within the bound
+  await new Promise((r) => setTimeout(r, 2600));
+  const t0 = Date.now();
+  await sync.stop();
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 5000, `stop() ha impiegato ${elapsed} ms`);
+  assert.equal((await sync.status()).serving, false);
+  await e.close();
+});
+
 test('a second Engine on the same root answers SYNC_BUSY at start', async () => {
   const dir = root();
   const e1 = await Engine.open({ root: dir, embedder: 'none', actor: 'homun' });

@@ -1266,6 +1266,10 @@ impl Task for CellOpenTask {
         // flight serializes against every open of that name. v0.4.3 (P2.3):
         // gate AND open under the SAME lock — see open_tracked_cell
         let (cell, tracker) = self.handle.open_tracked_cell(&self.name, self.create)?;
+        // v0.6.2 (S4): a SHARED cell's local writes carry their device's
+        // signature, or the peers' gate refuses them (the CLI arms the
+        // signer at every open; the binding arms at open and at share)
+        arm_shared_signer(&self.handle.root, &cell, &self.name);
         let actor = match &self.actor {
             // v0.4.1 (P1.6): an empty actor is the same as none — the
             // engine's own stamps the writes
@@ -1548,10 +1552,13 @@ impl Task for DropCellTask {
             return Err(invalid_argument("reason è obbligatoria"));
         }
         // v0.6.2 (S2): a SHARED cell does not go quietly — the service
-        // would keep syncing a deleted file. Say it, refuse it.
-        if let Ok(shared) =
-            engramma_sync::service::cell_is_shared(&self.handle.root, &self.name)
-            && shared
+        // would keep syncing a deleted file. Say it, refuse it. (One stat
+        // first: a root without devices.db never shared anything, and the
+        // drop path must stay as fast as it was for the engines that
+        // never sync.)
+        if self.handle.root.join("devices.db").exists()
+            && engramma_sync::service::cell_is_shared(&self.handle.root, &self.name)
+                .unwrap_or(false)
         {
             return Err(transport_err(
                 "CONFLICT",
@@ -2940,6 +2947,8 @@ fn parse_relay(v: Option<serde_json::Value>) -> Result<Option<engramma_sync::rel
 pub struct SyncDeviceView {
     /// The name its owner chose.
     pub name: String,
+    /// The device id, hex (the signing public key).
+    pub device: String,
     /// The first 8 characters of the device id.
     pub short_id: String,
     /// Is it THIS device?
@@ -3204,6 +3213,7 @@ fn devices_view(v: Vec<engramma_sync::service::DeviceView>) -> Vec<SyncDeviceVie
     v.into_iter()
         .map(|d| SyncDeviceView {
             name: d.name,
+            device: d.device,
             short_id: d.short_id,
             is_self: d.is_self,
             last_contact: d.last_contact,
@@ -3217,6 +3227,7 @@ fn status_view(v: engramma_sync::service::StatusView) -> SyncStatusView {
     SyncStatusView {
         device: SyncDeviceView {
             name: v.device.name,
+            device: v.device.device,
             short_id: v.device.short_id,
             is_self: v.device.is_self,
             last_contact: v.device.last_contact,
@@ -3287,6 +3298,7 @@ impl Task for SyncOpenTask {
     fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
         Ok(Sync {
             service: out.0,
+            handle: self.handle.clone(),
             hub: out.1,
             device_name: out.2,
             relay: out.3,
@@ -3304,6 +3316,7 @@ impl Task for SyncOpenTask {
 #[napi(js_name = "Sync")]
 pub struct Sync {
     service: Arc<SyncService>,
+    handle: EngineHandle,
     hub: Arc<EventHub>,
     device_name: String,
     relay: Option<engramma_sync::relay::RelayChoice>,
@@ -3314,11 +3327,34 @@ impl Sync {
     fn enter(&self, env: Env) -> Result<GateGuard> {
         self.gate.enter_now().map_err(|e| recode(env, e))
     }
+
+    fn engine_handle(&self) -> EngineHandle {
+        self.handle.clone()
+    }
 }
 
 /// The service's refusals cross the async fence with their code.
 fn io_sync(e: engramma_sync::service::ServiceError) -> Error {
     sync_error(e)
+}
+
+/// Arm the device's operation signer on a cell of a SHARED root, as the
+/// CLI does at every open: from the share on, every LOCAL write carries
+/// its device's signature, or the peers' arrival gate refuses it.
+fn arm_shared_signer(root: &std::path::Path, cell: &CoreCell, name: &str) {
+    // a root without devices.db never shared anything: one stat, no
+    // SQLite — the open path must stay cheap for the engines that never
+    // sync (the 200-open race of v0.4.3 P2.3 runs right through here)
+    if !root.join("devices.db").exists() {
+        return;
+    }
+    let shared = engramma_sync::service::cell_is_shared(root, name).unwrap_or(false);
+    if !shared {
+        return;
+    }
+    if let Ok(dk) = engramma_sync::device::DeviceKey::load_or_create(root) {
+        let _ = cell.set_signer(Arc::new(engramma_sync::arrival::DeviceSigner::new(&dk)));
+    }
 }
 
 pub struct SyncStatusTask {
@@ -3396,8 +3432,15 @@ impl Task for SyncRemoveTask {
 
 pub struct SyncShareTask {
     service: Arc<SyncService>,
+    handle: EngineHandle,
     cell: String,
     _open: GateGuard,
+}
+
+impl SyncShareTask {
+    fn handle_shared_cell(&self) -> Result<CoreCell> {
+        self.handle.open_cell(&self.cell, false)
+    }
 }
 
 impl Task for SyncShareTask {
@@ -3405,7 +3448,12 @@ impl Task for SyncShareTask {
     type JsValue = ShareView;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        self.service.share(&self.cell).map_err(io_sync)
+        let out = self.service.share(&self.cell).map_err(io_sync)?;
+        // the ENGINE's own handles of this cell start signing now too
+        if let Ok(cell) = self.handle_shared_cell() {
+            arm_shared_signer(&self.handle.root, &cell, &self.cell);
+        }
+        Ok(out)
     }
 
     fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
@@ -3788,6 +3836,7 @@ impl Sync {
     ) -> Result<AsyncTask<SyncShareTask>> {
         Ok(AsyncTask::new(SyncShareTask {
             service: Arc::clone(&self.service),
+            handle: self.engine_handle(),
             cell,
             _open: self.enter(env)?,
         }))
@@ -3854,7 +3903,7 @@ impl Sync {
     ) -> Result<napi::sys::napi_value> {
         let tsfn = cb
             .build_threadsafe_function::<(serde_json::Value,)>()
-            .build_callback(|ctx| Ok(ctx.value))?;
+            .build_callback(|ctx| Ok(ctx.value.0))?;
         let listener: Listener = Box::new(move |event: serde_json::Value| {
             tsfn.call(
                 (event,),
