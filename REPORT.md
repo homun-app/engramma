@@ -6890,3 +6890,91 @@ resta non raggiunta e dichiarata.
 tetto del +10%, con la scomposizione che dice dove va: il commit, non
 la CPU. Sarà l'utente a decidere se accettarla come prezzo della
 convergenza.
+
+# Verifica v0.6.1 dopo la chiusura K1–K4
+
+Data: 2026-11-16. Revisore. Base: `main` @ `1353f64` (tag `fase-v0.6.1`).
+
+## Regge
+
+- **K1, il ciclo a riposo.** Una copia della misura C4 con
+  `ENGRAMMA_TRACE=1`, stderr in un file, 8 scritture e 30 s di silenzio
+  (test di scratch, cancellato): su A **8 passate per 8 scritture, zero
+  nel silenzio**; su B **zero passate** verso A. Latenza mediana
+  **2248 ms**, p95 **2302 ms**; senza rimbalzo 248 / 302 ms. Sopra il
+  rimbalzo, come deve essere.
+- **K2.** `PeerAddr::dial` è una sola `endpoint.connect` con tutti gli
+  indirizzi più il relay e un tetto di 10 s; niente loopback negli
+  indirizzi per gli altri.
+- **K3.** Fatte; la scelta degli stream unidirezionali è motivata.
+- **K4, il codice.** `prepare_cached`, `INSERT … RETURNING`, `op_objects`
+  multiriga: meccanico, a basso rischio.
+- **Suite.** macOS: fmt, clippy, 60 suite verdi, `cargo deny` pulito.
+  Convergenza a **2048 casi verde (81 s)** più **512 × 5** verdi
+  (21–23 s ciascuna). Linux (`scripts/linux.sh`): 59 suite verdi.
+- **Il binding.** `engramma.darwin-arm64.node` sul disco ha lo SHA256 del
+  REPORT, `bdb32610…`. Non l'ho ricostruito io.
+
+## K4 — la soglia d'inserimento, NON raggiunta e accettata
+
+Una coppia alternata, `--notes 10000 --runs 5`, release, base
+`fase-v0.5.3` in un worktree con target suo, `TMPDIR` separati:
+
+| corsa | inserimento viva | inserimento uniform | p95 testo+grafo viva / uniform |
+|---|---|---|---|
+| base v0.5.3 | 3192 note/s | 3232 | 2,0 / 1,9 ms |
+| v0.6.1 dopo K4 | 2523 | 2480 | 2,1 / 2,0 |
+
+- **Inserimento: +26% / +30% di tempo.** Tetto +10%: **NON raggiunta.**
+- **p95 testo+grafo:** +5% / +5%, cioè un passo di 0,1 ms: dentro il
+  rumore.
+- La seconda coppia l'ho fermata: con questa sono **cinque coppie
+  indipendenti** (due del revisore prima di K4, due di GLM, questa), tutte
+  fra +15% e +30%. Nessuna corsa in più può riportare la soglia sotto il
+  +10%.
+
+**La decisione dell'utente (2026-11-16): il costo è accettato** come
+prezzo della convergenza. In assoluto sono ~0,1 ms in più per nota
+(10.000 note da ~3,1 a ~4 s); le scritture di Homun arrivano una alla
+volta. La strada per recuperarlo, se servirà, è raggruppare più
+operazioni in un commit solo: il profilo di GLM dice che il 67% del tempo
+è il commit, non la firma.
+
+## Due casi limite del guardiano (minori, non bloccanti)
+
+`DataVersionWatch::evaluate` somma il delta di tutte le celle:
+- un `purge` in una cella può coprire una scrittura in un'altra;
+- una busta respinta ma contata come ricevuta può far leggere come
+  «ricevuta» una scrittura locale.
+
+In entrambi i casi la passata periodica di 5 minuti recupera. Da
+chiudere quando si tocca di nuovo il ciclo: un segnaposto per cella.
+
+## Trovato in verifica: i test riempivano il disco
+
+`convergence.rs`, `identity.rs` e `sync_serve_cli.rs` chiamavano
+`std::mem::forget` sulla `TempDir`. Ogni copia lasciava la sua cartella in
+`$TMPDIR`; una verifica di convergenza ne lasciava ~15.000. Trovate
+**91.959 cartelle, ~28 GB**, disco con 3,7 GB liberi.
+
+- Cancellate solo le cartelle con file dei test di Engramma (`*.sqlite`,
+  `nota.md`): il disco torna a 34 GB liberi.
+- Corretto in `19d2e9e`: `Kept { cell, _dir }` con `Deref<Target = Cell>`,
+  `Fleet` tiene le cartelle in `_dirs`. `convergence` e `identity` verdi,
+  le cartelle `.tmp*` restano 11 prima e dopo.
+
+## Per la prossima fase
+
+- Il banco carica i due modelli semantici a ogni giro: una misura di sola
+  scrittura dura ~45 min. Serve un modo di girare solo `viva` e `uniform`
+  (~5 min).
+- Il segnaposto per cella del guardiano, qui sopra.
+
+## Disco
+
+`du -sh target`: 15 G all'inizio e alla fine. Worktree e target della
+base cancellati, temporanei delle misure cancellati, nessun processo
+lasciato acceso.
+
+**Verdetto: la v0.6.1 è chiusa.** K1–K3 reggono; K4 resta NON raggiunta,
+dichiarata e accettata dall'utente.
