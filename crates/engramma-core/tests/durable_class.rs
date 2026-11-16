@@ -153,7 +153,7 @@ fn the_human_hand_wins_even_older_and_the_agent_loser_is_quarantined() {
         assert_eq!(copies[0].2, "active", "a human loser's copy is active, as ever");
         let queue: Vec<String> = cell
             .debug_column(&format!(
-                "SELECT COUNT(*) FROM proposals WHERE note_id = '{}'",
+                "SELECT CAST(COUNT(*) AS TEXT) FROM proposals WHERE note_id = '{}'",
                 copies[0].0
             ))
             .unwrap(/* t */);
@@ -259,7 +259,7 @@ fn five_branches_winner_by_class_four_copies_and_the_cap_of_three() {
     // row holds it, and conflicts() will list it (D3)
     let hidden: Vec<String> = x
         .debug_column(&format!(
-            "SELECT COUNT(*) FROM conflict_copies WHERE original_id = '{id}'"
+            "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE original_id = '{id}'"
         ))
         .unwrap(/* t */);
     assert_eq!(hidden, vec!["4".to_string()], "four derivations, three visible");
@@ -278,12 +278,11 @@ fn five_branches_winner_by_class_four_copies_and_the_cap_of_three() {
         after.iter().all(|(i, _, _)| i != closed),
         "the resolved copy is gone from the list"
     );
-    // the same closure reaches the other order's copy of the cell
-    y.delete_note(
-        &Ulid::from_string(closed).unwrap(/* t */),
-        "user",
-    )
-    .unwrap(/* t */);
+    // the same closure reaches the other order's copy of the cell — as
+    // an ARRIVAL, the same operation the writer wrote
+    for op in &x.ops().unwrap(/* t */) {
+        y.ingest_op(op).unwrap(/* t */);
+    }
     assert_eq!(
         x.replicated_digest().unwrap(/* t */),
         y.replicated_digest().unwrap(/* t */),

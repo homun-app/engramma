@@ -10,10 +10,8 @@ mod common;
 
 use common::*;
 use engramma_core::cell::ops::Op;
-use engramma_core::NotePatch;
-use engramma_core::Cell;
+use engramma_core::{Cell, NotePatch, ResolveKeep};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use ulid::Ulid;
 
 /// D1: a title patch on the original does NOT close the copy. The copy
@@ -236,4 +234,143 @@ fn a_hand_merge_closes_the_copy_and_a_later_delete_does_not_reopen_it() {
             "the witness is an existence: deleting the phrase does not reopen the copy"
         );
     }
+}
+
+/// D3: `resolveConflict` in its three ways — `original` (the delete on
+/// the copy's id), `copy` (the copy's body becomes the original's),
+/// `merged` (the body given by hand) — and the two errors of the
+/// contract: an unknown id is `NOT_FOUND`, a closed copy is
+/// `CONFLICT`. Two concurrent resolutions with EQUAL bodies create
+/// nothing new: the equal-body filter holds, and the second delete
+/// lands on the copy's tombstone.
+#[test]
+fn resolve_conflict_in_the_three_ways_and_concurrent_equal_resolutions() {
+    let mk = |tag: &str| -> (Kept, Kept, Ulid) {
+        let init = shared_init(tag);
+        let (a, wa) = cell_with("a");
+        let (b, wb) = cell_with("b");
+        a.ingest_op(&init).unwrap(/* t */);
+        b.ingest_op(&init).unwrap(/* t */);
+        let note = base_note(61, "alpha\nbeta\ngamma");
+        let id = note.id;
+        wa.store(K + 1, Ordering::SeqCst);
+        a.put_note(&note, "user").unwrap(/* t */);
+        let put: Vec<Op> = a
+            .ops()
+            .unwrap(/* t */)
+            .into_iter()
+            .filter(|o| o.kind.as_str() == "put_note")
+            .collect();
+        b.ingest_op(&put[0]).unwrap(/* t */);
+        // the agent's body loses to the human's: the copy opens
+        wb.store(K + 2, Ordering::SeqCst);
+        b.patch_note(
+            &id,
+            &NotePatch {
+                body: Some("alpha\nX\ngamma".into()),
+                ..Default::default()
+            },
+            "homun:bot-7",
+        )
+        .unwrap(/* t */);
+        wa.store(K + 3, Ordering::SeqCst);
+        a.patch_note(
+            &id,
+            &NotePatch {
+                body: Some("il corpo della mano umana".into()),
+                ..Default::default()
+            },
+            "user",
+        )
+        .unwrap(/* t */);
+        for op in &union(&a, &b) {
+            a.ingest_op(op).unwrap(/* t */);
+            b.ingest_op(op).unwrap(/* t */);
+        }
+        (a, b, id)
+    };
+    let open_ids = |cell: &Cell, id: &Ulid| -> Vec<String> {
+        open_copies(cell, id).into_iter().map(|(i, _, _)| i).collect()
+    };
+
+    // original: the copy closes, the original keeps its body
+    let (a, _b, id) = mk("res-orig");
+    let list = a.conflicts().unwrap(/* t */);
+    assert_eq!(list.len(), 1);
+    let copy = list[0].copy_id;
+    assert_eq!(list[0].original_id, id);
+    assert_eq!(list[0].loser_actor, "homun:bot-7");
+    assert!(list[0].quarantined, "an agent's copy is in quarantine");
+    assert!(list[0].visible, "one copy: visible");
+    a.resolve_conflict(&copy, ResolveKeep::Original, None, "user").unwrap(/* t */);
+    assert!(open_ids(&a, &id).is_empty(), "original: the copy closed");
+    assert!(
+        a.conflicts().unwrap(/* t */).is_empty(),
+        "the list is empty after the resolution"
+    );
+    let body: Vec<String> = a
+        .debug_column(&format!("SELECT body FROM notes WHERE id = '{id}'"))
+        .unwrap(/* t */);
+    assert_eq!(body[0], "il corpo della mano umana");
+    // resolving again: the copy is closed — CONFLICT
+    match a.resolve_conflict(&copy, ResolveKeep::Original, None, "user") {
+        Err(engramma_core::CellError::Conflict(_)) => {}
+        other => panic!("a closed copy is a CONFLICT, got {other:?}"),
+    }
+    // an id that is no conflict copy at all — NOT_FOUND
+    let stranger = Ulid::from_string("01AAAAAAAAAAAAAAAAAAAAAAAA").unwrap(/* t */);
+    match a.resolve_conflict(&stranger, ResolveKeep::Original, None, "user") {
+        Err(engramma_core::CellError::NoteNotFound(_)) => {}
+        other => panic!("an unknown id is NOT_FOUND, got {other:?}"),
+    }
+
+    // copy: the copy's body becomes the original's
+    let (a, b, id) = mk("res-copy");
+    let copy = a.conflicts().unwrap(/* t */)[0].copy_id;
+    a.resolve_conflict(&copy, ResolveKeep::Copy, None, "user").unwrap(/* t */);
+    let body: Vec<String> = a
+        .debug_column(&format!("SELECT body FROM notes WHERE id = '{id}'"))
+        .unwrap(/* t */);
+    assert_eq!(body[0], "alpha\nX\ngamma", "copy: the loser's body won by hand");
+    assert!(open_ids(&a, &id).is_empty());
+    // the same resolution, CONCURRENTLY, on the other device: equal
+    // bodies — nothing new is born
+    b.resolve_conflict(&copy, ResolveKeep::Copy, None, "user").unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    for cell in [&a, &b] {
+        assert!(
+            cell.conflicts().unwrap(/* t */).is_empty(),
+            "two equal concurrent resolutions create nothing"
+        );
+        assert_eq!(
+            cell.replicated_digest().unwrap(/* t */),
+            a.replicated_digest().unwrap(/* t */),
+            "the two devices agree"
+        );
+    }
+
+    // merged: the body given by hand
+    let (a, _b, id) = mk("res-merged");
+    let copy = a.conflicts().unwrap(/* t */)[0].copy_id;
+    a.resolve_conflict(
+        &copy,
+        ResolveKeep::Merged,
+        Some("alpha\nX e la frase della mano umana\ngamma"),
+        "user",
+    )
+    .unwrap(/* t */);
+    let body: Vec<String> = a
+        .debug_column(&format!("SELECT body FROM notes WHERE id = '{id}'"))
+        .unwrap(/* t */);
+    assert_eq!(body[0], "alpha\nX e la frase della mano umana\ngamma");
+    assert!(open_ids(&a, &id).is_empty());
+    // merged without a body is a usage error
+    let (a2, _b2, _id2) = mk("res-merged-err");
+    let copy2 = a2.conflicts().unwrap(/* t */)[0].copy_id;
+    assert!(a2
+        .resolve_conflict(&copy2, ResolveKeep::Merged, None, "user")
+        .is_err());
 }

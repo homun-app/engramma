@@ -216,6 +216,9 @@ struct PlannedCopy {
     note: Note,
     quarantined: bool,
     visible: bool,
+    /// False for a closed-with-operations loser: the row stays as the
+    /// birth base of a note that lives on, listed by no conflict.
+    open: bool,
 }
 
 /// One raw scan row: `(op_id, hlc, actor, kind, base, content_hash,
@@ -483,24 +486,36 @@ pub(crate) fn after_replay(
     for loser in candidates {
         let facts = rows[loser].body.as_ref().expect(/* just checked */ "applied body write");
         // the filters (D1.5): no copy for a body equal to the winner's,
-        // none for a body the fork already had
-        if let Some(w) = &plan.winner_body
-            && *w == facts.text
+        // none for a body the fork already had. A filtered loser the
+        // user made theirs keeps its birth row, like every closed one.
+        let fork_same = match winner
+            .and_then(|w| nearest_common_ancestor(&rows, loser, w))
         {
-            continue;
-        }
-        if let Some(w) = winner
-            && let Some(fork) = nearest_common_ancestor(&rows, loser, w)
-            && let Some(fork_body) = body_at_fork(&rows, Some(fork))
-            && fork_body == facts.text
-        {
-            continue;
-        }
+            Some(fork) => body_at_fork(&rows, Some(fork)).as_deref() == Some(facts.text.as_str()),
+            None => false,
+        };
+        let filtered =
+            plan.winner_body.as_deref() == Some(facts.text.as_str()) || fork_same;
         let copy_id = material::conflict_copy_id(&rows[loser].hash, hlc_ms_of(&rows[loser].hlc));
-        if let Some(w) = winner
-            && has_witness(tx, &rows, loser, &applied, &copy_id, w)?
-        {
-            continue;
+        let witnessed = match winner {
+            Some(w) => has_witness(tx, &rows, loser, &applied, &copy_id, w)?,
+            None => false,
+        };
+        let mut open = true;
+        if filtered || witnessed {
+            // closed. But a copy the user made THEIRS (an edit, the
+            // resolving delete, a decision) keeps its BIRTH ROW — it is
+            // the replay base of a note that lives on, and a rebuild
+            // from the log alone must land on it
+            let has_ops: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM op_objects WHERE object = ?1",
+                [format!("note:{copy_id}")],
+                |r| r.get(0),
+            )?;
+            if has_ops == 0 {
+                continue;
+            }
+            open = false;
         }
         let Some(state) = states.get(&rows[loser].hash) else {
             continue;
@@ -526,16 +541,22 @@ pub(crate) fn after_replay(
             note,
             quarantined,
             visible: false,
+            open,
         });
     }
-    // the cap: the three most recent open copies (total order) are
+    // the cap: the three most recent OPEN copies (total order) are
     // visible; the others stay open and wait for a window
     plan.copies.sort_by(|a, b| {
         (a.loser_hlc.clone(), a.loser_op.to_string()).cmp(&(b.loser_hlc.clone(), b.loser_op.to_string()))
     });
-    let first_visible = plan.copies.len().saturating_sub(VISIBLE_COPIES_CAP);
-    for (i, c) in plan.copies.iter_mut().enumerate() {
-        c.visible = i >= first_visible;
+    let open_count = plan.copies.iter().filter(|c| c.open).count();
+    let mut open_seen = 0_usize;
+    for c in plan.copies.iter_mut() {
+        if !c.open {
+            continue;
+        }
+        open_seen += 1;
+        c.visible = open_seen + VISIBLE_COPIES_CAP > open_count;
     }
     apply(tx, original, &plan)
 }
@@ -596,10 +617,10 @@ fn apply(tx: &Transaction<'_>, original: &Ulid, plan: &Plan) -> Result<(), CellE
         tx.execute(
             "INSERT INTO conflict_copies (copy_id, original_id, loser_op, state_json,
                                           loser_actor, loser_hlc, open, visible)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?8, ?7)
              ON CONFLICT(copy_id) DO UPDATE SET
                 original_id = ?2, loser_op = ?3, state_json = ?4,
-                loser_actor = ?5, loser_hlc = ?6, open = 1, visible = ?7",
+                loser_actor = ?5, loser_hlc = ?6, open = ?8, visible = ?7",
             rusqlite::params![
                 copy.copy_id.to_string(),
                 original.to_string(),
@@ -607,7 +628,8 @@ fn apply(tx: &Transaction<'_>, original: &Ulid, plan: &Plan) -> Result<(), CellE
                 copy.note.to_json().to_string(),
                 copy.loser_actor,
                 copy.loser_hlc,
-                i64::from(copy.visible)
+                i64::from(copy.visible),
+                i64::from(copy.open)
             ],
         )?;
         if copy.visible {
@@ -1015,4 +1037,37 @@ mod tests {
         );
         assert!(human > agent, "the class outranks the clock");
     }
+}
+
+/// (v0.6.4, tests only) Does the SET hold a closure witness for the
+/// conflict copy of one loser op — recomputed from the log alone, the
+/// same predicate the derivation applies? The monotonicity property
+/// uses this as its judge: a copy that was open and is no longer must
+/// have one.
+///
+/// # Errors
+/// [`CellError::Db`] on SQL failure; [`CellError::NoteNotFound`] when
+/// the op is no loser of any derivation.
+pub fn witness_for_test(
+    tx: &Transaction<'_>,
+    original: &Ulid,
+    loser_op: &Ulid,
+) -> Result<bool, CellError> {
+    let rows = scan(tx, original)?;
+    let loser = rows
+        .iter()
+        .position(|r| r.op_id == *loser_op)
+        .ok_or_else(|| CellError::NoteNotFound(loser_op.to_string()))?;
+    let applied: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.body.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    let (winner, _) = winner_and_candidates(&rows, &applied);
+    let Some(winner) = winner else {
+        return Ok(false);
+    };
+    let copy_id = material::conflict_copy_id(&rows[loser].hash, hlc_ms_of(&rows[loser].hlc));
+    has_witness(tx, &rows, loser, &applied, &copy_id, winner)
 }

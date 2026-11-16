@@ -7,7 +7,7 @@
 
 use engramma_core::cell::ops::Op;
 use engramma_core::format::{At, Note, NoteType};
-use engramma_core::{Cell, Confidence, NotePatch, Status};
+use engramma_core::{Cell, Confidence, Status};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -142,7 +142,7 @@ pub fn open_copies(cell: &Cell, original: &Ulid) -> Vec<(String, String, String)
     cell.debug_column(&format!(
         "SELECT n.id || '' || n.body || '' || n.status FROM notes n
          JOIN note_tags t ON t.note_id = n.id
-         WHERE t.tag = 'conflitto' AND n.id != '{}'
+         WHERE t.tag = 'conflitto' AND n.id != '{}' AND n.status != 'deleted'
          ORDER BY n.id",
         original
     ))

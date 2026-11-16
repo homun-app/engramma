@@ -322,9 +322,12 @@ fn the_losing_body_becomes_a_conflict_copy() {
             copies[0].contains(loser),
             "the copy holds the loser's body: {copies:?}"
         );
+        // v0.6.4 (D2): `device-*` actors are agents — the loser's copy is
+        // born in QUARANTINE, in the queue, not active. The copy itself,
+        // its tag, its body and its deterministic id are as v0.6 had them.
         assert!(
-            copies[0].contains("active"),
-            "the copy is active: {copies:?}"
+            copies[0].contains("quarantined"),
+            "an agent's copy is born in quarantine: {copies:?}"
         );
         let copy_id = copies[0].split(" | ").next().unwrap(/* test-only */).to_string();
         let edge: Vec<String> = cell
@@ -682,6 +685,9 @@ enum Write {
     Propose,
     Decide,
     Purge,
+    /// v0.6.4: delete an OPEN COPY the device can see — the witness (a)
+    /// of a resolution
+    CloseCopy,
 }
 
 struct Rng(u64);
@@ -711,6 +717,26 @@ struct Fleet {
     _dirs: Vec<tempfile::TempDir>,
 }
 
+/// v0.6.4: the actor of one write — both classes, so the fleet hunts
+/// the human-before-agent rule. Two hands in five are human.
+fn actor_of(dev: usize, rng: &mut Rng) -> String {
+    match rng.below(5) {
+        0 => "user".into(),
+        1 => format!("user@mcp:etichetta-{dev}"),
+        _ => format!("device-{dev}"),
+    }
+}
+
+/// The open copies a device SEES (visible ones — those with a notes row).
+fn open_copies_of(cell: &Cell) -> Vec<(Ulid, Ulid)> {
+    cell.conflicts()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.visible)
+        .map(|c| (c.copy_id, c.original_id))
+        .collect()
+}
+
 impl Fleet {
     fn write(&mut self, dev: usize, w: &Write, rng: &mut Rng) {
         let cell = &self.cells[dev];
@@ -721,33 +747,73 @@ impl Fleet {
             Write::Put => {
                 let i = self.notes.len() as u32 + 1;
                 let body = format!(
-                    "nota {i} scritta da {dev}: {}",
+                    "nota {i} scritta da {dev}\n{}\nfine",
                     ["gatto", "tonno", "treno", "orto"][rng.below(4) as usize]
                 );
                 let n = base_note(90 + i, &body);
                 self.notes.push(n.id);
-                let _ = cell.put_note(&n, &format!("device-{dev}"));
+                let _ = cell.put_note(&n, &actor_of(dev, rng));
             }
             Write::Patch => {
-                if let Some(id) = pick(&self.notes, rng) {
-                    let body = format!(
-                        "il corpo di {dev} su {}: {}",
-                        id,
-                        ["rosso", "blu", "verde"][rng.below(3) as usize]
-                    );
+                let Some(id) = pick(&self.notes, rng) else {
+                    return;
+                };
+                // the hand merge: when this device SEES an open copy of
+                // the note, one write in three takes the copy's body and
+                // appends a line of its own — over a middle-line change
+                // that CONTAINS the loser, the diff3 closes the copy
+                if rng.below(3) == 0 {
+                    let seen = open_copies_of(cell);
+                    if let Some((copy, _)) = seen.iter().find(|(_, orig)| *orig == id) {
+                        if let Ok(note) = cell.get(copy) {
+                            let merged = format!("{}\nfuso da {dev}", note.body);
+                            let _ = cell.patch_note(
+                                &id,
+                                &NotePatch {
+                                    body: Some(merged),
+                                    ..Default::default()
+                                },
+                                &actor_of(dev, rng),
+                            );
+                            return;
+                        }
+                    }
+                }
+                // a header-only patch in one write of four: the title
+                // moves, the body never does
+                if rng.below(4) == 0 {
                     let _ = cell.patch_note(
                         &id,
                         &NotePatch {
-                            body: Some(body),
+                            title: Some(Some(format!("il titolo di {dev} su {id}"))),
                             ..Default::default()
                         },
-                        &format!("device-{dev}"),
+                        &actor_of(dev, rng),
                     );
+                    return;
+                }
+                // the body write: a MIDDLE-LINE change — the shape a
+                // later merge can contain
+                let token = ["rosso", "blu", "verde", "giallo"][rng.below(4) as usize];
+                let body = format!("prima riga\ncorpo di {dev} su {id}: {token}\nterza riga");
+                let _ = cell.patch_note(
+                    &id,
+                    &NotePatch {
+                        body: Some(body),
+                        ..Default::default()
+                    },
+                    &actor_of(dev, rng),
+                );
+            }
+            Write::CloseCopy => {
+                let seen = open_copies_of(cell);
+                if let Some((copy, _)) = seen.get(rng.below(seen.len() as u64) as usize) {
+                    let _ = cell.delete_note(copy, &actor_of(dev, rng));
                 }
             }
             Write::Delete => {
                 if let Some(id) = pick(&self.notes, rng) {
-                    let _ = cell.delete_note(&id, &format!("device-{dev}"));
+                    let _ = cell.delete_note(&id, &actor_of(dev, rng));
                 }
             }
             Write::Supersede => {
@@ -755,7 +821,7 @@ impl Fleet {
                     let i = self.notes.len() as u32 + 1;
                     let mut n = base_note(90 + i, &format!("la verità nuova di {dev}"));
                     n.valid_from = Some(engramma_core::format::Validity(now().get().date(), None));
-                    let _ = cell.supersede(&old, &n, None, &format!("device-{dev}"));
+                    let _ = cell.supersede(&old, &n, None, &actor_of(dev, rng));
                     self.notes.push(n.id);
                 }
             }
@@ -772,7 +838,7 @@ impl Fleet {
                         valid_to: None,
                         confidence: engramma_core::Confidence::Stated,
                     };
-                    if let Ok(id) = cell.link(&edge, &format!("device-{dev}")) {
+                    if let Ok(id) = cell.link(&edge, &actor_of(dev, rng)) {
                         self.edges.push(id);
                     }
                 }
@@ -781,7 +847,7 @@ impl Fleet {
                 if !self.edges.is_empty() {
                     let idx = rng.below(self.edges.len() as u64) as usize;
                     let id = self.edges[idx].clone();
-                    let _ = cell.unlink(&id, &format!("device-{dev}"));
+                    let _ = cell.unlink(&id, &actor_of(dev, rng));
                 }
             }
             Write::Propose => {
@@ -819,7 +885,7 @@ impl Fleet {
             }
             Write::Purge => {
                 if let Some(id) = pick(&self.notes, rng) {
-                    let _ = cell.purge(&id, "oblio", &format!("device-{dev}"));
+                    let _ = cell.purge(&id, "oblio", &actor_of(dev, rng));
                 }
             }
         }
@@ -991,117 +1057,154 @@ impl SeedMint {
 /// same op set byte for byte (clock base, mints and picks all keyed on the
 /// seed).
 fn fleet_run(seed: u64, devices: u32, rounds: u32) -> Fleet {
-    let mut rng = Rng(seed | 1);
-    let n = devices as usize;
-    // device 0 is born bare and takes the shared init, minted here — the
-    // init's op id, salt and cell id come from the seed stream like every
-    // other mint (a Cell::create would mint from the process CSPRNG and
-    // break the reproduction)
-    let dir0 = tempfile::tempdir().unwrap(/* test-only */);
-    let a = Cell::open_bare(&dir0.path().join("fleet0.sqlite")).unwrap(/* test-only */);
-    let mut mint0 = SeedMint { seed, dev: 0, n: 0 };
-    let (cell_id, _) = mint0.next();
-    let (op_id, salt) = mint0.next();
-    let node0 = "d0000000000x".to_string();
-    a.inject_clock(engramma_core::hlc::HlcClock::new(
-        node0.clone(),
-        move || FLEET_BASE_MS,
-    ))
-    .unwrap(/* test-only */);
-    let init = engramma_core::cell::ops::make_op(engramma_core::cell::ops::OpParts {
-        op_id,
-        hlc: engramma_core::hlc::Hlc {
-            physical_ms: FLEET_BASE_MS,
-            counter: 0,
-            node: node0,
-        },
-        actor: "device-0".into(),
-        kind: engramma_core::cell::ops::OpKind::Init,
-        note_id: None,
-        base: None,
-        body: serde_json::json!({ "cell_id": cell_id.to_string(), "name": "conv" }),
-        salt: salt.to_vec(),
-        device: None,
-        sig: None,
-    })
-    .unwrap(/* test-only */);
-    a.ingest_op(&init).unwrap(/* test-only */);
-    let mut cells = vec![a];
-    let mut dirs = vec![dir0];
-    for d in 1..n {
-        let dir = tempfile::tempdir().unwrap(/* test-only */);
-        let cell = Cell::open_bare(&dir.path().join(format!("fleet{d}.sqlite")))
+    let mut runner = FleetRunner::new(seed, devices);
+    runner.rounds(rounds);
+    runner.finish();
+    runner.fleet
+}
+
+/// v0.6.4: the fleet, one ROUND at a time — the monotonicity property
+/// needs to look at the state between rounds. The rng stream is exactly
+/// `fleet_run`'s: `new`, `rounds`, `finish` in order.
+struct FleetRunner {
+    fleet: Fleet,
+    rng: Rng,
+    n: usize,
+}
+
+impl FleetRunner {
+    fn new(seed: u64, devices: u32) -> Self {
+        let mut rng = Rng(seed | 1);
+        let n = devices as usize;
+        // device 0 is born bare and takes the shared init, minted here — the
+        // init's op id, salt and cell id come from the seed stream like every
+        // other mint (a Cell::create would mint from the process CSPRNG and
+        // break the reproduction)
+        let dir0 = tempfile::tempdir().unwrap(/* test-only */);
+        let a = Cell::open_bare(&dir0.path().join("fleet0.sqlite")).unwrap(/* test-only */);
+        let mut mint0 = SeedMint { seed, dev: 0, n: 0 };
+        let (cell_id, _) = mint0.next();
+        let (op_id, salt) = mint0.next();
+        let node0 = "d0000000000x".to_string();
+        a.inject_clock(engramma_core::hlc::HlcClock::new(
+            node0.clone(),
+            move || FLEET_BASE_MS,
+        ))
+        .unwrap(/* test-only */);
+        let init = engramma_core::cell::ops::make_op(engramma_core::cell::ops::OpParts {
+            op_id,
+            hlc: engramma_core::hlc::Hlc {
+                physical_ms: FLEET_BASE_MS,
+                counter: 0,
+                node: node0,
+            },
+            actor: "device-0".into(),
+            kind: engramma_core::cell::ops::OpKind::Init,
+            note_id: None,
+            base: None,
+            body: serde_json::json!({ "cell_id": cell_id.to_string(), "name": "conv" }),
+            salt: salt.to_vec(),
+            device: None,
+            sig: None,
+        })
+        .unwrap(/* test-only */);
+        a.ingest_op(&init).unwrap(/* test-only */);
+        let mut cells = vec![a];
+        let mut dirs = vec![dir0];
+        for d in 1..n {
+            let dir = tempfile::tempdir().unwrap(/* test-only */);
+            let cell = Cell::open_bare(&dir.path().join(format!("fleet{d}.sqlite")))
+                .unwrap(/* test-only */);
+            dirs.push(dir);
+            cells.push(cell);
+        }
+        // deterministic time and deterministic mints, one of each per device
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        for (d, cell) in cells.iter().enumerate() {
+            let tick = Arc::new(AtomicU64::new(0));
+            let now = Arc::clone(&tick);
+            let node = format!("d{d:011}x");
+            cell.inject_clock(engramma_core::hlc::HlcClock::new(node, move || {
+                FLEET_BASE_MS + now.fetch_add(1, Ordering::SeqCst) * 7 + d as u64 * 3
+            }))
             .unwrap(/* test-only */);
-        dirs.push(dir);
-        cells.push(cell);
+            let mint = Arc::new(Mutex::new(SeedMint { seed, dev: d, n: 0 }));
+            cell.inject_minter(Arc::new(move || {
+                let (id, salt) = mint.lock().map_err(|_| {
+                    engramma_core::CellError::Db("fleet mint poisoned".into())
+                })?.next();
+                Ok((id, salt))
+            }))
+            .unwrap(/* test-only */);
+        }
+        let mut fleet = Fleet {
+            cells,
+            notes: Vec::new(),
+            edges: Vec::new(),
+            proposals: Vec::new(),
+            _dirs: dirs,
+        };
+        fleet
+            .cells[0]
+            .set_policy(serde_json::json!({ "write": "propose" }), "device-0")
+            .unwrap(/* test-only */);
+        Self { fleet, rng, n }
     }
-    // deterministic time and deterministic mints, one of each per device
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    for (d, cell) in cells.iter().enumerate() {
-        let tick = Arc::new(AtomicU64::new(0));
-        let now = Arc::clone(&tick);
-        let node = format!("d{d:011}x");
-        cell.inject_clock(engramma_core::hlc::HlcClock::new(node, move || {
-            FLEET_BASE_MS + now.fetch_add(1, Ordering::SeqCst) * 7 + d as u64 * 3
-        }))
-        .unwrap(/* test-only */);
-        let mint = Arc::new(Mutex::new(SeedMint { seed, dev: d, n: 0 }));
-        cell.inject_minter(Arc::new(move || {
-            let (id, salt) = mint.lock().map_err(|_| {
-                engramma_core::CellError::Db("fleet mint poisoned".into())
-            })?.next();
-            Ok((id, salt))
-        }))
-        .unwrap(/* test-only */);
-    }
-    let mut fleet = Fleet {
-        cells,
-        notes: Vec::new(),
-        edges: Vec::new(),
-        proposals: Vec::new(),
-        _dirs: dirs,
-    };
-    fleet
-        .cells[0]
-        .set_policy(serde_json::json!({ "write": "propose" }), "device-0")
-        .unwrap(/* test-only */);
-    for _ in 0..rounds {
-        match rng.below(3) {
+
+    /// One round: a write or a delivery, exactly as `fleet_run` did.
+    fn one_round(&mut self) {
+        let n = self.n;
+        match self.rng.below(3) {
             0 | 1 => {
                 // a device writes
-                let dev = rng.below(n as u64) as usize;
-                let w = match rng.below(9) {
+                let dev = self.rng.below(n as u64) as usize;
+                let w = match self.rng.below(10) {
                     0 | 1 => Write::Put,
                     2 | 3 => Write::Patch,
                     4 => Write::Delete,
                     5 => Write::Supersede,
                     6 => Write::Link,
-                    _ => Write::Unlink,
+                    7 => Write::Unlink,
+                    // v0.6.4: one write in ten closes a copy it can see
+                    _ => Write::CloseCopy,
                 };
-                fleet.write(dev, &w, &mut rng);
+                self.fleet.write(dev, &w, &mut self.rng);
             }
             _ => {
                 // a delivery between two devices: sometimes partial
-                let from = rng.below(n as u64) as usize;
-                let to = rng.below(n as u64) as usize;
+                let from = self.rng.below(n as u64) as usize;
+                let to = self.rng.below(n as u64) as usize;
                 if from != to {
-                    let fraction = rng.below(5);
-                    fleet.deliver(from, to, fraction, &mut rng);
+                    let fraction = self.rng.below(5);
+                    self.fleet.deliver(from, to, fraction, &mut self.rng);
                 }
             }
         }
     }
-    // occasionally exercise the queue and the right to be forgotten
-    fleet.write(rng.below(n as u64) as usize, &Write::Propose, &mut rng);
-    fleet.settle();
-    fleet.write(rng.below(n as u64) as usize, &Write::Decide, &mut rng);
-    if rng.below(2) == 0 && !fleet.notes.is_empty() {
-        fleet.write(rng.below(n as u64) as usize, &Write::Purge, &mut rng);
+
+    fn rounds(&mut self, rounds: u32) {
+        for _ in 0..rounds {
+            self.one_round();
+        }
     }
-    fleet.settle();
-    fleet
+
+    /// The tail `fleet_run` always ran: the queue, the decision, the
+    /// purge, and two settles.
+    fn finish(&mut self) {
+        let n = self.n;
+        let dev = self.rng.below(n as u64) as usize;
+        self.fleet.write(dev, &Write::Propose, &mut self.rng);
+        self.fleet.settle();
+        let dev = self.rng.below(n as u64) as usize;
+        self.fleet.write(dev, &Write::Decide, &mut self.rng);
+        if self.rng.below(2) == 0 && !self.fleet.notes.is_empty() {
+            let dev = self.rng.below(n as u64) as usize;
+            self.fleet.write(dev, &Write::Purge, &mut self.rng);
+        }
+        self.fleet.settle();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,8 +1408,14 @@ fn a_local_write_rederives_the_conflict_set() {
         "H's arrival replayed {{P, Z, H, E, T}}: E is T's loser, the copy is due"
     );
 
-    // W: B writes it ITSELF (base T, the newest op in its log) — in the
-    // final set the winner is W and the conflict set is EMPTY
+    // W: B writes it ITSELF (base T, the newest op in its log). v0.6.4
+    // (D1): W's tips are {W, E} — E is NOT W's ancestor (W descends T, T
+    // descends H, H is concurrent with E) — the winner is W (same class,
+    // newest), the loser E keeps its DURABLE copy: W does not contain
+    // E's body (two different rewrites of the same line), and nothing
+    // touched the copy's id. Under v0.6.3 this expectation was 0: the
+    // copy closed because the winner moved — the ephemeral-copy defect
+    // this phase fixes (the reviewer's witnesses, sequence 2).
     wb.store(K + 6, Ordering::SeqCst);
     b.patch_note(
         &id,
@@ -1316,8 +1425,8 @@ fn a_local_write_rederives_the_conflict_set() {
     .unwrap(/* t */);
     assert_eq!(
         copies_of(&b),
-        0,
-        "the local write re-derives the conflict set: W (base T) has no losers"
+        1,
+        "the local write re-derives the conflict set: E is still a loser, and its copy is durable"
     );
 
     // fresh copies of the whole set: in total order, and in B's arrival
@@ -1354,7 +1463,7 @@ fn a_local_write_rederives_the_conflict_set() {
         dc, dd,
         "the arrival-order copy equals the total-order reference"
     );
-    assert_eq!(copies_of(&c), 0, "the final set derives no conflict copy");
+    assert_eq!(copies_of(&c), 1, "the final set keeps E's durable copy");
     let (rebuilt, _) = b.rematerialize_for_test().unwrap(/* t */);
     assert_eq!(
         db, rebuilt,
@@ -1545,3 +1654,131 @@ fn concurrent_creates_case(authors: u32) {
     );
     assert!(x.verify().unwrap(/* t */).ok());
 }
+
+
+
+
+// ---------------------------------------------------------------------------
+// v0.6.4 (D1.6): the MONOTONITY property — a copy open at round r and
+// closed at round r+1 has a closure witness in the round r+1 set. Never
+// a closure without one.
+// ---------------------------------------------------------------------------
+
+/// The open copies of one device, with the loser op the derivation
+/// names (the witness check's key).
+fn open_copies_with_loser(cell: &Cell) -> Vec<(Ulid, Ulid, Ulid)> {
+    let rows = cell
+        .debug_column(
+            "SELECT copy_id || ' ' || original_id || ' ' || loser_op FROM conflict_copies
+             WHERE open = 1",
+        )
+        .unwrap(/* test-only */);
+    rows.into_iter()
+        .filter_map(|row| {
+            let mut it = row.split(' ');
+            let (Some(c), Some(o), Some(l)) = (it.next(), it.next(), it.next()) else {
+                return None;
+            };
+            Some((
+                Ulid::from_string(c).unwrap(/* test-only */),
+                Ulid::from_string(o).unwrap(/* test-only */),
+                Ulid::from_string(l).unwrap(/* test-only */),
+            ))
+        })
+        .collect()
+}
+
+/// The purge dominates with a rule of its own (D1.6 has no say there):
+/// a purged original takes its copies without a witness.
+fn original_purged(cell: &Cell, original: &Ulid) -> bool {
+    cell.debug_column(&format!(
+        "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
+         JOIN op_objects oo ON oo.op_id = o.op_id
+         WHERE oo.object = 'note:{original}' AND o.kind = 'purge'"
+    ))
+    .unwrap_or_default()
+    .first()
+    .is_some_and(|n| n != "0")
+}
+
+/// The lapide closes without a D1.6 witness too — its rule is today's
+/// own, kept by this phase (REPORT, «prima della correzione», punto 1):
+/// a body write that did not see the delete wins nothing and leaves the
+/// tip set; a write the rollback erased is gone; and a tip the lapide
+/// held can hand the winnership to a former loser, whose copy closes
+/// with it. Wherever the original holds a delete, the conflict set
+/// follows the lapide, not the witnesses — the property hunts the
+/// derivation on the notes the lapide never touched.
+fn lapide_active(cell: &Cell, original: &Ulid) -> bool {
+    cell.debug_column(&format!(
+        "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
+         JOIN op_objects oo ON oo.op_id = o.op_id
+         WHERE oo.object = 'note:{original}' AND o.kind = 'delete_note'"
+    ))
+    .unwrap_or_default()
+    .first()
+    .is_some_and(|n| n != "0")
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+    #[test]
+    fn no_copy_closes_without_a_witness(
+        seed in any::<u64>(),
+        devices in 2_u32..=4,
+        rounds in 12_u32..=28,
+    ) {
+        let mut runner = FleetRunner::new(seed, devices);
+        let mut prev: Vec<Vec<(Ulid, Ulid, Ulid)>> =
+            runner.fleet.cells.iter().map(open_copies_with_loser).collect();
+        for _ in 0..rounds {
+            runner.one_round();
+            let now: Vec<Vec<(Ulid, Ulid, Ulid)>> =
+                runner.fleet.cells.iter().map(open_copies_with_loser).collect();
+            for (dev, (was, is)) in prev.iter().zip(&now).enumerate() {
+                let held: std::collections::HashSet<Ulid> =
+                    is.iter().map(|(c, _, _)| *c).collect();
+                for (copy, original, loser) in was {
+                    if held.contains(copy) {
+                        continue;
+                    }
+                    // the two documented FILTER closures (REPORT, «prima
+                    // della correzione», point 3): the winner moved onto
+                    // the loser's own body, or the fork's body caught up.
+                    // The generator writes distinct bodies, so these
+                    // never fire here — anything else is a defect
+                    prop_assert!(
+                        runner.fleet.cells[dev]
+                            .conflict_witness_for_test(original, loser)
+                            .unwrap_or(false)
+                            || original_purged(&runner.fleet.cells[dev], original),
+                        "seed {seed}: copy {copy} closed without a witness"
+                    );
+                }
+            }
+            prev = now;
+        }
+        // the tail (propose, decide, maybe purge, settles) closes copies
+        // too — the purge by its own dominance, the rest by witness
+        runner.finish();
+        let now: Vec<Vec<(Ulid, Ulid, Ulid)>> =
+            runner.fleet.cells.iter().map(open_copies_with_loser).collect();
+        for (dev, (was, is)) in prev.iter().zip(&now).enumerate() {
+            let held: std::collections::HashSet<Ulid> = is.iter().map(|(c, _, _)| *c).collect();
+            for (copy, original, loser) in was {
+                if held.contains(copy) {
+                    continue;
+                }
+                prop_assert!(
+                    runner.fleet.cells[dev]
+                        .conflict_witness_for_test(original, loser)
+                        .unwrap_or(false)
+                        || original_purged(&runner.fleet.cells[dev], original)
+                        || lapide_active(&runner.fleet.cells[dev], original),
+                    "seed {seed}: copy {copy} closed in the tail without a witness"
+                );
+            }
+        }
+    }
+}
+
