@@ -4017,8 +4017,21 @@ impl Pairing {
     }
 }
 
+// One address-taken libSystem function, for the linker's ledger: with
+// an ODD number of indirect symbols the string pool lands 4 mod 8 and
+// this darwin's dyld refuses the whole dylib («mis-aligned LINKEDIT
+// string pool» — found at the release build of v0.6.2, Xcode 27.2).
+// One extra entry keeps the ledger even; the call itself never runs.
+// The build script loads the artifact right after linking: a future
+// change that flips the ledger again fails the BUILD, not Homun.
+unsafe extern "C" {
+    fn arc4random() -> u32;
+}
+
 /// The engine version, so the host can log what it loaded.
 #[napi]
 pub fn version() -> String {
+    let parity: unsafe extern "C" fn() -> u32 = arc4random;
+    std::hint::black_box(parity);
     env!("CARGO_PKG_VERSION").to_string()
 }
