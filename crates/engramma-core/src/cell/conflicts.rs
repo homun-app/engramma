@@ -160,8 +160,7 @@ pub fn diff3_merge(base: &str, a: &str, b: &str) -> Option<String> {
             }
         };
         let Some((k, sa, sb)) = common else {
-            return merge_chunk(&fb[bi..], &fa[ai..], &fbb[ci..], &mut out)
-                .then(|| out.join("\n"));
+            return merge_chunk(&fb[bi..], &fa[ai..], &fbb[ci..], &mut out).then(|| out.join("\n"));
         };
         if !merge_chunk(&fb[bi..k], &fa[ai..sa], &fbb[ci..sb], &mut out) {
             return None;
@@ -230,7 +229,15 @@ struct PlannedCopy {
 
 /// One raw scan row: `(op_id, hlc, actor, kind, base, content_hash,
 /// payload body)`.
-type ScanRow = (String, String, String, String, Option<String>, String, Option<String>);
+type ScanRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
 
 /// Read every operation of the note — above the compaction cut AND
 /// below it (the skeletons still carry hash, hlc and base, which is all
@@ -272,9 +279,7 @@ fn scan(tx: &Transaction<'_>, original: &Ulid) -> Result<Vec<NoteOpRow>, CellErr
             let body = body_json
                 .filter(|_| matches!(kind, OpKind::PutNote | OpKind::PatchNote))
                 .and_then(|b| body_facts(&kind, &b));
-            let parent = base
-                .as_ref()
-                .and_then(|b| by_hash.get(b).copied());
+            let parent = base.as_ref().and_then(|b| by_hash.get(b).copied());
             Ok(NoteOpRow {
                 hash,
                 op_id,
@@ -339,10 +344,7 @@ fn key_of(row: &NoteOpRow) -> (ActorClass, String, String) {
 /// write descending from them; the winner is the greatest key among
 /// them; the candidates are the applied body writes the winner's author
 /// never saw — the winner itself and its ancestors excepted.
-fn winner_and_candidates(
-    rows: &[NoteOpRow],
-    applied: &[usize],
-) -> (Option<usize>, Vec<usize>) {
+fn winner_and_candidates(rows: &[NoteOpRow], applied: &[usize]) -> (Option<usize>, Vec<usize>) {
     let applied_set: Vec<usize> = {
         let mut v = applied.to_vec();
         v.sort_unstable();
@@ -551,18 +553,18 @@ pub(crate) fn after_replay(
         }
     }
     for loser in candidates {
-        let facts = rows[loser].body.as_ref().expect(/* just checked */ "applied body write");
+        let facts = rows[loser]
+            .body
+            .as_ref()
+            .expect(/* just checked */ "applied body write");
         // the filters (D1.5): no copy for a body equal to the winner's,
         // none for a body the fork already had. A filtered loser the
         // user made theirs keeps its birth row, like every closed one.
-        let fork_same = match winner
-            .and_then(|w| nearest_common_ancestor(&rows, loser, w))
-        {
+        let fork_same = match winner.and_then(|w| nearest_common_ancestor(&rows, loser, w)) {
             Some(fork) => body_at_fork(&rows, Some(fork)).as_deref() == Some(facts.text.as_str()),
             None => false,
         };
-        let filtered =
-            plan.winner_body.as_deref() == Some(facts.text.as_str()) || fork_same;
+        let filtered = plan.winner_body.as_deref() == Some(facts.text.as_str()) || fork_same;
         let copy_id = material::conflict_copy_id(&rows[loser].hash, hlc_ms_of(&rows[loser].hlc));
         let witnessed = match winner {
             Some(w) => has_witness(tx, &rows, loser, &applied, &copy_id, w)?,
@@ -595,8 +597,7 @@ pub(crate) fn after_replay(
         } else {
             crate::format::Status::Active
         };
-        note.updated_at =
-            crate::format::At::parse(&facts.updated_at).unwrap_or(state.updated_at);
+        note.updated_at = crate::format::At::parse(&facts.updated_at).unwrap_or(state.updated_at);
         if !note.tags.iter().any(|t| t == "conflitto") {
             note.tags.push("conflitto".into());
         }
@@ -627,7 +628,8 @@ pub(crate) fn after_replay(
     // the cap: the three most recent OPEN copies (total order) are
     // visible; the others stay open and wait for a window
     plan.copies.sort_by(|a, b| {
-        (a.loser_hlc.clone(), a.loser_op.to_string()).cmp(&(b.loser_hlc.clone(), b.loser_op.to_string()))
+        (a.loser_hlc.clone(), a.loser_op.to_string())
+            .cmp(&(b.loser_hlc.clone(), b.loser_op.to_string()))
     });
     let open_count = plan.copies.iter().filter(|c| c.open).count();
     let mut open_seen = 0_usize;
@@ -645,26 +647,28 @@ pub(crate) fn after_replay(
 /// body from a version snapshot without being a body write; the
 /// winner-body correction (and its guard) yield to the newest one.
 fn newer_restore(rows: &[NoteOpRow], applied: &[usize]) -> bool {
-    let newest_write = applied
-        .iter()
-        .copied()
-        .max_by(|&a, &b| {
-            (rows[a].hlc.as_str(), rows[a].op_id.to_string())
-                .cmp(&(rows[b].hlc.as_str(), rows[b].op_id.to_string()))
-        });
+    let newest_write = applied.iter().copied().max_by(|&a, &b| {
+        (rows[a].hlc.as_str(), rows[a].op_id.to_string())
+            .cmp(&(rows[b].hlc.as_str(), rows[b].op_id.to_string()))
+    });
     let Some(newest_write) = newest_write else {
         return false;
     };
     rows.iter().any(|r| {
         r.kind == OpKind::Restore
             && (r.hlc.as_str(), r.op_id.to_string())
-                > (rows[newest_write].hlc.as_str(), rows[newest_write].op_id.to_string())
+                > (
+                    rows[newest_write].hlc.as_str(),
+                    rows[newest_write].op_id.to_string(),
+                )
     })
 }
 
 /// The `physical_ms` of an hlc string (the copy id's time part).
 fn hlc_ms_of(hlc: &str) -> u64 {
-    crate::hlc::Hlc::parse(hlc).map(|h| h.physical_ms).unwrap_or(0)
+    crate::hlc::Hlc::parse(hlc)
+        .map(|h| h.physical_ms)
+        .unwrap_or(0)
 }
 
 /// Write the plan: refresh the open copies' rows (and the notes rows of
@@ -675,8 +679,9 @@ fn hlc_ms_of(hlc: &str) -> u64 {
 fn apply(tx: &Transaction<'_>, original: &Ulid, plan: &Plan) -> Result<(), CellError> {
     let desired: Vec<Ulid> = plan.copies.iter().map(|c| c.copy_id).collect();
     let existing: Vec<String> = {
-        let mut stmt =
-            tx.prepare("SELECT copy_id FROM conflict_copies WHERE original_id = ?1 ORDER BY copy_id")?;
+        let mut stmt = tx.prepare(
+            "SELECT copy_id FROM conflict_copies WHERE original_id = ?1 ORDER BY copy_id",
+        )?;
         let rows = stmt.query_map([original.to_string()], |r| r.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
@@ -804,10 +809,9 @@ fn apply(tx: &Transaction<'_>, original: &Ulid, plan: &Plan) -> Result<(), CellE
         // the same language every writer detects: the note's own, or
         // the detection over title and body (the correction once wrote
         // body_norm unstemmed — the oracle saw it)
-        let lang = row
-            .note
-            .lang
-            .or_else(|| crate::text::detect_lang(&format!("{}\n{}", row.note.display_title(), body)));
+        let lang = row.note.lang.or_else(|| {
+            crate::text::detect_lang(&format!("{}\n{}", row.note.display_title(), body))
+        });
         let body_norm = crate::text::normalize_for_index(row.note.title.as_deref(), body, lang);
         tx.execute(
             "UPDATE notes SET body = ?2, body_norm = ?3 WHERE id = ?1",
@@ -863,13 +867,17 @@ fn needs_replay(
                         .then_with(|| ia.cmp(ib))
                 })
                 .map(|(_, r)| r)
-            && newest.body.as_ref().is_some_and(|b| b.text != row.note.body)
+            && newest
+                .body
+                .as_ref()
+                .is_some_and(|b| b.text != row.note.body)
         {
             return Ok(true);
         }
     }
-    let cut: i64 =
-        tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| r.get(0))?;
+    let cut: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
+        r.get(0)
+    })?;
     let heavy: i64 = tx.query_row(
         "SELECT COUNT(*) FROM ops o
          JOIN op_objects oo ON oo.op_id = o.op_id
@@ -896,8 +904,8 @@ pub(crate) fn after_body_write(
     }
     // the arriving op's applied state is the live row — it applied over
     // the state the replay would have produced
-    let arriving_state = ops::read_note_row(tx, original)?
-        .map(|row| (arriving.content_hash.clone(), row.note));
+    let arriving_state =
+        ops::read_note_row(tx, original)?.map(|row| (arriving.content_hash.clone(), row.note));
     let mut states = HashMap::new();
     let mut known_only_partial = false;
     let rows = scan(tx, original)?;
@@ -966,9 +974,7 @@ pub(crate) fn after_body_write(
              WHERE cc.original_id = ?1 AND cc.open = 1",
         )?;
         let rows_out: Vec<(String, String)> = stmt
-            .query_map([original.to_string()], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
+            .query_map([original.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         let by_op: std::collections::HashMap<String, String> = rows_out
@@ -1054,9 +1060,8 @@ pub(crate) fn rederive_note(tx: &Transaction<'_>, original: &Ulid) -> Result<(),
     let mut states: HashMap<String, Note> = HashMap::new();
     let mut needs_full = false;
     let open_rows: std::collections::HashMap<String, String> = {
-        let mut stmt = tx.prepare(
-            "SELECT loser_op, state_json FROM conflict_copies WHERE original_id = ?1",
-        )?;
+        let mut stmt =
+            tx.prepare("SELECT loser_op, state_json FROM conflict_copies WHERE original_id = ?1")?;
         let out: Vec<(String, String)> = stmt
             .query_map([original.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1131,35 +1136,36 @@ pub fn conflicts(tx: &Transaction<'_>) -> Result<Vec<ConflictInfo>, CellError> {
             Ok((copy_id, original_id, loser_actor, loser_hlc, open, visible))
         })?
         .filter_map(|row| row.ok())
-        .filter_map(|(copy_id, original_id, loser_actor, loser_hlc, open, visible)| {
-            if open == 0 {
-                return None;
-            }
-            let (Ok(copy_id), Ok(original_id)) = (
-                Ulid::from_string(&copy_id),
-                Ulid::from_string(&original_id),
-            ) else {
-                return None;
-            };
-            let at = crate::hlc::Hlc::parse(&loser_hlc)
-                .map(|h| {
-                    let t = time::OffsetDateTime::UNIX_EPOCH
-                        + time::Duration::milliseconds(h.physical_ms as i64);
-                    crate::format::At(t).to_db_string()
+        .filter_map(
+            |(copy_id, original_id, loser_actor, loser_hlc, open, visible)| {
+                if open == 0 {
+                    return None;
+                }
+                let (Ok(copy_id), Ok(original_id)) =
+                    (Ulid::from_string(&copy_id), Ulid::from_string(&original_id))
+                else {
+                    return None;
+                };
+                let at = crate::hlc::Hlc::parse(&loser_hlc)
+                    .map(|h| {
+                        let t = time::OffsetDateTime::UNIX_EPOCH
+                            + time::Duration::milliseconds(h.physical_ms as i64);
+                        crate::format::At(t).to_db_string()
+                    })
+                    .unwrap_or_else(|_| loser_hlc.clone());
+                let loser_class = classify_actor(&loser_actor);
+                Some(ConflictInfo {
+                    copy_id,
+                    original_id,
+                    loser_class,
+                    loser_at: at,
+                    loser_actor,
+                    // an agent's copy is born in quarantine, in the queue
+                    quarantined: loser_class == ActorClass::Agent,
+                    visible: visible != 0,
                 })
-                .unwrap_or_else(|_| loser_hlc.clone());
-            let loser_class = classify_actor(&loser_actor);
-            Some(ConflictInfo {
-                copy_id,
-                original_id,
-                loser_class,
-                loser_at: at,
-                loser_actor,
-                // an agent's copy is born in quarantine, in the queue
-                quarantined: loser_class == ActorClass::Agent,
-                visible: visible != 0,
-            })
-        })
+            },
+        )
         .collect();
     // the quarantine lives in the copy's own note state (derived)
     let mut with_status = Vec::with_capacity(out.len());
@@ -1316,10 +1322,7 @@ fn note_row_is_absent(tx: &Transaction<'_>, id: &Ulid) -> Result<bool, CellError
 
 /// Which note's body writes mint this copy id, when no derivation row
 /// says so.
-fn original_of_copy(
-    tx: &Transaction<'_>,
-    copy: &Ulid,
-) -> Result<Option<Ulid>, CellError> {
+fn original_of_copy(tx: &Transaction<'_>, copy: &Ulid) -> Result<Option<Ulid>, CellError> {
     let notes: Vec<String> = {
         let mut stmt = tx.prepare(
             "SELECT DISTINCT oo2.object FROM op_objects oo2
@@ -1382,7 +1385,11 @@ mod tests {
         // the containment that closes a copy: the loser's middle-line
         // change, again and verbatim, plus more
         assert_eq!(
-            diff3_merge("alpha\nbeta\ngamma", "alpha\nX\ngamma\ndelta", "alpha\nX\ngamma"),
+            diff3_merge(
+                "alpha\nbeta\ngamma",
+                "alpha\nX\ngamma\ndelta",
+                "alpha\nX\ngamma"
+            ),
             Some("alpha\nX\ngamma\ndelta".into())
         );
         // both replace the same line differently: the overlap

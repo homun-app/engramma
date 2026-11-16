@@ -17,7 +17,9 @@ pub mod search;
 pub mod text;
 pub mod vector;
 
-pub use cell::{Cell, NotePatch, PurgeReport, ResolveKeep, VaultFile, VaultView, VerifyReport, snapshot_of};
+pub use cell::{
+    Cell, NotePatch, PurgeReport, ResolveKeep, VaultFile, VaultView, VerifyReport, snapshot_of,
+};
 pub use cell::{EmbedPendingReport, ModelCoverage, ModelRow, ModelState};
 // v0.5 (P1): proposals, decisions, rollback.
 pub use cell::proposals::{

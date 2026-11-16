@@ -17,8 +17,8 @@
 use engramma_core::cell::ops::Op;
 use engramma_core::format::{At, Note, NoteType};
 use engramma_core::{Cell, Confidence, NotePatch, Status};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use time::OffsetDateTime;
 use ulid::Ulid;
@@ -77,7 +77,9 @@ fn db_bytes(cell: &Cell) -> u64 {
 /// The cell file's size on disk (the WAL checkpointed first).
 fn file_bytes(cell: &Cell) -> u64 {
     cell.debug_column("PRAGMA wal_checkpoint(TRUNCATE)").ok();
-    std::fs::metadata(cell.file_path()).map(|m| m.len()).unwrap_or_default()
+    std::fs::metadata(cell.file_path())
+        .map(|m| m.len())
+        .unwrap_or_default()
 }
 
 fn body_of(note_size: usize) -> String {
@@ -176,7 +178,10 @@ fn fleet_ten_thousand_notes_one_and_ten_percent() {
         let (b, wall_b) = bench_cell("b", dir.path());
         let mut ids: Vec<Ulid> = Vec::new();
         for i in 1..=10_000_u32 {
-            let n = note(i, &format!("nota {i} del banco: il corpo di righe bastevoli"));
+            let n = note(
+                i,
+                &format!("nota {i} del banco: il corpo di righe bastevoli"),
+            );
             ids.push(n.id);
             a.put_note(&n, "user").unwrap(/* t */);
         }
@@ -230,10 +235,8 @@ fn fleet_ten_thousand_notes_one_and_ten_percent() {
         for op in a.ops().unwrap(/* t */).into_iter().skip(1) {
             union.push(op);
         }
-        let held: std::collections::HashSet<String> = union
-            .iter()
-            .map(|o| o.content_hash.clone())
-            .collect();
+        let held: std::collections::HashSet<String> =
+            union.iter().map(|o| o.content_hash.clone()).collect();
         for op in b.ops().unwrap(/* t */) {
             if !held.contains(&op.content_hash) {
                 union.push(op);
@@ -257,7 +260,9 @@ fn fleet_ten_thousand_notes_one_and_ten_percent() {
             "D5 flotta {tag}: file {size} B ({} B/nota{}, copie aperte {}, \
              passata {:.2} s)",
             size / 10_000,
-            growth.map(|g| format!(", +{g:.1}% sul quieto")).unwrap_or_default(),
+            growth
+                .map(|g| format!(", +{g:.1}% sul quieto"))
+                .unwrap_or_default(),
             copies.first().map(String::as_str).unwrap_or("?"),
             pass.as_secs_f64()
         );

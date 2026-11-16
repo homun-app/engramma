@@ -541,11 +541,9 @@ fn materialize_note(
                 TombstoneOutcome::Wins => {
                     // the tombstone wins: the write is stored, without effect
                     events.push(ReplayEvent {
-
                         hash: op.content_hash.clone(),
 
                         body: None,
-
                     });
                     continue;
                 }
@@ -561,11 +559,9 @@ fn materialize_note(
             }
             if let Some(row) = ops::read_note_row(tx, id)? {
                 events.push(ReplayEvent {
-
                     hash: op.content_hash.clone(),
 
                     body: Some((row.note, row.version)),
-
                 });
             }
         } else {
@@ -948,7 +944,10 @@ pub(crate) fn restore_conflict_copy(
 
 /// Delete every state row of a note (no log rows touched), the
 /// rematerialization's delete-first for derived copies.
-pub(crate) fn delete_note_state(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
+pub(crate) fn delete_note_state(
+    tx: &rusqlite::Transaction<'_>,
+    id: &Ulid,
+) -> Result<(), CellError> {
     if let Some(row) = ops::read_note_row(tx, id)?
         && let Some(idx) = ops::index_for(row.note.status)
     {

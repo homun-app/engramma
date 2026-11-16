@@ -8,13 +8,13 @@
 
 mod common;
 
-use common::*;
 use common::K;
+use common::*;
 use engramma_core::cell::ops::Op;
 use engramma_core::{Cell, NotePatch};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use ulid::Ulid;
 
 /// D2: on two concurrent tips the HUMAN wins even when older, and the
@@ -32,7 +32,8 @@ fn the_human_hand_wins_even_older_and_the_agent_loser_is_quarantined() {
     let id = note.id;
     wa.store(K + 1, Ordering::SeqCst);
     a.put_note(&note, "user").unwrap(/* t */);
-    let put: Vec<Op> = a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
+    let put: Vec<Op> =
+        a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
     b.ingest_op(&put[0]).unwrap(/* t */);
 
     // the human writes FIRST (older HLC), the agent AFTER: the human
@@ -65,7 +66,10 @@ fn the_human_hand_wins_even_older_and_the_agent_loser_is_quarantined() {
         );
         let copies = open_copies(cell, &id);
         assert_eq!(copies.len(), 1, "the agent's loser became one copy");
-        assert_eq!(copies[0].2, "quarantined", "the agent's copy is born in quarantine");
+        assert_eq!(
+            copies[0].2, "quarantined",
+            "the agent's copy is born in quarantine"
+        );
         assert!(copies[0].1.contains("il bot, più nuovo"));
         // the queue holds it, derived, with the reason that says conflitto
         let queue: Vec<String> = cell
@@ -88,7 +92,8 @@ fn the_human_hand_wins_even_older_and_the_agent_loser_is_quarantined() {
     let id2 = note2.id;
     wc.store(K + 1, Ordering::SeqCst);
     c.put_note(&note2, "user").unwrap(/* t */);
-    let put2: Vec<Op> = c.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
+    let put2: Vec<Op> =
+        c.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
     let (d, wd) = cell_with("d");
     d.ingest_op(&init).unwrap(/* t */);
     d.ingest_op(&put2[0]).unwrap(/* t */);
@@ -125,7 +130,8 @@ fn the_human_hand_wins_even_older_and_the_agent_loser_is_quarantined() {
     let id3 = note3.id;
     we.store(K + 1, Ordering::SeqCst);
     e.put_note(&note3, "user").unwrap(/* t */);
-    let put3: Vec<Op> = e.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
+    let put3: Vec<Op> =
+        e.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
     let (f, wf) = cell_with("f");
     f.ingest_op(&init).unwrap(/* t */);
     f.ingest_op(&put3[0]).unwrap(/* t */);
@@ -150,14 +156,21 @@ fn the_human_hand_wins_even_older_and_the_agent_loser_is_quarantined() {
     for cell in [&e, &f] {
         let copies = open_copies(cell, &id3);
         assert_eq!(copies.len(), 1, "one copy for the older human hand");
-        assert_eq!(copies[0].2, "active", "a human loser's copy is active, as ever");
+        assert_eq!(
+            copies[0].2, "active",
+            "a human loser's copy is active, as ever"
+        );
         let queue: Vec<String> = cell
             .debug_column(&format!(
                 "SELECT CAST(COUNT(*) AS TEXT) FROM proposals WHERE note_id = '{}'",
                 copies[0].0
             ))
             .unwrap(/* t */);
-        assert_eq!(queue, vec!["0".to_string()], "a human's copy never enters the queue");
+        assert_eq!(
+            queue,
+            vec!["0".to_string()],
+            "a human's copy never enters the queue"
+        );
     }
 }
 
@@ -175,7 +188,8 @@ fn five_branches_winner_by_class_four_copies_and_the_cap_of_three() {
     let id = note.id;
     wa.store(K + 1, Ordering::SeqCst);
     a.put_note(&note, "user").unwrap(/* t */);
-    let put: Vec<Op> = a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
+    let put: Vec<Op> =
+        a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
 
     // five devices, five concurrent body writes from the same base: the
     // human is the OLDEST, four agents follow
@@ -219,7 +233,8 @@ fn five_branches_winner_by_class_four_copies_and_the_cap_of_three() {
     let mut all: BTreeMap<String, Op> = BTreeMap::new();
     for cell in &writers {
         for op in cell.ops().unwrap(/* t */) {
-            all.entry(op.op_id.to_string()).or_insert_with(|| op.clone());
+            all.entry(op.op_id.to_string())
+                .or_insert_with(|| op.clone());
         }
     }
     let mut by_total: Vec<Op> = all.into_values().collect();
@@ -262,7 +277,11 @@ fn five_branches_winner_by_class_four_copies_and_the_cap_of_three() {
             "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE original_id = '{id}'"
         ))
         .unwrap(/* t */);
-    assert_eq!(hidden, vec!["4".to_string()], "four derivations, three visible");
+    assert_eq!(
+        hidden,
+        vec!["4".to_string()],
+        "four derivations, three visible"
+    );
 
     // a visible one closes (the delete that resolves it): the fourth
     // becomes visible
@@ -303,7 +322,8 @@ fn two_losers_with_equal_bodies_yield_one_copy() {
     let id = note.id;
     wa.store(K + 1, Ordering::SeqCst);
     a.put_note(&note, "user").unwrap(/* t */);
-    let put: Vec<Op> = a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
+    let put: Vec<Op> =
+        a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
 
     let mk = |name: &str, wall_ms: u64, actor: &str, body: &str| -> Kept {
         let (cell, wall) = cell_with(name);
@@ -325,7 +345,8 @@ fn two_losers_with_equal_bodies_yield_one_copy() {
     let mut all: BTreeMap<String, Op> = BTreeMap::new();
     for cell in [&l1, &l2, &w] {
         for op in cell.ops().unwrap(/* t */) {
-            all.entry(op.op_id.to_string()).or_insert_with(|| op.clone());
+            all.entry(op.op_id.to_string())
+                .or_insert_with(|| op.clone());
         }
     }
     let mut by_total: Vec<Op> = all.into_values().collect();

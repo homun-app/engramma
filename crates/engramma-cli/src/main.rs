@@ -2810,7 +2810,9 @@ fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliE
     let cell = open_cell(cli)?;
     match action {
         None => {
-            let rows = cell.conflicts().map_err(|e| CliError::internal(e.to_string()))?;
+            let rows = cell
+                .conflicts()
+                .map_err(|e| CliError::internal(e.to_string()))?;
             if cli.json {
                 let arr: Vec<serde_json::Value> = rows.iter().map(conflict_json).collect();
                 print_json(&serde_json::json!({ "cell": cli.cell, "conflicts": arr }));
@@ -2828,14 +2830,22 @@ fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliE
                         },
                         r.loser_actor,
                         r.loser_at,
-                        if r.visible { "" } else { "  (in attesa: oltre il tetto di tre)" }
+                        if r.visible {
+                            ""
+                        } else {
+                            "  (in attesa: oltre il tetto di tre)"
+                        }
                     );
                     println!("  originale {}", &r.original_id.to_string()[..8]);
                 }
             }
             Ok(())
         }
-        Some(ConflictsAction::Resolve { id, keep, body_file }) => {
+        Some(ConflictsAction::Resolve {
+            id,
+            keep,
+            body_file,
+        }) => {
             let id = cell
                 .resolve_note_id(id)
                 .map_err(|e| CliError::usage(e.to_string()))?;

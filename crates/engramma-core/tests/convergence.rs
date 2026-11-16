@@ -782,10 +782,8 @@ impl Fleet {
                     let seen = open_copies_of(cell);
                     if let Some((copy, _)) = seen.get(rng.below(seen.len() as u64) as usize)
                         && let Ok(note) = cell.get(copy)
-                        && let Some(original) = seen
-                            .iter()
-                            .find(|(c, _)| c == copy)
-                            .map(|(_, o)| *o)
+                        && let Some(original) =
+                            seen.iter().find(|(c, _)| c == copy).map(|(_, o)| *o)
                     {
                         let merged = format!("{}\nfuso da {dev}", note.body);
                         let _ = cell.patch_note(
@@ -1724,9 +1722,6 @@ fn concurrent_creates_case(authors: u32) {
     assert!(x.verify().unwrap(/* t */).ok());
 }
 
-
-
-
 // ---------------------------------------------------------------------------
 // v0.6.4 (D1.6): the MONOTONITY property — a copy open at round r and
 // closed at round r+1 has a closure witness in the round r+1 set. Never
@@ -1858,8 +1853,6 @@ proptest! {
     }
 }
 
-
-
 /// v0.6.4 (measurement, `--ignored`): the generator's case frequencies
 /// over 1000 fleets — both actor classes, header-only patches, hand
 /// merges, deletes on copy ids. The numbers go in the REPORT.
@@ -1942,11 +1935,3 @@ fn generator_frequencies_1000_fleets() {
         100.0 * agent as f64 / ops as f64,
     );
 }
-
-
-
-
-
-
-
-

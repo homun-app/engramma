@@ -63,9 +63,7 @@ pub(crate) fn looks_like_alpn_refusal(e: &std::io::Error) -> bool {
     // rustls's own words for a server that offers none of our protocols
     // ("error 120: peer doesn't support any known protocol"), and the
     // shapes older stacks used for the same refusal
-    t.contains("known protocol")
-        || t.contains("no application protocol")
-        || t.contains("alpn")
+    t.contains("known protocol") || t.contains("no application protocol") || t.contains("alpn")
 }
 
 /// Convenience alias.

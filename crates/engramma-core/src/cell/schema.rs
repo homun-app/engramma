@@ -423,9 +423,7 @@ fn migrate_conflicts_v21(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::er
     )?;
     // everything else is derivation: it goes and comes back from the log
     let stale: Vec<String> = {
-        let mut stmt = tx.prepare(
-            "SELECT copy_id FROM conflict_copies WHERE open = 1",
-        )?;
+        let mut stmt = tx.prepare("SELECT copy_id FROM conflict_copies WHERE open = 1")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.flatten().collect()
     };

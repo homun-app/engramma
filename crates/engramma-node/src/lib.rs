@@ -1276,8 +1276,12 @@ impl Task for CellOpenTask {
         arm_shared_signer(&self.handle.root, &cell, &self.name);
         // v0.6.3 (C5.3): and again at every WRITE, when the registry moved
         // under the open cell — a share by the CLI in another process
-        // arms the first write after it
-        let _ = cell.set_signer_gate(signer_gate_for(&self.handle.root, &self.name));
+        // arms the first write after it. ENGRAMMA_BENCH_NO_SIGNER_GATE
+        // skips the gate — a BENCH-ONLY variable (D6.1 of v0.6.4: what
+        // the one-stat-per-write gate costs on a root that never synced)
+        if std::env::var("ENGRAMMA_BENCH_NO_SIGNER_GATE").is_err() {
+            let _ = cell.set_signer_gate(signer_gate_for(&self.handle.root, &self.name));
+        }
         let actor = match &self.actor {
             // v0.4.1 (P1.6): an empty actor is the same as none — the
             // engine's own stamps the writes

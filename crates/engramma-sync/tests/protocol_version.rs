@@ -29,7 +29,11 @@ fn unhex32(s: &str) -> [u8; 32] {
 /// `PeerOutdated` naming the device, and not one frame moved.
 #[tokio::test]
 async fn a_peer_of_the_old_rules_is_refused_before_any_exchange() {
-    assert_eq!(protocol::ALPN, b"engramma/sync/2", "this build speaks rules 2");
+    assert_eq!(
+        protocol::ALPN,
+        b"engramma/sync/2",
+        "this build speaks rules 2"
+    );
     assert_eq!(PROTOCOL_VERSION, 2);
 
     let key_old = DeviceKey::from_seed([7_u8; 32]);

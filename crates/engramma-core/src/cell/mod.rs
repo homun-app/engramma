@@ -1667,9 +1667,8 @@ impl Cell {
                         "la copia di conflitto è già chiusa".into(),
                     ));
                 }
-                Some((original, _)) => Ulid::from_string(&original).map_err(|_| {
-                    CellError::Db(format!("bad conflict original {original}"))
-                })?,
+                Some((original, _)) => Ulid::from_string(&original)
+                    .map_err(|_| CellError::Db(format!("bad conflict original {original}")))?,
             }
         };
         match keep {
@@ -1679,9 +1678,7 @@ impl Cell {
             ResolveKeep::Copy | ResolveKeep::Merged => {
                 let body = match (keep, body) {
                     (ResolveKeep::Merged, Some(b)) => b.to_string(),
-                    (ResolveKeep::Copy, _) => self
-                        .conflict_copy_body(copy_id)?
-                        .unwrap_or_default(),
+                    (ResolveKeep::Copy, _) => self.conflict_copy_body(copy_id)?.unwrap_or_default(),
                     (ResolveKeep::Merged, None) => {
                         return Err(CellError::Invalid(
                             "resolveConflict: serve il corpo per `merged`".into(),
@@ -1691,7 +1688,10 @@ impl Cell {
                 };
                 self.patch_note(
                     &original,
-                    &NotePatch { body: Some(body), ..Default::default() },
+                    &NotePatch {
+                        body: Some(body),
+                        ..Default::default()
+                    },
                     actor,
                 )?;
                 // the patch itself may have CLOSED the copy: `keep: copy`
@@ -1747,8 +1747,8 @@ impl Cell {
         .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?;
         // the stored state has no body (D5): the loser's payload is its
         // home
-        if note.body.is_empty() {
-            if let Some(body) = inner
+        if note.body.is_empty()
+            && let Some(body) = inner
                 .conn
                 .query_row(
                     "SELECT json_extract(p.body, '$.set.body') FROM op_payloads p
@@ -1758,9 +1758,8 @@ impl Cell {
                     |r| r.get::<_, String>(0),
                 )
                 .optional()?
-            {
-                note.body = body;
-            }
+        {
+            note.body = body;
         }
         Ok(Some(note.body))
     }

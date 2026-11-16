@@ -23,7 +23,6 @@ pub fn now() -> At {
 }
 
 pub fn base_note(id: u32, body: &str) -> Note {
-
     Note {
         id: Ulid::from_string(&format!("01{}{:08}", "0".repeat(16), id))
             .unwrap(/* test-only: valid Crockford */),
@@ -155,4 +154,3 @@ pub fn open_copies(cell: &Cell, original: &Ulid) -> Vec<(String, String, String)
     })
     .collect()
 }
-

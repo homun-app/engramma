@@ -7812,3 +7812,160 @@ aperte più recenti nell'ordine totale sono visibili (riga in `notes`,
 FTS, tag, arco, e coda se in quarantena); le altre restano aperte e
 invisibili, e appaiono quando una visibile si chiude. Schema 21, solo
 tabelle derivate, migrazione che le rimaterializza.
+
+## v0.6.4 — la copia di conflitto è durevole
+
+Una sezione per punto. I numeri sono misurati, nessuno è stato scritto
+prima di correrlo.
+
+### D1 — la regola nuova dei conflitti del corpo
+
+- **Solo il corpo confligge.** `is_body_write` ora guarda il `set`:
+  una patch di sola intestazione non è una scrittura del corpo. I due
+  difetti del revisore chiusi dai test deterministici: un titolo
+  sull'originale non chiude la copia; un titolo concorrente a un corpo
+  non crea copie spurie.
+- **Punte per ascendenza, vincitore per classe.** Il grafo cammina le
+  `base` attraverso ogni operazione della nota; le punte sono le
+  scritture del corpo applicate senza discendenti corporei; il
+  vincitore è la chiave `(classe, hlc, op_id)`. Una scrittura senza
+  `base` è una radice: il doppio importo della v0.6.1 dà ancora la
+  copia del corpo perdente.
+- **La copia è durevole** e chiude solo con un testimone: (a)
+  un'operazione sull'id della copia; (b) una scrittura del corpo
+  applicata successiva che la contiene (diff3 rigoroso, cambi identici
+  = un cambiamento) o che ne discende. Il corpo della nota è quello
+  del vincitore, anche quando un'altra mano gli è passata sopra
+  nell'ordine d'arrivo; un `restore` più recente del vincitore tiene
+  il suo.
+- **Tetto di tre visibili** per nota, le più recenti nell'ordine
+  totale; le altre restano aperte e appaiono quando una visibile si
+  chiude.
+- **La scorciatoia è morta.** `reconcile_conflict_copies(tx, &nid,
+  &[])` non esiste più: ogni arrivo per una nota — corpo, intestazione,
+  soppressione, operazione sulla copia — rideriva l'insieme dei
+  conflitti. La proprietà di monotonia («mai una chiusura senza
+  testimone», con le dominanze ammesse: purga, lapide, grafo completato)
+  e l'oracolo differenziale giudicano.
+- **La caccia ha trovato quattro difetti del percorso incrementale**,
+  tutti chiusi, tutti con il seme nel messaggio di commit: le
+  righe-nascita mancanti per le copie con operazioni quando il
+  perdente diventa vincitore (due volte, semi `7729712691107302376` e
+  `15192944291106605994`); il contenuto della copia diverso fra i
+  percorsi (attiva da una parte, in quarantena dall'altra, seme
+  `10782023552461549766`); la riderivazione assente sugli arrivi che
+  non sono corpo (seme `1421488054822918858`); e la guardia del replay
+  che confrontava col vincitore-per-classe invece che col più recente
+  nell'ordine totale, lasciando divergere le istantanee di versione
+  (seme `12328535914020248362`). Ogni difetto è la stessa malattia:
+  due percorsi verso la stessa derivazione, uno dei quali shortcuts.
+- **I semi di `convergence.proptest-regressions`** restano verdi: con
+  il generatore nuovo asseriscono convergenza e oracolo, che la regola
+  nuova tiene per costruzione (una funzione dell'insieme in ogni
+  percorso).
+- **La sequenza minima della v0.6.3** cambia attesa, come scritto
+  nell'analisi a priori: la copia di E resta aperta anche dopo W
+  (l'attesa passa da 0 a 1); il test `a_local_write_rederives` ora
+  asserisce la durabilità invece del vuoto. I due semi testimone
+  (`7348206116156780080`, `7729712691107302376`) verdi.
+
+### D2 — la classe dell'autore
+
+`classify_actor`: umano è `user`, chi finisce in `:user`, chi comincia
+con `user@`; tutto il resto agente, compresi gli sconosciuti. La
+convenzione sta nel DESIGN § 4.3 e in `docs/node.md`, con l'avvertenza:
+dichiarata e non firmata — basta nella sync personale, nelle
+organizzazioni andrà legata a una firma. I test: l'umana vince anche
+più vecchia; il perdente d'agente nasce in quarantena, nella coda
+(`proposals`, riga derivata col motivo «conflitto», che `decide` e il
+revert trattano come ogni proposta); il perdente umano dà la copia
+attiva di sempre; gli actor di Homun rientrano senza modifiche. La
+flotta genera entrambe le classi (misurate sotto).
+
+### D3 — conflicts e resolveConflict
+
+Core: `Cell::conflicts()` (ogni copia aperta: `copy_id, original_id,
+loser_actor, loser_class, loser_at, quarantined, visible` — nessun
+testo) e `Cell::resolve_conflict(copy, keep, body, actor)` con
+`ResolveKeep::{Original, Copy, Merged}`. JS: `cell.conflicts()` e
+`cell.resolveConflict(copyId, {keep, body?})`. CLI: `engramma conflicts
+<cella>` e `engramma conflicts resolve <cella> <copia> --keep …
+[--body-file f]`. Errori: `NOT_FOUND` per un id che non è una copia (o
+una copia chiusa senza operazioni sue), `CONFLICT` per una copia chiusa
+che tiene la riga. Due risoluzioni concorrenti con corpi uguali non
+creano nulla (provato su due dispositivi accoppiati); la risoluzione
+`copy` chiude spesso già con la patch (il corpo uguale contiene il
+perdente) e il delete diventa un no-op. Una risoluzione che scelga il
+corpo dell'agente contro il proprio corpo umano precedente fa nascere
+la copia del corpo umano scartato: durabile anche contro la
+risoluzione — il compito lo chiama «nasce un conflitto nuovo, ed è
+giusto così», e il test lo asserisce.
+
+### D4 — la versione delle regole nel protocollo
+
+L'ALPN `engramma/sync/2` (e `engramma/mailbox/2`) È la versione delle
+regole di materializzazione; l'hello porta `version: 2` come cintura.
+La scelta è nel REPORT perché è la più stretta: un pari v0.6.3 non
+condivide nemmeno l'ALPN, l'handshake muore prima di un frame, e chi
+chiama mappa il rifiuto rustls («peer doesn't support any known
+protocol») in `Error::PeerOutdated(dispositivo)` → `PEER_OUTDATED` in
+JS, col nome del dispositivo da aggiornare e nessuna operazione
+scambiata. L'utente vede: «il dispositivo mac usa regole di
+materializzazione diverse: aggiornalo (o aggiorna questo dispositivo)
+prima di sincronizzare». L'abbinamento resta `engramma/pairing/1` (non
+trasporta operazioni da materializzare): due dispositivi di versioni
+diverse si abbinano, e la prima passata rifiuta con `PEER_OUTDATED`.
+Test: uno stub ALPN v1 su loopback rifiutata come `PeerOutdated` col
+nome; due endpoint v2 si stringono la mano.
+
+### D5 — quanto cresce il database
+
+Misure (release, `dbstat` e file):
+
+- **Byte per copia**: nota 1 KB → **5 734 B** per copia; nota 10 KB →
+  **30 105 B** (20 copie aperte per misura, differenza divisa).
+- **Il risparmio misurato e fatto**: prima della correzione la copia
+  costava 7 372 B (1 KB) e 41 984 B (10 KB): il corpo dentro
+  `state_json` era il **28%** del costo della copia da 10 KB — oltre la
+  soglia del 20% — e ora la riga di derivazione conserva tutto fuorché
+  il corpo: il payload del perdente è la sua casa (un perdente è
+  sempre una scrittura del corpo col payload sopra il taglio; contro la
+  compattazione è verificato dal fatto che le punte vivono sopra il
+  taglio). I punti di lettura della riga (la base del replay della
+  copia, `resolveConflict` con `copy`, i percorsi rapidi) rileggono il
+  corpo dal payload.
+- **Banco di flotta** (10 000 note, conflitti offline, una passata
+  intera in una copia fresca):
+
+  | flotta | file | per nota | crescita | copie | passata |
+  |---|---|---|---|---|---|
+  | senza conflitti | 18 231 296 B | 1 823 B | — | 0 | 3,09 s |
+  | 1% (100) | 18 788 352 B | 1 878 B | **+3,1%** | 100 | 3,23 s |
+  | 10% (1 000) | 23 293 952 B | 2 329 B | **+27,8%** | 1 000 | 4,58 s |
+
+- **La soglia dichiarata (+15% al 10%) NON è raggiunta**, e i numeri
+  dicono perché: ogni nota in conflitto porta DUE scritture in più
+  (l'agente e la mano umana — il conflitto stesso, ~800 B l'una col
+  suo payload e i suoi indici) oltre alle righe della copia. Le righe
+  DERIVATE della copia sono ~9–10 punti dei 27,8; il resto è il costo
+  delle operazioni che il conflitto porta con sé, che ogni sistema che
+  non perde testo paga. Fermarsi e scriverlo, come chiedeva la fase.
+  I vettori non entrano in queste misure (il banco non incorpora): il
+  secondo risparmio (nessun vettore per le copie) resta therefore non
+  misurato qui e non fatto.
+
+### D6 — le minori
+
+1. **Il cancello del firmatario, misurato dove vive.** Banco da Node:
+  10 000 `put` su una radice senza `devices.db`, col cancello della
+  v0.6.3 (una `stat` per scrittura) contro la variabile da banco
+  `ENGRAMMA_BENCH_NO_SIGNER_GATE`: **332,7 µs contro 327,2 µs per put,
+  +1,68%** — dentro la soglia del +2%.
+2. **I numeri del REPORT si scrivono dopo la misura**: la dimensione
+  del `.node` e le `.tmp*` sono in fondo, contate alla fine.
+
+### Il contratto JS
+
+`npm test` **54/54** (i 51 della v0.6.3 identici più i tre nuovi:
+l'elenco a cella quieta, i due D3 fra due processi accoppiati);
+`test:electron` **54/54**.

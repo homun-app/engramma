@@ -31,7 +31,8 @@ fn a_title_patch_on_the_original_does_not_close_the_copy() {
     // concurrent, both saw the put
     wa.store(K + 1, Ordering::SeqCst);
     a.put_note(&note, "user").unwrap(/* t */);
-    let put: Vec<Op> = a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
+    let put: Vec<Op> =
+        a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
     b.ingest_op(&put[0]).unwrap(/* t */);
     wb.store(K + 2, Ordering::SeqCst);
     b.patch_note(
@@ -52,8 +53,16 @@ fn a_title_patch_on_the_original_does_not_close_the_copy() {
         a.ingest_op(op).unwrap(/* t */);
         b.ingest_op(op).unwrap(/* t */);
     }
-    assert_eq!(open_copies(&a, &id).len(), 1, "the agent's copy is open on A");
-    assert_eq!(open_copies(&b, &id).len(), 1, "the agent's copy is open on B");
+    assert_eq!(
+        open_copies(&a, &id).len(),
+        1,
+        "the agent's copy is open on A"
+    );
+    assert_eq!(
+        open_copies(&b, &id).len(),
+        1,
+        "the agent's copy is open on B"
+    );
 
     // A changes ONLY the title of the original: the copy must stay
     wa.store(K + 4, Ordering::SeqCst);
@@ -102,7 +111,8 @@ fn a_concurrent_title_does_not_create_a_spurious_copy() {
     let id = note.id;
     wa.store(K + 1, Ordering::SeqCst);
     a.put_note(&note, "user").unwrap(/* t */);
-    let put: Vec<Op> = a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
+    let put: Vec<Op> =
+        a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
     b.ingest_op(&put[0]).unwrap(/* t */);
 
     // B (agent) changes the body, A (human, LATER in the total order)
@@ -140,8 +150,7 @@ fn a_concurrent_title_does_not_create_a_spurious_copy() {
             ))
             .unwrap(/* t */);
         assert_eq!(
-            row[0],
-            "il titolo della mano umanaalpha\nX\ngamma",
+            row[0], "il titolo della mano umanaalpha\nX\ngamma",
             "the human's title (later) and the agent's body: no copy, no loss"
         );
     }
@@ -162,7 +171,8 @@ fn a_hand_merge_closes_the_copy_and_a_later_delete_does_not_reopen_it() {
     let id = note.id;
     wa.store(K + 1, Ordering::SeqCst);
     a.put_note(&note, "user").unwrap(/* t */);
-    let put: Vec<Op> = a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
+    let put: Vec<Op> =
+        a.ops().unwrap(/* t */).into_iter().filter(|o| o.kind.as_str() == "put_note").collect();
     b.ingest_op(&put[0]).unwrap(/* t */);
 
     // the agent's branch: change the middle line; the human's concurrent
@@ -186,7 +196,11 @@ fn a_hand_merge_closes_the_copy_and_a_later_delete_does_not_reopen_it() {
         a.ingest_op(op).unwrap(/* t */);
         b.ingest_op(op).unwrap(/* t */);
     }
-    assert_eq!(open_copies(&a, &id).len(), 1, "the copy is open before the merge");
+    assert_eq!(
+        open_copies(&a, &id).len(),
+        1,
+        "the copy is open before the merge"
+    );
 
     // the human merges BY HAND: from the fork's own body, the same
     // middle-line change plus a new tail — the diff3 contains the loser
@@ -290,7 +304,10 @@ fn resolve_conflict_in_the_three_ways_and_concurrent_equal_resolutions() {
         (a, b, id)
     };
     let open_ids = |cell: &Cell, id: &Ulid| -> Vec<String> {
-        open_copies(cell, id).into_iter().map(|(i, _, _)| i).collect()
+        open_copies(cell, id)
+            .into_iter()
+            .map(|(i, _, _)| i)
+            .collect()
     };
 
     // original: the copy closes, the original keeps its body
@@ -331,7 +348,10 @@ fn resolve_conflict_in_the_three_ways_and_concurrent_equal_resolutions() {
     let body: Vec<String> = a
         .debug_column(&format!("SELECT body FROM notes WHERE id = '{id}'"))
         .unwrap(/* t */);
-    assert_eq!(body[0], "alpha\nX\ngamma", "copy: the loser's body won by hand");
+    assert_eq!(
+        body[0], "alpha\nX\ngamma",
+        "copy: the loser's body won by hand"
+    );
     assert!(open_ids(&a, &id).is_empty());
     // the same resolution, CONCURRENTLY, on the other device: equal
     // bodies — nothing new is born
@@ -370,7 +390,8 @@ fn resolve_conflict_in_the_three_ways_and_concurrent_equal_resolutions() {
     // merged without a body is a usage error
     let (a2, _b2, _id2) = mk("res-merged-err");
     let copy2 = a2.conflicts().unwrap(/* t */)[0].copy_id;
-    assert!(a2
-        .resolve_conflict(&copy2, ResolveKeep::Merged, None, "user")
-        .is_err());
+    assert!(
+        a2.resolve_conflict(&copy2, ResolveKeep::Merged, None, "user")
+            .is_err()
+    );
 }
