@@ -7290,7 +7290,7 @@ Sul tag `fase-v0.6.2` (`dd79a79`), main pulito, macchina altrimenti ferma.
 
 ### Disco
 
-- `target/`: 9,8 G all'inizio.
+- `target/`: 9,8 G all'inizio, 14 G alla fine (la build di debug della suite e la release del banco).
 - Le cartelle `.tmp*` in `$TMPDIR` restano a 1 prima e dopo le suite Node e i testimoni.
 - I worktree e i target temporanei del revisore (`target/nohack`, `target/base-target`) sono cancellati.
 
