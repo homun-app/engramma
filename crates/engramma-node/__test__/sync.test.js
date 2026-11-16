@@ -127,9 +127,20 @@ test('after close, sync answers CLOSED', async () => {
   const sync = await e.sync({ relay: 'none' });
   await sync.start();
   await e.close();
-  await assert.rejects(sync.status(), (err) => err.code === 'CLOSED');
-  // and the service is really down: the loop's stop is part of close
-  await new Promise((r) => setTimeout(r, 200));
+  // the calls throw at CALL time (the gate is checked on the JS thread):
+  // an async wrapper turns that into the rejection to catch
+  const closed = async (call) => {
+    try {
+      await call();
+      assert.fail('expected CLOSED');
+    } catch (err) {
+      assert.equal(err.code, 'CLOSED', `message: ${err.message}`);
+    }
+  };
+  await closed(() => sync.status());
+  await closed(() => sync.runOnce());
+  await closed(() => sync.stop());
+  // closing twice is not an error, and the service went with the first
   await e.close();
 });
 

@@ -40,6 +40,7 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use engramma_core::Cell as CoreCell;
+use engramma_sync::service::SyncService;
 use engramma_core::Status as NoteStatus;
 use engramma_core::format::{At, Note, NoteType};
 use engramma_core::search::{Mode, Query, Semantic};
@@ -76,6 +77,15 @@ fn split_transport(err: &Error) -> (&'static str, String) {
                 // v0.5 (P0): the cell was migrated by a newer binary
                 "SCHEMA_TOO_NEW",
                 "CLOSED",
+                // v0.6.2 (S2): the sync service's own refusals
+                "SYNC_BUSY",
+                "PAIRING_EXPIRED",
+                "PAIRING_REJECTED",
+                "PAIRING_TIMEOUT",
+                "NO_MAILBOX",
+                "NOT_SHARED",
+                "LAST_DEVICE",
+                "CANCELLED",
             ];
             let c: &str = code;
             match known.iter().find(|k| **k == c) {
@@ -168,6 +178,12 @@ fn cell_error(e: CellError) -> Error {
         CellError::Io(e) => transport_err("IO", e),
         other => transport_err("IO", other),
     }
+}
+
+/// The sync service's refusals, in the transport's terms: the code rides
+/// the message prefix, `e.code` stays stable (v0.6.2, S2).
+fn sync_error(e: engramma_sync::service::ServiceError) -> Error {
+    transport_err(e.code(), e.message())
 }
 
 fn search_error(e: SearchError) -> Error {
@@ -994,6 +1010,10 @@ pub struct EngineHandle {
     /// takes gate and cell under this same lock, so no Cell is ever born
     /// with a gate a completed drop had already sealed (born dead).
     trackers: Arc<Mutex<HashMap<String, Arc<Gate>>>>,
+    /// v0.6.2 (S2): this engine's sync service, started at the first
+    /// `sync()` and shared by every Sync object — one service per root,
+    /// one event hub to fan the events out to JS.
+    sync: Arc<Mutex<Option<Arc<SyncShared>>>>,
     gate: Gate,
 }
 
@@ -1217,6 +1237,7 @@ impl Task for OpenTask {
             want_builtin,
             cells: Arc::new(Mutex::new(HashMap::new())),
             trackers: Arc::new(Mutex::new(HashMap::new())),
+            sync: Arc::new(Mutex::new(None)),
             gate: Gate::default(),
         })
     }
@@ -1457,6 +1478,10 @@ impl Task for EngineSearchTask {
 pub struct CloseTask {
     cells: Arc<Mutex<HashMap<String, CoreCell>>>,
     gate: Gate,
+    /// v0.6.2 (S4): the sync service of this engine, if one was started —
+    /// `close` stops it (a daemon that exits with the service on must
+    /// not hang on a thread of ours).
+    sync: Arc<Mutex<Option<Arc<SyncShared>>>>,
 }
 
 impl Task for CloseTask {
@@ -1464,6 +1489,16 @@ impl Task for CloseTask {
     type JsValue = ();
 
     fn compute(&mut self) -> Result<Self::Output> {
+        // v0.6.2 (S4): the service goes FIRST — its own shutdown is
+        // bounded, and after it no thread of ours holds the root
+        if let Some(shared) = self
+            .sync
+            .lock()
+            .map_err(|_| transport_err("IO", "lock della sync avvelenato"))?
+            .take()
+        {
+            shared.stop();
+        }
         // v0.4.1 (P1.7): seal first, then WAIT — the computes already in
         // flight finish before this close resolves, and no later task can
         // enter. Closing twice is fine: the gate is already sealed.
@@ -1511,6 +1546,17 @@ impl Task for DropCellTask {
     fn compute(&mut self) -> Result<Self::Output> {
         if self.reason.trim().is_empty() {
             return Err(invalid_argument("reason è obbligatoria"));
+        }
+        // v0.6.2 (S2): a SHARED cell does not go quietly — the service
+        // would keep syncing a deleted file. Say it, refuse it.
+        if let Ok(shared) =
+            engramma_sync::service::cell_is_shared(&self.handle.root, &self.name)
+            && shared
+        {
+            return Err(transport_err(
+                "CONFLICT",
+                "la cella è condivisa: `unshare` prima di `dropCell`",
+            ));
         }
         let path = self.handle.cell_path(&self.name)?;
         if !path.exists() {
@@ -1713,11 +1759,26 @@ impl Engine {
 
     /// Release the engine's cell handles. Outstanding Cell objects keep
     /// working until the GC drops them.
+    /// The sync service of this root: one per Engine, started at the
+    /// first call and shared by every Sync object (v0.6.2, S2).
+    #[napi(ts_return_type = "Promise<Sync>")]
+    pub fn sync(&self, env: Env, opts: Option<SyncOpts>) -> Result<AsyncTask<SyncOpenTask>> {
+        Ok(AsyncTask::new(SyncOpenTask {
+            handle: self.handle.clone(),
+            opts: opts.unwrap_or(SyncOpts {
+                device_name: None,
+                relay: None,
+            }),
+            _open: self.handle.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
+    }
+
     #[napi(ts_return_type = "Promise<void>")]
     pub fn close(&self) -> AsyncTask<CloseTask> {
         AsyncTask::new(CloseTask {
             cells: self.handle.cells.clone(),
             gate: self.handle.gate.clone(),
+            sync: Arc::clone(&self.handle.sync),
         })
     }
 }
@@ -2827,6 +2888,1084 @@ impl Task for VaultUnbindTask {
     }
 
     reject_recode!();
+}
+
+
+// ---------------------------------------------------------------------------
+// the sync service (v0.6.2, S2–S4): the JS contract over the library's
+// own SyncService — one per Engine, on the service's own thread; every
+// call answers within its bound and the event loop never blocks
+// ---------------------------------------------------------------------------
+
+/// `sync()`'s options.
+#[napi(object)]
+pub struct SyncOpts {
+    /// This device's name in the list, when it is the first (and the
+    /// name a `join` presents). Default `portatile`.
+    pub device_name: Option<String>,
+    /// `'default'` (n0's public relays), `'none'` (direct connections
+    /// only) or `{ url }` for one's own — like the CLI's flags; the
+    /// choice is saved in the root as today.
+    #[napi(ts_type = "'default' | 'none' | { url: string }")]
+    pub relay: Option<serde_json::Value>,
+}
+
+/// The relay choice as the service takes it.
+fn parse_relay(v: Option<serde_json::Value>) -> Result<Option<engramma_sync::relay::RelayChoice>> {
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    match &v {
+        serde_json::Value::String(s) if s == "default" => {
+            Ok(Some(engramma_sync::relay::RelayChoice::Default))
+        }
+        serde_json::Value::String(s) if s == "none" => {
+            Ok(Some(engramma_sync::relay::RelayChoice::Disabled))
+        }
+        serde_json::Value::Object(map)
+            if map.len() == 1 && map.contains_key("url") && map["url"].is_string() =>
+        {
+            Ok(Some(engramma_sync::relay::RelayChoice::Own(
+                map["url"].as_str().unwrap_or_default().to_string(),
+            )))
+        }
+        _ => Err(invalid_argument(
+            "relay non valida: 'default' | 'none' | { url }",
+        )),
+    }
+}
+
+/// One device of the list.
+#[napi(object)]
+pub struct SyncDeviceView {
+    /// The name its owner chose.
+    pub name: String,
+    /// The first 8 characters of the device id.
+    pub short_id: String,
+    /// Is it THIS device?
+    pub is_self: bool,
+    /// The last session the address book saw (RFC 3339).
+    pub last_contact: Option<String>,
+    /// What the book holds: `diretta` or `relay`.
+    pub via: Option<String>,
+    /// Live, or removed (the row stays for the history).
+    pub live: bool,
+}
+
+/// One shared cell of the status.
+#[napi(object)]
+pub struct SyncCellView {
+    pub name: String,
+    pub shared: bool,
+    /// The cell's current key epoch.
+    pub epoch: f64,
+    /// How many live devices hold it.
+    pub devices: f64,
+    /// The last confirmed session (RFC 3339).
+    pub last_session: Option<String>,
+    /// Operations written but not yet confirmed anywhere.
+    pub pending: f64,
+    /// Operations that still cannot leave (R4).
+    pub unsent: f64,
+}
+
+/// What `status` answers.
+#[napi(object)]
+pub struct SyncStatusView {
+    pub device: SyncDeviceView,
+    pub serving: bool,
+    /// `"default"`, `"none"`, the relay's URL, or null before a choice.
+    pub relay: Option<String>,
+    pub cells: Vec<SyncCellView>,
+}
+
+/// What `share` says.
+#[napi(object)]
+pub struct ShareView {
+    pub cell: String,
+    /// The adopt operation's id (the signed root of the pre-sync era).
+    pub adopt: String,
+    pub epoch: f64,
+    /// The first 8 characters of the epoch key.
+    pub key: String,
+    /// How many OTHER live devices received a wrapped key.
+    pub wraps: f64,
+}
+
+/// One rotated cell of a removal.
+#[napi(object)]
+pub struct RotatedView {
+    pub cell: String,
+    pub epoch: f64,
+}
+
+/// What `remove` says.
+#[napi(object)]
+pub struct RemoveView {
+    pub removed: String,
+    pub accepted_root: String,
+    pub accepted_count: f64,
+    pub rotated: Vec<RotatedView>,
+}
+
+/// One device's row of a pass.
+#[napi(object)]
+pub struct PassDeviceView {
+    pub name: String,
+    pub device: String,
+    pub reached: bool,
+    pub why_not: Option<String>,
+    /// `diretta` or `relay` when a session ran.
+    pub via: Option<String>,
+}
+
+/// One cell's row of a pass.
+#[napi(object)]
+pub struct PassCellView {
+    pub cell: String,
+    pub sent: f64,
+    pub received: f64,
+    pub refused: f64,
+    pub conflicts: f64,
+    pub unsent: f64,
+    pub head: f64,
+    pub frontier: f64,
+}
+
+/// What `runOnce` says: an unreachable device is a row, never an error.
+#[napi(object)]
+pub struct PassView {
+    pub devices: Vec<PassDeviceView>,
+    pub cells: Vec<PassCellView>,
+}
+
+/// What `start` publishes.
+#[napi(object)]
+pub struct ServeInfoView {
+    pub node: String,
+    pub addrs: Vec<String>,
+    pub relay: Option<String>,
+    pub relay_warning: Option<String>,
+}
+
+/// The pairing's ticket/code side, ready when `invite`/`code` resolves.
+#[napi(object)]
+pub struct PairingInfoView {
+    /// The ticket, textual form (`invite` only).
+    pub ticket: Option<String>,
+    /// The ticket in the QR's alphanumeric clothes (`invite` only).
+    pub ticket_qr: Option<String>,
+    /// The short code (`code` only).
+    pub code: Option<String>,
+    /// When the ticket (the window) ends, RFC 3339.
+    pub expires_at: String,
+    /// The relay URL the ticket carries, when there is one.
+    pub relay: Option<String>,
+    pub relay_warning: Option<String>,
+    /// How many SAS rounds this pairing shows (1 for the ticket flows,
+    /// 2 for the short code: the meeting's and the ticket's).
+    pub rounds: f64,
+}
+
+/// One cell a pairing delivered, or received.
+#[napi(object)]
+pub struct CellArrivedView {
+    pub name: String,
+    pub ops: f64,
+}
+
+/// The other device, briefly.
+#[napi(object)]
+pub struct DeviceBriefView {
+    pub name: String,
+    pub short_id: String,
+}
+
+/// What `done` says: the other device and the cells.
+#[napi(object)]
+pub struct PairingResultView {
+    pub peer: Option<DeviceBriefView>,
+    pub cells: Vec<CellArrivedView>,
+    pub registry_rows: f64,
+}
+
+/// The listeners of the event hub.
+type Listener = Box<dyn Fn(serde_json::Value) + Send + std::marker::Sync>;
+
+/// The fan-out the pump thread feeds: JS callbacks come and go, the hub
+/// stays (one per service, shared by every Sync object).
+#[derive(Default)]
+pub struct EventHub {
+    next: std::sync::atomic::AtomicU64,
+    listeners: Mutex<Vec<(u64, Listener)>>,
+}
+
+impl EventHub {
+    fn add(&self, l: Listener) -> u64 {
+        let id = self
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.listeners
+            .lock()
+            .map_err(|_| transport_err("IO", "lock degli eventi avvelenato"))
+            .and_then(|mut ls| {
+                ls.push((id, l));
+                Ok(())
+            })
+            .ok();
+        id
+    }
+
+    fn remove(&self, id: u64) {
+        if let Ok(mut ls) = self.listeners.lock() {
+            ls.retain(|(i, _)| *i != id);
+        }
+    }
+
+    fn emit(&self, event: serde_json::Value) {
+        if let Ok(ls) = self.listeners.lock() {
+            for (_, l) in ls.iter() {
+                l(event.clone());
+            }
+        }
+    }
+}
+
+/// The engine's own share of the service: the handle, the hub, the pump
+/// thread that drains the service's events into JS.
+pub struct SyncShared {
+    service: Arc<SyncService>,
+    hub: Arc<EventHub>,
+}
+
+impl SyncShared {
+    fn start(root: &std::path::Path) -> Result<Self> {
+        let service = SyncService::start(root).map_err(sync_error)?;
+        let hub = Arc::new(EventHub::default());
+        if let Some(events) = service.take_events() {
+            // the pump: a plain thread, a blocking read, the hub's fan-out
+            // — the event loop never blocks, and the thread dies with the
+            // service (the channel closes when the worker ends)
+            let hub = Arc::clone(&hub);
+            std::thread::Builder::new()
+                .name("engramma-sync-events".into())
+                .spawn(move || {
+                    while let Ok(event) = events.recv() {
+                        hub.emit(event_json(event));
+                    }
+                })
+                .map_err(|e| transport_err("IO", e))?;
+        }
+        Ok(Self { service, hub })
+    }
+
+    /// The end of the service: the continuous loop stops, the worker
+    /// thread ends, the pump follows the closed channel.
+    fn stop(&self) {
+        self.service.shutdown();
+    }
+}
+
+/// One service event, as JS reads it (a union on `type`).
+fn event_json(event: engramma_sync::service::ServiceEvent) -> serde_json::Value {
+    use engramma_sync::service::ServiceEvent;
+    use serde_json::json;
+    match event {
+        ServiceEvent::Pass { peers, cells } => json!({
+            "type": "pass",
+            "devices": peers.iter().map(|p| json!({
+                "name": p.name, "device": p.device, "reached": p.reached,
+                "whyNot": p.why_not, "via": p.via,
+            })).collect::<Vec<_>>(),
+            "cells": cells.iter().map(|c| json!({
+                "cell": c.name, "sent": c.sent, "received": c.received,
+                "refused": c.refused, "conflicts": c.conflicts,
+                "unsent": c.unsent, "head": c.head, "frontier": c.frontier,
+            })).collect::<Vec<_>>(),
+        }),
+        ServiceEvent::Arrived { cell, count } => {
+            json!({ "type": "arrived", "cell": cell, "count": count })
+        }
+        ServiceEvent::Device { name, short, added } => {
+            json!({ "type": "device", "name": name, "short": short, "added": added })
+        }
+        ServiceEvent::RemovedSelf => json!({ "type": "removed" }),
+        ServiceEvent::Unsent { cell, count } => {
+            json!({ "type": "unsent", "cell": cell, "count": count })
+        }
+        ServiceEvent::Error { code, message } => {
+            json!({ "type": "error", "code": code, "message": message })
+        }
+    }
+}
+
+/// The views the service's own answers map onto.
+fn devices_view(v: Vec<engramma_sync::service::DeviceView>) -> Vec<SyncDeviceView> {
+    v.into_iter()
+        .map(|d| SyncDeviceView {
+            name: d.name,
+            short_id: d.short_id,
+            is_self: d.is_self,
+            last_contact: d.last_contact,
+            via: d.via,
+            live: d.live,
+        })
+        .collect()
+}
+
+fn status_view(v: engramma_sync::service::StatusView) -> SyncStatusView {
+    SyncStatusView {
+        device: SyncDeviceView {
+            name: v.device.name,
+            short_id: v.device.short_id,
+            is_self: v.device.is_self,
+            last_contact: v.device.last_contact,
+            via: v.device.via,
+            live: v.device.live,
+        },
+        serving: v.serving,
+        relay: v.relay,
+        cells: v
+            .cells
+            .into_iter()
+            .map(|c| SyncCellView {
+                name: c.name,
+                shared: c.shared,
+                epoch: c.epoch as f64,
+                devices: c.devices as f64,
+                last_session: c.last_session,
+                pending: c.pending as f64,
+                unsent: c.unsent as f64,
+            })
+            .collect(),
+    }
+}
+
+pub struct SyncOpenTask {
+    handle: EngineHandle,
+    opts: SyncOpts,
+    _open: GateGuard,
+}
+
+impl Task for SyncOpenTask {
+    type Output = (
+        Arc<SyncService>,
+        Arc<EventHub>,
+        String,
+        Option<engramma_sync::relay::RelayChoice>,
+    );
+    type JsValue = Sync;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        // parse the relay ONCE: every call the service takes reuses it —
+        // and an explicit choice SAVES in the root right here, as the
+        // CLI's flags always did
+        let flag = parse_relay(self.opts.relay.clone())?;
+        engramma_sync::relay::resolve(&self.handle.root, flag.as_ref())
+            .map_err(|e| transport_err("IO", e))?;
+        let name = self
+            .opts
+            .device_name
+            .clone()
+            .unwrap_or_else(|| "portatile".into());
+        let mut slot = self
+            .handle
+            .sync
+            .lock()
+            .map_err(|_| transport_err("IO", "lock della sync avvelenato"))?;
+        let shared = match slot.as_ref() {
+            Some(shared) => Arc::clone(shared),
+            None => {
+                let shared = Arc::new(SyncShared::start(&self.handle.root)?);
+                *slot = Some(Arc::clone(&shared));
+                shared
+            }
+        };
+        Ok((Arc::clone(&shared.service), Arc::clone(&shared.hub), name, flag))
+    }
+
+    fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
+        Ok(Sync {
+            service: out.0,
+            hub: out.1,
+            device_name: out.2,
+            relay: out.3,
+            gate: self.handle.gate.clone(),
+        })
+    }
+
+    reject_recode!();
+}
+
+/// The sync service of one root, as JS drives it (v0.6.2): every method
+/// is async on libuv's pool, the service runs on its own thread, the
+/// events fan out from the hub. After `Engine.close` every method
+/// answers `CLOSED`.
+#[napi(js_name = "Sync")]
+pub struct Sync {
+    service: Arc<SyncService>,
+    hub: Arc<EventHub>,
+    device_name: String,
+    relay: Option<engramma_sync::relay::RelayChoice>,
+    gate: Gate,
+}
+
+impl Sync {
+    fn enter(&self, env: Env) -> Result<GateGuard> {
+        self.gate.enter_now().map_err(|e| recode(env, e))
+    }
+}
+
+/// The service's refusals cross the async fence with their code.
+fn io_sync(e: engramma_sync::service::ServiceError) -> Error {
+    sync_error(e)
+}
+
+pub struct SyncStatusTask {
+    service: Arc<SyncService>,
+    _open: GateGuard,
+}
+
+impl Task for SyncStatusTask {
+    type Output = engramma_sync::service::StatusView;
+    type JsValue = SyncStatusView;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.service.status().map_err(io_sync)
+    }
+
+    fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
+        Ok(status_view(out))
+    }
+
+    reject_recode!();
+}
+
+pub struct SyncDevicesTask {
+    service: Arc<SyncService>,
+    _open: GateGuard,
+}
+
+impl Task for SyncDevicesTask {
+    type Output = Vec<engramma_sync::service::DeviceView>;
+    type JsValue = Vec<SyncDeviceView>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.service.devices().map_err(io_sync)
+    }
+
+    fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
+        Ok(devices_view(out))
+    }
+
+    reject_recode!();
+}
+
+pub struct SyncRemoveTask {
+    service: Arc<SyncService>,
+    name: String,
+    _open: GateGuard,
+}
+
+impl Task for SyncRemoveTask {
+    type Output = engramma_sync::service::RemoveView;
+    type JsValue = RemoveView;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.service.remove(&self.name).map_err(io_sync)
+    }
+
+    fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
+        Ok(RemoveView {
+            removed: out.removed,
+            accepted_root: out.accepted_root,
+            accepted_count: out.accepted_count as f64,
+            rotated: out
+                .rotated
+                .into_iter()
+                .map(|(cell, epoch)| RotatedView {
+                    cell,
+                    epoch: epoch as f64,
+                })
+                .collect(),
+        })
+    }
+
+    reject_recode!();
+}
+
+pub struct SyncShareTask {
+    service: Arc<SyncService>,
+    cell: String,
+    _open: GateGuard,
+}
+
+impl Task for SyncShareTask {
+    type Output = engramma_sync::service::ShareView;
+    type JsValue = ShareView;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.service.share(&self.cell).map_err(io_sync)
+    }
+
+    fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
+        Ok(ShareView {
+            cell: out.cell,
+            adopt: out.adopt,
+            epoch: out.epoch as f64,
+            key: out.key,
+            wraps: out.wraps as f64,
+        })
+    }
+
+    reject_recode!();
+}
+
+pub struct SyncUnshareTask {
+    service: Arc<SyncService>,
+    cell: String,
+    _open: GateGuard,
+}
+
+impl Task for SyncUnshareTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.service.unshare(&self.cell).map_err(io_sync)
+    }
+
+    fn resolve(&mut self, _env: Env, _out: ()) -> Result<()> {
+        Ok(())
+    }
+
+    reject_recode!();
+}
+
+pub struct SyncRunOnceTask {
+    service: Arc<SyncService>,
+    relay: Option<engramma_sync::relay::RelayChoice>,
+    _open: GateGuard,
+}
+
+impl Task for SyncRunOnceTask {
+    type Output = engramma_sync::serve::PassReport;
+    type JsValue = PassView;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.service.run_once(self.relay.clone()).map_err(io_sync)
+    }
+
+    fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
+        Ok(PassView {
+            devices: out
+                .peers
+                .into_iter()
+                .map(|p| PassDeviceView {
+                    name: p.name,
+                    device: p.device,
+                    reached: p.reached,
+                    why_not: p.why_not,
+                    via: p.via.map(str::to_string),
+                })
+                .collect(),
+            cells: out
+                .cells
+                .into_iter()
+                .map(|c| PassCellView {
+                    cell: c.name,
+                    sent: c.sent as f64,
+                    received: c.received as f64,
+                    refused: c.refused as f64,
+                    conflicts: c.conflicts as f64,
+                    unsent: c.unsent as f64,
+                    head: c.head as f64,
+                    frontier: c.frontier as f64,
+                })
+                .collect(),
+        })
+    }
+
+    reject_recode!();
+}
+
+pub struct SyncServeStartTask {
+    service: Arc<SyncService>,
+    relay: Option<engramma_sync::relay::RelayChoice>,
+    _open: GateGuard,
+}
+
+impl Task for SyncServeStartTask {
+    type Output = engramma_sync::service::ServeInfo;
+    type JsValue = ServeInfoView;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.service.serve_start(self.relay.clone()).map_err(io_sync)
+    }
+
+    fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
+        Ok(ServeInfoView {
+            node: out.node,
+            addrs: out.addrs,
+            relay: out.relay,
+            relay_warning: out.relay_warning,
+        })
+    }
+
+    reject_recode!();
+}
+
+pub struct SyncServeStopTask {
+    service: Arc<SyncService>,
+    _open: GateGuard,
+}
+
+impl Task for SyncServeStopTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.service.serve_stop().map_err(io_sync)
+    }
+
+    fn resolve(&mut self, _env: Env, _out: ()) -> Result<()> {
+        Ok(())
+    }
+
+    reject_recode!();
+}
+
+/// A pairing in flight: the staged handle, its info ready at resolve.
+#[napi(js_name = "Pairing")]
+pub struct Pairing {
+    handle: engramma_sync::service::PairingHandle,
+    info: PairingInfoView,
+    gate: Gate,
+}
+
+pub struct PairingSasTask {
+    handle: engramma_sync::service::PairingHandle,
+    _open: GateGuard,
+}
+
+impl Task for PairingSasTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.handle
+            .sas(std::time::Duration::from_secs(11 * 60))
+            .map_err(io_sync)
+    }
+
+    fn resolve(&mut self, _env: Env, out: String) -> Result<String> {
+        Ok(out)
+    }
+
+    reject_recode!();
+}
+
+pub struct PairingConfirmTask {
+    handle: engramma_sync::service::PairingHandle,
+    same: bool,
+    _open: GateGuard,
+}
+
+impl Task for PairingConfirmTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.handle.confirm(self.same).map_err(io_sync)
+    }
+
+    fn resolve(&mut self, _env: Env, _out: ()) -> Result<()> {
+        Ok(())
+    }
+
+    reject_recode!();
+}
+
+pub struct PairingDoneTask {
+    handle: engramma_sync::service::PairingHandle,
+    _open: GateGuard,
+}
+
+impl Task for PairingDoneTask {
+    type Output = engramma_sync::service::PairingView;
+    type JsValue = PairingResultView;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.handle
+            .done(std::time::Duration::from_secs(3 * 60))
+            .map_err(io_sync)
+    }
+
+    fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
+        Ok(PairingResultView {
+            peer: out.peer.map(|p| DeviceBriefView {
+                name: p.name,
+                short_id: p.short_id,
+            }),
+            cells: out
+                .cells
+                .into_iter()
+                .map(|c| CellArrivedView {
+                    name: c.name,
+                    ops: c.ops as f64,
+                })
+                .collect(),
+            registry_rows: out.registry_rows as f64,
+        })
+    }
+
+    reject_recode!();
+}
+
+/// The staged pairing tasks' shared shape (invite, code, join): bind,
+/// mint (or meet), resolve with the info ready.
+enum PairingRoad {
+    Invite,
+    Code,
+    Join(String),
+}
+
+pub struct PairingStartTask {
+    service: Arc<SyncService>,
+    road: PairingRoad,
+    name: String,
+    relay: Option<engramma_sync::relay::RelayChoice>,
+    gate: Gate,
+    _open: GateGuard,
+}
+
+impl Task for PairingStartTask {
+    type Output = (
+        engramma_sync::service::PairingHandle,
+        engramma_sync::service::PairingInfo,
+        u32,
+    );
+    type JsValue = Pairing;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let (handle, rounds) = match &self.road {
+            PairingRoad::Invite => (
+                self.service
+                    .invite(&self.name, self.relay.clone())
+                    .map_err(io_sync)?,
+                1,
+            ),
+            PairingRoad::Code => (
+                self.service
+                    .code(&self.name, self.relay.clone())
+                    .map_err(io_sync)?,
+                2,
+            ),
+            PairingRoad::Join(text) => (
+                self.service
+                    .join(text, &self.name, self.relay.clone())
+                    .map_err(io_sync)?,
+                if text.starts_with("engramma-invite-v1") { 1 } else { 2 },
+            ),
+        };
+        // resolve when the ticket (the code) is ready: the relay wait
+        // included, never after
+        let info = handle
+            .info(std::time::Duration::from_secs(60))
+            .map_err(io_sync)?;
+        Ok((handle, info, rounds))
+    }
+
+    fn resolve(&mut self, _env: Env, (handle, info, rounds): Self::Output) -> Result<Pairing> {
+        Ok(Pairing {
+            handle,
+            info: PairingInfoView {
+                ticket: info.ticket,
+                ticket_qr: info.ticket_qr,
+                code: info.code,
+                expires_at: info.expires_at,
+                relay: info.relay,
+                relay_warning: info.relay_warning,
+                rounds: rounds as f64,
+            },
+            gate: self.gate.clone(),
+        })
+    }
+
+    reject_recode!();
+}
+
+
+#[napi]
+impl Sync {
+    /// This device, the service, the relay, the shared cells.
+    #[napi(ts_return_type = "Promise<SyncStatusView>")]
+    pub fn status(&self, env: Env) -> Result<AsyncTask<SyncStatusTask>> {
+        Ok(AsyncTask::new(SyncStatusTask {
+            service: Arc::clone(&self.service),
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// The devices: name, short id, is-this, last contact, what the book
+    /// holds, live or removed.
+    #[napi(ts_return_type = "Promise<SyncDeviceView[]>")]
+    pub fn devices(&self, env: Env) -> Result<AsyncTask<SyncDevicesTask>> {
+        Ok(AsyncTask::new(SyncDevicesTask {
+            service: Arc::clone(&self.service),
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// Invite with a ticket (ten minutes, one use): resolves when the
+    /// ticket is ready; `sas()`, `confirm()`, `done()` drive the rest.
+    #[napi(ts_return_type = "Promise<Pairing>")]
+    pub fn invite(&self, env: Env) -> Result<AsyncTask<PairingStartTask>> {
+        Ok(AsyncTask::new(PairingStartTask {
+            service: Arc::clone(&self.service),
+            road: PairingRoad::Invite,
+            name: self.device_name.clone(),
+            relay: self.relay.clone(),
+            gate: self.gate.clone(),
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// Invite with the short code (the blind mailbox must be configured:
+    /// `NO_MAILBOX` otherwise). TWO SAS rounds: the meeting's and the
+    /// ticket's.
+    #[napi(ts_return_type = "Promise<Pairing>")]
+    pub fn code(&self, env: Env) -> Result<AsyncTask<PairingStartTask>> {
+        Ok(AsyncTask::new(PairingStartTask {
+            service: Arc::clone(&self.service),
+            road: PairingRoad::Code,
+            name: self.device_name.clone(),
+            relay: self.relay.clone(),
+            gate: self.gate.clone(),
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// Enter with a ticket (both forms) or a short code: this device's
+    /// name is the one `sync()` was given.
+    #[napi(ts_return_type = "Promise<Pairing>")]
+    pub fn join(
+        &self,
+        env: Env,
+        #[napi(ts_arg_type = "string")] ticket_or_code: String,
+    ) -> Result<AsyncTask<PairingStartTask>> {
+        Ok(AsyncTask::new(PairingStartTask {
+            service: Arc::clone(&self.service),
+            road: PairingRoad::Join(ticket_or_code),
+            name: self.device_name.clone(),
+            relay: self.relay.clone(),
+            gate: self.gate.clone(),
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// Remove a device and rotate every shared cell's key; the removed
+    /// device hears it from this one and stops its own service.
+    #[napi(ts_return_type = "Promise<RemoveView>")]
+    pub fn remove(
+        &self,
+        env: Env,
+        #[napi(ts_arg_type = "string")] name: String,
+    ) -> Result<AsyncTask<SyncRemoveTask>> {
+        Ok(AsyncTask::new(SyncRemoveTask {
+            service: Arc::clone(&self.service),
+            name,
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// Share a cell (the adopt, epoch 0, the wrapped keys).
+    #[napi(ts_return_type = "Promise<ShareView>")]
+    pub fn share(
+        &self,
+        env: Env,
+        #[napi(ts_arg_type = "string")] cell: String,
+    ) -> Result<AsyncTask<SyncShareTask>> {
+        Ok(AsyncTask::new(SyncShareTask {
+            service: Arc::clone(&self.service),
+            cell,
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// Stop sharing a cell from here (`NOT_SHARED` when it is not).
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn unshare(
+        &self,
+        env: Env,
+        #[napi(ts_arg_type = "string")] cell: String,
+    ) -> Result<AsyncTask<SyncUnshareTask>> {
+        Ok(AsyncTask::new(SyncUnshareTask {
+            service: Arc::clone(&self.service),
+            cell,
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// One pass with every reachable device and the blind node: an
+    /// unreachable device is a row of the report, never an error. With
+    /// the continuous service on, the pass rides its endpoint and its
+    /// one-pass-at-a-time lock.
+    #[napi(ts_return_type = "Promise<PassView>")]
+    pub fn run_once(&self, env: Env) -> Result<AsyncTask<SyncRunOnceTask>> {
+        Ok(AsyncTask::new(SyncRunOnceTask {
+            service: Arc::clone(&self.service),
+            relay: self.relay.clone(),
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// The continuous service: accept, sync at every local write and
+    /// every five minutes. A second one on the same root — this process
+    /// or another — is `SYNC_BUSY`. Starting twice changes nothing.
+    #[napi(ts_return_type = "Promise<ServeInfoView>")]
+    pub fn start(&self, env: Env) -> Result<AsyncTask<SyncServeStartTask>> {
+        Ok(AsyncTask::new(SyncServeStartTask {
+            service: Arc::clone(&self.service),
+            relay: self.relay.clone(),
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// Stop the continuous service: the session in flight is
+    /// interrupted, the convergence holds by construction, the lock goes.
+    /// Stopping a stopped service changes nothing. Bounded at 5 s.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn stop(&self, env: Env) -> Result<AsyncTask<SyncServeStopTask>> {
+        Ok(AsyncTask::new(SyncServeStopTask {
+            service: Arc::clone(&self.service),
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// The events of the service: `pass`, `arrived`, `device`,
+    /// `removed`, `unsent`, `error` — nothing here carries note text, a
+    /// ticket or a short code. Returns the function that unsubscribes.
+    #[napi(ts_return_type = "() => void")]
+    pub fn on_event(
+        &self,
+        env: Env,
+        #[napi(ts_arg_type = "(e: SyncEvent) => void")] cb: Function<'static, (serde_json::Value,)>,
+    ) -> Result<napi::sys::napi_value> {
+        let tsfn = cb
+            .build_threadsafe_function::<(serde_json::Value,)>()
+            .build_callback(|ctx| Ok(ctx.value))?;
+        let listener: Listener = Box::new(move |event: serde_json::Value| {
+            tsfn.call(
+                (event,),
+                napi::threadsafe_function::ThreadsafeFunctionCallMode::Blocking,
+            );
+        });
+        let id = self.hub.add(listener);
+        let hub = Arc::clone(&self.hub);
+        let off: napi::bindgen_prelude::Function<(), ()> =
+            env.create_function_from_closure("unsubscribe", move |_ctx| {
+                hub.remove(id);
+                Ok(())
+            })?;
+        // the raw handle crosses back as the JS function itself (a
+        // `Function<'_>` cannot be returned: it borrows the Env — the
+        // raw `napi_value` is the one owned shape `ToNapiValue` takes)
+        use napi::bindgen_prelude::JsValue;
+        Ok(off.raw())
+    }
+}
+
+#[napi]
+impl Pairing {
+    /// The ticket, textual form (`invite` only).
+    #[napi(getter)]
+    pub fn ticket(&self) -> Option<String> {
+        self.info.ticket.clone()
+    }
+
+    /// The ticket in the QR's alphanumeric clothes (`invite` only):
+    /// uppercase, digits and the few symbols the QR mode allows — a
+    /// smaller, more readable QR than the byte mode.
+    #[napi(getter)]
+    pub fn ticket_qr(&self) -> Option<String> {
+        self.info.ticket_qr.clone()
+    }
+
+    /// The short code (`code` only).
+    #[napi(getter)]
+    pub fn code(&self) -> Option<String> {
+        self.info.code.clone()
+    }
+
+    /// When the ticket (the window) ends, RFC 3339.
+    #[napi(getter)]
+    pub fn expires_at(&self) -> String {
+        self.info.expires_at.clone()
+    }
+
+    /// The relay URL the ticket carries, or null.
+    #[napi(getter)]
+    pub fn relay(&self) -> Option<String> {
+        self.info.relay.clone()
+    }
+
+    /// The relay never connected: said, never silent.
+    #[napi(getter)]
+    pub fn relay_warning(&self) -> Option<String> {
+        self.info.relay_warning.clone()
+    }
+
+    /// How many SAS rounds this pairing shows (1 for the ticket flows,
+    /// 2 for the short code).
+    #[napi(getter)]
+    pub fn rounds(&self) -> f64 {
+        self.info.rounds
+    }
+
+    /// The six digits of the next round, when both sides hold them (with
+    /// the short code there are two: ask again after each `confirm`).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn sas(&self, env: Env) -> Result<AsyncTask<PairingSasTask>> {
+        Ok(AsyncTask::new(PairingSasTask {
+            handle: self.handle.clone(),
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
+    }
+
+    /// The human's answer to the digits on the screen. Before `sas()`
+    /// hands them out it is `INVALID_ARGUMENT` — the comparison cannot
+    /// be skipped, and there is no confirming by default.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn confirm(
+        &self,
+        env: Env,
+        #[napi(ts_arg_type = "boolean")] same: bool,
+    ) -> Result<AsyncTask<PairingConfirmTask>> {
+        Ok(AsyncTask::new(PairingConfirmTask {
+            handle: self.handle.clone(),
+            same,
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
+    }
+
+    /// The end of the flow: the other device and the cells — or the
+    /// refusal (`PAIRING_REJECTED`, `PAIRING_TIMEOUT`, `PAIRING_EXPIRED`,
+    /// `CANCELLED`).
+    #[napi(ts_return_type = "Promise<PairingResultView>")]
+    pub fn done(&self, env: Env) -> Result<AsyncTask<PairingDoneTask>> {
+        Ok(AsyncTask::new(PairingDoneTask {
+            handle: self.handle.clone(),
+            _open: self.gate.enter_now().map_err(|e| recode(env, e))?,
+        }))
+    }
+
+    /// Close the pairing endpoint, now: the other side hears a clean
+    /// refusal once its human answers, never a hang.
+    #[napi(ts_return_type = "void")]
+    pub fn cancel(&self) {
+        self.handle.cancel();
+    }
 }
 
 /// The engine version, so the host can log what it loaded.
