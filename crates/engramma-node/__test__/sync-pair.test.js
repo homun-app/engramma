@@ -251,7 +251,7 @@ test('S4: a put on A arrives on B as an event, and the note is readable', async 
     // the write, from A's OWN process (a different connection on the same
     // file: the guardian must see it — the C4 lesson, seen from JS)
     await a.cmd('put', { cell: 'memoria', body: 'la nota che attraversa js' });
-    const { event } = await b.cmd('wait-event', { type: 'arrived', timeoutMs: 25000 });
+    const { event } = await b.cmd('wait-event', { type: 'arrived', timeoutMs: 5000 });
     assert.ok(event, 'B never said the arrival out loud');
     assert.equal(event.cell, 'memoria');
     assert.ok(event.count >= 1);
@@ -298,7 +298,7 @@ test('S4: thirty seconds of silence, zero pass events (the resting cycle)', asyn
     await b.cmd('events-on');
     // one write first: it crosses, the cycle runs — then it must STOP
     await a.cmd('put', { cell: 'memoria', body: 'lultima scritta' });
-    await a.cmd('wait-event', { type: 'pass', timeoutMs: 25000 });
+    await a.cmd('wait-event', { type: 'pass', timeoutMs: 5000 });
     // thirty seconds of silence: no SECOND pass may arrive (the wait
     // drains the queue, so anything that fires now is news)
     await new Promise((r) => setTimeout(r, 30000));
