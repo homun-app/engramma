@@ -7859,6 +7859,17 @@ prima di correrlo.
   nell'ordine totale, lasciando divergere le istantanee di versione
   (seme `12328535914020248362`). Ogni difetto è la stessa malattia:
   due percorsi verso la stessa derivazione, uno dei quali shortcuts.
+- **Il generatore della flotta a fasi.** La vecchia flotta seminava le
+  consegne fra le scritture: i rami concorrenti convergevano prima che
+  un dispositivo potesse VEDERLI (sei copie in mille flotte, e le
+  fusioni a mano e le chiusure di copia non scattavano mai). Lo
+  schedulatore nuovo scrive per quattro giri senza consegnare, poi
+  sincronizza tutto: i rami crescono, gli incontri derivano, le
+  finestre si aprono. **Frequenze per 1000 flotte** (3 dispositivi,
+  20 giri): 23 928 operazioni, **21,6% umane** e 78,4% agente; 2 082
+  scritture del corpo; **1 392 patch di sola intestazione**; **24
+  fusioni a mano**; **18 delete su id di copia**; 138 copie aperte a
+  fine corsa, di cui 126 in quarantena.
 - **I semi di `convergence.proptest-regressions`** restano verdi: con
   il generatore nuovo asseriscono convergenza e oracolo, che la regola
   nuova tiene per costruzione (una funzione dell'insieme in ogni
