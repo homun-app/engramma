@@ -86,10 +86,7 @@ fn the_cli_serve_and_the_library_service_share_one_lock() {
             .run_once(Some(engramma_sync::relay::RelayChoice::Disabled))
             .is_ok();
         if free || Instant::now() > deadline {
-            assert!(
-                free,
-                "the lock outlived the daemon that held it"
-            );
+            assert!(free, "the lock outlived the daemon that held it");
             break;
         }
         std::thread::sleep(Duration::from_millis(200));

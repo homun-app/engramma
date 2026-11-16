@@ -168,6 +168,10 @@ pub struct JoinReport {
     pub cells: Vec<(String, usize)>,
     /// The registry rows applied.
     pub registry_rows: usize,
+    /// The OTHER device, when the flow learned it (v0.6.2): its name and
+    /// its device id — the inviter reads the joiner's identity frame, the
+    /// joiner looks the inviter up in the rows that arrived.
+    pub peer: Option<(String, String)>,
 }
 
 /// The INVITER's side: wait for the one device that enters with this
@@ -248,6 +252,7 @@ pub async fn invite(
     registry
         .add(&key, &device, &name, &transport, &hpke)
         .map_err(|e| Error::Registry(e.to_string()))?;
+    let peer = Some((name.clone(), device.clone()));
     // the registry rows travel first
     send_frame(
         &conn,
@@ -304,6 +309,7 @@ pub async fn invite(
     }
     send_frame(&conn, &json!({"kind": "done"})).await?;
     report.registry_rows = registry.rows_json().len();
+    report.peer = peer;
     // the joiner's goodbye: only then may this side drop the connection
     // (a sooner drop resets the wire and the last frames in flight would
     // vanish — the lockstep test found it)
@@ -417,6 +423,18 @@ pub async fn join(
     let mut report = JoinReport {
         registry_rows: registry.rows_json().len() - before,
         cells: Vec::new(),
+        // the inviter's row, when the registry that arrived says it
+        peer: reg_frame
+            .get("device")
+            .and_then(Value::as_str)
+            .and_then(|device| {
+                registry
+                    .live_members()
+                    .ok()?
+                    .into_iter()
+                    .find(|m| m.device == device)
+                    .map(|m| (m.name, m.device))
+            }),
     };
     // the cells: sync id, wrapped keys, then the sealed operations
     let dk = DeviceKey::load_or_create(root)?;

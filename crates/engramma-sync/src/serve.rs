@@ -639,27 +639,55 @@ impl DataVersionWatch {
 
     /// Decide, now that the file's counter moved and the debounce is
     /// over: compare the LOG's marker with its baseline and the sessions'
-    /// ledger. When the answer is a pass, the baselines stay where they
-    /// are — `settle` moves them when the pass is done (K1: the ack comes
-    /// AFTER the pass, never before, or the pass's own writes re-light
-    /// the cycle). When the answer is nothing, the baselines settle here.
+    /// ledger, **per cell** (v0.6.2, S1). A cell's rows are judged
+    /// against the rows THIS cell's sessions brought — one cell's story
+    /// (a ledger inflated by a refused envelope, rows that vanished)
+    /// can no longer decide another cell's:
+    ///
+    /// - any cell with rows beyond its sessions' work has LOCAL writes:
+    ///   a pass toward EVERY live device (they have not seen them);
+    /// - cells whose rows are all the sessions' own work name their
+    ///   sources: a pass toward the OTHERS, never back to them (K1);
+    /// - no rows anywhere: bookkeeping, not operations — no pass, and
+    ///   the baselines settle.
+    ///
+    /// When the answer is a pass, the baselines stay where they are —
+    /// `settle` moves them when the pass is done (K1: the ack comes AFTER
+    /// the pass, never before, or the pass's own writes re-light the
+    /// cycle). When the answer is nothing, the baselines settle here.
     ///
     /// # Errors
     /// [`Error::Db`] on SQL failure.
     pub fn evaluate(&mut self) -> Result<PassDecision> {
         let now = Self::read_markers(&self.cells, &self.root)?;
-        let delta: i64 = now
-            .iter()
-            .zip(&self.marker)
-            .map(|(a, b)| a.1.0 - b.1.0)
-            .sum();
-        let sessions: i64 = self.fed.values().flat_map(|per| per.values()).sum::<i64>();
-        let decision = if delta <= 0 {
-            PassDecision::None
-        } else if delta > sessions {
+        let mut any_local = false;
+        let mut sources: Vec<String> = Vec::new();
+        for (cell, base) in &self.marker {
+            let Some(current) = now.iter().find(|(name, _)| name == cell) else {
+                continue;
+            };
+            let delta = current.1.0 - base.0;
+            let fed_cell: i64 = self
+                .fed
+                .values()
+                .map(|per| per.get(cell).copied().unwrap_or(0))
+                .sum();
+            if delta > fed_cell {
+                any_local = true;
+            } else if delta > 0 && fed_cell > 0 {
+                for (device, per) in &self.fed {
+                    if per.get(cell).copied().unwrap_or(0) > 0 && !sources.contains(device) {
+                        sources.push(device.clone());
+                    }
+                }
+            }
+        }
+        let decision = if any_local {
             PassDecision::All
+        } else if sources.is_empty() {
+            PassDecision::None
         } else {
-            PassDecision::Others(self.fed.keys().cloned().collect())
+            PassDecision::Others(sources)
         };
         match decision {
             PassDecision::None => self.settle()?,
@@ -689,27 +717,41 @@ impl DataVersionWatch {
         Ok(())
     }
 
-    /// Close an armed pass (K1): settle the baselines, and say whether
-    /// rows that are NOT the sessions' own work arrived WHILE the pass
-    /// ran — a local write that lands mid-pass must not be swallowed by
-    /// the settle (its baseline would take it as already seen). The
-    /// caller answers `true` with another pass.
+    /// Close an armed pass (K1), PER CELL (v0.6.2, S1): settle the
+    /// baselines, and say whether rows that are NOT the sessions' own
+    /// work arrived WHILE the pass ran — a local write that lands mid-pass
+    /// must not be swallowed by the settle (its baseline would take it as
+    /// already seen), and a receipt earned in ONE cell settles only that
+    /// cell. The caller answers `true` with another pass.
     ///
     /// # Errors
     /// [`Error::Db`] on SQL failure.
     pub fn finish_pass(&mut self, pass_received: &[(String, i64)]) -> Result<bool> {
         let now = Self::read_markers(&self.cells, &self.root)?;
         let start = self.pass_start.clone().unwrap_or_else(|| now.clone());
-        let delta: i64 = now.iter().zip(&start).map(|(a, b)| a.1.0 - b.1.0).sum();
-        // the sessions' own work during the pass: what the inbound
-        // sessions noted in the ledger, and what the pass itself ingested
-        let sessions: i64 = self
-            .fed
-            .values()
-            .flat_map(|per| per.values())
-            .sum::<i64>()
-            + pass_received.iter().map(|(_, n)| *n).sum::<i64>();
-        let again = delta > sessions;
+        let mut again = false;
+        for (cell, base) in &start {
+            let Some(current) = now.iter().find(|(name, _)| name == cell) else {
+                continue;
+            };
+            let delta = current.1.0 - base.0;
+            // the sessions' own work during the pass, in THIS cell: what
+            // the inbound sessions noted in the ledger, and what the pass
+            // itself received here
+            let receipt: i64 = pass_received
+                .iter()
+                .find(|(name, _)| name == cell)
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            let fed_cell: i64 = self
+                .fed
+                .values()
+                .map(|per| per.get(cell).copied().unwrap_or(0))
+                .sum();
+            if delta > fed_cell + receipt {
+                again = true;
+            }
+        }
         self.last = Self::read(&self.cells, &self.root)?;
         self.marker = now;
         self.fed.clear();

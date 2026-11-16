@@ -507,11 +507,17 @@ enum DevicesAction {
     /// Bind the pairing endpoint and print the invite ticket with the real
     /// address; waits (10 minutes, one use) for the device that enters
     Invite {
+        /// This device's name in the list, when it is the first
+        #[arg(long)]
+        name: Option<String>,
         #[command(flatten)]
         relay: RelayArgs,
     },
     /// Print a short pairing code
     Code {
+        /// This device's name in the list, when it is the first
+        #[arg(long)]
+        name: Option<String>,
         #[command(flatten)]
         relay: RelayArgs,
     },
@@ -3449,9 +3455,11 @@ fn devices_run(cli: &Cli, action: &DevicesAction) -> Result<(), CliError> {
             }
             Ok(())
         }
-        DevicesAction::Invite { relay } => synccli::devices_invite(&r, cli.json, relay_flag(relay)),
-        DevicesAction::Code { relay } => {
-            crate::mailboxcli::devices_code(&r, cli.json, relay_flag(relay))
+        DevicesAction::Invite { name, relay } => {
+            synccli::devices_invite(&r, cli.json, relay_flag(relay), name.clone())
+        }
+        DevicesAction::Code { name, relay } => {
+            synccli::devices_code(&r, cli.json, relay_flag(relay), name.clone())
         }
         DevicesAction::Join {
             ticket_or_code,

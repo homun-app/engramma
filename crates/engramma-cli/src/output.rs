@@ -69,6 +69,16 @@ impl CliError {
             message: message.into(),
         }
     }
+
+    /// Another sync service already holds this root's lock (v0.6.2, S1):
+    /// `sync.lock` is someone else's — a second `serve`, or a pass
+    /// against a serving root. Nothing was touched.
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self {
+            code: 7,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<CellError> for CliError {

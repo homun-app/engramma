@@ -103,12 +103,13 @@ fn invite_join_share_write_remove_roundtrip() {
         drop(cell);
         let svc_a = SyncService::start(&a.root).unwrap(/* t */);
         let svc_b = SyncService::start(&b.root).unwrap(/* t */);
-        let mut events_b = svc_b.take_events().expect(/* one */ "the events");
+        let events_b = svc_b.take_events().expect(/* one */ "the events");
+        // the invite FIRST: it names the list as the caller asked (a
+        // share before it would have named it «portatile», the default)
+        let invite = svc_a.invite("laptop", NO_RELAY).unwrap(/* t */);
         // the share, from the service
         let shared = svc_a.share("memoria").unwrap(/* t */);
         assert_eq!(shared.epoch, 0, "the share opens epoch 0");
-        // the invite names the first device as the CALLER asked
-        let invite = svc_a.invite("laptop", NO_RELAY).unwrap(/* t */);
         let info = invite.info(LONG).unwrap(/* t */);
         let ticket = info.ticket.expect(/* invite */ "the ticket");
         assert!(
@@ -118,8 +119,9 @@ fn invite_join_share_write_remove_roundtrip() {
         assert!(
             info.ticket_qr.as_deref().is_some_and(|qr| qr
                 .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.')),
-            "the QR form wears the QR's alphanumeric clothes"
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || "$%*+-./:".contains(c))),
+            "the QR form wears the QR's alphanumeric clothes: {:?}",
+            info.ticket_qr
         );
         // B enters with the TEXTUAL form; the QR form enters too (below,
         // in its own test)
@@ -136,8 +138,8 @@ fn invite_join_share_write_remove_roundtrip() {
             done_b
                 .cells
                 .iter()
-                .any(|c| c.name == "memoria" && c.ops == 3),
-            "the cell arrived whole on B: {:?}",
+                .any(|c| c.name == "memoria" && c.ops >= 3),
+            "the cell arrived whole on B (its ops, genesis and adopt included): {:?}",
             done_b.cells
         );
         assert_eq!(
@@ -186,15 +188,27 @@ fn invite_join_share_write_remove_roundtrip() {
             }
         };
         assert!(arrived, "the write never crossed to B");
-        // and B said it as an EVENT
-        let mut said_arrived = false;
-        while let Ok(ev) = events_b.try_recv() {
-            if let engramma_sync::service::ServiceEvent::Arrived { cell, count } = ev {
-                assert_eq!(cell, "memoria");
-                assert!(count >= 1, "an arrival says how many");
-                said_arrived = true;
+        // and B said it as an EVENT (the note is readable MID-session; the
+        // event lands when the session ends — wait for it, don't drain)
+        let said_arrived = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                match events_b.recv_timeout(Duration::from_millis(200)) {
+                    Ok(engramma_sync::service::ServiceEvent::Arrived { cell, count }) => {
+                        assert_eq!(cell, "memoria");
+                        assert!(count >= 1, "an arrival says how many");
+                        break true;
+                    }
+                    Ok(_) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break false,
+                }
             }
-        }
+        };
         assert!(said_arrived, "B never said the arrival out loud");
         // the digests agree
         assert_eq!(
@@ -212,12 +226,15 @@ fn invite_join_share_write_remove_roundtrip() {
         );
         let (heard, stopped) = {
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut heard = false;
             loop {
                 std::thread::sleep(Duration::from_millis(100));
-                let heard = matches!(
-                    events_b.try_recv(),
-                    Ok(engramma_sync::service::ServiceEvent::RemovedSelf)
-                );
+                // drain everything that piled up, look for the removal
+                while let Ok(ev) = events_b.try_recv() {
+                    if matches!(ev, engramma_sync::service::ServiceEvent::RemovedSelf) {
+                        heard = true;
+                    }
+                }
                 if heard {
                     break (true, !svc_b.status().unwrap(/* t */).serving);
                 }
@@ -246,7 +263,10 @@ fn the_qr_form_of_the_ticket_joins() {
         let info = invite.info(LONG).unwrap(/* t */);
         let qr = info.ticket_qr.expect(/* invite */ "the QR form");
         let join = svc_b.join(&qr, "mac", NO_RELAY).unwrap(/* t */);
-        let (sas_a, sas_b) = (invite.sas(LONG).unwrap(/* t */), join.sas(LONG).unwrap(/* t */));
+        let (sas_a, sas_b) = (
+            invite.sas(LONG).unwrap(/* t */),
+            join.sas(LONG).unwrap(/* t */),
+        );
         assert_eq!(sas_a, sas_b);
         invite.confirm(true).unwrap(/* t */);
         join.confirm(true).unwrap(/* t */);
@@ -345,8 +365,9 @@ fn an_unanswered_sas_times_out() {
     });
 }
 
-/// `cancel` at any moment: this side answers `CANCELLED` at `done`, and
-/// the other side hears a refusal.
+/// `cancel` at any moment: this side answers `CANCELLED` at `done`, the
+/// endpoint closes — and the other side, once ITS human answers, gets a
+/// clean refusal off the dead wire (never a hang).
 #[test]
 fn cancel_closes_cleanly() {
     bounded("cancel", 120, || {
@@ -361,11 +382,14 @@ fn cancel_closes_cleanly() {
         let _ = join.sas(LONG).unwrap(/* t */);
         invite.cancel();
         let out_a = invite.done(Duration::from_secs(20));
-        let out_b = join.done(Duration::from_secs(20));
         assert!(
             matches!(out_a, Err(ServiceError::Cancelled)),
             "the canceller hears it: {out_a:?}"
         );
+        // B's human still answers yes — and the answer meets a closed
+        // wire: a refusal, not a wait
+        join.confirm(true).unwrap(/* t */);
+        let out_b = join.done(Duration::from_secs(20));
         assert!(
             matches!(out_b, Err(ServiceError::PairingRejected)),
             "the other side hears a clean refusal: {out_b:?}"
@@ -403,7 +427,10 @@ fn the_code_without_a_mailbox_is_refused() {
     let a = Root::new("nomb-a");
     let svc = SyncService::start(&a.root).unwrap(/* t */);
     assert!(
-        matches!(svc.code("portatile", NO_RELAY), Err(ServiceError::NoMailbox)),
+        matches!(
+            svc.code("portatile", NO_RELAY),
+            Err(ServiceError::NoMailbox)
+        ),
         "the code needs the blind node"
     );
 }
@@ -420,10 +447,16 @@ fn unsharing_a_stranger_is_not_shared() {
     )
     .unwrap(/* t */);
     let svc = SyncService::start(&a.root).unwrap(/* t */);
-    assert!(matches!(svc.unshare("solitaria"), Err(ServiceError::NotShared)));
+    assert!(matches!(
+        svc.unshare("solitaria"),
+        Err(ServiceError::NotShared)
+    ));
     svc.share("solitaria").unwrap(/* t */);
     svc.unshare("solitaria").unwrap(/* t */);
-    assert!(matches!(svc.unshare("solitaria"), Err(ServiceError::NotShared)));
+    assert!(matches!(
+        svc.unshare("solitaria"),
+        Err(ServiceError::NotShared)
+    ));
 }
 
 /// Removing the last device is `LAST_DEVICE`.

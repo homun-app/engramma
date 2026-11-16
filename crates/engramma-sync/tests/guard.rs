@@ -53,12 +53,7 @@ fn scene(tag: &str) -> (tempfile::TempDir, DataVersionWatch, Cell, Option<Cell>)
 fn scene_cells(
     tag: &str,
     names: &[&str],
-) -> (
-    tempfile::TempDir,
-    DataVersionWatch,
-    Cell,
-    Option<Cell>,
-) {
+) -> (tempfile::TempDir, DataVersionWatch, Cell, Option<Cell>) {
     let dir = tempfile::tempdir().unwrap(/* t */);
     let root = dir.path().join(tag);
     std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
@@ -70,12 +65,9 @@ fn scene_cells(
     // the guard watches; a SECOND handle writes, as another process would
     let writer = Cell::open(&root.join("cells").join(format!("{}.sqlite", names[0])))
         .unwrap(/* t */);
-    let other = names
-        .last()
-        .filter(|last| **last != names[0])
-        .map(|last| {
-            Cell::open(&root.join("cells").join(format!("{last}.sqlite"))).unwrap(/* t */)
-        });
+    let other = names.last().filter(|last| **last != names[0]).map(|last| {
+        Cell::open(&root.join("cells").join(format!("{last}.sqlite"))).unwrap(/* t */)
+    });
     let watch = DataVersionWatch::new(&root).unwrap(/* t */);
     (dir, watch, writer, other)
 }
