@@ -453,6 +453,7 @@ test('C5.4: stop() during a session with many notes concludes within 5 s', async
     const t0 = Date.now();
     await b.cmd('stop');
     const elapsed = Date.now() - t0;
+    console.log(`stop() durante la sessione da 5000 note: ${elapsed} ms`);
     assert.ok(elapsed < 5000, `stop() durante la sessione ha impiegato ${elapsed} ms`);
     assert.equal((await b.cmd('status')).serving, false);
   } finally {

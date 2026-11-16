@@ -1270,6 +1270,10 @@ impl Task for CellOpenTask {
         // signature, or the peers' gate refuses them (the CLI arms the
         // signer at every open; the binding arms at open and at share)
         arm_shared_signer(&self.handle.root, &cell, &self.name);
+        // v0.6.3 (C5.3): and again at every WRITE, when the registry moved
+        // under the open cell — a share by the CLI in another process
+        // arms the first write after it
+        let _ = cell.set_signer_gate(signer_gate_for(&self.handle.root, &self.name));
         let actor = match &self.actor {
             // v0.4.1 (P1.6): an empty actor is the same as none — the
             // engine's own stamps the writes
@@ -3372,6 +3376,47 @@ fn arm_shared_signer(root: &std::path::Path, cell: &CoreCell, name: &str) {
     if let Ok(dk) = engramma_sync::device::DeviceKey::load_or_create(root) {
         let _ = cell.set_signer(Arc::new(engramma_sync::arrival::DeviceSigner::new(&dk)));
     }
+}
+
+/// v0.6.3 (C5.3): the stamp of `devices.db` — modified time and length,
+/// the cheapest thing that MOVES when the registry changes (a share, a
+/// join, a device added — by this Engine or by the CLI in another
+/// process while ours holds the cell open).
+fn devices_db_stamp(root: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(root.join("devices.db")).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// v0.6.3 (C5.3): the write-time signer gate of one cell. Every local
+/// write pays ONE stat of `devices.db`: a root without it (the engines
+/// that never sync — the insert bench's roots) stops there, at a failed
+/// stat. When the stamp moves, the first write after the change (re)arms
+/// the signer — the arm is decided at the WRITE, not at the open, so a
+/// cell shared by ANOTHER process under an open Engine signs too.
+fn signer_gate_for(root: &std::path::Path, name: &str) -> engramma_core::cell::SignerGate {
+    let root = root.to_path_buf();
+    let name = name.to_string();
+    let last = Arc::new(std::sync::Mutex::new(devices_db_stamp(&root)));
+    Arc::new(move || {
+        let now = devices_db_stamp(&root);
+        {
+            let mut last = last
+                .lock()
+                .map_err(|_| engramma_core::CellError::Db("gate".into()))
+                .ok()?;
+            if now == *last {
+                return None;
+            }
+            *last = now;
+        }
+        // the stamp moved: arm only if THIS cell is shared now
+        if !engramma_sync::service::cell_is_shared(&root, &name).unwrap_or(false) {
+            return None;
+        }
+        let dk = engramma_sync::device::DeviceKey::load_or_create(&root).ok()?;
+        Some(Arc::new(engramma_sync::arrival::DeviceSigner::new(&dk))
+            as Arc<dyn engramma_core::cell::ops::Signer>)
+    })
 }
 
 pub struct SyncStatusTask {

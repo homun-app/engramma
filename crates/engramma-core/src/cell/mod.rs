@@ -498,12 +498,25 @@ pub(crate) struct GraphDirt {
     pub(crate) global: bool,
 }
 
+/// v0.6.3 (C5.3): the write-time signer gate — asked before every local
+/// write, it answers with the signer to (re)arm or `None` when nothing
+/// changed. The host that knows when sharing may have moved under an open
+/// cell (the Node binding: `devices.db` changed) installs one; a cell
+/// without a gate pays nothing.
+pub type SignerGate =
+    std::sync::Arc<dyn Fn() -> Option<std::sync::Arc<dyn ops::Signer>> + Send + Sync>;
+
 pub(crate) struct Inner {
     pub(crate) conn: Connection,
     clock: HlcClock,
     /// The sync era's signer (v0.6, P2): signs every LOCAL operation with
     /// the device key. `None` outside the sync era.
     pub(crate) signer: Option<std::sync::Arc<dyn ops::Signer>>,
+    /// v0.6.3 (C5.3): asked before every LOCAL write — the host that
+    /// knows when sharing may have changed under an open cell answers
+    /// with the signer to (re)arm, or `None` when nothing moved. A cell
+    /// without a gate pays nothing.
+    pub(crate) signer_gate: Option<SignerGate>,
     /// Lazily built on the first semantic search (opening a cell stays ≤ 50 ms).
     pub(crate) index: Option<IndexState>,
     /// Lazily built on the first graph walk (same reason).
@@ -832,6 +845,7 @@ impl Cell {
                 conn,
                 clock,
                 signer: None,
+                signer_gate: None,
                 index: None,
                 graph: None,
                 graph_dirt: GraphDirt::default(),
@@ -1047,6 +1061,16 @@ impl Cell {
         Ok(())
     }
 
+    /// Install the write-time signer gate (v0.6.3, C5.3): `execute` asks
+    /// it before every local write, so a cell that was open BEFORE the
+    /// root started sharing signs its first write after the change — the
+    /// arm is decided at the WRITE, not at the open.
+    pub fn set_signer_gate(&self, gate: SignerGate) -> Result<(), CellError> {
+        let mut inner = self.lock()?;
+        inner.signer_gate = Some(gate);
+        Ok(())
+    }
+
     /// Replace the HLC clock — tests inject skewed wall clocks to play
     /// multiple processes on the same file, and the convergence simulator
     /// fixes time so a failing case reproduces byte for byte (the HLCs
@@ -1083,6 +1107,14 @@ impl Cell {
             .lock()
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
         let mut inner = self.lock()?;
+        // v0.6.3 (C5.3): the gate answers before the write — under the
+        // write lock, so the arm and the write are one step. A cell with
+        // no gate (the engines that never sync) pays a null check.
+        if let Some(gate) = inner.signer_gate.clone()
+            && let Some(signer) = gate()
+        {
+            inner.signer = Some(signer);
+        }
         execute_op(&mut inner, kind, note_id, actor, payload)?;
         Ok(())
     }
