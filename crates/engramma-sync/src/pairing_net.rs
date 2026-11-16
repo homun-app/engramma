@@ -174,6 +174,16 @@ pub struct JoinReport {
     pub peer: Option<(String, String)>,
 }
 
+/// v0.6.3 (C5.5): one SAS round as a FUTURE — the flow hands the digits
+/// out and AWAITS the human's answer; no worker is ever parked, and the
+/// pairing runtime can be one thread. (Before, the closure blocked the
+/// worker it ran on: a single-thread runtime froze the endpoint's wire,
+/// and the v0.6.2 workaround was a second worker.)
+pub trait SasConfirm {
+    /// Show the digits, await the answer (bounded by the implementer).
+    fn confirm(&self, digits: &str) -> impl std::future::Future<Output = bool>;
+}
+
 /// The INVITER's side: wait for the one device that enters with this
 /// ticket, run the turns, and — after BOTH confirmations — sign the `add`,
 /// hand over the registry, the wrapped epoch keys and the shared cells.
@@ -181,12 +191,12 @@ pub struct JoinReport {
 ///
 /// # Errors
 /// Whatever turn fails; nothing about any note.
-pub async fn invite(
+pub async fn invite<C: SasConfirm>(
     endpoint: &Endpoint,
     registry: &DeviceRegistry,
     root: &std::path::Path,
     ticket: &Ticket,
-    mut confirm: impl FnMut(&str) -> bool,
+    confirm: &C,
 ) -> Result<JoinReport> {
     let Some(incoming) = tokio::time::timeout(
         std::time::Duration::from_millis(pairing::TICKET_TTL_MS),
@@ -204,7 +214,7 @@ pub async fn invite(
     let (shared, transcript) = pake_turns(&conn, Side::Inviter, &ticket.secret).await?;
     // SAS: both screens, both humans
     let sas = six_digits(&shared, &transcript);
-    if !confirm(&sas) {
+    if !confirm.confirm(&sas).await {
         // this side said no: close, the peer's next read fails, no add
         return Err(Error::Malformed(" SAS rifiutata da chi invita".into()));
     }
@@ -334,12 +344,12 @@ type JoinEnvelope = (u64, [u8; 32], Vec<u8>, Vec<u8>);
 ///
 /// # Errors
 /// Whatever turn fails; nothing about any note.
-pub async fn join(
+pub async fn join<C: SasConfirm>(
     endpoint: &Endpoint,
     ticket: &Ticket,
     name: &str,
     root: &std::path::Path,
-    mut confirm: impl FnMut(&str) -> bool,
+    confirm: &C,
 ) -> Result<JoinReport> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -368,7 +378,7 @@ pub async fn join(
         .map_err(|e| Error::Io(std::io::Error::other(e)))?;
     let (shared, transcript) = pake_turns(&conn, Side::Joiner, &ticket.secret).await?;
     let sas = six_digits(&shared, &transcript);
-    if !confirm(&sas) {
+    if !confirm.confirm(&sas).await {
         return Err(Error::Malformed(" SAS rifiutata da chi entra".into()));
     }
     send_frame(&conn, &json!({"kind": "confirmed"})).await?;

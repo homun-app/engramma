@@ -445,9 +445,14 @@ struct PairingInner {
     info_cv: std::sync::Condvar,
     state: std::sync::Mutex<PairingState>,
     state_cv: std::sync::Condvar,
-    /// The answers to the SAS rounds; the DRIVER owns the receiving end
-    /// (a `Receiver` is not `Sync`, and the handle crosses threads).
-    answers: std::sync::mpsc::Sender<Answer>,
+    /// The answers to the SAS rounds. v0.6.3 (C5.5): an unbounded TOKIO
+    /// channel — the round AWAITS the answer instead of parking a worker,
+    /// and the sender side stays the plain sync call it always was for
+    /// the UI thread.
+    answers: tokio::sync::mpsc::UnboundedSender<Answer>,
+    /// The receiving end, owned here behind an async mutex: the rounds
+    /// await it (SasConfirm), the handle never touches it.
+    answers_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Answer>>,
     /// `cancel()` was called.
     cancelled: std::sync::atomic::AtomicBool,
     /// This side's human never answered.
@@ -475,25 +480,31 @@ impl PairingInner {
         self.state_cv.notify_all();
     }
 
-    /// The SAS closure one round runs with: hand the digits out, block for
-    /// the answer (bounded), and remember WHY when the answer never came.
-    fn confirm_round(&self, answer_rx: &std::sync::mpsc::Receiver<Answer>, digits: &str) -> bool {
+    /// The SAS closure one round runs with: hand the digits out, AWAIT the
+    /// answer (bounded), and remember WHY when the answer never came.
+    /// v0.6.3 (C5.5): the wait is a Future — no worker is parked while
+    /// the human looks at the screen, and the runtime can be one thread
+    /// (before, the blocked closure froze a single-thread runtime's wire:
+    /// the v0.6.2 S1 defect that two workers worked around).
+    async fn confirm_round(&self, digits: &str) -> bool {
         self.sas_shown
             .store(true, std::sync::atomic::Ordering::Release);
         let _round = self.round.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.set_state(PairingState::SasReady(digits.to_string()));
-        match answer_rx.recv_timeout(sas_timeout()) {
-            Ok(Answer::Human(true)) => {
+        let mut answer_rx = self.answers_rx.lock().await;
+        match tokio::time::timeout(sas_timeout(), answer_rx.recv()).await {
+            Ok(Some(Answer::Human(true))) => {
                 self.set_state(PairingState::Answered);
                 true
             }
-            Ok(Answer::Human(false)) => {
+            Ok(Some(Answer::Human(false))) => {
                 self.refused
                     .store(true, std::sync::atomic::Ordering::Release);
                 self.set_state(PairingState::Answered);
                 false
             }
-            Ok(Answer::Cancelled) => false,
+            Ok(Some(Answer::Cancelled)) => false,
+            Ok(None) => false,
             Err(_) => {
                 self.timed_out
                     .store(true, std::sync::atomic::Ordering::Release);
@@ -503,8 +514,19 @@ impl PairingInner {
     }
 }
 
+/// v0.6.3 (C5.5): the SAS rounds of a pairing, as the pairing flow
+/// awaits them — `PairingInner` IS the round gate.
+impl crate::pairing_net::SasConfirm for PairingInner {
+    async fn confirm(&self, digits: &str) -> bool {
+        self.confirm_round(digits).await
+    }
+}
+
 impl PairingHandle {
-    fn from_parts(answers: std::sync::mpsc::Sender<Answer>) -> Self {
+    fn from_parts(
+        answers: tokio::sync::mpsc::UnboundedSender<Answer>,
+        answers_rx: tokio::sync::mpsc::UnboundedReceiver<Answer>,
+    ) -> Self {
         Self {
             inner: Arc::new(PairingInner {
                 info: std::sync::Mutex::new(None),
@@ -512,6 +534,7 @@ impl PairingHandle {
                 state: std::sync::Mutex::new(PairingState::Waiting),
                 state_cv: std::sync::Condvar::new(),
                 answers,
+                answers_rx: tokio::sync::Mutex::new(answers_rx),
                 cancelled: std::sync::atomic::AtomicBool::new(false),
                 timed_out: std::sync::atomic::AtomicBool::new(false),
                 refused: std::sync::atomic::AtomicBool::new(false),
@@ -2076,25 +2099,22 @@ fn spawn_pairing(
     {
         return Err(ServiceError::NoMailbox);
     }
-    let (answer_tx, answer_rx) = std::sync::mpsc::channel::<Answer>();
-    let handle = PairingHandle::from_parts(answer_tx);
+    let (answer_tx, answer_rx) = tokio::sync::mpsc::unbounded_channel::<Answer>();
+    let handle = PairingHandle::from_parts(answer_tx, answer_rx);
     let inner = Arc::clone(&handle.inner);
     let root = root.to_path_buf();
     let events = events.clone();
     let spawn_result = std::thread::Builder::new()
         .name("engramma-pairing".into())
         .spawn(move || {
-            // TWO workers, not a current-thread runtime: the SAS closure
-            // BLOCKS the thread it runs on (it waits for the human), and a
-            // blocked single-thread runtime freezes the endpoint itself —
-            // the frames already queued never leave, the peer's connection
-            // idles out, and the pairing dies of a timeout that is nobody's
-            // fault. With two workers the closure parks one and the wire
-            // keeps moving on the other (the found-by-measure defect of
-            // v0.6.2 S1: the probe showed B's PAKE complete while A's
+            // v0.6.3 (C5.5): ONE thread. The SAS round AWAITS its answer
+            // (a tokio channel, a timeout future) instead of blocking the
+            // worker, so the endpoint's wire keeps moving while the human
+            // looks at the screen — the two-worker runtime was the v0.6.2
+            // workaround for the closure that parked a whole worker
+            // (S1's found-by-measure defect: B's PAKE completed while A's
             // never did, the moment the closures started blocking).
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
             {
@@ -2105,7 +2125,7 @@ fn spawn_pairing(
                 }
             };
             rt.block_on(async move {
-                let out = drive_pairing(&inner, answer_rx, &root, &kind, flag, &events).await;
+                let out = drive_pairing(&inner, &root, &kind, flag, &events).await;
                 inner.set_state(PairingState::Done(out));
             });
         });
@@ -2118,7 +2138,6 @@ fn spawn_pairing(
 /// Drive one pairing road to its end, mapping every failure to its code.
 async fn drive_pairing(
     inner: &Arc<PairingInner>,
-    answer_rx: std::sync::mpsc::Receiver<Answer>,
     root: &Path,
     kind: &PairingKind,
     flag: Option<RelayChoice>,
@@ -2150,9 +2169,7 @@ async fn drive_pairing(
             });
             let out = race_cancel(
                 inner,
-                pairing_net::invite(&endpoint, &reg, root, &minted.ticket, |sas| {
-                    inner.confirm_round(&answer_rx, sas)
-                }),
+                pairing_net::invite(&endpoint, &reg, root, &minted.ticket, inner.as_ref()),
             )
             .await;
             // cancel closes the endpoint itself: the peer must hear the
@@ -2181,18 +2198,16 @@ async fn drive_pairing(
                     .map_err(ServiceError::io)?;
                 let out = race_cancel(
                     inner,
-                    pairing_net::join(&endpoint, &ticket, name, root, |sas| {
-                        inner.confirm_round(&answer_rx, sas)
-                    }),
+                    pairing_net::join(&endpoint, &ticket, name, root, inner.as_ref()),
                 )
                 .await;
                 let _ = endpoint.close().await;
                 out
             } else {
-                join_with_code(inner, answer_rx, root, &dk, &choice, text, name).await
+                join_with_code(inner, root, &dk, &choice, text, name).await
             }
         }
-        PairingKind::Code => code_invite(inner, answer_rx, root, &dk, &reg, &choice).await,
+        PairingKind::Code => code_invite(inner, root, &dk, &reg, &choice).await,
     };
     match result {
         Ok(report) => {
@@ -2268,7 +2283,6 @@ fn rfc3339_of(unix_ms: u64) -> String {
 /// the sealed ticket — then the ticket's own flow with its SECOND SAS.
 async fn code_invite(
     inner: &Arc<PairingInner>,
-    answer_rx: std::sync::mpsc::Receiver<Answer>,
     root: &Path,
     dk: &DeviceKey,
     reg: &DeviceRegistry,
@@ -2301,7 +2315,7 @@ async fn code_invite(
             return Err(e);
         }
     };
-    if !inner.confirm_round(&answer_rx, &sas) {
+    if !inner.confirm_round(&sas).await {
         relay.burn(code.channel).await.ok();
         return Err(Error::Malformed(
             " SAS rifiutata da chi invita col codice".into(),
@@ -2321,17 +2335,13 @@ async fn code_invite(
     // the ticket is handed over: the channel burns
     relay.burn(code.channel).await.ok();
     // and the invite flow runs on the pairing endpoint (its own SAS round)
-    pairing_net::invite(&pair_endpoint, reg, root, &minted.ticket, |sas| {
-        inner.confirm_round(&answer_rx, sas)
-    })
-    .await
+    pairing_net::invite(&pair_endpoint, reg, root, &minted.ticket, inner.as_ref()).await
 }
 
 /// The code way in: the meeting, the FIRST SAS, the sealed ticket — then
 /// the ticket flow with its SECOND SAS.
 async fn join_with_code(
     inner: &Arc<PairingInner>,
-    answer_rx: std::sync::mpsc::Receiver<Answer>,
     root: &Path,
     dk: &DeviceKey,
     choice: &RelayChoice,
@@ -2363,7 +2373,7 @@ async fn join_with_code(
             return Err(e);
         }
     };
-    if !inner.confirm_round(&answer_rx, &sas) {
+    if !inner.confirm_round(&sas).await {
         relay.burn(code.channel).await.ok();
         return Err(Error::Malformed(
             " SAS rifiutata da chi entra col codice".into(),
@@ -2382,8 +2392,5 @@ async fn join_with_code(
     // ONE attempt per code: the channel that carried the ticket burns
     relay.burn(code.channel).await.ok();
     // the direct ticket flow (its own SAS round)
-    pairing_net::join(&endpoint, &ticket, name, root, |sas| {
-        inner.confirm_round(&answer_rx, sas)
-    })
-    .await
+    pairing_net::join(&endpoint, &ticket, name, root, inner.as_ref()).await
 }

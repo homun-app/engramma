@@ -13,6 +13,14 @@ use std::time::Duration;
 use engramma_core::format::{Note, NoteType};
 use engramma_core::{Cell, Confidence, Status};
 use engramma_sync::device::{DeviceKey, hex};
+/// v0.6.3 (C5.5): the tests' SAS gate — always confirms, as a Future.
+struct AlwaysYes;
+impl engramma_sync::pairing_net::SasConfirm for AlwaysYes {
+    async fn confirm(&self, _digits: &str) -> bool {
+        true
+    }
+}
+
 use engramma_sync::pairing_net::{self, PAIRING_ALPN};
 use engramma_sync::protocol::{self, authorize};
 use engramma_sync::relay::{self, RelayChoice};
@@ -160,7 +168,7 @@ async fn pairing_and_sync_ride_the_relay_and_the_summary_says_so() {
                     let dir = p.dir_a.path().to_path_buf();
                     let ticket = ticket.clone();
                     tokio::task::spawn_local(async move {
-                        pairing_net::invite(&ep, &reg, &dir, &ticket, |_| true).await
+                        pairing_net::invite(&ep, &reg, &dir, &ticket, &AlwaysYes).await
                     })
                 };
                 // the joiner rides the relay too
@@ -172,7 +180,7 @@ async fn pairing_and_sync_ride_the_relay_and_the_summary_says_so() {
                     let ticket = ticket.clone();
                     let dir = p.dir_b.path().to_path_buf();
                     tokio::task::spawn_local(async move {
-                        pairing_net::join(&ep, &ticket, "mac", &dir, |_| true).await
+                        pairing_net::join(&ep, &ticket, "mac", &dir, &AlwaysYes).await
                     })
                 };
                 join.await.expect(/* the join */ "join").expect(/* ok */ "the join flow");
