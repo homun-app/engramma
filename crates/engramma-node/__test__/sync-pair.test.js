@@ -444,18 +444,47 @@ test('C5.4: stop() during a session with many notes concludes within 5 s', async
     const infoB = await b.cmd('start');
     await b.cmd('remember', { device: 'laptop', serve: infoA });
     await a.cmd('remember', { device: 'mac', serve: infoB });
-    // A writes five thousand notes in one command: the next pass will be
-    // a long session, and stop() lands in the middle of it
-    await a.cmd('put-many', { cell: 'memoria', count: 5000, body: 'la nota che riempie la passata' });
-    // the watch fires ~2.5 s after the writes; give the session a beat to
-    // be born, then stop B while it receives
-    await new Promise((r) => setTimeout(r, 3500));
+    await b.cmd('events-on');
+    // A writes five thousand notes WITHOUT waiting for the bulk to end:
+    // while it streams, A's watcher fires pass after pass (the debounce
+    // counts from the first writes, ~2.5 s) and B receives session after
+    // session — the service is provably BUSY, not over an empty pass
+    const bulkSent = Date.now();
+    const bulk = a.cmd('put-many', {
+      cell: 'memoria',
+      count: 20000,
+      body: 'la nota che riempie la passata',
+    });
+    await new Promise((r) => setTimeout(r, 2600));
     const t0 = Date.now();
     await b.cmd('stop');
     const elapsed = Date.now() - t0;
-    console.log(`stop() durante la sessione da 5000 note: ${elapsed} ms`);
-    assert.ok(elapsed < 5000, `stop() durante la sessione ha impiegato ${elapsed} ms`);
+    const stopReturned = Date.now();
+    console.log(`stop() durante il flusso da 20000 note: ${elapsed} ms`);
+    assert.ok(elapsed < 5000, `stop() durante il flusso ha impiegato ${elapsed} ms`);
     assert.equal((await b.cmd('status')).serving, false);
+    // the corpus was STILL BEING WRITTEN when stop() returned: the bulk's
+    // answer lands only now, well after the stop — the sync was in
+    // flight (the parent clock is enough: the reply was not queued yet)
+    const bulkDone = Date.now();
+    await bulk;
+    assert.ok(
+      Date.now() - bulkSent > 2600 && bulkDone >= stopReturned,
+      'the bulk had not answered when stop() returned',
+    );
+    assert.ok(
+      Date.now() > stopReturned + 250,
+      `il flusso era già finito prima dello stop (risposta a ${Date.now() - stopReturned} ms dallo stop)`,
+    );
+    // and the interrupted stream is not wedged: B's own pass (runOnce)
+    // resumes the pull — the silence after A's last write runs no pass
+    // by itself (the resting cycle), so the pass is B's
+    const pass = await b.cmd('runOnce');
+    const cell = (pass.cells || [])[0] || {};
+    assert.ok(
+      cell.received > 0,
+      `la ripresa non ha ricevuto nulla (${JSON.stringify(pass.cells)})`,
+    );
   } finally {
     await a.quit();
     await b.quit();

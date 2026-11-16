@@ -19,13 +19,15 @@ const state = {
 };
 
 function answer(id, ok, out) {
+  // `t` stamps WHEN the child answered: the parent can prove a command
+  // was still running at a moment of its choosing (C5.4)
   if (out instanceof Error || (out && out.code && out.message)) {
     process.stdout.write(
-      `${JSON.stringify({ id, ok: false, code: out.code, message: out.message })}\n`,
+      `${JSON.stringify({ id, ok: false, code: out.code, message: out.message, t: Date.now() })}\n`,
     );
     return;
   }
-  process.stdout.write(`${JSON.stringify({ id, ok, out })}\n`);
+  process.stdout.write(`${JSON.stringify({ id, ok, out, t: Date.now() })}\n`);
 }
 
 async function run(op, args) {
