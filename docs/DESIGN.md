@@ -330,7 +330,7 @@ query {
 - **Il modello predefinito** — *deciso in v0.2 misurando sul benchmark italiano (§ 11), confermato in v0.4* — è **IBM Granite Embedding Multilingual R2 97M**: Apache 2.0, ModernBERT, 384 dimensioni, italiano tra le lingue di addestramento, nessun prefisso (MTEB Multilingual Retrieval 60,3). Il 311M (768 dimensioni con Matryoshka, 65,2) resta un'opzione per chi dà più RAM. **EmbeddingGemma 308M** (62,5) ha **licenza Gemma, non open source**: supportato come cartella fornita dall'utente, non incluso né scaricato di serie.
   - I modelli si scaricano con `engramma model pull`, con revisione e sha256 fissati.
 - **Il lotto di incorporazione (v0.4.6):** i testi sono **ordinati per lunghezza in token vera** e tagliati in lotti con un **tetto di token**: `righe × seq_lotto ≤ ENGRAMMA_EMBED_TOKEN_BUDGET` (predefinito **512** dalla v0.4.6.1, pari a `max_tokens`: su CPU i lotti grandi non comprano tempo e gonfiano solo le attivazioni — a 1 lavoratore, mimalloc, 512 → picco 878 MB e 64 note in 5,8 s, 4096 → 1126 MB e 6,4 s; banco a 10k 100 contro 75 note/s; un valore non valido — 0, non numerico — ricade sul predefinito). Un **pool fisso di lavoratori** — **predefinito 1**, `ENGRAMMA_EMBED_THREADS` per stringerlo o allargarlo — prende i lotti da una coda, a fette dei buffer, senza le doppie copie della v0.4.4; l'offset di ogni lotto è la **somma prefissa** di `righe × seq`. *Cosa non funzionava nella v0.4.5:* il `tokenizer.json` di Granite R2 porta il **riempimento BatchLongest**, quindi `encode_batch` riempiva ogni testo al più lungo della chiamata — l'ordinamento non ordinava niente, una nota corta pagava il calcolo della più lunga (il calo del banco a 100k da 201 a 74 note/s) e gli offset `inizio × seq` erano giusti **solo** perché il riempimento uniformava i seq: tolto il riempimento, senza la somma prefissa un lavoratore leggeva fuori dai limiti. Da v0.4.6 il tokenizer è caricato **senza** riempimento (`with_padding(None)`; il suo `pad_id`, se configurato, è quello dei nostri lotti) e la troncatura resta sua (32768, sopra il nostro taglio a `max_tokens`) così `approx_tokens` vede la lunghezza vera. **La proprietà vera dei vettori:** identici bit per bit a parità di configurazione (un ordine diverso dà gli stessi lotti); **fra budget diversi** la forma del lotto cambia l'ordine delle somme dentro tract e l'ultima cifra si muove — la promessa onesta è coseno ≥ 0,999999 e |Δ| ≤ 1e-5 per componente (test di fedeltà).
-- **La RAM del modello, misurata a matrice (v0.4.6.1, macOS arm64, Granite 97M f32 da 390 MB, 5 corse in processi separati — mediana / min / max):** la griglia della v0.4.6 ({2048, 4096, 8192} × {1, 2, 4, 6}) sceglieva (4096, 1) — 1126 MB di picco con mimalloc — ma non aveva budget piccoli a 1 lavoratore; misurati in verifica: **(512, 1) picco 878 MB, +10 s 888 MB, 64 note 5,8 s** (sistema: 1024 / 1132 MB), (1024, 1) 912 MB, (2048, 1) 993 MB. Lezione: una regola «il punto migliore della griglia» vale quanto la griglia — va esplorata fino al bordo di entrambe le dimensioni. Nell'artefatto Node 24: modello caricato **894 MB**, dopo `embedPending` di 64 note **959 / 959 / 959 MB** a +10 s (1224 a budget 4096), `embedPending` ~11,4 s; il picco (`maxRSS`) **1222 MB** è ora quello del **caricamento del modello** (1220 MB già dopo `Engine.open`: l'ottimizzazione del grafo in tract), non dell'embedding — abbassarlo vuol dire toccare il carico, non i lotti. **La soglia di 700 MB a +10 s NON è raggiunta**: le pagine liberate restano residenti su macOS con qualunque allocatore (causa misurata nella v0.4.5: `malloc_zone_pressure_relief` su darwin 27 restituisce 0 MB — provato, inutile, da non riprovare). Portare l'embedding **fuori processo** resta l'opzione architetturale della v0.5 (§ 12). Numeri nel REPORT v0.4.6.
+- **La RAM del modello, misurata a matrice (v0.4.6.1, macOS arm64, Granite 97M f32 da 390 MB, 5 corse in processi separati — mediana / min / max):** la griglia della v0.4.6 ({2048, 4096, 8192} × {1, 2, 4, 6}) sceglieva (4096, 1) — 1126 MB di picco con mimalloc — ma non aveva budget piccoli a 1 lavoratore; misurati in verifica: **(512, 1) picco 878 MB, +10 s 888 MB, 64 note 5,8 s** (sistema: 1024 / 1132 MB), (1024, 1) 912 MB, (2048, 1) 993 MB. Lezione: una regola «il punto migliore della griglia» vale quanto la griglia — va esplorata fino al bordo di entrambe le dimensioni. Nell'artefatto Node 24: modello caricato **894 MB**, dopo `embedPending` di 64 note **959 / 959 / 959 MB** a +10 s (1224 a budget 4096), `embedPending` ~11,4 s; il picco (`maxRSS`) **1222 MB** è ora quello del **caricamento del modello** (1220 MB già dopo `Engine.open`: l'ottimizzazione del grafo in tract), non dell'embedding — abbassarlo vuol dire toccare il carico, non i lotti. **La soglia di 700 MB a +10 s NON è raggiunta**: le pagine liberate restano residenti su macOS con qualunque allocatore (causa misurata nella v0.4.5: `malloc_zone_pressure_relief` su darwin 27 restituisce 0 MB — provato, inutile, da non riprovare). Portare l'embedding **fuori processo** resta un'opzione architetturale, nel binario parallelo del § 12. Numeri nel REPORT v0.4.6.
 - **mimalloc è l'allocatore dei due artefatti finali** (il `.node` di Homun e il binario `engramma`), *non* delle librerie: l'allocatore lo sceglie chi produce l'eseguibile. Su **macOS vince nettamente** anche nella v0.4.6 (modello caricato 846 contro 1100 MB a processo nudo; al punto scelto (512, 1): +10 s 888 contro 1132 MB, picco 878 contro 1024); su **Linux glibc restituisce e trattiene meno** (v0.4.5: 637 contro 1166 MB a +10 s; i numeri v0.4.6 nel REPORT), quindi da v0.4.5 l'allocazione è **per piattaforma**: mimalloc solo dove vince.
 - **La cache NNEF del modello è stata provata e scartata** (v0.4.5): il grafo **ottimizzato** di tract non è serializzabile in NNEF (le op `Opt*` non hanno serializzatore) e nemmeno quello tipizzato (`StridedSlice`); servirebbero serializzatori custom. Misurato prima di arrendersi: il carico a freddo costa 0,6–2,4 s e picca a ~1,11 GB. Da non riprovare con tract 0.23.
 - **I pesi in f16 sono stati provati e scartati** (v0.4.4): `FloatPrecisionTranslator` su Granite 97M non abbassa la memoria dopo il carico (803 vs 822 MB a processo nudo, 983 vs 1192 MB dopo il lavoro) e peggiora la fedeltà — coseno contro f32: medio 0,99948, peggiore 0,99438. Da non riprovare.
@@ -553,9 +553,9 @@ segreti client, mai token nella query string.
   conferma raggiungibile dal web richiede di autenticare il
   proprietario **sul web pubblico**: senza un segreto indovinabile
   serve una passkey (WebAuthn) — una crate e una fase a sé. Candidata
-  per la v0.7 insieme a `engramma serve` (§ 12).
+  per la v0.8 insieme a `engramma serve` (§ 12).
 
-## 9. Server e cluster (architettura, non costruita prima della v0.6)
+## 9. Server e cluster (architettura, v0.8 e v0.9)
 
 - **`engramma serve`:** API HTTP/gRPC + MCP HTTP, autenticazione con token per ambito o OIDC, migliaia di celle per processo e celle aperte su richiesta, con un tetto di celle aperte.
 - **Cluster:**
@@ -581,3 +581,171 @@ segreti client, mai token nella query string.
 - **Il modello delle minacce e i suoi limiti.** Il relay di n0 e il nodo cieco vedono chiavi, indirizzi, orari e dimensioni; non vedono testo, nomi, titoli, tag, autori, né `op_id` in chiaro. Possono trattenere o scartare messaggi (disponibilità), non falsificarli né riordinarli: le operazioni sono firmate e lo stato è indipendente dall'ordine (§ 4.3.1). Un orologio oltre ora+5 minuti è rifiutato all'arrivo. **Cosa questa fase non promette:** né sicurezza dopo compromissione (PCS) né segretezza in avanti (FS) per messaggio — una chiave d'epoca rubata apre tutta l'epoca; la rotazione alla rimozione è il compromesso giusto per i dispositivi di una sola persona. **MLS (RFC 9420)** presuppone un servizio di consegna che ordina (OpenMLS 0.9); **BeeKEM/Keyhive** e **DCGKA** sono ancora pre-alpha: è la scelta da rivedere per la condivisione con altre persone (v0.6.x). Fonti: RFC 9180 (HPKE), RFC 9382 (SPAKE2), RFC 9420 (MLS), il [paper Keyhive](https://dstaley.com/thesis.pdf) (2025) e [DCGKA](https://eprint.iacr.org/2024/1665) (2024).
 - **Quello che resta locale e non viaggia mai:** `device.key`, `oauth.db`, la configurazione; i legami della vista markdown; i vettori e il registro dei modelli (ogni dispositivo li ricalcola); le istantanee, la riga `hlc` di `meta`.
 
+## 11. Come si misura
+
+- **Benchmark nostro**, in italiano e inglese: storie sintetiche di una persona nell'arco di mesi (traslochi, lavori, persone, preferenze che cambiano), con domande:
+  - fattuali, temporali («dove abitava a marzo?»);
+  - di aggiornamento;
+  - multi-salto («chi lavora con il partner di…»);
+  - di astensione (la risposta non c'è).
+
+  Si misurano il richiamo@k e il MRR sulla parte del motore: **non** serve un giudice LLM, perché si giudica se la nota giusta è tra le prime k.
+- **Confronto esterno — LongMemEval** (v0.4.4, `bench/examples/longmemeval.rs`; metriche e divisione rifatte in v0.4.5): LongMemEval-S *cleaned*, 470 domande (le 30 di astensione escluse), una cella per domanda, nota = round, **metriche ufficiali** di `eval_utils.py` (`recall_any/all@k` e `ndcg@k` a livello turno e sessione — l'ndcg di sessione dal v0.4.5 è ESATTAMENTE quello ufficiale: lista non deduplicata, taglio `k_eff` al primo prefisso con k sessioni distinte, ideale che conta i round del corpus nelle sessioni giuste; ndcg = 0 se l'ideale è 0), k = 5 e 10, modalità testo (BM25, `graph_hops = 0`) e ibrida, `question_date` come «adesso» per la recenza. Lo studio di α (v0.4.5) divide le domande una volta per tutte: **dev** = le 150 del sottoinsieme fisso della v0.4.4, **test** = le altre 320 (sha256 della lista nel REPORT), e la scelta del predefinito avviene su dev + banco italiano, con il test guardato UNA volta, dopo. **Il numero di partenza (v0.4.5, su tutte le 470, α=0,5):** testo → sessione `any@5` 0,9702, `ndcg@5` 0,6607, turno `ndcg@5` 0,6829; ibrida → sessione `any@5` **0,9809**, `all@5` **0,8723**, `ndcg@5` **0,7536**, turno `any@5` **0,9106**, turno `ndcg@5` **0,6970** (corsa rifatta in verifica: la riga originale del REPORT era ad α=0,7). Su questo dataset ripulito BM25 è quasi saturo in cima, ma con α=0,5 la fusione lo batte su tutte le metriche, sessione e turno. I lavori pubblicati (dataset originale, indici diversi) riportano 0,8–0,97: il confronto resta un ordine di grandezza. LoCoMo solo con cautela: il suo giudice e le sue risposte di riferimento sono stati contestati nel 2026.
+- **Prestazioni**, su un Mac M-series, cella da 100 000 note — **misurate** (v0.4.3, verifiche; confermate dal banco in v0.4.4 entro il rumore):
+  - inserimento ~1 900–2 500 note/s senza embedding;
+  - ricerca testo + grafo p95 **12,3 ms**;
+  - ricerca mista calda (embedding della domanda già calcolato) p50 **10,5 ms**, p95 **13,9 ms**;
+  - ricerca ibrida con embedding della domanda p95 ~24 ms;
+  - apertura di una cella ~1 ms;
+  - embedding ~135–148 note/s (Granite 97M, 10 filoni).
+
+  Gli obiettivi della bozza (≥ 2 000/s, p95 ≤ 30 e ≤ 50 ms) sono dunque raggiunti con margine.
+- **Il costo della convergenza (v0.6.1, banco 10k, contro `fase-v0.5.3`):** l'inserimento costa il **26–30% di tempo in più** (3192 → 2523 note/s), sopra il tetto del +10% della spec: **NON raggiunta, accettata dall'utente** il 2026-11-16 come prezzo della convergenza. Il tempo va nel commit (riga `ops` più larga, due indici e `op_objects` per operazione), non nella firma (5–12 µs). La ricerca testo+grafo non cambia. Le misure di sola scrittura si lanciano con `ENGRAMMA_SKIP_MODEL_TESTS=1`, che salta i modelli semantici.
+- **Engramma è multilingua:** ogni banco e ogni modello si misura per lingua, almeno sulle sei lingue dello stemmer; nessuna soglia vale solo per l'italiano.
+- **Correttezza:**
+  - test di proprietà (giro del formato senza perdite; registro rigiocato = stesso stato; esportazione → importazione = stesso stato);
+  - `engramma verify`: ricostruisce gli indici e li confronta.
+
+## 12. Tabella di marcia
+
+Rivista il 2026-11-14 (prima in `note-private/roadmap.md`, riportata qui alla chiusura della v0.6.1).
+
+**La visione.** Engramma non è solo «la mia memoria su più dispositivi». È anche la **memoria di un'organizzazione**, con un livello di governo come quello di Tailscale:
+- un'organizzazione con amministratori;
+- persone con ruoli;
+- celle personali, che restano private;
+- celle aziendali, con permessi decisi da una politica firmata;
+- revoca che ruota le chiavi e chiude anche le copie sui dispositivi.
+
+**Principio:** l'autorità sono le chiavi degli amministratori, verificabili offline da ogni copia (come il Tailnet Lock di Tailscale). Un server di coordinamento è facoltativo: distribuisce, tiene l'audit e fa da nodo cieco, ma non è la fonte dell'autorità.
+
+**Limite dichiarato:** nessun sistema cancella il passato; la revoca agisce sul futuro. Si può però decidere **quanto passato finisce sui dispositivi** (modalità di replica) e **per quanto resta leggibile senza contatto** (affitto delle chiavi).
+
+### Fatto
+
+| Fase | Contenuto | Tag |
+|---|---|---|
+| v0.1 → v0.1.1 | Formato, cella SQLite, registro con HLC e hash, FTS, grafo, quarantena, CLI, MCP in sola lettura | `fase-v0.1`, `fase-v0.1.1` |
+| v0.2 → v0.2.1 | Embedding locale (tract, Granite R2 97M), vettori int8, ricerca mista, cambio di modello blu/verde | `fase-v0.2`, `fase-v0.2.1` |
+| v0.3 → v0.3.2 | Grafo PPR, registro v2 con payload dimenticabili, `purge`, compattazione, vista markdown, consolidamento | `fase-v0.3` … `fase-v0.3.2` |
+| v0.4 → v0.4.6.1 | Modulo Node e integrazione in Homun; disco, RAM, Linux, LongMemEval, α = 0,5 (§ 6.3, § 7, § 11). Slittati: il grafo adattivo e l'audit MCP con ambiti | `fase-v0.4` … `fase-v0.4.6.1` |
+| v0.5 → v0.5.1 | Scrittura da altri assistenti: proposte, decisioni, rollback, politiche, revisori, pagina di revisione (§ 8.5) | `fase-v0.5`, `fase-v0.5.1` |
+| v0.5.2 → v0.5.2.2 | MCP su HTTP con OAuth 2.1, provato con ChatGPT, claude.ai e Codex (§ 8.6) | `fase-v0.5.2` … |
+| v0.5.3 | Domande corte, note nascoste senza impronta, rifiniture HTTP | `fase-v0.5.3` |
+| v0.6 → v0.6.1 | Sincronizzazione cifrata fra i dispositivi del proprietario (§ 4.3.1, § 10.1, `docs/sync.md`): identità immutabile delle operazioni, firme verificate all'arrivo, abbinamento in rete (biglietto e codice breve), relay, `sync run/serve`, nodo cieco, rotazione alla rimozione, Linux. L'inserimento costa il 26–30% in più, accettato (§ 11). Restano due casi limite minori del guardiano di `sync serve` (un segnaposto per cella) | `fase-v0.6`, `fase-v0.6.1` |
+
+### Davanti
+
+| Fase | Contenuto | Dipende da | Note |
+|---|---|---|---|
+| **v0.6.2** | **API JS della sincronizzazione**, piccola: stato, biglietto (per il QR), elenco dei dispositivi, rimozione. Homun può offrire la sync dei propri dispositivi prima delle organizzazioni | v0.6.1 | Contratto JS esteso, mai rotto |
+| **v0.7 — Organizzazioni** | Identità a tre livelli (organizzazione → persona → dispositivo); la **politica come codice firmata**: gruppi, celle per spazio di nomi, concessioni lettore/proponente/scrittore, chi può invitare e condividere cosa, approvazione dei dispositivi, scadenza delle chiavi; **celle personali** (l'organizzazione non ha le chiavi) contro **celle aziendali**; ruoli imposti dalla distribuzione delle chiavi (lettura) e dalla verifica all'arrivo (scrittura e proposta); **revoca centrale** di una persona con rotazione; audit firmato delle decisioni; la condivisione fra due privati come caso minimo | v0.6.1 | Prima una fase di **ricerca**: Tailscale (grants, Tailnet Lock, approvazione dei dispositivi), capacità firmate (UCAN, Biscuit, Keyhive), cifratura di gruppo (MLS e simili), SSO/OIDC per legare le persone. Poi la bozza nel DESIGN, poi la spec. Decisioni già prese: § 14 |
+| **v0.7.1 — Protezione a riposo e revoca dei dispositivi** | **Cifratura a riposo** delle celle aziendali, file intero con FTS, vettori e WAL; **chiave in affitto** con scadenza fissata dalla politica e rinnovo a ogni contatto; **cancellazione crittografica** alla revoca (online) o blocco alla scadenza (offline); chiavi nel portachiavi del sistema o nel chip sicuro (Secure Enclave, TPM), anche `device.key`; **replica parziale** (per tag, ambito o periodo) | v0.7 | La replica parziale va progettata insieme alla convergenza (filtrare per oggetto senza rompere la frontiera stabile). Limite dichiarato: protegge da dispositivo perso e dall'ex dipendente comune, non da chi si prepara apposta |
+| **v0.8 — `engramma serve` e pannello di controllo** | API, autenticazione legata all'SSO, molte celle in un processo (§ 9); **pannello di controllo facoltativo**: distribuzione della politica, console di amministrazione, **audit delle letture**; celle **solo online** (nessuna copia sui dispositivi, ogni lettura passa dal server e dall'audit); nodo cieco | v0.7.1 | Candidati: elicitation in modalità URL con passkey (§ 8.6), approvazione OAuth sulla pagina di revisione o nella console |
+| **v0.9 — Cluster** | Posizionamento con Raft, router, replica, spostamento delle celle, backup su storage a oggetti (§ 9) | v0.8 | |
+| **Poi** | Python, Swift, Kotlin, WASM; messaggi A2A sul canale cifrato | | |
+
+### Binario parallelo: decisioni e qualità
+
+Da inserire dove c'è spazio, perché non dipende dalle organizzazioni.
+
+- **Decision model:**
+  - prima una fase di **sola misura**: decisioni tipizzate (supporto di un'affermazione per `memory_check`, revisione delle proposte, doppioni e contraddizioni del consolidamento, tipo di domanda per un grafo adattivo), banchi d'oro **multilingua** con regole d'accettazione per lingua, modelli piccoli aperti confrontati con un LLM grande come insegnante;
+  - poi, solo se serve, un encoder multilingue piccolo (100–400 milioni di parametri) addestrato dall'insegnante, in ONNX su tract;
+  - non è mai l'unico cancello di sicurezza.
+- **RAM:** l'embedding in un processo separato (la soglia di 700 MB a riposo del § 7 non è mai stata raggiunta).
+- **Windows:** mai provato.
+
+## 13. v0.1 nel dettaglio (storico)
+
+Il primo prompt per GLM, tenuto com'era. Le fasi successive stanno nelle spec in `note-private/prompts/` e nel REPORT.
+
+**Repository nuovo** (`~/Projects/Bot/engramma`, nome da confermare), licenza **Apache-2.0**, Rust stabile, workspace come al § 8.1, con solo `engramma-core`, `engramma-cli` e `engramma-mcp`.
+
+1. **Formato** (§ 3):
+   - parser e serializzatore;
+   - validazione con errori leggibili;
+   - `spec/format-v0.md` con esempi validi e non validi usati come test;
+   - collegamenti, relazioni tipizzate e tag dal corpo.
+2. **Cella** (§ 4):
+   - schema e migrazioni versionate;
+   - ogni scrittura come operazione nella stessa transazione;
+   - HLC, ULID, hash concatenato;
+   - `note_versions`, lapidi, `supersedes` che chiude la validità.
+3. **Testo** (§ 6.1): `body_norm` con le radici (`rust-stemmers`) e rilevamento della lingua (`whatlang`).
+4. **Ricerca v0.1:**
+   - BM25 + allargamento nel grafo + filtri (tipo, tag con figli, `as_of`, affidabilità, quarantena, sostituite) + riordino per affidabilità e recenza;
+   - spiegazioni;
+   - `neighbors`, `path`, `tags`, `entities`, `timeline`, `history`, `changes_since`.
+5. **Import/export:**
+   - cartella markdown ↔ cella, senza perdite;
+   - import di una cartella Obsidian qualsiasi (le note senza intestazione ricevono `id`, `type: note` e `source: import:obsidian`).
+6. **CLI `engramma`:** tutti i comandi del § 8.1 tranne `serve`, con uscita leggibile e `--json`.
+7. **`engramma mcp`:** stdio, in sola lettura, `--cells`, i 5 strumenti del § 8.3, con descrizioni chiare per i modelli.
+8. **Test:**
+   - unitari;
+   - **di proprietà** (`proptest`): giro del formato, registro rigiocato = stesso stato, export → import = stesso stato;
+   - **dorati**, su una cartella di esempio in italiano: «Fabio, Giulia, trasloco a Milano, lavoro, preferenze che cambiano», circa 60 note;
+   - `engramma verify`.
+9. **Benchmark** in `bench/`:
+   - generatore sintetico da 10 000 e 100 000 note;
+   - domande con la nota attesa;
+   - richiamo@5 / MRR e latenze p50 e p95, stampate in un rapporto.
+10. **Integrazione continua:**
+    - compilazione e test su macOS (arm64, x86_64), Linux e Windows;
+    - `cargo deny` per le licenze: solo licenze permissive;
+    - `cargo clippy -D warnings`;
+    - nessuna rete nei test.
+
+**Criteri di chiusura:**
+- tutti i test verdi sulle tre piattaforme;
+- benchmark eseguito, con i numeri nel rapporto;
+- un utente può fare `engramma init`, `import` di una cartella Obsidian, `search` e `mcp`, e collegarlo a Claude Desktop per leggere la sua memoria.
+
+## 14. Decisioni aperte
+
+Chiuse lungo la strada:
+
+1. ~~Il nome~~ → **Engramma** (deciso 2026-11-05; il pacchetto npm sarà `@engramma/core`).
+2. ~~**Campi in inglese** nel formato~~ → adottati dalla v0.1, confermati.
+3. ~~**Il modello di embedding predefinito**~~ → **Granite R2 97M** (v0.2, misurato; § 7). Il 311M resta un'opzione. Runtime (tract) deciso 2026-11-05.
+4. ~~**Indice vettoriale**~~ → `FlatI8` in Rust: **sqlite-vec scartato** (un'estensione caricata a runtime, da tenere in passo con SQLite e da firmare diversamente in Electron; la scansione int8 nostra basta fino a ~1M vettori, § 11).
+5. ~~**L'istantanea di compattazione**~~ → facoltativa (`--keep-snapshot`): la compattazione base è un punto di controllo senza seconda copia; l'istantanea serve a chi vuole un file coerente da portare via (v0.3.2).
+6. ~~**L'allocatore degli artefatti finali**~~ → mimalloc nel `.node` e nel binario CLI, librerie neutre (v0.4.4, § 7); **per piattaforma** dalla v0.4.5 (macOS sì, Linux no: glibc trattiene meno a riposo — § 7).
+7. ~~**α della fusione convessa**~~ → **0,5** (v0.4.5: due banchi + conferma su domande tenute da parte, § 6.3 e § 11; la storia 0,6 → 0,7 → 0,5 sta nel commento di `Fusion::default`).
+8. ~~**Il costo d'inserimento della convergenza**~~ → accettato (2026-11-16): +26–30% di tempo contro il tetto del +10% (§ 11).
+
+Chiuse dall'utente il 2026-11-14, per la v0.7:
+
+9. **Autorità delle organizzazioni:** solo chiavi degli amministratori, verificabili offline da ogni copia. Un server, quando c'è (v0.8), distribuisce e tiene l'audit ma non decide.
+10. **Identità delle persone:** chiavi nostre nella v0.7. L'SSO aziendale (OIDC) arriva dopo, come modo di legare una persona già esistente a un account aziendale: con `engramma serve` nella v0.8 o in una fase sua. Il modello della v0.7 deve lasciargli il posto, senza dipenderne.
+11. **Celle personali:** illeggibili dall'organizzazione **per costruzione**. L'organizzazione non riceve mai le loro chiavi, né la revoca né la cancellazione remota le toccano, e nessuna politica può cambiarlo.
+12. **Chiavi dell'organizzazione e recupero:**
+    - **radice a quorum, fredda:** per esempio 2 su 3 chiavi hardware (YubiKey o simili) in mani o luoghi diversi, firma multipla e mai un segreto ricostruito; usata solo per cambiare gli amministratori; copia d'emergenza su carta o metallo facoltativa, mai in cloud;
+    - **chiavi operative degli amministratori** nel chip sicuro (Secure Enclave, TPM) o su chiave hardware, non esportabili, con presenza della persona a ogni firma e **certificato a scadenza** (per esempio 90 giorni) firmato dalla radice;
+    - **ritardo con veto** sugli atti della radice (nuovo amministratore, concessioni a tutta l'organizzazione): in vigore dopo per esempio 72 ore, notificati a ogni dispositivo, annullabili da qualunque altro amministratore;
+    - ogni dispositivo che firma **mostra in parole chiare cosa firma**, e la conferma passa da un canale diverso;
+    - la **politica è una catena** con versione e hash: nessuna copia accetta una versione più vecchia, e le revoche ne fanno parte;
+    - **modo semplice** per l'organizzazione di una persona: un amministratore nel Secure Enclave, la radice su una YubiKey più un kit di recupero stampato;
+    - **firme P-256 accanto a Ed25519:** il Secure Enclave firma solo P-256. Ed25519 resta per i dispositivi e iroh;
+    - **dichiarato:** se si perdono tutte le chiavi, radice compresa, la politica non si cambia più. Quello che c'è vive fino alla scadenza degli affitti, poi si rifonda l'organizzazione. La compromissione della radice non apre comunque le celle personali.
+
+Ancora aperte:
+
+13. **Dove vive:** repository privato o pubblico su GitHub?
+14. **Cifratura a riposo:** SQLCipher o cifratura di pagina. Si chiude nella v0.7.1.
+15. **Windows:** non provato (macOS arm64 provato, Linux arm64 provato in Docker, x86_64 e Windows no; i punti sensibili — file aperti, nomi riservati, separatori — sono nel REPORT v0.4.4).
+16. **Il rapporto con Homun:** il motore resta un progetto separato, con le sue versioni. Homun fissa una versione precisa (il lock con gli hash dei tre file). La v0.6.1 non va agganciata: a Homun serve la v0.6.2.
+
+## Fonti (verificate il 2026-11-05)
+- Licenza SurrealDB: https://surrealdb.com/license
+- Kùzu archiviato: https://biggo.com/news/202510130126_KuzuDB-embedded-graph-database-archived · CozoDB fermo: https://github.com/cozodb/cozo/discussions/299
+- Turso (stato beta): https://www.theregister.com/databases/2026/07/29/after-rewriting-sqlite-in-rust-turso-turns-its-sights-on-postgres/5279835 · https://explainx.ai/blog/turso-database-sqlite-rust-rewrite-guide-2026
+- Benchmark della memoria e i loro limiti: https://mem0.ai/library/agent-memory/ai-memory-benchmarks-in-2026
+- Fonte e avvelenamento della memoria: https://arxiv.org/pdf/2605.30771 · https://arxiv.org/pdf/2606.22030
+- Memoria temporale: https://arxiv.org/pdf/2601.07468
+- A2A e i suoi limiti di sicurezza: https://arxiv.org/pdf/2609.10871 · https://arxiv.org/pdf/2606.31498
+- EmbeddingGemma: https://developers.googleblog.com/en/introducing-embeddinggemma/ · Granite Embedding R2 (ONNX, terza parte): https://huggingface.co/Hisham480/multilingual-r2-ONNX
+- Memoria portabile: https://github.com/MacPaw/portable-memory · https://portable-ai-memory.org/spec/v1.0/
+- (2026-11-05, v0.2) Rilasci di sqlite-vec (0.1.9 stabile, DiskANN/IVF solo in 0.1.10-alpha): https://github.com/asg017/sqlite-vec/releases · Granite Embedding Multilingual R2: https://huggingface.co/blog/ibm-granite/granite-embedding-multilingual-r2 · Fusione convessa contro RRF (ACM TOIS 2023): https://dl.acm.org/doi/10.1145/3596512 · Le misure di tract, sqlite-vec e scansione int8 sono nostre (prototipi nel commit 90a106e e nel prompt v0.2).
+- (2026-11-06, v0.3) HippoRAG 2 e PPR per la memoria: https://github.com/osu-nlp-group/hipporag · Hub nei grafi di memoria (GAAMA): https://arxiv.org/pdf/2603.27910 · MemGraphRAG: https://arxiv.org/pdf/2606.00610 · Payload dimenticabili e crypto-shredding: https://verraes.net/2019/05/eventsourcing-patterns-forgettable-payloads/ · https://verraes.net/2019/05/eventsourcing-patterns-throw-away-the-key/ · Digest salati (SD-JWT, RFC 9901): https://rfc-editor.org/rfc/rfc9901 · Il prototipo PPR e le misure di latenza a 100k sono nostri (prompt v0.3, allegato `ppr`).

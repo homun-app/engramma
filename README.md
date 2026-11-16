@@ -22,14 +22,18 @@ search** (text + graph + time) that **explains** every result.
   fused, with the graph and time on top. Paraphrases with no word in common
   with the note are found; the explanation says which branch carried each
   result.
-- **MCP**: read-only access for Claude and other MCP clients, scoped to the
-  cells you choose.
+- **MCP**: access for Claude and other MCP clients, over stdio or HTTP with
+  OAuth 2.1, scoped to the cells you choose; writes follow each cell's policy
+  (proposals in quarantine, review, rollback).
 
-**Status: v0.4 — the format is unstable.** The bidirectional Markdown view
-(`engramma vault`), the right to be forgotten (`purge`) and the Node.js
-binding for in-process hosts (Homun) are in; encrypted peer sync is next
-(v0.5). Tested on macOS arm64 and Linux arm64 (Docker); x86_64 and Windows
-are not tested yet. See `docs/DESIGN.md` for the full roadmap.
+**Status: v0.6.1 — the format is unstable.** The bidirectional Markdown
+view (`engramma vault`), the right to be forgotten (`purge`), the Node.js
+binding for in-process hosts (Homun), writes from other assistants with
+review and rollback, MCP over HTTP with OAuth 2.1, and end-to-end encrypted
+sync between one owner's devices (`engramma sync`, see `docs/sync.md`) are
+in. Next: the sync API for Node.js (v0.6.2), then organizations (v0.7).
+Tested on macOS arm64 and Linux arm64 (Docker); x86_64 and Windows are not
+tested yet. See `docs/DESIGN.md` § 12 for the full roadmap.
 
 ## Install from source
 
