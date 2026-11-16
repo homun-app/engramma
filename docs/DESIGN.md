@@ -216,6 +216,23 @@ rompe la catena — estesa all'identità di rete.
   nota che già vive è concorrente per costruzione (lo stesso import su
   due macchine): le regole dei conflitti corrono anche lì — trovato dal
   test a tre dispositivi.
+- **La copia di conflitto è funzione dell'insieme, anche per chi
+  scrive** (v0.6.3). L'insieme dei perdenti di una nota — e quindi le
+  sue copie — si ricalcola a OGNI scrittura del corpo che la tocca,
+  **scrittura locale compresa**: una scrittura locale è l'ultima del
+  suo oggetto e la sua base è la testa del registro, quindi i suoi
+  perdenti sono vuoti e ogni copia lasciata da un insieme più piccolo
+  va via subito, anche sul dispositivo che scrive. Prima il percorso di
+  scrittura locale non riconciliava mai: una copia scritta da una
+  ricostruzione intermedia (l'arrivo fuori ordine che l'aveva resa
+  perdente) sopravviveva per sempre sullo scrittore mentre ogni copia
+  ricevente la derivava via — i due testimoni della verifica v0.6.2.
+  L'**oracolo differenziale** controlla la regola:
+  `rematerialize_for_test` ricostruisce tutto lo stato replicato dal
+  **solo registro** (una materializzazione per oggetto, fino al punto
+  fisso) e la proprietà `every_copy_equals_its_reconstruction`
+  pretende che lo stato incrementale di ogni copia sia uguale alla
+  propria ricostruzione, qualunque sia l'ordine d'arrivo.
 - **L'`adopt` con la prova.** La radice di Merkle copre l'era senza
   firma; l'operazione senza firma viaggia con la **prova** che la sua
   foglia cammina fino a quella radice (`merkle_prove`/
@@ -635,6 +652,7 @@ Rivista il 2026-11-14 (prima in `note-private/roadmap.md`, riportata qui alla ch
 | v0.5.3 | Domande corte, note nascoste senza impronta, rifiniture HTTP | `fase-v0.5.3` |
 | v0.6 → v0.6.1 | Sincronizzazione cifrata fra i dispositivi del proprietario (§ 4.3.1, § 10.1, `docs/sync.md`): identità immutabile delle operazioni, firme verificate all'arrivo, abbinamento in rete (biglietto e codice breve), relay, `sync run/serve`, nodo cieco, rotazione alla rimozione, Linux. L'inserimento costa il 26–30% in più, accettato (§ 11) | `fase-v0.6`, `fase-v0.6.1` |
 | **v0.6.2** | **API JS della sincronizzazione**: il ciclo sta nella libreria (`SyncService`) e la CLI ne è il guscio; `Engine.sync()` lo apre a Homun — stato, dispositivi, biglietto (anche nella forma QR alfanumerica, il QR lo disegna l'app), codice, ingresso, condivisione, rimozione, passata, servizio continuo, eventi; SAS da interfaccia che non si può saltare; un lucchetto per radice (`sync.lock`, `SYNC_BUSY`); il guardiano confronta **per cella** (i due casi limite della v0.6.1 chiusi). Contratto JS esteso, mai rotto: i 29 test della v0.4 identici e verdi più i nuovi | `fase-v0.6.2` |
+| **v0.6.3** | **La copia di conflitto converge, e le minori**: la scrittura locale riconcilia l'insieme dei perdenti (i testimoni della verifica v0.6.2 chiusi, con l'oracolo differenziale dal registro); l'ascoltatore di `onEvent` non tiene vivo il processo e `close` svuota l'hub; il test di Electron chiude con `app.quit()`; l'artefatto Node si costruisce senza strip (dyld rifiutava il LINKEDIT disallineato dello strip di rustc, l'`arc4random` di v0.6.2 era il paravento); il biglietto in maiuscolo entra, il pid del lucchetto si scrive dopo la flock, il firmatario si arma alla scrittura dopo un cambio di condivisione, il SAS si attende come Future (runtime dell'abbinamento a un filo), i limiti dei test d'arrivo a 5 s | `fase-v0.6.3` |
 
 ### Davanti
 

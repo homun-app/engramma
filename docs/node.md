@@ -509,6 +509,13 @@ const off = sync.onEvent((e) => {
 off();
 ```
 
+**Un ascoltatore da solo non tiene vivo il processo** (v0.6.3): la
+semantica è quella di un `EventEmitter` — ciò che tiene vivo il
+processo è il motore aperto, e `close()` svuota l'hub e rilascia ogni
+chiamata, anche quella di chi non ha mai chiamato `off()`. Il processo
+esce da solo entro un attimo dopo `close()` (il test lo misura da un
+figlio: ~100 ms); `off()` dopo `close()` non lancia, toglie nulla.
+
 **Il ciclo di vita**: il servizio gira su un thread suo; il ciclo a
 riposo non fa passate (il test lo guarda per 30 s da JS). `start()` due
 volte non fa nulla la seconda, `stop()` a servizio spento altrettanto,
@@ -517,7 +524,10 @@ ferma il servizio: un'app Electron che esce col servizio acceso non si
 appende (provato in `test:electron-main`). Le scritture fatte con
 `Cell.put` dello stesso processo accendono il guardiano come quelle di
 un processo accanto: la firma del dispositivo si arma da sola sulle
-celle condivise. **Un solo servizio per radice**: un secondo
+celle condivise. L'armo si decide **alla scrittura** (v0.6.3): una
+cella condivisa da un altro processo — la CLI — mentre l'Engine la tiene
+aperta firma la prima scrittura dopo il cambio; una scrittura paga una
+stat di `devices.db`, e una radice che non sincronizza non paga altro. **Un solo servizio per radice**: un secondo
 `engramma sync serve` sulla stessa radice (o un altro servizio nello
 stesso processo) riceve `SYNC_BUSY` — un lucchetto esclusivo del sistema
 operativo, `<root>/sync.lock`.
