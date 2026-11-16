@@ -534,3 +534,68 @@ fn the_handle_refuses_what_it_must() {
     ));
     invite.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// v0.6.3 (C5): the minors — every textual form of a ticket enters, and
+// the root lock's second taker writes nothing.
+// ---------------------------------------------------------------------------
+
+/// v0.6.3 (C5.1): a ticket pasted in ANY of its textual forms enters —
+/// the original lowercase, the QR's uppercase clothes, and the ORIGINAL
+/// form pasted all in caps (base32 is case-insensitive: we wrote it).
+#[test]
+fn every_textual_form_of_a_ticket_normalizes() {
+    use engramma_sync::service::normalize_ticket_input as norm;
+    let original = "engramma-invite-v1.abcdefghij234567";
+    assert_eq!(norm(original), original, "the original stays");
+    assert_eq!(
+        norm("  engramma-invite-v1.abcdefghij234567  "),
+        original,
+        "the trim is part of the deal"
+    );
+    assert_eq!(
+        norm("ENG-INVITE-V1.ABCDEFGHIJ234567"),
+        original,
+        "the QR's uppercase clothes come off"
+    );
+    assert_eq!(
+        norm("ENGRAMMA-INVITE-V1.ABCDEFGHIJ234567"),
+        original,
+        "the ORIGINAL pasted all in caps comes off too"
+    );
+}
+
+/// v0.6.3 (C5.2): who finds the root lock busy writes NOTHING — the pid
+/// in `sync.lock` stays the holder's — and who TAKES it truncates what an
+/// earlier holder left before writing its own.
+#[test]
+fn the_second_lock_taker_leaves_the_holders_pid_alone() {
+    use engramma_sync::service::try_lock_root;
+
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let holder = try_lock_root(dir.path()).unwrap(/* t */);
+    // the holder's pid is in the file (here: staged by hand, so the test
+    // does not read its own pid back)
+    std::fs::write(dir.path().join("sync.lock"), "424242\n").unwrap(/* t */);
+    assert!(
+        matches!(try_lock_root(dir.path()), Err(ServiceError::Busy)),
+        "the second taker finds it busy"
+    );
+    let content = std::fs::read_to_string(dir.path().join("sync.lock")).unwrap(/* t */);
+    assert_eq!(
+        content.trim(), "424242",
+        "who finds the lock busy writes nothing: {content:?}"
+    );
+    drop(holder);
+    // and the next winner TRUNCATES: no leftovers of a shorter pid after
+    // a longer one
+    std::fs::write(dir.path().join("sync.lock"), "999999999999\n").unwrap(/* t */);
+    let winner = try_lock_root(dir.path()).unwrap(/* t */);
+    let content = std::fs::read_to_string(dir.path().join("sync.lock")).unwrap(/* t */);
+    assert_eq!(
+        content.trim(),
+        format!("{}", std::process::id()),
+        "the winner writes its own pid, and only that"
+    );
+    drop(winner);
+}
