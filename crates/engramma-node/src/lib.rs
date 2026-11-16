@@ -79,6 +79,8 @@ fn split_transport(err: &Error) -> (&'static str, String) {
                 "CLOSED",
                 // v0.6.2 (S2): the sync service's own refusals
                 "SYNC_BUSY",
+                // v0.6.4 (D4): the peer speaks other materialization rules
+                "PEER_OUTDATED",
                 "PAIRING_EXPIRED",
                 "PAIRING_REJECTED",
                 "PAIRING_TIMEOUT",
@@ -173,6 +175,8 @@ fn cell_error(e: CellError) -> Error {
             "QUARANTINED",
             "la nota non è in quarantena: niente da confermare",
         ),
+        // v0.6.4 (D3): resolving a conflict that is already closed
+        CellError::Conflict(m) => transport_err("CONFLICT", m),
         CellError::Invalid(m) if m.contains("empty patch") => invalid("patch vuota"),
         CellError::Invalid(m) => invalid(m),
         CellError::Io(e) => transport_err("IO", e),
@@ -1800,6 +1804,27 @@ impl Engine {
 
 /// One cell of memory. Usable from many promises in parallel: writes on
 /// the same cell serialize inside the engine (the cell's own lock).
+/// One open conflict copy (v0.6.4, D3): who lost, when, in quarantine
+/// or not. No text — the copy is a note, read it with `get`.
+#[napi(object)]
+pub struct ConflictEntry {
+    /// The copy's note id.
+    pub copy_id: String,
+    /// The original the copy lost against.
+    pub original_id: String,
+    /// Who wrote the losing body.
+    pub loser_actor: String,
+    /// `human` | `agent`.
+    pub loser_class: String,
+    /// The loser's HLC, RFC 3339.
+    pub loser_at: String,
+    /// An agent's copy is born in quarantine, in the queue.
+    pub quarantined: bool,
+    /// Inside the cap's window of three. The others stay open and appear
+    /// when a visible one closes.
+    pub visible: bool,
+}
+
 #[napi(js_name = "Cell")]
 pub struct Cell {
     cell: CoreCell,
@@ -2319,6 +2344,85 @@ impl Task for DeleteTask {
     reject_recode!();
 }
 
+pub struct ConflictsTask {
+    cell: CoreCell,
+    _open: CellPermits,
+}
+
+impl Task for ConflictsTask {
+    type Output = Vec<engramma_core::cell::conflicts::ConflictInfo>;
+    type JsValue = Vec<ConflictEntry>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.cell.conflicts().map_err(cell_error)
+    }
+
+    fn resolve(&mut self, _env: Env, rows: Self::Output) -> Result<Self::JsValue> {
+        Ok(rows
+            .into_iter()
+            .map(|r| ConflictEntry {
+                copy_id: r.copy_id.to_string(),
+                original_id: r.original_id.to_string(),
+                loser_actor: r.loser_actor.clone(),
+                loser_class: match r.loser_class {
+                    engramma_core::cell::conflicts::ActorClass::Human => "human".into(),
+                    engramma_core::cell::conflicts::ActorClass::Agent => "agent".into(),
+                },
+                loser_at: r.loser_at.clone(),
+                quarantined: r.quarantined,
+                visible: r.visible,
+            })
+            .collect())
+    }
+
+    reject_recode!();
+}
+
+/// `keep`: `original` (the delete), `copy` (the loser's body), `merged`
+/// (the body given).
+#[napi(object)]
+pub struct ResolveInput {
+    pub keep: String,
+    pub body: Option<String>,
+}
+
+pub struct ResolveConflictTask {
+    cell: CoreCell,
+    actor: String,
+    copy_id: String,
+    keep: String,
+    body: Option<String>,
+    _open: CellPermits,
+}
+
+impl Task for ResolveConflictTask {
+    type Output = Ulid;
+    type JsValue = String;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let copy_id = parse_ulid(&self.copy_id)?;
+        let keep = match self.keep.as_str() {
+            "original" => engramma_core::ResolveKeep::Original,
+            "copy" => engramma_core::ResolveKeep::Copy,
+            "merged" => engramma_core::ResolveKeep::Merged,
+            other => {
+                return Err(invalid_argument(format!(
+                    "`keep` vale original | copy | merged, non `{other}`"
+                )));
+            }
+        };
+        self.cell
+            .resolve_conflict(&copy_id, keep, self.body.as_deref(), &self.actor)
+            .map_err(cell_error)
+    }
+
+    fn resolve(&mut self, _env: Env, out: Ulid) -> Result<Self::JsValue> {
+        Ok(out.to_string())
+    }
+
+    reject_recode!();
+}
+
 pub struct PurgeTask {
     cell: CoreCell,
     actor: String,
@@ -2612,6 +2716,38 @@ impl Cell {
         Ok(AsyncTask::new(GetTask {
             cell: self.cell.clone(),
             id,
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// v0.6.4 (D3): every open conflict copy of the cell — the
+    /// «conflitti da risolvere» list. No text in the answer: the copy is
+    /// a note, read it with `get`.
+    #[napi(ts_return_type = "Promise<ConflictEntry[]>")]
+    pub fn conflicts(&self, env: Env) -> Result<AsyncTask<ConflictsTask>> {
+        Ok(AsyncTask::new(ConflictsTask {
+            cell: self.cell.clone(),
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// v0.6.4 (D3): resolve one conflict. Ordinary operations with the
+    /// cell's actor: `original` is a delete on the copy, `copy` and
+    /// `merged` first patch the original's body. Two concurrent
+    /// resolutions with equal bodies create nothing new.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn resolve_conflict(
+        &self,
+        env: Env,
+        copy_id: String,
+        input: ResolveInput,
+    ) -> Result<AsyncTask<ResolveConflictTask>> {
+        Ok(AsyncTask::new(ResolveConflictTask {
+            cell: self.cell.clone(),
+            actor: self.actor.clone(),
+            copy_id,
+            keep: input.keep,
+            body: input.body,
             _open: self.enter(env)?,
         }))
     }

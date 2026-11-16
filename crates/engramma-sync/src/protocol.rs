@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The sync protocol over iroh (v0.6, P5). ALPN `engramma/sync/1`. At
+//! The sync protocol over iroh (v0.6, P5; rules v2 in v0.6.4, D4). ALPN
+//! `engramma/sync/2`: the ALPN IS the version of the MATERIALIZATION
+//! RULES — a v0.6.4 device and a v0.6.3 one derive different states from
+//! the same set of operations, so they must not exchange a single one.
+//! The ALPN refuses the handshake before any frame, and the dialer maps
+//! the refusal to `PEER_OUTDATED` (the device to upgrade is named). At
 //! acceptance the caller's iroh id must be the TRANSPORT key of a live
 //! device of the list — otherwise the connection closes before any
 //! exchange. A session: protocol version, the device list reconciled
@@ -22,10 +27,14 @@ use crate::keystore::KeyStore;
 use crate::registry::DeviceRegistry;
 use crate::{Error, Result};
 
-/// The ALPN of the sync protocol.
-pub const ALPN: &[u8] = b"engramma/sync/1";
-/// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: u64 = 1;
+/// The ALPN of the sync protocol — and the version of the
+/// materialization rules (v0.6.4, D4): every change of the derivation
+/// bumps it, and peers on different versions refuse each other before a
+/// single operation moves.
+pub const ALPN: &[u8] = b"engramma/sync/2";
+/// The protocol version this build speaks (kept in the hello as a
+/// belt-and-braces check: the ALPN already gates the rules).
+pub const PROTOCOL_VERSION: u64 = 2;
 /// A message is at most 1 MiB.
 pub const MAX_MESSAGE: usize = 1024 * 1024;
 

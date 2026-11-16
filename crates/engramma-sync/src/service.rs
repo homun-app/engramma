@@ -78,6 +78,10 @@ pub enum ServiceError {
     NotFound(String),
     /// A wrong argument of the call.
     Invalid(String),
+    /// v0.6.4 (D4): the peer speaks other materialization rules; the
+    /// device named needs an upgrade (or this one does). Nothing was
+    /// exchanged.
+    PeerOutdated(String),
     /// Everything else (a broken root, a failed endpoint). The message is
     /// the underlying error's own, so the words a test or a human greps
     /// for (a burnt channel's «bruciato») survive the crossing.
@@ -99,6 +103,7 @@ impl ServiceError {
             Self::Cancelled => "CANCELLED",
             Self::NotFound(_) => "NOT_FOUND",
             Self::Invalid(_) => "INVALID_ARGUMENT",
+            Self::PeerOutdated(_) => "PEER_OUTDATED",
             Self::Io(_) => "IO",
         }
     }
@@ -121,6 +126,9 @@ impl ServiceError {
             Self::Cancelled => "abbinamento annullato".into(),
             Self::NotFound(what) => format!("{what} non esiste"),
             Self::Invalid(why) => why.clone(),
+            Self::PeerOutdated(who) => format!(
+                "il dispositivo {who} usa regole di materializzazione diverse:                  aggiornalo (o aggiorna questo dispositivo) prima di sincronizzare"
+            ),
             Self::Io(why) => why.clone(),
         }
     }

@@ -48,6 +48,24 @@ pub enum Error {
     /// Malformed data on the wire.
     #[error("malformed: {0}")]
     Malformed(String),
+    /// v0.6.4 (D4): the peer speaks other MATERIALIZATION RULES — its
+    /// ALPN refused ours. Nothing was exchanged; the peer needs an
+    /// upgrade (or this device does).
+    #[error("peer outdated: {0}")]
+    PeerOutdated(String),
+}
+
+/// Does this connect failure look like the peer's ALPN refusing ours —
+/// the only sound reading of a handshake that dies there, when the
+/// transport itself answered (v0.6.4, D4)?
+pub(crate) fn looks_like_alpn_refusal(e: &std::io::Error) -> bool {
+    let t = e.to_string().to_ascii_lowercase();
+    // rustls's own words for a server that offers none of our protocols
+    // ("error 120: peer doesn't support any known protocol"), and the
+    // shapes older stacks used for the same refusal
+    t.contains("known protocol")
+        || t.contains("no application protocol")
+        || t.contains("alpn")
 }
 
 /// Convenience alias.

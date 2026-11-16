@@ -1227,3 +1227,23 @@ process.on('exit', () => {
     fs.rmSync(TMP, { recursive: true, force: true });
   }
 });
+
+// v0.6.4 (D3): the contract's shapes on a quiet cell — an empty list,
+// and the two refusals.
+test('conflicts(): empty on a quiet cell; resolveConflict refuses cleanly', async () => {
+  const e = await engine();
+  try {
+    const cell = await e.cell('quieta');
+    assert.deepEqual(await cell.conflicts(), []);
+    await assert.rejects(
+      cell.resolveConflict('01AAAAAAAAAAAAAAAAAAAAAAAA', { keep: 'original' }),
+      (err) => err.code === 'NOT_FOUND',
+    );
+    await assert.rejects(
+      cell.resolveConflict('01AAAAAAAAAAAAAAAAAAAAAAAA', { keep: 'nonsense' }),
+      (err) => err.code === 'INVALID_ARGUMENT',
+    );
+  } finally {
+    await e.close();
+  }
+});

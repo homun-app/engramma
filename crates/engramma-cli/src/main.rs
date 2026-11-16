@@ -217,6 +217,12 @@ enum Command {
         #[command(subcommand)]
         action: Option<ProposalsAction>,
     },
+    /// The conflict copies to resolve (v0.6.4): who lost, when, in
+    /// quarantine or not — the copy is a note, read it with `get`
+    Conflicts {
+        #[command(subcommand)]
+        action: Option<ConflictsAction>,
+    },
     /// The decisions registry: who, when, what, why (v0.5)
     Decisions {
         /// Only this actor (exact or prefix, e.g. `reviewer:`)
@@ -433,6 +439,23 @@ enum ProposalsAction {
     },
     /// Retry the FAILED automatic reviews (never the escalated ones)
     Review,
+}
+
+#[derive(Subcommand)]
+enum ConflictsAction {
+    /// Resolve one copy: `--keep original` (the delete), `--keep copy`
+    /// (the copy's body wins), `--keep merged --body-file <f>` (the hand
+    /// merge; `-` = stdin)
+    Resolve {
+        /// The copy's id (or prefix)
+        id: String,
+        /// original | copy | merged
+        #[arg(long)]
+        keep: String,
+        /// The merged body, from a file or stdin (`-`), with --keep merged
+        #[arg(long)]
+        body_file: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1583,6 +1606,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             Ok(())
         }
         Command::Proposals { state, by, action } => run_proposals(cli, state, by, action),
+        Command::Conflicts { action } => run_conflicts(cli, action),
         Command::Decisions {
             by,
             since,
@@ -2777,6 +2801,85 @@ fn decision_json(row: &engramma_core::cell::proposals::DecisionRow) -> serde_jso
         "review": row.review,
         "reverted_by": row.reverted_by.map(|r| r.to_string()),
         "state": if row.reverted_by.is_some() { "reverted" } else { "active" },
+    })
+}
+
+/// v0.6.4 (D3): the conflicts list and `resolve`. The copy is a note
+/// like every other — the list carries no text, `get` reads it.
+fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliError> {
+    let cell = open_cell(cli)?;
+    match action {
+        None => {
+            let rows = cell.conflicts().map_err(|e| CliError::internal(e.to_string()))?;
+            if cli.json {
+                let arr: Vec<serde_json::Value> = rows.iter().map(conflict_json).collect();
+                print_json(&serde_json::json!({ "cell": cli.cell, "conflicts": arr }));
+            } else {
+                if rows.is_empty() {
+                    println!("nessuna copia di conflitto");
+                }
+                for r in &rows {
+                    println!(
+                        "{}  {}  {}  {}{}",
+                        &r.copy_id.to_string()[..8],
+                        match r.loser_class {
+                            engramma_core::cell::conflicts::ActorClass::Human => "umano",
+                            engramma_core::cell::conflicts::ActorClass::Agent => "agente",
+                        },
+                        r.loser_actor,
+                        r.loser_at,
+                        if r.visible { "" } else { "  (in attesa: oltre il tetto di tre)" }
+                    );
+                    println!("  originale {}", &r.original_id.to_string()[..8]);
+                }
+            }
+            Ok(())
+        }
+        Some(ConflictsAction::Resolve { id, keep, body_file }) => {
+            let id = cell
+                .resolve_note_id(id)
+                .map_err(|e| CliError::usage(e.to_string()))?;
+            let keep = match keep.as_str() {
+                "original" => engramma_core::ResolveKeep::Original,
+                "copy" => engramma_core::ResolveKeep::Copy,
+                "merged" => engramma_core::ResolveKeep::Merged,
+                other => {
+                    return Err(CliError::usage(format!(
+                        "`--keep` vale original | copy | merged, non `{other}`"
+                    )));
+                }
+            };
+            let body = match body_file {
+                Some(path) => Some(read_body(path)?),
+                None => None,
+            };
+            let original = cell
+                .resolve_conflict(&id, keep, body.as_deref(), "user@cli")
+                .map_err(|e| match e {
+                    engramma_core::CellError::NoteNotFound(_) => {
+                        CliError::usage("non è una copia di conflitto".to_string())
+                    }
+                    engramma_core::CellError::Conflict(m) => CliError::usage(m),
+                    other => CliError::internal(other.to_string()),
+                })?;
+            report_ok(cli, "conflitto risolto", &original.to_string());
+            Ok(())
+        }
+    }
+}
+
+fn conflict_json(r: &engramma_core::cell::conflicts::ConflictInfo) -> serde_json::Value {
+    serde_json::json!({
+        "copyId": r.copy_id.to_string(),
+        "originalId": r.original_id.to_string(),
+        "loserActor": r.loser_actor,
+        "loserClass": match r.loser_class {
+            engramma_core::cell::conflicts::ActorClass::Human => "human",
+            engramma_core::cell::conflicts::ActorClass::Agent => "agent",
+        },
+        "loserAt": r.loser_at,
+        "quarantined": r.quarantined,
+        "visible": r.visible,
     })
 }
 

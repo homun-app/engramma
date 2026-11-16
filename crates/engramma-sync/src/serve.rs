@@ -64,6 +64,12 @@ impl PeerAddr {
                 "nessuna strada ha risposto in 10 s",
             ))),
             Ok(Ok(conn)) => Ok(conn),
+            // v0.6.4 (D4): the peer's ALPN refused ours — it speaks other
+            // materialization rules, and not one operation may move. The
+            // name rides up so the user knows WHICH device to upgrade.
+            Ok(Err(e)) if crate::looks_like_alpn_refusal(&std::io::Error::other(e.to_string())) => {
+                Err(Error::PeerOutdated(self.device.clone()))
+            }
             Ok(Err(e)) => Err(Error::Io(std::io::Error::other(e.to_string()))),
         }
     }

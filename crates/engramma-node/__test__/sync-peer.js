@@ -37,7 +37,7 @@ async function run(op, args) {
       state.engine = await Engine.open({
         root: args.root,
         embedder: 'none',
-        actor: 'homun',
+        actor: args.actor || 'homun',
       });
       state.sync = await state.engine.sync({
         deviceName: args.name,
@@ -76,6 +76,24 @@ async function run(op, args) {
     case 'get': {
       const note = await state[args.cell].get(args.id);
       return { there: note !== null, body: note ? note.body : null };
+    }
+    case 'patch': {
+      // v0.6.4 (D3): a body patch or a HEADER-only patch (title), the
+      // two shapes the conflict rule must tell apart
+      const set = {};
+      if (args.body !== undefined) set.body = args.body;
+      if (args.title !== undefined) set.title = args.title;
+      const note = await state[args.cell].patch(args.id, set);
+      return { id: note.id, body: note.body };
+    }
+    case 'conflicts':
+      return await state[args.cell].conflicts();
+    case 'resolve': {
+      const original = await state[args.cell].resolveConflict(args.id, {
+        keep: args.keep,
+        body: args.body,
+      });
+      return { original };
     }
     case 'share':
       return await state.sync.share(args.cell);

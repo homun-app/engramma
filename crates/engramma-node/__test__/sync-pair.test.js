@@ -490,3 +490,185 @@ test('C5.4: stop() during a session with many notes concludes within 5 s', async
     await b.quit();
   }
 });
+
+// v0.6.4 (D3): the conflict list and its resolution, across two paired
+// devices. A concurrent body write opens a DURABLE copy on both sides —
+// an agent's loser is born in quarantine, in the queue — and the
+// resolution closes it everywhere.
+test('D3: conflicts and resolveConflict across two devices', async () => {
+  const a = new Peer();
+  const b = new Peer();
+  try {
+    await a.cmd('open', { root: rootName(), name: 'laptop', actor: 'user' });
+    await b.cmd('open', { root: rootName(), name: 'mac' });
+    await a.cmd('cell', { cell: 'memoria' });
+    const put = await a.cmd('put', { cell: 'memoria', body: 'alpha\nbeta\ngamma' });
+    const invite = await a.cmd('invite', { key: 'p' });
+    await a.cmd('share', { cell: 'memoria' });
+    await b.cmd('join', { ticketOrCode: invite.ticket, key: 'p' });
+    const sasA = (await a.cmd('sas', { key: 'p' })).sas;
+    const sasB = (await b.cmd('sas', { key: 'p' })).sas;
+    assert.equal(sasA, sasB);
+    await a.cmd('confirm', { same: true, key: 'p' });
+    await b.cmd('confirm', { same: true, key: 'p' });
+    await a.cmd('done', { key: 'p' });
+    await b.cmd('done', { key: 'p' });
+    // both services on; the books learn the other's live address the way
+    // the other tests do it: by hand, on loopback
+    const infoA = await a.cmd('start');
+    const infoB = await b.cmd('start');
+    await b.cmd('remember', { device: 'laptop', serve: infoA });
+    await a.cmd('remember', { device: 'mac', serve: infoB });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await b.cmd('cell', { cell: 'memoria' });
+
+    // two concurrent body writes from the same base: the human's wins,
+    // the agent's loser is the durable copy
+    await a.cmd('patch', { cell: 'memoria', id: put.id, body: 'la mano umana al lavoro' });
+    await b.cmd('patch', { cell: 'memoria', id: put.id, body: 'alpha\nX\ngamma' });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+
+    for (const peer of [a, b]) {
+      const list = await peer.cmd('conflicts', { cell: 'memoria' });
+      assert.equal(list.length, 1, `one open copy: ${JSON.stringify(list)}`);
+      const c = list[0];
+      assert.equal(c.originalId, put.id);
+      assert.equal(c.loserClass, 'agent');
+      assert.equal(c.loserActor, 'homun');
+      assert.equal(c.quarantined, true, 'the agent loser is born in quarantine');
+      assert.equal(c.visible, true);
+      const original = await peer.cmd('get', { cell: 'memoria', id: put.id });
+      assert.equal(original.body, 'la mano umana al lavoro', 'the human tip won');
+      // the agent's copy is QUARANTINED: `get` answers null — the closed
+      // oracle holds for it as for every hidden note (the queue is its
+      // surface). Its body proves itself below, when `keep: copy` makes
+      // it the original's.
+      const copy = await peer.cmd('get', { cell: 'memoria', id: c.copyId });
+      assert.equal(copy.there, false, 'a quarantined copy answers null');
+    }
+    const copyId = (await a.cmd('conflicts', { cell: 'memoria' }))[0].copyId;
+
+    // resolving with `copy`: the loser's body becomes the original's,
+    // and the OLD copy closes on both devices. The resolution is itself
+    // a body write that does not CONTAIN the pre-resolution human body —
+    // so that body, now a losing tip, opens ITS copy: durable means
+    // durable against a resolution too (the task's own «con corpi diversi
+    // nasce un conflitto nuovo, ed è giusto così»). A HUMAN loser: the
+    // copy is ACTIVE and readable with `get`, like every note.
+    await a.cmd('resolve', { cell: 'memoria', id: copyId, keep: 'copy' });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    for (const peer of [a, b]) {
+      const list = await peer.cmd('conflicts', { cell: 'memoria' });
+      assert.equal(list.length, 1, `the old copy closed, one new was born: ${JSON.stringify(list)}`);
+      assert.ok(!list.some((c) => c.copyId === copyId), 'the resolved copy is gone');
+      const reborn = list[0];
+      assert.equal(reborn.loserClass, 'human', 'the pre-resolution body was human');
+      assert.equal(reborn.quarantined, false, 'a human copy is active');
+      const original = await peer.cmd('get', { cell: 'memoria', id: put.id });
+      assert.equal(original.body, 'alpha\nX\ngamma', "the copy's body won by hand");
+      const humanCopy = await peer.cmd('get', { cell: 'memoria', id: reborn.copyId });
+      assert.equal(humanCopy.there, true, 'an active copy is readable with get');
+      assert.equal(humanCopy.body, 'la mano umana al lavoro');
+    }
+    // and the reborn conflict resolves with `original`: quiet again
+    const rebornId = (await a.cmd('conflicts', { cell: 'memoria' }))[0].copyId;
+    await a.cmd('resolve', { cell: 'memoria', id: rebornId, keep: 'original' });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    for (const peer of [a, b]) {
+      const list = await peer.cmd('conflicts', { cell: 'memoria' });
+      assert.equal(list.length, 0, `quiet after both resolutions: ${JSON.stringify(list)}`);
+    }
+
+    // the errors of the contract: unknown is NOT_FOUND, closed is CONFLICT
+    await assert.rejects(
+      a.cmd('resolve', { cell: 'memoria', id: '01AAAAAAAAAAAAAAAAAAAAAAAA', keep: 'original' }),
+      (err) => err.code === 'NOT_FOUND',
+    );
+    // a copy closed WITHOUT operations of its own (the hand merge
+    // contained it) is GONE — NOT_FOUND. The one closed BY the delete of
+    // its resolution keeps its birth row: CONFLICT.
+    await assert.rejects(
+      a.cmd('resolve', { cell: 'memoria', id: copyId, keep: 'original' }),
+      (err) => err.code === 'NOT_FOUND',
+    );
+    await assert.rejects(
+      a.cmd('resolve', { cell: 'memoria', id: rebornId, keep: 'original' }),
+      (err) => err.code === 'CONFLICT',
+    );
+  } finally {
+    await a.quit();
+    await b.quit();
+  }
+});
+
+// v0.6.4 (D3): a header-only patch does not close the copy and does not
+// create one — across the wire too.
+test('D3: a title patch neither closes nor creates copies', async () => {
+  const a = new Peer();
+  const b = new Peer();
+  try {
+    await a.cmd('open', { root: rootName(), name: 'laptop', actor: 'user' });
+    await b.cmd('open', { root: rootName(), name: 'mac' });
+    await a.cmd('cell', { cell: 'memoria' });
+    const put = await a.cmd('put', { cell: 'memoria', body: 'alpha\nbeta\ngamma' });
+    const invite = await a.cmd('invite', { key: 'p' });
+    await a.cmd('share', { cell: 'memoria' });
+    await b.cmd('join', { ticketOrCode: invite.ticket, key: 'p' });
+    const sasA = (await a.cmd('sas', { key: 'p' })).sas;
+    const sasB = (await b.cmd('sas', { key: 'p' })).sas;
+    assert.equal(sasA, sasB);
+    await a.cmd('confirm', { same: true, key: 'p' });
+    await b.cmd('confirm', { same: true, key: 'p' });
+    await a.cmd('done', { key: 'p' });
+    await b.cmd('done', { key: 'p' });
+    // both services on; the books learn the other's live address the way
+    // the other tests do it: by hand, on loopback
+    const infoA = await a.cmd('start');
+    const infoB = await b.cmd('start');
+    await b.cmd('remember', { device: 'laptop', serve: infoA });
+    await a.cmd('remember', { device: 'mac', serve: infoB });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await b.cmd('cell', { cell: 'memoria' });
+
+    await b.cmd('patch', { cell: 'memoria', id: put.id, body: 'alpha\nX\ngamma' });
+    await a.cmd('patch', { cell: 'memoria', id: put.id, body: 'il corpo della mano umana' });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    assert.equal((await a.cmd('conflicts', { cell: 'memoria' })).length, 1);
+
+    // a TITLE-only patch on the original: the copy stays
+    await a.cmd('patch', { cell: 'memoria', id: put.id, title: 'il titolo ritoccato' });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    for (const peer of [a, b]) {
+      const list = await peer.cmd('conflicts', { cell: 'memoria' });
+      assert.equal(list.length, 1, 'a title patch does not close the copy');
+      assert.equal(list[0].loserActor, 'homun', 'the loser did not move');
+    }
+
+    // a title CONCURRENT to a body creates nothing: only the body conflicts
+    await a.cmd('patch', { cell: 'memoria', id: put.id, title: 'un altro titolo' });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    const list = await a.cmd('conflicts', { cell: 'memoria' });
+    assert.equal(list.length, 1, 'a concurrent title creates no copy');
+  } finally {
+    await a.quit();
+    await b.quit();
+  }
+});
