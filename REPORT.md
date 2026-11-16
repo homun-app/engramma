@@ -6965,9 +6965,10 @@ chiudere quando si tocca di nuovo il ciclo: un segnaposto per cella.
 
 ## Per la prossima fase
 
-- Il banco carica i due modelli semantici a ogni giro: una misura di sola
-  scrittura dura ~45 min. Serve un modo di girare solo `viva` e `uniform`
-  (~5 min).
+- Le misure di sola scrittura si lanciano con
+  `ENGRAMMA_SKIP_MODEL_TESTS=1`: il banco salta i due modelli semantici,
+  che fanno quasi tutti i ~45 min di una corsa. Va scritto nella spec
+  delle soglie.
 - Il segnaposto per cella del guardiano, qui sopra.
 
 ## Disco
