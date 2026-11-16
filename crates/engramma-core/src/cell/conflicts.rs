@@ -188,6 +188,7 @@ struct NoteOpRow {
     op_id: Ulid,
     hlc: String,
     actor: String,
+    kind: OpKind,
     parent: Option<usize>,
     /// `Some` iff this op is a body write whose payload is here.
     body: Option<BodyFacts>,
@@ -203,6 +204,9 @@ struct BodyFacts {
 struct Plan {
     /// The winner's body text, when a body write is applied at all.
     winner_body: Option<String>,
+    /// A restore newer than every body write set the body by its own
+    /// hand: the correction yields.
+    yield_to_restore: bool,
     /// One entry per OPEN copy.
     copies: Vec<PlannedCopy>,
 }
@@ -273,6 +277,7 @@ fn scan(tx: &Transaction<'_>, original: &Ulid) -> Result<Vec<NoteOpRow>, CellErr
                 op_id,
                 hlc,
                 actor,
+                kind,
                 parent,
                 body,
             })
@@ -481,8 +486,66 @@ pub(crate) fn after_replay(
     let winner_body = winner.and_then(|w| rows[w].body.as_ref().map(|b| b.text.clone()));
     let mut plan = Plan {
         winner_body,
+        yield_to_restore: newer_restore(&rows, &applied),
         copies: Vec::new(),
     };
+    // BIRTH ROWS: any note whose id is a copy's id and carries
+    // operations of its own (an edit, the resolving delete, a decision)
+    // needs its derivation row — it is the replay base. That includes a
+    // loser that later became the WINNER (or the winner's ancestor): the
+    // incremental path kept its row from when it was a loser, and a
+    // rebuild from the log alone must land on the same row or the copy's
+    // own ops park forever (found by the oracle on the phased fleet)
+    let mut planned: Vec<Ulid> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        if row.body.is_none() || !applied.contains(&i) {
+            continue;
+        }
+        let copy_id = material::conflict_copy_id(&row.hash, hlc_ms_of(&row.hlc));
+        let has_ops: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM op_objects WHERE object = ?1",
+            [format!("note:{copy_id}")],
+            |r| r.get(0),
+        )?;
+        if has_ops == 0 {
+            continue;
+        }
+        planned.push(copy_id);
+        if plan.copies.iter().any(|c| c.copy_id == copy_id) {
+            continue;
+        }
+        let quarantined = classify_actor(&row.actor) == ActorClass::Agent;
+        if let Some(state) = states.get(&row.hash) {
+            let mut note = state.clone();
+            note.id = copy_id;
+            // the same content every path writes: the class decides the
+            // state (a divergence here left one copy active on one device
+            // and quarantined on another — found by the phased fleet)
+            note.status = if quarantined {
+                crate::format::Status::Quarantined
+            } else {
+                crate::format::Status::Active
+            };
+            if let Some(facts) = row.body.as_ref()
+                && let Ok(at) = crate::format::At::parse(&facts.updated_at)
+            {
+                note.updated_at = at;
+            }
+            if !note.tags.iter().any(|t| t == "conflitto") {
+                note.tags.push("conflitto".into());
+            }
+            plan.copies.push(PlannedCopy {
+                loser_op: row.op_id,
+                loser_hlc: row.hlc.clone(),
+                loser_actor: row.actor.clone(),
+                copy_id,
+                note,
+                quarantined,
+                visible: false,
+                open: false,
+            });
+        }
+    }
     for loser in candidates {
         let facts = rows[loser].body.as_ref().expect(/* just checked */ "applied body write");
         // the filters (D1.5): no copy for a body equal to the winner's,
@@ -533,16 +596,25 @@ pub(crate) fn after_replay(
         if !note.tags.iter().any(|t| t == "conflitto") {
             note.tags.push("conflitto".into());
         }
-        plan.copies.push(PlannedCopy {
-            loser_op: rows[loser].op_id,
-            loser_hlc: rows[loser].hlc.clone(),
-            loser_actor: rows[loser].actor.clone(),
-            copy_id,
-            note,
-            quarantined,
-            visible: false,
-            open,
-        });
+        if !planned.contains(&copy_id) {
+            plan.copies.push(PlannedCopy {
+                loser_op: rows[loser].op_id,
+                loser_hlc: rows[loser].hlc.clone(),
+                loser_actor: rows[loser].actor.clone(),
+                copy_id,
+                note,
+                quarantined,
+                visible: false,
+                open,
+            });
+        } else if open {
+            // the birth pass wrote it closed; an OPEN loser upgrades it
+            if let Some(slot) = plan.copies.iter_mut().find(|c| c.copy_id == copy_id) {
+                slot.note = note;
+                slot.open = true;
+                slot.quarantined = quarantined;
+            }
+        }
     }
     // the cap: the three most recent OPEN copies (total order) are
     // visible; the others stay open and wait for a window
@@ -559,6 +631,27 @@ pub(crate) fn after_replay(
         c.visible = open_seen + VISIBLE_COPIES_CAP > open_count;
     }
     apply(tx, original, &plan)
+}
+
+/// Is a RESTORE the newest body-setting event? A restore rewrites the
+/// body from a version snapshot without being a body write; the
+/// winner-body correction (and its guard) yield to the newest one.
+fn newer_restore(rows: &[NoteOpRow], applied: &[usize]) -> bool {
+    let newest_write = applied
+        .iter()
+        .copied()
+        .max_by(|&a, &b| {
+            (rows[a].hlc.as_str(), rows[a].op_id.to_string())
+                .cmp(&(rows[b].hlc.as_str(), rows[b].op_id.to_string()))
+        });
+    let Some(newest_write) = newest_write else {
+        return false;
+    };
+    rows.iter().any(|r| {
+        r.kind == OpKind::Restore
+            && (r.hlc.as_str(), r.op_id.to_string())
+                > (rows[newest_write].hlc.as_str(), rows[newest_write].op_id.to_string())
+    })
 }
 
 /// The `physical_ms` of an hlc string (the copy id's time part).
@@ -632,6 +725,14 @@ fn apply(tx: &Transaction<'_>, original: &Ulid, plan: &Plan) -> Result<(), CellE
                 i64::from(copy.open)
             ],
         )?;
+        if !copy.open {
+            // a closed birth row: the copy's note lives its own life
+            // (an edit, the resolving delete's tombstone, a decision) —
+            // its rows belong to its own materialization, not to this
+            // derivation
+            material::materialize(tx, &format!("note:{}", copy.copy_id))?;
+            continue;
+        }
         if copy.visible {
             material::restore_conflict_copy(tx, &copy.copy_id, original, &copy.note)?;
             if copy.quarantined {
@@ -675,17 +776,24 @@ fn apply(tx: &Transaction<'_>, original: &Ulid, plan: &Plan) -> Result<(), CellE
     // the winner's body: the note's body is the winner's even when a
     // later write applied over it — the human hand, older, wins. The
     // lapide keeps its own state: a deleted note is not corrected.
+    // a RESTORE newer than the winner set the body by its own hand (it
+    // is no body write, but it rewrites the body from a version): the
+    // correction yields to the newest body-setting event, or it would
+    // undo every restore of a note with a conflict past
     if let Some(body) = &plan.winner_body
         && let Some(row) = ops::read_note_row(tx, original)?
         && row.note.status != crate::format::Status::Deleted
         && row.note.body != *body
+        && !plan.yield_to_restore
     {
-        let lang = row.note.lang;
-        let body_norm = crate::text::normalize_for_index(
-            row.note.title.as_deref(),
-            body,
-            lang,
-        );
+        // the same language every writer detects: the note's own, or
+        // the detection over title and body (the correction once wrote
+        // body_norm unstemmed — the oracle saw it)
+        let lang = row
+            .note
+            .lang
+            .or_else(|| crate::text::detect_lang(&format!("{}\n{}", row.note.display_title(), body)));
+        let body_norm = crate::text::normalize_for_index(row.note.title.as_deref(), body, lang);
         tx.execute(
             "UPDATE notes SET body = ?2, body_norm = ?3 WHERE id = ?1",
             rusqlite::params![original.to_string(), body, body_norm],
@@ -699,7 +807,11 @@ fn apply(tx: &Transaction<'_>, original: &Ulid, plan: &Plan) -> Result<(), CellE
 /// derivation? Deletes, restores, supersedes and purges move state in
 /// ways only the replay can see, and a pending object has operations
 /// the state does not reflect yet.
-fn needs_replay(tx: &Transaction<'_>, original: &Ulid) -> Result<bool, CellError> {
+fn needs_replay(
+    tx: &Transaction<'_>,
+    original: &Ulid,
+    arriving: Option<&str>,
+) -> Result<bool, CellError> {
     let pending: i64 = tx.query_row(
         "SELECT COUNT(*) FROM pending_objects WHERE object = ?1",
         [format!("note:{original}")],
@@ -707,6 +819,39 @@ fn needs_replay(tx: &Transaction<'_>, original: &Ulid) -> Result<bool, CellError
     )?;
     if pending > 0 {
         return Ok(true);
+    }
+    // the winner-body correction is in effect: the live row's body is
+    // NOT the body a sequential replay would hold at this point (it is
+    // the class-winner's, an older write's). Any version snapshot taken
+    // from the live state now — the next patch's, the next delete's —
+    // would diverge from the rebuild's sequential snapshot (found by
+    // the oracle, seed 12328535914020248362): replay the whole note, so
+    // the snapshots and the chain land as the rebuild computes them
+    if let Some(row) = ops::read_note_row(tx, original)? {
+        let rows = scan(tx, original)?;
+        // the newest body write in the TOTAL ORDER (not the class
+        // winner): that is the body a sequential replay holds now
+        let applied_all: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.body.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        if !newer_restore(&rows, &applied_all)
+            && let Some(newest) = rows
+                .iter()
+                .filter(|r| r.body.is_some() && Some(r.hash.as_str()) != arriving)
+                .enumerate()
+                .max_by(|(ia, a), (ib, b)| {
+                    (a.hlc.as_str(), a.op_id.to_string())
+                        .cmp(&(b.hlc.as_str(), b.op_id.to_string()))
+                        .then_with(|| ia.cmp(ib))
+                })
+                .map(|(_, r)| r)
+            && newest.body.as_ref().is_some_and(|b| b.text != row.note.body)
+        {
+            return Ok(true);
+        }
     }
     let cut: i64 =
         tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| r.get(0))?;
@@ -731,7 +876,7 @@ pub(crate) fn after_body_write(
     original: &Ulid,
     arriving: &Op,
 ) -> Result<(), CellError> {
-    if needs_replay(tx, original)? {
+    if needs_replay(tx, original, Some(&arriving.content_hash))? {
         return material::materialize(tx, &format!("note:{original}"));
     }
     // the arriving op's applied state is the live row — it applied over
@@ -768,6 +913,31 @@ pub(crate) fn after_body_write(
         if !is_arrival && has_row == 0 {
             known_only_partial = true;
             break;
+        }
+    }
+    // and any copy-with-ops whose birth row is missing needs the replay
+    // too (the loser may have become the winner: only the replay's
+    // events carry the state the birth row wants)
+    for row in &rows {
+        let Some(_facts) = row.body.as_ref() else {
+            continue;
+        };
+        let copy_id = material::conflict_copy_id(&row.hash, hlc_ms_of(&row.hlc));
+        let has_ops: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM op_objects WHERE object = ?1",
+            [format!("note:{copy_id}")],
+            |r| r.get(0),
+        )?;
+        if has_ops > 0 {
+            let has_row: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM conflict_copies WHERE copy_id = ?1",
+                [copy_id.to_string()],
+                |r| r.get(0),
+            )?;
+            if has_row == 0 {
+                known_only_partial = true;
+                break;
+            }
         }
     }
     if known_only_partial {
@@ -814,26 +984,19 @@ pub(crate) fn after_body_write(
     after_replay(tx, original, &applied_hashes, &states)
 }
 
-/// After any operation touched a COPY's id — a modification, the delete
-/// that resolves it, a decision on its queue row: the copy's conflict
-/// is closed by (a), and the ORIGINAL's derivation must see it.
-pub(crate) fn rederive_original_of(tx: &Transaction<'_>, copy: &Ulid) -> Result<(), CellError> {
-    let original: Option<String> = tx
-        .query_row(
-            "SELECT original_id FROM conflict_copies WHERE copy_id = ?1",
-            [copy.to_string()],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(original) = original else {
-        return Ok(());
-    };
-    let original = Ulid::from_string(&original)
-        .map_err(|_| CellError::Db(format!("bad conflict original {original}")))?;
-    if needs_replay(tx, &original)? {
+/// After any operation touched a note — a body write, a header patch, a
+/// supersede, an operation on a COPY's id: every arrival can change the
+/// derivation (a node that completes the graph moves a tip; an
+/// operation on a copy's id is a closure witness). Without this, a
+/// device whose last arrival for the note was not a body write kept a
+/// stale conflict set until some later write fixed it — and two devices
+/// of one fleet diverged (found by the phased fleet, seed
+/// 1421488054822918858).
+pub(crate) fn rederive_note(tx: &Transaction<'_>, original: &Ulid) -> Result<(), CellError> {
+    if needs_replay(tx, original, None)? {
         return material::materialize(tx, &format!("note:{original}"));
     }
-    let rows = scan(tx, &original)?;
+    let rows = scan(tx, original)?;
     let applied: Vec<usize> = rows
         .iter()
         .enumerate()
@@ -841,6 +1004,31 @@ pub(crate) fn rederive_original_of(tx: &Transaction<'_>, copy: &Ulid) -> Result<
         .map(|(i, _)| i)
         .collect();
     let (_, candidates) = winner_and_candidates(&rows, &applied);
+    // a copy with operations of its own whose BIRTH ROW is missing
+    // needs the replay: only the replay's events carry the state the
+    // row wants (found by the oracle — the merged fleet, seed
+    // 15192944291106605994)
+    for row in &rows {
+        if row.body.is_none() {
+            continue;
+        }
+        let copy_id = material::conflict_copy_id(&row.hash, hlc_ms_of(&row.hlc));
+        let has_ops: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM op_objects WHERE object = ?1",
+            [format!("note:{copy_id}")],
+            |r| r.get(0),
+        )?;
+        if has_ops > 0 {
+            let has_row: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM conflict_copies WHERE copy_id = ?1",
+                [copy_id.to_string()],
+                |r| r.get(0),
+            )?;
+            if has_row == 0 {
+                return material::materialize(tx, &format!("note:{original}"));
+            }
+        }
+    }
     // every candidate the witnesses have not closed needs its state:
     // open rows carry theirs; anything else needs the replay
     let mut states: HashMap<String, Note> = HashMap::new();
@@ -875,7 +1063,7 @@ pub(crate) fn rederive_original_of(tx: &Transaction<'_>, copy: &Ulid) -> Result<
         .filter(|r| r.body.is_some())
         .map(|r| r.hash.clone())
         .collect();
-    after_replay(tx, &original, &applied_hashes, &states)
+    after_replay(tx, original, &applied_hashes, &states)
 }
 
 /// One conflict of a cell, as `conflicts()` reports it (D3).
@@ -1060,6 +1248,69 @@ pub fn deserved_for_test(
         return Ok(false);
     }
     Ok(true)
+}
+
+/// The copy-id hook: an operation touched a COPY's id (a modification,
+/// the resolving delete, a decision on its queue row) — the ORIGINAL's
+/// derivation must see the witness.
+pub(crate) fn rederive_original_of(tx: &Transaction<'_>, copy: &Ulid) -> Result<(), CellError> {
+    let original: Option<String> = tx
+        .query_row(
+            "SELECT original_id FROM conflict_copies WHERE copy_id = ?1",
+            [copy.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let original = match original {
+        Some(original) => Ulid::from_string(&original)
+            .map_err(|_| CellError::Db(format!("bad conflict original {original}")))?,
+        // the birth row does not exist HERE (this copy never opened on
+        // this device — its loser was the winner, or it never derived):
+        // find the original by walking the copy id back over every
+        // note's body writes (the id is blake3 of the loser — not
+        // invertible, but the cell is small and orphan copy ops are
+        // rare). Found by the oracle, seed 15192944291106605994
+        None => match original_of_copy(tx, copy)? {
+            Some(original) => original,
+            None => return Ok(()),
+        },
+    };
+    rederive_note(tx, &original)
+}
+
+/// Which note's body writes mint this copy id, when no derivation row
+/// says so.
+fn original_of_copy(
+    tx: &Transaction<'_>,
+    copy: &Ulid,
+) -> Result<Option<Ulid>, CellError> {
+    let notes: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT oo2.object FROM op_objects oo2
+             JOIN ops o ON o.op_id = oo2.op_id
+             WHERE o.kind IN ('put_note', 'patch_note') AND oo2.object LIKE 'note:%'",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.flatten().collect()
+    };
+    for object in notes {
+        let Some(id) = object.strip_prefix("note:") else {
+            continue;
+        };
+        let Ok(original) = Ulid::from_string(id) else {
+            continue;
+        };
+        let rows = scan(tx, &original)?;
+        for row in rows {
+            if row.body.is_none() {
+                continue;
+            }
+            if material::conflict_copy_id(&row.hash, hlc_ms_of(&row.hlc)) == *copy {
+                return Ok(Some(original));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

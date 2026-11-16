@@ -271,11 +271,18 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
             }
         }
     }
-    // v0.6.4 (D1.6a): an operation on a COPY's id — a modification, the
-    // delete that resolves it, a decision on its queue row — is a
-    // closure witness, and the ORIGINAL's derivation must see it. One
-    // point query per arrival; nothing for a note that is no copy.
+    // v0.6.4: EVERY arrival for a note re-derives its conflict set —
+    // body writes through their own hook (above), everything else
+    // through the set-only rederivation: a node that completes the
+    // graph moves a tip. And an operation on a COPY's id is a closure
+    // witness the ORIGINAL's derivation must see — both, not either
     for object in &objects {
+        if let Some(nid) = object.strip_prefix("note:")
+            && let Ok(nid) = Ulid::from_string(nid)
+            && !is_body_write(op, &nid)
+        {
+            super::conflicts::rederive_note(tx, &nid)?;
+        }
         if let Some(nid) = object.strip_prefix("note:")
             && let Ok(nid) = Ulid::from_string(nid)
         {
@@ -1025,17 +1032,18 @@ pub(crate) fn reconcile_after_local_write(
     op: &Op,
 ) -> Result<(), CellError> {
     for object in ops::objects_of(op) {
-        if let Some(nid) = object.strip_prefix("note:")
-            && let Ok(nid) = Ulid::from_string(nid)
-            && is_body_write(op, &nid)
-        {
+        let Some(nid) = object.strip_prefix("note:") else {
+            continue;
+        };
+        let Ok(nid) = Ulid::from_string(nid) else {
+            continue;
+        };
+        if is_body_write(op, &nid) {
             super::conflicts::after_body_write(tx, &nid, op)?;
+        } else {
+            super::conflicts::rederive_note(tx, &nid)?;
         }
-        if let Some(nid) = object.strip_prefix("note:")
-            && let Ok(nid) = Ulid::from_string(nid)
-        {
-            super::conflicts::rederive_original_of(tx, &nid)?;
-        }
+        super::conflicts::rederive_original_of(tx, &nid)?;
     }
     Ok(())
 }

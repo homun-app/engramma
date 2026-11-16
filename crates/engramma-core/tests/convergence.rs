@@ -755,21 +755,41 @@ impl Fleet {
                 let _ = cell.put_note(&n, &actor_of(dev, rng));
             }
             Write::Patch => {
-                let Some(id) = pick(&self.notes, rng) else {
+                // the notes THIS device holds (a patch on a note it
+                // does not hold is a usage error that rolls back — the
+                // writer must have seen the note), the OLDEST few, so
+                // devices that synced COLLIDE on them between
+                // deliveries: the fleet needs real concurrency or it
+                // hunts nothing (six copies in a thousand fleets,
+                // before this)
+                let own: Vec<Ulid> = cell
+                    .debug_column(
+                        "SELECT id FROM notes WHERE status != 'deleted'
+                         ORDER BY created_at, id LIMIT 5",
+                    )
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|id| Ulid::from_string(&id).ok())
+                    .collect();
+                let Some(id) = own.get(rng.below(own.len() as u64) as usize).copied() else {
                     return;
                 };
-                // the hand merge: when this device SEES an open copy of
-                // the note, one write in three takes the copy's body and
-                // appends a line of its own — over a middle-line change
-                // that CONTAINS the loser, the diff3 closes the copy
-                if rng.below(3) == 0 {
+                // the hand merge: when this device SEES an open copy,
+                // half the patches take the copy's body and append a
+                // line of its own — over a middle-line change that
+                // CONTAINS the loser, the diff3 closes the copy
+                if rng.below(2) == 0 {
                     let seen = open_copies_of(cell);
-                    if let Some((copy, _)) = seen.iter().find(|(_, orig)| *orig == id)
+                    if let Some((copy, _)) = seen.get(rng.below(seen.len() as u64) as usize)
                         && let Ok(note) = cell.get(copy)
+                        && let Some(original) = seen
+                            .iter()
+                            .find(|(c, _)| c == copy)
+                            .map(|(_, o)| *o)
                     {
                         let merged = format!("{}\nfuso da {dev}", note.body);
                         let _ = cell.patch_note(
-                            &id,
+                            &original,
                             &NotePatch {
                                 body: Some(merged),
                                 ..Default::default()
@@ -807,9 +827,15 @@ impl Fleet {
             }
             Write::CloseCopy => {
                 let seen = open_copies_of(cell);
-                if let Some((copy, _)) = seen.get(rng.below(seen.len() as u64) as usize) {
-                    let _ = cell.delete_note(copy, &actor_of(dev, rng));
+                if seen.is_empty() {
+                    // no copy in THIS device's view: the dice were spent,
+                    // write a patch instead (the case fires where copies
+                    // ARE visible, or the fleet never exercises it)
+                    self.write(dev, &Write::Patch, rng);
+                    return;
                 }
+                let (copy, _) = seen[rng.below(seen.len() as u64) as usize];
+                let _ = cell.delete_note(&copy, &actor_of(dev, rng));
             }
             Write::Delete => {
                 if let Some(id) = pick(&self.notes, rng) {
@@ -1070,6 +1096,7 @@ struct FleetRunner {
     fleet: Fleet,
     rng: Rng,
     n: usize,
+    round: u64,
 }
 
 impl FleetRunner {
@@ -1150,12 +1177,34 @@ impl FleetRunner {
             .cells[0]
             .set_policy(serde_json::json!({ "write": "propose" }), "device-0")
             .unwrap(/* test-only */);
-        Self { fleet, rng, n }
+        Self {
+            fleet,
+            rng,
+            n,
+            round: 0,
+        }
     }
 
-    /// One round: a write or a delivery, exactly as `fleet_run` did.
+    /// One round. v0.6.4: the schedule is PHASED — four write rounds
+    /// with no delivery in between (the devices drift apart, concurrent
+    /// branches GROW from stale heads), then one full sync round where
+    /// every pair delivers everything. The pairwise sprinkling of the
+    /// old fleet converged every branch before a conflict could ever be
+    /// SEEN: the copies appeared only at the final settle, and the
+    /// windows the conflict cases need (a merge, a close) never opened.
     fn one_round(&mut self) {
         let n = self.n;
+        self.round += 1;
+        if self.round.is_multiple_of(5) {
+            for from in 0..n {
+                for to in 0..n {
+                    if from != to {
+                        self.fleet.deliver(from, to, 4, &mut self.rng);
+                    }
+                }
+            }
+            return;
+        }
         match self.rng.below(3) {
             0 | 1 => {
                 // a device writes
@@ -1166,19 +1215,34 @@ impl FleetRunner {
                     4 => Write::Delete,
                     5 => Write::Supersede,
                     6 => Write::Link,
-                    7 => Write::Unlink,
-                    // v0.6.4: one write in ten closes a copy it can see
-                    _ => Write::CloseCopy,
+                    7 | 8 => Write::Unlink,
+                    // v0.6.4: two writes in ten close a copy. The close
+                    // comes from a device that SEES one (the window is
+                    // short — the fleet's own traffic closes copies fast,
+                    // each closure a descendant witness at work); when
+                    // nobody does, the round spends itself on a patch
+                    _ => {
+                        let seers: Vec<usize> = (0..n)
+                            .filter(|d| !open_copies_of(&self.fleet.cells[*d]).is_empty())
+                            .collect();
+                        if seers.is_empty() {
+                            self.fleet.write(dev, &Write::Patch, &mut self.rng);
+                        } else {
+                            let d = seers[self.rng.below(seers.len() as u64) as usize];
+                            self.fleet.write(d, &Write::CloseCopy, &mut self.rng);
+                        }
+                        return;
+                    }
                 };
                 self.fleet.write(dev, &w, &mut self.rng);
             }
+            // the sync rounds carry the deliveries now; write rounds
+            // also sometimes move ONE op across (a straggler)
             _ => {
-                // a delivery between two devices: sometimes partial
                 let from = self.rng.below(n as u64) as usize;
                 let to = self.rng.below(n as u64) as usize;
                 if from != to {
-                    let fraction = self.rng.below(5);
-                    self.fleet.deliver(from, to, fraction, &mut self.rng);
+                    self.fleet.deliver(from, to, 0, &mut self.rng);
                 }
             }
         }
@@ -1488,6 +1552,11 @@ proptest! {
         for cell in &fleet.cells {
             let live = cell.replicated_digest().unwrap(/* test-only */);
             let (rebuilt, rebuilt_dump) = cell.rematerialize_for_test().unwrap(/* test-only */);
+            if live != rebuilt {
+                eprintln!(
+                    "CASE seed {seed} devices {devices} rounds {rounds}"
+                );
+            }
             prop_assert_eq!(
                 live, rebuilt,
                 "the incremental state diverged from the reconstruction\n\
@@ -1788,5 +1857,96 @@ proptest! {
         }
     }
 }
+
+
+
+/// v0.6.4 (measurement, `--ignored`): the generator's case frequencies
+/// over 1000 fleets — both actor classes, header-only patches, hand
+/// merges, deletes on copy ids. The numbers go in the REPORT.
+#[test]
+#[ignore = "a measurement, not an assertion"]
+fn generator_frequencies_1000_fleets() {
+    let mut ops = 0_u64;
+    let mut human = 0_u64;
+    let mut agent = 0_u64;
+    let mut header_only = 0_u64;
+    let mut hand_merges = 0_u64;
+    let mut body_writes = 0_u64;
+    let mut copy_deletes = 0_u64;
+    let mut open_copies = 0_u64;
+    let mut quarantined_copies = 0_u64;
+    for seed in 0..1000_u64 {
+        let fleet = fleet_run(seed, 3, 20);
+        for cell in &fleet.cells {
+            let rows = cell
+                .debug_column(
+                    "SELECT o.kind || ' ' || o.actor || ' ' || COALESCE(json_extract(p.body, '$.set.body'), '') FROM ops o
+                     LEFT JOIN op_payloads p ON p.op_id = o.op_id",
+                )
+                .unwrap_or_default();
+            for row in &rows {
+                let mut it = row.splitn(3, ' ');
+                let (kind, actor, body) = (
+                    it.next().unwrap_or_default(),
+                    it.next().unwrap_or_default(),
+                    it.next().unwrap_or_default(),
+                );
+                ops += 1;
+                match engramma_core::cell::conflicts::classify_actor(actor) {
+                    engramma_core::cell::conflicts::ActorClass::Human => human += 1,
+                    engramma_core::cell::conflicts::ActorClass::Agent => agent += 1,
+                }
+                if kind == "patch_note" && body.is_empty() {
+                    header_only += 1;
+                }
+                if kind == "patch_note" && body.contains("fuso da ") {
+                    hand_merges += 1;
+                }
+                if matches!(kind, "put_note" | "patch_note") && !body.is_empty() {
+                    body_writes += 1;
+                }
+            }
+            copy_deletes += cell
+                .debug_column(
+                    "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
+                     JOIN op_objects oo ON oo.op_id = o.op_id
+                     JOIN conflict_copies cc ON cc.copy_id = substr(oo.object, 6)
+                     WHERE o.kind = 'delete_note'",
+                )
+                .unwrap_or_default()
+                .first()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            open_copies += cell
+                .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE open = 1")
+                .unwrap_or_default()
+                .first()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            quarantined_copies += cell
+                .debug_column(
+                    "SELECT CAST(COUNT(*) AS TEXT) FROM notes n JOIN conflict_copies cc ON cc.copy_id = n.id
+                     WHERE cc.open = 1 AND n.status = 'quarantined'",
+                )
+                .unwrap_or_default()
+                .first()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    eprintln!(
+        "frequenze/1000 flotte: operazioni {ops}, umane {human} ({:.1}%), agente {agent} ({:.1}%), \
+         scritture corpo {body_writes}, patch sola intestazione {header_only}, fusioni a mano {hand_merges}, \
+         delete su copie {copy_deletes}, copie aperte a fine corsa {open_copies}, in quarantena {quarantined_copies}",
+        100.0 * human as f64 / ops as f64,
+        100.0 * agent as f64 / ops as f64,
+    );
+}
+
+
+
+
+
+
 
 
