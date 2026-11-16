@@ -57,6 +57,20 @@ async function run(op, args) {
       });
       return { id: note.id };
     }
+    case 'put-many': {
+      // C5.4: a bulk of writes in ONE command — the parent's round trip
+      // must not be the slow part of "many notes to send"
+      const ids = [];
+      for (let i = 0; i < args.count; i++) {
+        const note = await state[args.cell].put({
+          body: `${args.body} ${i}`,
+          source: 'homun',
+          confidence: 'stated',
+        });
+        ids.push(note.id);
+      }
+      return { count: ids.length };
+    }
     case 'get': {
       const note = await state[args.cell].get(args.id);
       return { there: note !== null, body: note ? note.body : null };

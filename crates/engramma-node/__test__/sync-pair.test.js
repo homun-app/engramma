@@ -344,3 +344,119 @@ test('S4: removing B from A, B hears it and its service stops by itself', async 
     await b.quit();
   }
 });
+
+// ---------------------------------------------------------------------------
+// v0.6.3 (C5.3/C5.4)
+// ---------------------------------------------------------------------------
+
+// v0.6.3 (C5.3): a cell shared by ANOTHER PROCESS under an Engine that
+// holds it OPEN. B opens the cell first (its handle never reopens); a
+// third process on the SAME root shares it (the CLI's road); only then B
+// writes — the write must carry its device's signature and ARRIVE on the
+// peer. Before the fix the arm was decided at the open: B's stale handle
+// wrote unsigned and the peer's gate refused it forever.
+test('C5.3: a share by another process under an open cell, and the write arrives', async () => {
+  const a = new Peer();
+  const b = new Peer();
+  try {
+    const rootB = path.join(TMP, `c53-${Math.random().toString(36).slice(2, 8)}`);
+    fs.rmSync(rootB, { recursive: true, force: true });
+    await b.cmd('open', { root: rootB, name: 'mac' });
+    // B's handle of the cell — open BEFORE anything is shared
+    await b.cmd('cell', { cell: 'memoria' });
+    await b.cmd('put', { cell: 'memoria', body: 'la base' });
+    // B invites; BEFORE the join, a third process on B's own root shares
+    // the cell (what the CLI does while Homun holds the engine open)
+    const invite = await b.cmd('invite', { key: 'p' });
+    await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['-e', `
+        const { Engine } = require(${JSON.stringify(require.resolve('..'))});
+        (async () => {
+          const e = await Engine.open({ root: ${JSON.stringify(rootB)}, embedder: 'none', actor: 'cli' });
+          const sync = await e.sync({ relay: 'none' });
+          await sync.share('memoria');
+          await e.close();
+          console.log('shared');
+        })().catch((err) => { console.error(err); process.exitCode = 3; });
+      `], { stdio: ['ignore', 'pipe', 'inherit'] });
+      let said = false;
+      child.stdout.on('data', (d) => {
+        if (String(d).includes('shared')) said = true;
+      });
+      child.on('exit', (code) => (code === 0 && said ? resolve() : reject(new Error(`la condivisione esterna è fallita (${code})`))));
+    });
+    // A joins the shared cell, both services run
+    await a.cmd('open', { root: rootName(), name: 'laptop' });
+    await a.cmd('join', { ticketOrCode: invite.ticket, key: 'p' });
+    await a.cmd('sas', { key: 'p' });
+    await b.cmd('sas', { key: 'p' });
+    await a.cmd('confirm', { same: true, key: 'p' });
+    await b.cmd('confirm', { same: true, key: 'p' });
+    await a.cmd('done', { key: 'p' });
+    await b.cmd('done', { key: 'p' });
+    await a.cmd('cell', { cell: 'memoria' });
+    const infoA = await a.cmd('start');
+    const infoB = await b.cmd('start');
+    await b.cmd('remember', { device: 'laptop', serve: infoA });
+    await a.cmd('remember', { device: 'mac', serve: infoB });
+    await a.cmd('events-on');
+    // B writes through the STALE handle, never reopened
+    await b.cmd('put', { cell: 'memoria', body: 'scritta senza riaprire' });
+    const { event } = await a.cmd('wait-event', { type: 'arrived', timeoutMs: 5000 });
+    assert.ok(event, 'the write never arrived: unsigned, the gate refused it');
+    let list = [];
+    for (let i = 0; i < 50; i++) {
+      list = await a.cmd('list', { cell: 'memoria' });
+      if (list.some((n) => n.body === 'scritta senza riaprire')) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    assert.ok(
+      list.some((n) => n.body === 'scritta senza riaprire'),
+      'the write of the stale handle is readable on the peer',
+    );
+  } finally {
+    await a.quit();
+    await b.quit();
+  }
+});
+
+// v0.6.3 (C5.4): stop() with a REAL session in flight — thousands of
+// notes crossing — must conclude within 5 s (the old test stopped during
+// an EMPTY pass: nothing was ever in flight).
+test('C5.4: stop() during a session with many notes concludes within 5 s', async () => {
+  const a = new Peer();
+  const b = new Peer();
+  try {
+    await a.cmd('open', { root: rootName(), name: 'laptop' });
+    await b.cmd('open', { root: rootName(), name: 'mac' });
+    await a.cmd('cell', { cell: 'memoria' });
+    await a.cmd('put', { cell: 'memoria', body: 'la base' });
+    const invite = await a.cmd('invite', { key: 'p' });
+    await a.cmd('share', { cell: 'memoria' });
+    await b.cmd('join', { ticketOrCode: invite.ticket, key: 'p' });
+    await a.cmd('sas', { key: 'p' });
+    await b.cmd('sas', { key: 'p' });
+    await a.cmd('confirm', { same: true, key: 'p' });
+    await b.cmd('confirm', { same: true, key: 'p' });
+    await a.cmd('done', { key: 'p' });
+    await b.cmd('done', { key: 'p' });
+    const infoA = await a.cmd('start');
+    const infoB = await b.cmd('start');
+    await b.cmd('remember', { device: 'laptop', serve: infoA });
+    await a.cmd('remember', { device: 'mac', serve: infoB });
+    // A writes five thousand notes in one command: the next pass will be
+    // a long session, and stop() lands in the middle of it
+    await a.cmd('put-many', { cell: 'memoria', count: 5000, body: 'la nota che riempie la passata' });
+    // the watch fires ~2.5 s after the writes; give the session a beat to
+    // be born, then stop B while it receives
+    await new Promise((r) => setTimeout(r, 3500));
+    const t0 = Date.now();
+    await b.cmd('stop');
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 5000, `stop() durante la sessione ha impiegato ${elapsed} ms`);
+    assert.equal((await b.cmd('status')).serving, false);
+  } finally {
+    await a.quit();
+    await b.quit();
+  }
+});
