@@ -7301,3 +7301,280 @@ Sul tag `fase-v0.6.2` (`dd79a79`), main pulito, macchina altrimenti ferma.
 Restano aperti il difetto di convergenza preesistente (1) e i difetti 2–4. Vanno nella **v0.6.3**, da chiudere prima di offrire la sync agli utenti di Homun.
 
 Homun **può agganciare la v0.6.2 per lo sviluppo** (l'API non cambierà forma). Non deve proporre la sync fra dispositivi agli utenti prima della v0.6.3.
+
+# v0.6.3 — la copia di conflitto converge, e le minori
+
+Base `main` @ `e9ee357` (tag `fase-v0.6.2`). Nessuna funzione nuova: un
+difetto di convergenza preesistente e i difetti della verifica v0.6.2.
+Il contratto JS non cambia forma: i 46 test della v0.6.2 restano
+identici salvo il limite di C5.6 (dichiarato sotto). Nessun formato sul
+filo cambia, schema 20.
+
+Ogni punto è aperto dal commit del test rosso (C3 e C5.4 non hanno uno
+stato rosso raggiungibile: lo si dice dove capita).
+
+## C1 — la copia di conflitto è funzione dell'insieme (bloccante)
+
+### La causa, prima della correzione
+
+I due testimoni del revisore, come `#[test]` deterministici
+(`the_witness_fleets_converge`): `(7348206116156780080, 2, 19)` diverge
+con le digestioni `e86485bb…` contro `00cf8382…`, `(7729712691107302376,
+2, 25)` con `dfc5af5e…` contro `e1f75346…` — le stesse del revisore.
+
+La sequenza d'arrivo che li spiega (testimone 1, nota
+`01000000000000000000000091`; l'ordine totale è P < D < Z < H < E < T <
+W, con Z e H concorrenti sulla stessa base D):
+
+| op | tipo | base | autore |
+|---|---|---|---|
+| P | put | — | disp. 1 |
+| D | delete | P | disp. 0 |
+| Z | patch | D | disp. 1 |
+| H | patch | D | disp. 0 |
+| E | patch | Z | disp. 1 |
+| T | patch | H | disp. 0 |
+| W | patch | T | disp. 1 |
+
+Sul dispositivo 1: T arriva quando H manca (parcheggia, base ignota);
+l'arrivo di H forza la ricostruzione dell'insieme {P, D, Z, H, E, T}: il
+vincitore è T (base H) ed E sta fra H e T → **copia di E scritta** —
+corretta per quell'insieme. Poi il dispositivo 1 **scrive W da sé**
+(`patch_note`): `execute_op` applica l'operazione e **non ricalcola mai
+l'insieme dei perdenti**. La copia resta: fantasma, perché nell'insieme
+finale il vincitore è W (base T) e i perdenti sono vuoti. Sul
+dispositivo 0 le ultime arrivate sono E e Z, *ingerite*: ogni arrivo
+rifà la derivazione e la copia non c'è.
+
+La scorciatoia incrementale del percorso d'arrivo
+(`reconcile_conflict_copies(tx, &nid, &[])` quando arriva il nuovo
+vincitore finale) aveva una premessa vera — la sua base è la testa, fra
+la testa e se stessa non ci sono scritture del corpo — ma il percorso
+di **scrittura locale** non pagava mai quella riconciliazione. Il
+minimo che lo riproduce è `a_local_write_rederives_the_conflict_set`:
+sei scritture con orologio e conio iniettati, la copia esiste dopo
+l'arrivo di H (asserito), e deve sparire con la scrittura propria di W.
+
+### L'oracolo differenziale
+
+`verify` rigioca il registro **in ordine d'arrivo**: riproduce lo stato
+incrementale, non può fare da oracolo. L'oracolo è
+`Cell::rematerialize_for_test` (solo test): copia il registro in una
+connessione vergine **senza applicare nulla**, poi materializza ogni
+oggetto dal proprio insieme fino al punto fisso (la ricostruzione di un
+originale deriva le righe delle copie; una copia editata dall'utente
+materializza poi sulla sua derivazione). La proprietà
+`every_copy_equals_its_reconstruction` confronta la digestione di ogni
+copia con la propria ricostruzione — e quando diverge stampa il dump
+vivo contro il ricostruito.
+
+### La correzione
+
+`material::reconcile_after_local_write`: dopo l'applicazione di una
+scrittura del corpo nata qui, la nota riconcilia i conflitti — la
+stessa chiamata del percorso d'arrivo, con la stessa premessa (una
+scrittura locale è l'ultima del suo oggetto e la sua base è la testa:
+perdenti vuoti, e le copie di un insieme più piccolo vanno via adesso).
+Nessuna operazione nuova: la copia resta derivata. Il costo per
+scrittura è una SELECT su `conflict_copies` per l'id dell'originale
+(vuota nel caso comune).
+
+### La caccia
+
+- **Corsa rossa deliberata** (sorgente del commit rosso `edb67b1`,
+  `every_copy_equals_its_reconstruction`, 3000 casi in release): fallita
+  al caso 2731, nuovo testimone **seed 16888028934669089344 / 2 / 19**,
+  ridotto al minimo. Il seme entra in
+  `convergence.proptest-regressions`: è chiuso, e ogni corsa lo riesegue
+  verde in testa.
+- `the_fleet_converges` a **20 000 casi**: verde, 826,6 s.
+- `every_copy_equals_its_reconstruction` a **20 000 casi**: verde,
+  753,2 s.
+- `PROPTEST_CASES=2048` più **cinque corse** della suite convergence
+  completa: verdi, 210,0 / 133,7 / 142,9 / 132,2 / 144,8 s, `.tmp*` 0 dopo ognuna.
+- **Cartelle `.tmp*` in `$TMPDIR`:** 0 prima e 0 dopo la corsa rossa con
+  riduzione (contate anche a metà corsa), 0 dopo ogni caccia verde. Le
+  2319 cartelle (~4 GB) viste da GLM nella verifica v0.6.2 non si
+  riproducono: il percorso di riduzione di oggi costruisce le flotte in
+  `Kept`/`Fleet`, i cui `TempDir` cadono anche nello unwind di
+  un'asserzione; la perdita veniva dal codice di allora (il `copy_of`
+  che perdeva la cartella, sistemato in `19d2e9e`), non da questo.
+
+## C2 — l'ascoltatore non tiene vivo Node
+
+`onEvent` costruisce la `ThreadsafeFunction` **non referenzita**
+(`.weak::<true>()`): da sola non trattiene il loop degli eventi — la
+semantica di un `EventEmitter`. Ciò che tiene vivo il processo è il
+motore aperto, e `close()` lo ferma. La fine del servizio svuota l'hub:
+il filo della pompa lo svuota quando il canale chiude (stop, close,
+rimozione che ferma il servizio da sé) e `SyncShared::stop` lo svuota
+subito dopo lo shutdown — ogni tsfn si rilascia.
+
+Tre figli con limite di tempo (`sync.test.js`): `onEvent` + `close()`
+**senza** mai chiamare la rimozione esce da solo (96 ms dal close);
+lo stesso con `start()` prima (128 ms); e dopo `close()` la funzione di
+rimozione non lancia. Contro il binario della v0.6.2 i primi due erano
+rossi: il figlio restava vivo oltre il limite.
+
+## C3 — il test di Electron chiude con `app.quit()`
+
+La parte S4 ora fa ciò che dice: una cella condivisa con una scrittura,
+l'ascoltatore registrato, il servizio acceso — poi `app.quit()`. Il
+codice d'uscita viaggia in `process.exitCode` (nessun `app.exit` nel
+file), e il runner (`scripts/electron-main-run.js`) misura dal lato del
+chiamante e **fallisce oltre 10 s**: il figlio non può dare un voto
+alla propria uscita.
+
+Uscita 0 in 313–588 ms. **Nessuno stato rosso raggiungibile:** contro il
+binario pre-C2 (tsfn referenziata, il difetto di fondo) Electron esce
+comunque in 1183 ms — `app.quit()` chiude nonostante i riferimenti
+libuv; il difetto vero appendeva Node puro ed è chiuso da C2. Il test
+resta a provare che il percorso provato è `app.quit()`, non `app.exit`.
+
+## C4 — la causa del rifiuto di dyld è lo strip di rustc
+
+Tolti l'extern `arc4random` e il `black_box` da `version()`. L'artefatto
+Node si costruisce senza strip: `[profile.release.package.engramma-node]
+strip = "none"` — Cargo accetta la chiave a livello di pacchetto.
+
+**La riproduzione minima** (una cdylib qualunque, sorgente di 8 righe):
+
+| passo | esito |
+|---|---|
+| un extern preso per indirizzo (registro dei simboli indiretti **dispari**), build release di default (rustc 1.95, strumenti di Xcode 27.2) | dyld rifiuta: «mis-aligned LINKEDIT string pool», fileOffset 0xC0CC |
+| la stessa sorgente con `CARGO_PROFILE_RELEASE_STRIP=none` | **carica**, 49 984 B — la stessa dimensione di prima: con `debug = false` non c'è nulla da togliere, è la riscrittura del LINKEDIT del passaggio di strip di rustc che disallinea la tavola delle stringhe |
+| lo stesso file buono passato a `xcrun strip -S` **dopo** | carica ancora (49 992 B): l'invocazione manuale non riproduce il difetto, lo riproduce solo lo strip dentro il link di rustc |
+| registro **pari** (nessun extern) + strip di default | carica |
+
+Il nostro artefatto, senza `arc4random`: con lo strip di default
+48 440 208 B, **rifiutato** (il testimone del revisore, riprodotto); con
+`strip = "none"` 50 381 064 B (il `.node` copiato: 50 380 088 B),
+**carica**. `npm run build` carica l'artefatto appena collegato, e la
+CLI in release (57 979 232 B, strip di default) parte:
+`engramma --version` risponde `engramma 0.1.0-dev`.
+
+## C5 — le minori
+
+1. **`normalize_ticket_input`:** il ramo morto («ENGGRAMMA», tre G)
+   diventa vero: la forma originale incollata tutta in maiuscolo torna
+   minuscola e decodifica. Rosso: `ENGRAMMA-INVITE-V1.ABC…` restava
+   com'era; verde ora.
+2. **`try_lock_root`:** il pid si scrive **dopo** la flock riuscita,
+   troncando (`set_len(0)`): chi trova il lucchetto occupato non scrive
+   nulla (rosso: il pid del titolare diventava `43399\n\n`, il pid del
+   perdente), e un pid più corto non lascia la coda del precedente.
+3. **Il firmatario si arma alla scrittura.** `Cell::set_signer_gate`
+   (core): `execute` chiede un cancello prima di ogni scrittura locale,
+   sotto il lucchetto di scrittura — l'armo e la scrittura sono un
+   passo solo; una cella senza cancello paga un controllo nullo. Il
+   binding installa il cancello di ogni cella che apre: una stat di
+   `devices.db` per scrittura (una radice che non sincronizza si ferma
+   lì: il banco d'inserimento, che passa per il core, non se ne accorge
+   — vedi sotto); quando il timbro si muove — una condivisione, un
+   abbinamento, un giro d'epoca, di questo Engine o della CLI in un
+   altro processo — la prima scrittura dopo il cambio arma. Il test con
+   tre processi (B tiene la cella aperta, un terzo processo sulla
+   stessa radice condivide come la CLI, A è il pari): rosso — la
+   scrittura del handle vecchio non arrivava mai (senza firma, il
+   cancello del pari la rifiuta); verde — arriva in 2 545 ms.
+4. **`stop()` durante una sessione vera:** il vecchio test fermava una
+   passata vuota (un Engine senza pari: niente in volo). Il nuovo manda
+   in scena **20 000 note scritte senza attendere la fine del comando**
+   (il figlio le scrive a ~3 700/s: il flusso dura ~5,4 s) e ferma B a
+   2,6 s, nel mezzo — la prova che era nel mezzo è la risposta del
+   comando bulk, che arriva solo DOPO lo stop. `stop()` si conclude in
+   **0–16 ms** (limite 5 s), e la passata di B subito dopo riprende il
+   tiro della sessione interrotta (`received` > 0): niente resta
+   inceppato. Verde dalla nascita: il servizio già interrompeva le
+   sessioni in corso pulitamente; il test ora lo prova. (Curiosità
+   raccolta strada facendo: `Cell.list` ha limite di default 100 — non
+   è una misura di convergenza; e una sessione porta ~2 000 operazioni,
+   un corpus grosso converge su passate ripetute.)
+5. **La conferma SAS è un Future.** `pairing_net` non prende più una
+   chiusura che blocca ma il tratto `SasConfirm` (un metodo che
+   restituisce un Future); `PairingInner` lo implementa attendendo un
+   canale tokio con una timeout future — nessun filo parcheggiato. Il
+   runtime dell'abbinamento torna a **un filo** (`current_thread`): i
+   due lavoratori erano l'aggiramento del difetto S1 della v0.6.2 (il
+   PAKE di B completava, quello di A mai). Suite sync e contratto JS
+   verdi al completo, abbinamenti a due processi compresi.
+6. **Il test dell'arrivo a 5 s** (e la prima passata del ciclo di
+   riposo, stessa macchina): la mediana del revisore era 2,3 s; qui
+   l'evento `arrived` arriva in 2 448 ms. È l'unico limite di un test
+   esistente che questa fase tocca; gli altri 46 restano identici.
+
+## Il contratto
+
+- `npm test`: **51/51** (i 46 della v0.6.2 identici salvo il limite di C5.6, più i 5 nuovi: tre figli di C2, C5.3, C5.4).
+- `test:electron`: **51/51**.
+- `test:electron-main`: verde, uscita 0 in 242 ms.
+- Suite Rust (`cargo test --workspace`): **61 suite verdi** su macOS; `cargo fmt --check` e `clippy -D warnings` puliti.
+- `cargo fmt --check` e `clippy -D warnings`: puliti.
+
+## La build e i tre file
+
+`npm run build` verde (l'artefatto appena collegato si carica). SHA256:
+
+- `engramma.darwin-arm64.node`: ``4cef6bb68afa3a04258fdf2a1e7715b330fad5334fd9258db777db1caf33b033``
+- `index.js`: ``6a440672963f2da32989bd306a91863b9ca87df2e50c6d6d15d7049e9fce8053``
+- `index.d.ts`: ``aa3c17d279e63b75b15d7c08d02d1214f4f881f9c7d2769daf5043baa32abbd3``
+
+Dimensione del `.node`: 50 380 088 B (48 438 288 nella v0.6.2: +2,0 MB,
+lo strip disattivato — vedi C4).
+
+## L'inserimento non peggiora (soglia +5%)
+
+`engramma-bench --notes 10000 --runs 5` con
+`ENGRAMMA_SKIP_MODEL_TESTS=1`, base `fase-v0.6.2` in un worktree col
+suo `target` dentro `target/` (cancellato alla fine), **due coppie
+alternate**, macchina altrimenti ferma:
+
+| corsa | viva (note/s) | uniform (note/s) | p95 testo+grafo (ms) |
+|---|---|---|---|
+| base-1 | 2481 | 2637 | 2,5 / 2,1 |
+| fase-1 | 2597 | 2679 | 2,0 / 2,1 |
+| base-2 | 2660 | 2600 | 2,2 / 2,1 |
+| fase-2 | 2605 | 2197 | 2,0 / 2,1 |
+| base-3 | 2462 | 2584 | 2,3 / 2,6 |
+| fase-3 | 2571 | 2558 | 2,3 / 2,0 |
+
+Terza corsa per coppia: la `uniform` della fase-2 (2197 note/s) è
+l'unica sotto la banda di tutte le altre nove misure (2462–2679) —
+rumore di macchina, e la terza coppia lo chiarisce.
+
+Tempo d'inserimento per nota (µs, mediana dei due corpora): coppia 1
+base 390,8 → fase 379,1 (**−3,0%**); coppia 2 base 380,2 → fase 416,5
+(**+9,5%**, la corsa rumorosa); coppia 3 base 396,4 → fase 389,9
+(**−1,6%**). Media delle coppie: **+1,6%** (delle due sole corse
+richieste: +3,2%), dentro il +5%; mediana dei tassi: base 2559, fase
+2565 note/s — la fase non è più lenta. p95 testo+grafo: base 2,33/2,27
+ms (viva/uniform), fase 2,10/2,07 ms — **meglio**, non peggio.
+
+## Linux
+
+`scripts/linux.sh`: **verde**, uscita 0, **61 suite** (fmt + clippy +
+test, container offline). Una prima corsa, partita mentre il banco e la
+build giravano insieme, era caduta su `-p engramma-cli --test mcp`
+(l'uscita era mascherata da una pipe: colpa mia); a macchina ferma la
+corsa è verde, e `mcp` è verde anche su macOS.
+
+## Disco e pulizia
+
+- `target/`: 14 G all'inizio della fase, 20 G alla fine (le build di release delle cacce, dell'artefatto Node, della CLI e del banco; il target del worktree della base è cancellato con il worktree).
+- Cartelle `.tmp*` in `$TMPDIR`: **0** alla fine (0 anche prima e dopo ogni caccia, verde e rossa, e a metà corsa).
+- I temporanei della diagnosi ( `/tmp/c4repro`, `/tmp/pptest` ) cancellati.
+- Nessun processo lasciato acceso: né `sync serve`, né Node, né Electron.
+
+## I commit
+
+- `edb67b1` test(C1): i testimoni, la sequenza minima, l'oracolo dal registro
+- `4eb737f` fix(C1): la scrittura locale paga la riconciliazione dei conflitti
+- `e744dcb` test(C2): l'ascoltatore da solo non tiene vivo il processo Node
+- `bf1631e` fix(C2): l'hub si svuota alla fine del servizio
+- `01c8f8a` test(C3): il test di Electron chiude con app.quit()
+- `e2f81b1` fix(C4): la causa del rifiuto di dyld è lo strip di rustc
+- `56a49a3` test(C5.1+C5.2), `97193be` fix(C5.1+C5.2)
+- `2981341` test(C5.6): il limite del test d'arrivo a 5 s
+- `2683db5` test(C5.3+C5.4), `e978915` fix(C5.3)
+- `c75d8f0` refactor(C5.5): la conferma SAS è un Future, runtime a un filo
+- `4322736` docs: DESIGN §4.3 e §12, node.md, il seme chiuso nelle regressioni
