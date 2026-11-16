@@ -4,9 +4,11 @@
 // a Node run (`ELECTRON_RUN_AS_NODE`). This is the proof the module loads
 // and works in a real MAIN process: it opens an engine, writes, searches,
 // closes, checks CLOSED and exits 0 — `npm run test:electron-main`.
-// v0.6.2 (S4): the sync service too — started, then `app.quit()` with the
-// service ON: the process must END (a daemon that exits does not hang on
-// a thread of ours).
+// v0.6.2 (S4): the sync service too, started before the quit.
+// v0.6.3 (C3): the quit is `app.quit()` itself — no `app.exit` force: the
+// exit code travels in `process.exitCode`, the events listener stays
+// registered, a shared cell holds a write, and the RUNNER bounds the whole
+// process at 10 s (a daemon that exits must not hang on a thread of ours).
 
 const { app } = require('electron');
 const fs = require('node:fs');
@@ -51,24 +53,31 @@ app.whenReady().then(async () => {
     }
     if (!closed) throw new Error('get dopo close non ha risposto CLOSED');
 
-    // v0.6.2 (S4): the sync service in the main process — start it, then
-    // quit with it ON: the process ends within the harness's bound
+    // v0.6.3 (C3): the S4 part — a shared cell with a write, the events
+    // listener registered, the service ON, then `app.quit()` for real: the
+    // process must END on its own, and the runner's 10 s bound is what
+    // proves it (no app.exit anywhere in this file)
     const e2 = await Engine.open({
       root: path.join(tmp, 'root-sync'),
       embedder: 'none',
       actor: 'homun',
     });
     const sync = await e2.sync({ deviceName: 'portatile', relay: 'none' });
+    const shared = await e2.cell('memoria');
+    await shared.put({ body: 'scritta condivisa', source: 'homun', confidence: 'stated' });
+    await sync.share('memoria');
+    sync.onEvent(() => {}); // stays registered: the quit must not owe it anything
     const info = await sync.start();
     if (!info.node) throw new Error('il servizio non ha pubblicato il nodo');
-    // app.quit() fires below with the service still on: if a thread of
-    // ours held the process, the 10 s bound of the runner would catch it
     console.log(`electron-main ok — engramma-node ${version()}`);
   } catch (err) {
     console.error('electron-main FAILED:', err);
     code = 1;
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
-    app.exit(code);
+    // the code crosses without app.exit: Electron propagates
+    // process.exitCode through app.quit()
+    process.exitCode = code;
+    app.quit();
   }
 });
