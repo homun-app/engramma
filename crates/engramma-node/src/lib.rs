@@ -3125,6 +3125,16 @@ impl EventHub {
         }
     }
 
+    /// v0.6.3 (C2): the end of the service empties the hub — every
+    /// listener goes, and with it the tsfn it holds (its release is the
+    /// Drop). A listener that will never fire again must not hold
+    /// anything, least of all the process's event loop.
+    fn clear(&self) {
+        if let Ok(mut ls) = self.listeners.lock() {
+            ls.clear();
+        }
+    }
+
     fn emit(&self, event: serde_json::Value) {
         if let Ok(ls) = self.listeners.lock() {
             for (_, l) in ls.iter() {
@@ -3156,6 +3166,10 @@ impl SyncShared {
                     while let Ok(event) = events.recv() {
                         hub.emit(event_json(event));
                     }
+                    // v0.6.3 (C2): the channel closed — the service is
+                    // over (a stop, a close, a removal that stopped it by
+                    // itself) — the listeners go with it
+                    hub.clear();
                 })
                 .map_err(|e| transport_err("IO", e))?;
         }
@@ -3166,6 +3180,10 @@ impl SyncShared {
     /// thread ends, the pump follows the closed channel.
     fn stop(&self) {
         self.service.shutdown();
+        // v0.6.3 (C2): close() empties the hub itself — the pump follows
+        // when the channel closes, and a listener that slipped in between
+        // would hear nothing anyway (the service is over)
+        self.hub.clear();
     }
 }
 
@@ -3899,6 +3917,12 @@ impl Sync {
     /// The events of the service: `pass`, `arrived`, `device`,
     /// `removed`, `unsent`, `error` — nothing here carries note text, a
     /// ticket or a short code. Returns the function that unsubscribes.
+    ///
+    /// v0.6.3 (C2): a listener alone does not keep the process alive —
+    /// the `EventEmitter`'s own semantics. What keeps it alive is the
+    /// open engine (and its running service); `close()` empties the hub
+    /// and releases every callback, and the unsubscribe of a closed
+    /// engine does not throw.
     #[napi(ts_return_type = "() => void")]
     pub fn on_event(
         &self,
@@ -3907,6 +3931,9 @@ impl Sync {
     ) -> Result<napi::sys::napi_value> {
         let tsfn = cb
             .build_threadsafe_function::<(serde_json::Value,)>()
+            // v0.6.3 (C2): an UNREFERENCED tsfn — the listener alone must
+            // not hold the event loop; the engine does, while it is open
+            .weak::<true>()
             .build_callback(|ctx| Ok(ctx.value.0))?;
         let listener: Listener = Box::new(move |event: serde_json::Value| {
             tsfn.call(
