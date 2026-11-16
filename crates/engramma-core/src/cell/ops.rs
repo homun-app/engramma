@@ -1321,7 +1321,7 @@ pub(crate) fn reopen_tombstone(tx: &Transaction<'_>, id: &Ulid) -> Result<(), Ce
     Ok(())
 }
 
-fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Result<(), CellError> {
+pub(crate) fn reindex_note(tx: &Transaction<'_>, id: &Ulid, old: Option<&NoteRow>) -> Result<(), CellError> {
     let Some(row) = read_note(tx, id)? else {
         return Err(CellError::NoteNotFound(id.to_string()));
     };

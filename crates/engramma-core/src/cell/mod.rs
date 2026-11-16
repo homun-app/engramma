@@ -6,6 +6,7 @@
 //! `BEGIN IMMEDIATE` transaction, so exactly one writer at a time. Readers
 //! (search, get) share the same connection in WAL mode.
 
+pub mod conflicts;
 pub(crate) mod material;
 pub mod ops;
 pub mod policy;
@@ -50,6 +51,18 @@ pub struct EdgeInput {
 }
 
 /// Partial update for [`Cell::patch_note`].
+/// v0.6.4 (D3): how a conflict is resolved (DESIGN §4.3, D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveKeep {
+    /// The original stays, the copy closes (a delete on its id).
+    Original,
+    /// The copy's body becomes the original's, the copy closes.
+    Copy,
+    /// The given body becomes the original's (the hand merge), the copy
+    /// closes.
+    Merged,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NotePatch {
     /// New title (`None` = leave; `Some(None)` = clear).
@@ -1603,6 +1616,136 @@ impl Cell {
             "old_updated_at": old_updated_at.to_db_string(),
         });
         self.execute(OpKind::Supersede, Some(*old_id), actor, payload)
+    }
+
+    /// v0.6.4 (D3): every OPEN conflict copy of the cell — what a
+    /// «conflitti da risolvere» list shows. No text in the answer: the
+    /// copy is a note like every other, read with [`Cell::get`].
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn conflicts(&self) -> Result<Vec<conflicts::ConflictInfo>, CellError> {
+        let inner = self.lock()?;
+        let tx = inner.conn.unchecked_transaction()?;
+        let out = conflicts::conflicts(&tx)?;
+        Ok(out)
+    }
+
+    /// v0.6.4 (D3): resolve one conflict copy. Ordinary operations with
+    /// the cell's own actor — nothing new for the log: `original` is a
+    /// `delete` on the copy's id (the witness (a) that closes it);
+    /// `copy` and `merged` first patch the ORIGINAL's body (the copy's
+    /// body, or the one given), then delete the copy. Two concurrent
+    /// resolutions on two devices are two concurrent writes: with equal
+    /// bodies nothing is born, with different bodies a NEW conflict is
+    /// — and it should be.
+    ///
+    /// # Errors
+    /// [`CellError::NoteNotFound`] when the id is no conflict copy at
+    /// all; [`CellError::Conflict`] when the copy is already closed.
+    pub fn resolve_conflict(
+        &self,
+        copy_id: &Ulid,
+        keep: ResolveKeep,
+        body: Option<&str>,
+        actor: &str,
+    ) -> Result<Ulid, CellError> {
+        let original = {
+            let inner = self.lock()?;
+            let tx = inner.conn.unchecked_transaction()?;
+            let row: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT original_id, open FROM conflict_copies WHERE copy_id = ?1",
+                    [copy_id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match row {
+                None => return Err(CellError::NoteNotFound(copy_id.to_string())),
+                Some((_, 0)) => {
+                    return Err(CellError::Conflict(
+                        "la copia di conflitto è già chiusa".into(),
+                    ));
+                }
+                Some((original, _)) => Ulid::from_string(&original).map_err(|_| {
+                    CellError::Db(format!("bad conflict original {original}"))
+                })?,
+            }
+        };
+        match keep {
+            ResolveKeep::Original => {
+                self.delete_note(copy_id, actor)?;
+            }
+            ResolveKeep::Copy | ResolveKeep::Merged => {
+                let body = match (keep, body) {
+                    (ResolveKeep::Merged, Some(b)) => b.to_string(),
+                    (ResolveKeep::Copy, _) => self
+                        .conflict_copy_body(copy_id)?
+                        .unwrap_or_default(),
+                    (ResolveKeep::Merged, None) => {
+                        return Err(CellError::Invalid(
+                            "resolveConflict: serve il corpo per `merged`".into(),
+                        ));
+                    }
+                    (ResolveKeep::Original, _) => unreachable!(/* matched above */),
+                };
+                self.patch_note(
+                    &original,
+                    &NotePatch { body: Some(body), ..Default::default() },
+                    actor,
+                )?;
+                // the patch itself may have CLOSED the copy: `keep: copy`
+                // writes the loser's own body, and a later write with the
+                // loser's very text CONTAINS it (D1.6b — the diff3 of two
+                // identical changes is clean). The delete is the witness
+                // only when the patch did not already close it; deleting a
+                // copy that just went is not an error — the conflict is
+                // resolved either way.
+                if self.conflict_copy_is_open(copy_id)? {
+                    match self.delete_note(copy_id, actor) {
+                        Ok(()) | Err(CellError::NoteNotFound(_)) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+        Ok(original)
+    }
+
+    /// Is this conflict copy's derivation still open?
+    fn conflict_copy_is_open(&self, copy_id: &Ulid) -> Result<bool, CellError> {
+        let inner = self.lock()?;
+        let open: Option<i64> = inner
+            .conn
+            .query_row(
+                "SELECT open FROM conflict_copies WHERE copy_id = ?1",
+                [copy_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(open == Some(1))
+    }
+
+    /// The derived body a conflict copy holds (its derivation row).
+    fn conflict_copy_body(&self, copy_id: &Ulid) -> Result<Option<String>, CellError> {
+        let inner = self.lock()?;
+        let json: Option<String> = inner
+            .conn
+            .query_row(
+                "SELECT state_json FROM conflict_copies WHERE copy_id = ?1",
+                [copy_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let note = crate::format::Note::from_json(
+            &serde_json::from_str::<serde_json::Value>(&json)
+                .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?,
+        )
+        .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?;
+        Ok(Some(note.body))
     }
 
     /// Logical delete (tombstone).

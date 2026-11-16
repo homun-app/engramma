@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 20] = [
+pub const MIGRATIONS: [&str; 21] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -341,6 +341,20 @@ ALTER TABLE ops ADD COLUMN sig TEXT;
 ALTER TABLE ops ADD COLUMN payload_state TEXT NOT NULL DEFAULT 'whole';
 CREATE INDEX idx_ops_content_hash ON ops(content_hash);
 "#,
+    r#"
+-- v21 (v0.6.4, D1): the conflict copies became DURABLE. The derivation
+-- remembers WHO lost (the actor, for the class of D2 and the queue row
+-- of the agent's quarantined copy) and WHEN (the loser's hlc, for the
+-- cap's window: the three most recent open copies are the visible
+-- ones), whether the copy is still OPEN (it closes only with a witness
+-- in the set), and whether it is VISIBLE. All of it DERIVED — the
+-- migration below rematerializes every derivation from the log — so it
+-- never enters the replicated digest: the notes rows it produces do.
+ALTER TABLE conflict_copies ADD COLUMN loser_actor TEXT NOT NULL DEFAULT '';
+ALTER TABLE conflict_copies ADD COLUMN loser_hlc TEXT NOT NULL DEFAULT '';
+ALTER TABLE conflict_copies ADD COLUMN open INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE conflict_copies ADD COLUMN visible INTEGER NOT NULL DEFAULT 1;
+"#,
 ];
 
 /// Rust-side migration steps, run right after the SQL of version `v`.
@@ -378,6 +392,63 @@ fn migrate_rust(tx: &rusqlite::Transaction<'_>, v: i64) -> Result<(), crate::err
     }
     if v == 20 {
         migrate_log_v20(tx)?;
+    }
+    if v == 21 {
+        migrate_conflicts_v21(tx)?;
+    }
+    Ok(())
+}
+
+/// The Rust side of migration v21 (v0.6.4, D1): rematerialize the
+/// conflict derivations under the new rule. A copy the user made theirs
+/// with edits keeps its row — it is the replay base of a note that now
+/// lives on its own — with its new columns backfilled from the loser's
+/// own op and `open = 0` (witness (a): an operation on the copy's id).
+/// Every other row is pure derivation: it goes, state and all, and the
+/// whole conflict set is re-derived from the log for every note with
+/// more than one body write — the notes a fresh put ever touches alone
+/// have no conflict set to derive.
+fn migrate_conflicts_v21(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
+    // the user-edited copies keep their rows, closed, with the new
+    // columns backfilled from the loser op's own log row
+    tx.execute(
+        "UPDATE conflict_copies SET
+             loser_actor = (SELECT o.actor FROM ops o WHERE o.op_id = conflict_copies.loser_op),
+             loser_hlc   = (SELECT o.hlc FROM ops o WHERE o.op_id = conflict_copies.loser_op),
+             open = 0, visible = 0
+         WHERE copy_id IN (SELECT object FROM op_objects
+                           WHERE object LIKE 'note:%'
+                             AND substr(object, 6) = copy_id)",
+        [],
+    )?;
+    // everything else is derivation: it goes and comes back from the log
+    let stale: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT copy_id FROM conflict_copies WHERE open = 1",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.flatten().collect()
+    };
+    for copy in stale {
+        if let Ok(id) = ulid::Ulid::from_string(&copy) {
+            super::material::delete_note_state(tx, &id)?;
+            super::vectors::delete_note_vectors(tx, &id)?;
+        }
+        tx.execute("DELETE FROM conflict_copies WHERE copy_id = ?1", [&copy])?;
+    }
+    // re-derive: every note with more than one body write
+    let originals: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT oo.object FROM op_objects oo
+             JOIN ops o ON o.op_id = oo.op_id
+             WHERE o.kind IN ('put_note', 'patch_note') AND oo.object LIKE 'note:%'
+             GROUP BY oo.object HAVING COUNT(*) > 1",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.flatten().collect()
+    };
+    for object in originals {
+        super::material::materialize(tx, &object)?;
     }
     Ok(())
 }

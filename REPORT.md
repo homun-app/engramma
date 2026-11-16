@@ -7679,3 +7679,122 @@ agganciare la v0.6.3 per lo sviluppo, ma non offrire la sync agli
 utenti prima della v0.6.4** (copie durevoli, solo il corpo crea
 conflitti, la copia si spegne quando il vincitore la contiene, la mano
 umana prima dell'agente).
+
+## v0.6.4, prima della correzione — la regola nuova contro i testimoni vecchi
+
+Scritta prima di toccare il codice, come chiede la fase: come la regola
+nuova (D1) tratta i testimoni della v0.6.2, la sequenza minima della
+v0.6.3, i semi di `convergence.proptest-regressions`, e i due angoli in
+cui le regole della fase si toccano.
+
+### La sequenza minima della v0.6.3 (P < Z < H < E < T < W)
+
+`a_local_write_rederives_the_conflict_set`: catena P→Z→E su B, catena
+P→H→T su A, poi W (base T) scritta da B. Sotto la regola nuova le punte
+corporee dopo W sono **{W, E}** (E non è antenata di W: W discende T, T
+discende H, H è concorrente di E), entrambe d'agente (`device-*`), il
+vincitore è W per ordine totale, il perdente è E con biforcazione P.
+Nessun testimone di chiusura: W non contiene E (diff3 su F = «il corpo
+iniziale»: due sostituzioni diverse della stessa riga → sovrapposizione)
+e nessuna operazione tocca l'id della copia. **La copia di E resta
+aperta**: il testo di E non vive da nessun'altra parte. Le attese del
+test cambiano: `copies_of` dopo W da 0 a 1, e `copies_of(&c)` (la copia
+totale in ordine) da 0 a 1. Le asserzioni di convergenza (b = c = d,
+l'oracolo) restano. È il cambiamento voluto: chiudere quella copia era
+esattamente il difetto dell'effimera.
+
+### I testimoni della v0.6.2 e la premessa del cammino rapido
+
+Il commento della v0.6.3 («una scrittura locale è l'ultima del suo
+oggetto, quindi i suoi perdenti sono vuoti») **non vale più**: con la
+classe dell'autore, una scrittura attaccata alla testa può perdere
+contro una punta umana più vecchia, e la sua copia deve nascere anche
+sul dispositivo che scrive. Le due scorciatoie
+(`reconcile_conflict_copies(tx, &nid, &[])` nell'arrivo e in
+`reconcile_after_local_write`) vanno riscritte come derivazione piena
+dell'insieme; il costo è pagato solo dalle scritture del corpo (una
+scansione degli operazioni della nota), le note fresche — tutto il banco
+d'inserimento — pagano una scansione di una riga.
+
+I due semi testimone (`7348206116156780080` e `7729712691107302376`)
+asseriscono solo convergenza e uguaglianza con l'oracolo: restano verdi
+per costruzione, perché la derivazione nuova è una sola funzione
+dell'insieme, condivisa dal percorso incrementale e dal replay.
+
+### I semi di `convergence.proptest-regressions` (12 semi)
+
+Anche loro asseriscono solo convergenza e oracolo. La regola nuova
+cambia lo **stato derivato** (copie diverse, in più o in meno), non la
+ proprietà che quei semi cacciano. Attesa: tutti verdi; la caccia a
+20 000 casi lo prova.
+
+### Dove le regole della fase si toccano (scritto prima, per decisione)
+
+1. **La lapide e le copie.** La regola della lapide resta quella di
+   oggi, per la nota e per la derivazione: una scrittura *battuta*
+   dalla lapide non produce copia (ha perso contro una cancellazione,
+   non contro un'altra mano), e una scrittura *cancellata dal rollback
+   del delete* (il delete non l'aveva vista) esce pure dalla
+   derivazione — niente punte, niente copie, niente «vincitore» che
+   resusciti un corpo che la lapide ha scartato. *Aggiornato in
+   implementazione:* la prima stesura di questa sezione teneva la
+   copia anche al rollback; il seme 8354786356070561648 della flotta
+   ha mostrato il prezzo: la correzione del corpo del vincitore
+   rimetteva il corpo cancellato sopra lo stato che la lapide (e il
+   supersede che ne seguiva) avevano lasciato, e i due percorsi —
+   replay e arrivo — divergevano. La regola della lapide vince anche
+   sulla durabilità: è ciò che la fase chiede («la regola della
+   lapide resta quella di oggi»).
+2. **Il testimone (b) si allarga di un caso: il discendente.** Una
+   scrittura del corpo **che discende dal perdente** (la sua catena di
+   `base` passa per lui) lo ha *visto per costruzione*: è un testimone
+   di chiusura anche quando il diff3 non torna (l'appendice in coda:
+   F = «a», perdente = «a\\nx», discendente = «a\\nx\\ny» — stessa
+   regione, contenuti diversi, diff3 in conflitto). Senza questo
+   testimone, le tre regole della fase non stanno insieme: la copia di
+   un perdente il cui ramo continua resterebbe aperta per sempre, e
+   chiuderla «perché non è più una punta» romperebbe la monotonia
+   (chiusura senza testimone). È il principio della sezione — «un
+   conflitto si chiude solo con qualcosa che l'ha visto» — preso alla
+   lettera: il discendente ha visto l'operazione, il diff3 dice che ne
+   ha visto il **testo**.
+3. **Due chiusure da filtro, senza diff3.** Il filtro D1.5 (corpo
+   uguale a quello del vincitore, corpo uguale alla biforcazione)
+   chiude una copia già aperta quando il vincitore **cambia**: un
+   vincitore umano più vecchio col corpo per coincidenza uguale al
+   perdente, o una biforcazione che si sposta su uno stato col corpo
+   del perdente. Sono angoli misurati in anni-futura della vita di
+   una cella (servono corpi identici da rami diversi); il generatore
+   della flotta usa corpi numerati, quindi la caccia non li produce.
+   La convergenza vince su di essi (la copia è funzione dell'insieme,
+   sempre): la monotonia li dichiara nel REPORT se mai appaiono.
+4. **Le scritture senza `base` sono radici.** Il doppio importo della
+   v0.6.1 (stesso id su due macchine, due put senza base) deve
+   continuare a dare la copia del corpo perdente, come oggi: una
+   scrittura senza base non è antenata di niente. Le catene del
+   pre-v0.6, che non rimaterializzano mai, non cambiano comportamento
+   (la derivazione corre dove già correva).
+5. **La purga e le copie resta quella di oggi**, verificata dai test
+   che già la coprono (`the_purge_dominates_whatever_the_arrival_order`
+   e la proprietà della flotta): la purga della nota porta via le
+   copie e le righe derivate della coda; la purga di una copia chiude
+   il conflitto (è un'operazione sul suo id).
+
+### Il piano della derivazione (una funzione, due percorsi)
+
+Per ogni nota, dall'insieme delle sue operazioni: **punte** = le
+scritture del corpo applicate senza discendenti corporei; **vincitore**
+= chiave `(classe, hlc, op_id)` massima fra le punte; **candidati** =
+le scritture del corpo applicate che non sono il vincitore né suoi
+antenati; ognuna ha una copia **aperta** se nessun testimone è
+nell'insieme (operazione sull'id della copia; discendente; diff3 dalla
+biforcazione) e i filtri D1.5 passano (il corpo differsce da quello del
+vincitore e dalla biforcazione; un perdente più recente col suo stesso
+corpo è, a un tempo, la copia che resta e il suo testimone diff3). Il
+**corpo della nota** è quello del vincitore — anche quando non è
+l'ultima applicata: la mano umana più vecchia vince — e l'intestazione
+resta ultima-scrittura-per-campo nell'ordine totale. **Tetto**: le tre
+aperte più recenti nell'ordine totale sono visibili (riga in `notes`,
+FTS, tag, arco, e coda se in quarantena); le altre restano aperte e
+invisibili, e appaiono quando una visibile si chiude. Schema 21, solo
+tabelle derivate, migrazione che le rimaterializza.

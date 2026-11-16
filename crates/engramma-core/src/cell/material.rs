@@ -232,21 +232,6 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
                         TombstoneOutcome::Reopens => ops::reopen_tombstone(tx, &nid)?,
                         TombstoneOutcome::NoTombstone => {}
                     }
-                    // v0.6.1 (P0): an APPLIED body write on the fast path is
-                    // the note's new FINAL winner — the last body write in
-                    // total order, chained on the head. Its losers are the
-                    // body writes after its base, and there are none between
-                    // the head and itself: the desired conflict set is EMPTY,
-                    // and any copy left by an earlier, smaller set (a winner
-                    // the fleet has since moved past — found by the
-                    // convergence fleet as a stale copy the total-order
-                    // reference kept and the rematerializing copies dropped)
-                    // goes now. A pre-v0.6 write (no base) never takes this
-                    // road: its losers would be every earlier body write,
-                    // which only a materialization can derive.
-                    if op.base.is_some() {
-                        reconcile_conflict_copies(tx, &nid, &[])?;
-                    }
                 }
                 match apply_half(tx, op, object) {
                     Ok(()) => {}
@@ -254,6 +239,21 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
                         mark_pending(tx, object, &op.op_id.to_string())?;
                     }
                     Err(e) => return Err(e),
+                }
+            }
+            // v0.6.4 (D1): the conflict set derives at EVERY body write —
+            // the arrival fast path pays the same derivation the replay
+            // pays. The v0.6.1–v0.6.3 shortcut emptied the loser set
+            // (the arrival is newest, its base the head): with the class
+            // of the author a head-chained write can still LOSE to an
+            // older human tip, and its copy must be born here too. A
+            // write the lapide held never reaches this line.
+            for object in &objects {
+                if let Some(nid) = object.strip_prefix("note:")
+                    && let Ok(nid) = Ulid::from_string(nid)
+                    && is_body_write(op, &nid)
+                {
+                    super::conflicts::after_body_write(tx, &nid, op)?;
                 }
             }
         } else {
@@ -269,6 +269,17 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
             for object in &to_materialize {
                 materialize(tx, object)?;
             }
+        }
+    }
+    // v0.6.4 (D1.6a): an operation on a COPY's id — a modification, the
+    // delete that resolves it, a decision on its queue row — is a
+    // closure witness, and the ORIGINAL's derivation must see it. One
+    // point query per arrival; nothing for a note that is no copy.
+    for object in &objects {
+        if let Some(nid) = object.strip_prefix("note:")
+            && let Ok(nid) = Ulid::from_string(nid)
+        {
+            super::conflicts::rederive_original_of(tx, &nid)?;
         }
     }
     // a note that just landed may unblock PENDING edges that cite it (a
@@ -501,9 +512,6 @@ fn materialize_note(
             events.push(ReplayEvent {
                 hash: op.content_hash.clone(),
                 body: None,
-                base: op.base.clone(),
-                op_id: op.op_id,
-                hlc_ms: op.hlc.physical_ms,
             });
             continue;
         }
@@ -518,9 +526,6 @@ fn materialize_note(
             events.push(ReplayEvent {
                 hash: op.content_hash.clone(),
                 body: None,
-                base: op.base.clone(),
-                op_id: op.op_id,
-                hlc_ms: op.hlc.physical_ms,
             });
             continue;
         }
@@ -529,11 +534,11 @@ fn materialize_note(
                 TombstoneOutcome::Wins => {
                     // the tombstone wins: the write is stored, without effect
                     events.push(ReplayEvent {
+
                         hash: op.content_hash.clone(),
+
                         body: None,
-                        base: op.base.clone(),
-                        op_id: op.op_id,
-                        hlc_ms: op.hlc.physical_ms,
+
                     });
                     continue;
                 }
@@ -549,11 +554,11 @@ fn materialize_note(
             }
             if let Some(row) = ops::read_note_row(tx, id)? {
                 events.push(ReplayEvent {
+
                     hash: op.content_hash.clone(),
+
                     body: Some((row.note, row.version)),
-                    base: op.base.clone(),
-                    op_id: op.op_id,
-                    hlc_ms: op.hlc.physical_ms,
+
                 });
             }
         } else {
@@ -570,6 +575,14 @@ fn materialize_note(
                 {
                     replace_note_state(tx, id, &state, version)?;
                 }
+                // v0.6.4 (D1): the lapide's rule stays today's — the writes
+                // the delete did not see are GONE, and they are gone for the
+                // conflict rules too: no tips, no copies. A body the user's
+                // delete explicitly discarded unseen must not come back as a
+                // "winner" the derivation resurrects over the tombstone.
+                for e in events.iter_mut().skip(pos + 1) {
+                    e.body = None;
+                }
             }
             match ops::apply_scoped(tx, op, Scope::Note(*id)) {
                 Ok(()) => {}
@@ -582,9 +595,6 @@ fn materialize_note(
             events.push(ReplayEvent {
                 hash: op.content_hash.clone(),
                 body: None,
-                base: op.base.clone(),
-                op_id: op.op_id,
-                hlc_ms: op.hlc.physical_ms,
             });
         }
     }
@@ -593,73 +603,36 @@ fn materialize_note(
     } else {
         clear_pending(tx, object)?;
     }
-    // THE CONFLICT SET, derived once from the FINAL winner: the last body
-    // write in total order wins (the replay applied it last), and the
-    // losers are exactly the body writes it did not see — those after its
-    // `base`. Derived from the whole set at the end of the replay, the
-    // set is a function of the SET by construction: every copy replays
-    // the same total order, computes the same winner and the same losers
-    // — however the operations arrived.
-    let losers = final_losers(&events);
-    reconcile_conflict_copies(tx, id, &losers)?;
+    // THE CONFLICT SET (v0.6.4, D1): derived once, at the end of the
+    // replay, from the SET — the tips the ancestry graph leaves, the
+    // winner by (class, hlc, op_id), the durable copies with their
+    // closure witnesses and their cap. Every copy of the cell walks the
+    // same graph over the same set and lands on the same rows,
+    // however the operations arrived.
+    let applied: std::collections::HashSet<String> = events
+        .iter()
+        .filter(|e| e.body.is_some())
+        .map(|e| e.hash.clone())
+        .collect();
+    let states: std::collections::HashMap<String, crate::format::Note> = events
+        .iter()
+        .filter_map(|e| {
+            e.body
+                .as_ref()
+                .map(|(state, _)| (e.hash.clone(), state.clone()))
+        })
+        .collect();
+    super::conflicts::after_replay(tx, id, &applied, &states)?;
     restore_hlc_watermark(tx, watermark, None)?;
     Ok(())
 }
 
-/// The losers of the whole replay: the body writes after the WINNER's
-/// `base`, the winner being the LAST body write in total order.
-fn final_losers(events: &[ReplayEvent]) -> Vec<LoserRecord> {
-    let Some(winner_pos) = events.iter().rposition(|e| e.body.is_some()) else {
-        return Vec::new();
-    };
-    let winner_base = events[winner_pos].base.clone();
-    // A base that is not among the events can only be BELOW the compaction
-    // cut: the winner applied (a body write never applies while its base is
-    // unknown — v0.6.1, P0), and an applied base is either above the cut,
-    // in the events, or a redacted skeleton under it. Below the cut the
-    // state is frozen and sequential by the frontier's own promise: no
-    // losers. (When the censor still rewrote content hashes, "absent" also
-    // meant "censored on this copy only", and reading it as sequential
-    // made the conflict set depend on the arrival order — the phantom
-    // copies of the v0.6 review.)
-    let start = match &winner_base {
-        Some(b) => events
-            .iter()
-            .position(|e| &e.hash == b)
-            .map_or(winner_pos, |p| (p + 1).min(winner_pos)),
-        None => 0,
-    };
-    events[start..winner_pos]
-        .iter()
-        .filter_map(|e| {
-            e.body.as_ref().map(|(state, _)| LoserRecord {
-                op_id: e.op_id,
-                hlc_ms: e.hlc_ms,
-                content_hash: e.hash.clone(),
-                state: state.clone(),
-            })
-        })
-        .collect()
-}
-
-/// One applied operation of the replay, with what the conflict rules need:
-/// its wire identity and the note state a BODY write produced (at its
-/// version).
+/// One applied operation of the replay, with what the conflict rules
+/// need: its wire identity and, for a BODY write that applied, the note
+/// state it produced (at its version).
 struct ReplayEvent {
     hash: String,
     body: Option<(crate::format::Note, i64)>,
-    base: Option<String>,
-    op_id: Ulid,
-    hlc_ms: u64,
-}
-
-/// A body write a later concurrent write did not see: its state becomes a
-/// conflict copy.
-struct LoserRecord {
-    op_id: Ulid,
-    hlc_ms: u64,
-    content_hash: String,
-    state: crate::format::Note,
 }
 
 /// Replace the note's row with a replayed state, at that state's OWN
@@ -802,13 +775,23 @@ fn breaks_the_chain(
 }
 
 /// Does this operation write the BODY of note `id` (a full replace or a
-/// patch carrying one)?
+/// patch whose `set` carries one)? A header-only patch — title, tags,
+/// state, validity, confidence… — is NEVER a body write (v0.6.4, D1):
+/// the header stays last-write-per-field and never creates conflicts.
 fn is_body_write(op: &Op, id: &Ulid) -> bool {
     if op.body.is_none() {
         return false;
     }
     match op.kind {
-        OpKind::PatchNote => op.note_id.is_some_and(|n| n == *id),
+        OpKind::PatchNote => {
+            op.note_id.is_some_and(|n| n == *id)
+                && op
+                    .body
+                    .as_ref()
+                    .and_then(|b| b.get("set"))
+                    .and_then(|set| set.get("body"))
+                    .is_some()
+        }
         OpKind::PutNote => op
             .body
             .as_ref()
@@ -867,7 +850,7 @@ fn tombstone_rule(
 /// The deterministic id of a conflict copy (DESIGN §4.3):
 /// `blake3("engramma/conflict/v1" ‖ content_hash del perdente)` in ULID
 /// form, the losing operation's HLC as the time part.
-fn conflict_copy_id(loser_hash: &str, loser_hlc_ms: u64) -> Ulid {
+pub(crate) fn conflict_copy_id(loser_hash: &str, loser_hlc_ms: u64) -> Ulid {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"engramma/conflict/v1");
     hasher.update(loser_hash.as_bytes());
@@ -881,7 +864,7 @@ fn conflict_copy_id(loser_hash: &str, loser_hlc_ms: u64) -> Ulid {
 }
 
 /// The derivation record of a conflict copy, when this note IS one.
-fn conflict_copy_state(
+pub(crate) fn conflict_copy_state(
     tx: &rusqlite::Transaction<'_>,
     id: &Ulid,
 ) -> Result<Option<(Ulid, crate::format::Note)>, CellError> {
@@ -909,7 +892,7 @@ fn conflict_copy_state(
 /// active, tagged `conflitto`, the loser's content — its FTS and tags, and
 /// the edge to the original. Pure derivation: no operation of its own, and
 /// every copy of the cell produces it identically.
-fn restore_conflict_copy(
+pub(crate) fn restore_conflict_copy(
     tx: &rusqlite::Transaction<'_>,
     copy_id: &Ulid,
     original: &Ulid,
@@ -940,40 +923,9 @@ fn restore_conflict_copy(
     Ok(())
 }
 
-/// Record and write one conflict copy derived from `original`'s replay.
-fn write_conflict_copy(
-    tx: &rusqlite::Transaction<'_>,
-    original: &Ulid,
-    loser: &LoserRecord,
-) -> Result<Ulid, CellError> {
-    let copy_id = conflict_copy_id(&loser.content_hash, loser.hlc_ms);
-    // the copy's state: the loser's note, active, tagged
-    let mut note = loser.state.clone();
-    note.id = copy_id;
-    note.status = crate::format::Status::Active;
-    if !note.tags.iter().any(|t| t == "conflitto") {
-        note.tags.push("conflitto".into());
-    }
-    // the derivation row first: it is the base the copy's own materialization
-    // (and a user's later edits on the copy) replay from
-    tx.execute(
-        "INSERT INTO conflict_copies (copy_id, original_id, loser_op, state_json)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(copy_id) DO UPDATE SET original_id = ?2, loser_op = ?3, state_json = ?4",
-        rusqlite::params![
-            copy_id.to_string(),
-            original.to_string(),
-            loser.op_id.to_string(),
-            note.to_json().to_string()
-        ],
-    )?;
-    restore_conflict_copy(tx, &copy_id, original, &note)?;
-    Ok(copy_id)
-}
-
 /// Delete every state row of a note (no log rows touched), the
 /// rematerialization's delete-first for derived copies.
-fn delete_note_state(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
+pub(crate) fn delete_note_state(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
     if let Some(row) = ops::read_note_row(tx, id)?
         && let Some(idx) = ops::index_for(row.note.status)
     {
@@ -1060,75 +1012,14 @@ pub(crate) fn purge_conflict_copies(
     Ok(())
 }
 
-/// Does this note have operations of its own (a conflict copy the user
-/// edited, or a note that was never derived)?
-fn note_has_ops(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<bool, CellError> {
-    let n: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM op_objects WHERE object = ?1",
-        [format!("note:{id}")],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
-}
-
-/// After the replay of the original: the copies the conflict rules derive
-/// are written, the copies of conflicts that no longer exist go (unless the
-/// user made them theirs with edits), and a copy whose derivation moved
-/// rematerializes.
-fn reconcile_conflict_copies(
-    tx: &rusqlite::Transaction<'_>,
-    original: &Ulid,
-    losers: &[LoserRecord],
-) -> Result<(), CellError> {
-    let desired: Vec<Ulid> = losers
-        .iter()
-        .map(|l| conflict_copy_id(&l.content_hash, l.hlc_ms))
-        .collect();
-    let existing: Vec<String> = {
-        let mut stmt = tx.prepare(
-            "SELECT copy_id FROM conflict_copies WHERE original_id = ?1 ORDER BY copy_id",
-        )?;
-        let rows = stmt.query_map([original.to_string()], |r| r.get::<_, String>(0))?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
-    for copy_id in existing {
-        let ulid = Ulid::from_string(&copy_id)
-            .map_err(|_| CellError::Db(format!("bad conflict copy id {copy_id}")))?;
-        if desired.contains(&ulid) {
-            continue;
-        }
-        if note_has_ops(tx, &ulid)? {
-            // the user edited the copy: the note lives on as its own
-            continue;
-        }
-        delete_note_state(tx, &ulid)?;
-        tx.execute("DELETE FROM conflict_copies WHERE copy_id = ?1", [copy_id])?;
-    }
-    let mut written: Vec<Ulid> = Vec::new();
-    for loser in losers {
-        let copy_id = write_conflict_copy(tx, original, loser)?;
-        if !written.contains(&copy_id) && note_has_ops(tx, &copy_id)? && copy_id != *original {
-            // the copy carries the user's edits and its base just moved:
-            // it rematerializes over the new derivation
-            materialize(tx, &format!("note:{copy_id}"))?;
-        }
-        written.push(copy_id);
-        clear_pending(tx, &format!("note:{copy_id}"))?;
-    }
-    Ok(())
-}
-
-/// v0.6.3 (C1): a LOCAL write pays the same reconciliation the arrival
-/// fast path pays (the call in `arrive`, above). A local body write is the
-/// NEWEST operation of its note and its `base` is the head of its log —
-/// `execute_op` builds exactly that — so its losers are the body writes
-/// between the head and itself, and there are none. The conflict copies a
-/// cell derives are then a function of the SET it holds: a copy left by an
-/// earlier, smaller set (a winner the fleet has since moved past) goes
-/// NOW, on the writer itself — before, only the copies that received the
-/// new winner as an ARRIVAL re-derived it, and the two sides of one sync
-/// diverged (the reviewer's witnesses, once every few thousand fleet
-/// cases).
+/// v0.6.4 (D1): a LOCAL body write pays the same derivation the
+/// arrival path pays (`after_body_write`) — and through it, when the
+/// note needs it, the full replay. The v0.6.3 premise (a local write is
+/// newest, base at the head, losers empty) died with the class of the
+/// author: a head-chained write can LOSE to an older human tip, and
+/// losing means its copy is born on the writing device itself. A
+/// header-only patch derives nothing: the header never creates or
+/// closes conflicts (D1.1).
 pub(crate) fn reconcile_after_local_write(
     tx: &rusqlite::Transaction<'_>,
     op: &Op,
@@ -1137,9 +1028,13 @@ pub(crate) fn reconcile_after_local_write(
         if let Some(nid) = object.strip_prefix("note:")
             && let Ok(nid) = Ulid::from_string(nid)
             && is_body_write(op, &nid)
-            && op.base.is_some()
         {
-            reconcile_conflict_copies(tx, &nid, &[])?;
+            super::conflicts::after_body_write(tx, &nid, op)?;
+        }
+        if let Some(nid) = object.strip_prefix("note:")
+            && let Ok(nid) = Ulid::from_string(nid)
+        {
+            super::conflicts::rederive_original_of(tx, &nid)?;
         }
     }
     Ok(())
