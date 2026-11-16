@@ -4,6 +4,16 @@
 [profile.dev]
 debug = "line-tables-only"
 
+# v0.6.3 (C4): the `.node` artifact builds UNSTRIPPED. Cargo's release
+# default is `strip = "debuginfo"`, and rustc's `strip -S` (Xcode 27.2)
+# mis-aligns the LINKEDIT string pool of this dylib: dyld refuses the
+# whole artifact («mis-aligned LINKEDIT string pool» — the v0.6.2
+# `arc4random` parity trick only hid it). `npm run build` loads the
+# artifact right after linking, so a toolchain that breaks it again
+# fails the build.
+[profile.release.package.engramma-node]
+strip = "none"
+
 [profile.dev.package."*"]
 debug = false
 
