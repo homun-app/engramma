@@ -585,7 +585,6 @@ fn add_note(root: &std::path::Path, who: &str) {
         ],
     );
     assert!(ok, "add su {who}: {err}");
-    std::mem::forget(file);
 }
 
 /// P5: three devices, concurrent writes on all of them, one device that
@@ -1253,7 +1252,6 @@ fn the_serve_cycle_pushes_a_second_process_write() {
         ],
     );
     assert!(ok, "add: {err}");
-    std::mem::forget(file);
     // B receives WITHOUT ever pulling: the watch (≤250 ms) + debounce
     // (2 s) + the pass — 20 s is the bound of shame
     let mut arrived = false;

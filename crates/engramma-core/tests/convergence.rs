@@ -42,9 +42,24 @@ fn base_note(id: u32, body: &str) -> Note {
     }
 }
 
+/// A copy and the folder that holds its file. Fields drop in declaration
+/// order: the cell closes first, then the folder goes with it (a leaked
+/// folder per copy was ~15k folders per convergence run).
+struct Kept {
+    cell: Cell,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for Kept {
+    type Target = Cell;
+    fn deref(&self) -> &Cell {
+        &self.cell
+    }
+}
+
 /// A fresh copy that ingests `ops` in the given order: a bare file, the
 /// shared `init` first, then the rest as it arrives.
-fn copy_of(name: &str, ops: &[Op]) -> Cell {
+fn copy_of(name: &str, ops: &[Op]) -> Kept {
     let dir = tempfile::tempdir().unwrap(/* test-only */);
     let cell = Cell::open_bare(&dir.path().join(format!("{name}.sqlite"))).unwrap(/* test-only */);
     for op in ops {
@@ -54,10 +69,7 @@ fn copy_of(name: &str, ops: &[Op]) -> Cell {
             op.op_id
         );
     }
-    // the tempdir would take the file with it: leak the path's parent so
-    // the cell stays alive for the caller (tests are short-lived)
-    std::mem::forget(dir);
-    cell
+    Kept { cell, _dir: dir }
 }
 
 /// The union of two cells' logs, deduplicated by op_id, keeping the first
@@ -198,7 +210,6 @@ fn concurrent_patches_converge_on_every_copy() {
         .unwrap(/* test-only */);
     let dir_z = tempfile::tempdir().unwrap(/* test-only */);
     let z = Cell::open_bare(&dir_z.path().join("z.sqlite")).unwrap(/* test-only */);
-    std::mem::forget(dir_z);
     z.ingest_op(&init).unwrap(/* test-only */);
     z.ingest_op(&patch_of("da A")).unwrap(/* test-only */);
     // the patch waits: its note is not here yet
@@ -696,6 +707,8 @@ struct Fleet {
     notes: Vec<Ulid>,
     edges: Vec<String>,
     proposals: Vec<Ulid>,
+    /// the folders of `cells`: declared last, so they go after the cells
+    _dirs: Vec<tempfile::TempDir>,
 }
 
 impl Fleet {
@@ -915,13 +928,12 @@ proptest! {
         let reference = {
             let dir = tempfile::tempdir().unwrap(/* test-only */);
             let cell = Cell::open_bare(&dir.path().join("ref.sqlite")).unwrap(/* test-only */);
-            std::mem::forget(dir);
             cell.inject_clock(engramma_core::hlc::HlcClock::new("ref00000000x", || FLEET_BASE_MS))
                 .unwrap(/* test-only */);
             for op in &by_total {
                 cell.ingest_op(op).unwrap(/* test-only */);
             }
-            cell
+            Kept { cell, _dir: dir }
         };
         prop_assert_eq!(
             reference.replicated_digest().unwrap(/* test-only */),
@@ -987,7 +999,6 @@ fn fleet_run(seed: u64, devices: u32, rounds: u32) -> Fleet {
     // break the reproduction)
     let dir0 = tempfile::tempdir().unwrap(/* test-only */);
     let a = Cell::open_bare(&dir0.path().join("fleet0.sqlite")).unwrap(/* test-only */);
-    std::mem::forget(dir0);
     let mut mint0 = SeedMint { seed, dev: 0, n: 0 };
     let (cell_id, _) = mint0.next();
     let (op_id, salt) = mint0.next();
@@ -1016,11 +1027,12 @@ fn fleet_run(seed: u64, devices: u32, rounds: u32) -> Fleet {
     .unwrap(/* test-only */);
     a.ingest_op(&init).unwrap(/* test-only */);
     let mut cells = vec![a];
+    let mut dirs = vec![dir0];
     for d in 1..n {
         let dir = tempfile::tempdir().unwrap(/* test-only */);
         let cell = Cell::open_bare(&dir.path().join(format!("fleet{d}.sqlite")))
             .unwrap(/* test-only */);
-        std::mem::forget(dir);
+        dirs.push(dir);
         cells.push(cell);
     }
     // deterministic time and deterministic mints, one of each per device
@@ -1049,6 +1061,7 @@ fn fleet_run(seed: u64, devices: u32, rounds: u32) -> Fleet {
         notes: Vec::new(),
         edges: Vec::new(),
         proposals: Vec::new(),
+        _dirs: dirs,
     };
     fleet
         .cells[0]
@@ -1218,7 +1231,6 @@ fn concurrent_creates_case(authors: u32) {
         let dir = tempfile::tempdir().unwrap(/* t */);
         let cell = Cell::open_bare(&dir.path().join(format!("c{k}.sqlite")))
             .unwrap(/* t */);
-        std::mem::forget(dir);
         for op in &first {
             cell.ingest_op(op).unwrap(/* t */);
         }

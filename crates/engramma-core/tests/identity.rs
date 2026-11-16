@@ -42,15 +42,29 @@ fn note(id: u32, body: &str) -> Note {
     }
 }
 
+/// A copy and the folder that holds its file. Fields drop in declaration
+/// order: the cell closes first, then the folder goes with it (a leaked
+/// folder per copy was ~15k folders per convergence run).
+struct Kept {
+    cell: Cell,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for Kept {
+    type Target = Cell;
+    fn deref(&self) -> &Cell {
+        &self.cell
+    }
+}
+
 /// A fresh copy that ingests `ops` in the given order.
-fn copy_of(name: &str, ops: &[Op]) -> Cell {
+fn copy_of(name: &str, ops: &[Op]) -> Kept {
     let dir = tempfile::tempdir().unwrap(/* test-only */);
     let cell = Cell::open_bare(&dir.path().join(format!("{name}.sqlite"))).unwrap(/* t */);
     for op in ops {
         assert!(cell.ingest_op(op).unwrap(/* t */));
     }
-    std::mem::forget(dir);
-    cell
+    Kept { cell, _dir: dir }
 }
 
 fn union_of(cells: &[&Cell]) -> BTreeMap<String, Op> {
