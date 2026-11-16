@@ -1971,11 +1971,12 @@ impl Cell {
     /// SQL failure.
     pub fn rematerialize_for_test(&self) -> Result<(String, String), CellError> {
         let inner = self.lock()?;
-        let cut: i64 = inner.conn.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM snapshots",
-            [],
-            |r| r.get(0),
-        )?;
+        let cut: i64 =
+            inner
+                .conn
+                .query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
+                    r.get(0)
+                })?;
         if cut > 0 {
             return Err(CellError::Invalid(
                 "the oracle covers cells without a compaction cut".into(),
@@ -3416,6 +3417,13 @@ fn execute_op(
     op.seq = prev_seq + 1;
     op.seal(&prev_hash);
     ops::apply(&tx, &op)?;
+    // v0.6.3 (C1): the conflict set re-derives on a LOCAL write too — the
+    // same reconciliation the arrival fast path pays, under the same
+    // premise (newest of its note, base at the head). Without this, a
+    // conflict copy left by an earlier, smaller set survived on the
+    // writing device forever while every receiving copy dropped it: the
+    // convergence witnesses of v0.6.2's review.
+    material::reconcile_after_local_write(&tx, &op)?;
     tx.commit()?;
     // A tombstone leaves the index immediately (its vectors were deleted
     // inside the op). The guard is the one the caller holds.

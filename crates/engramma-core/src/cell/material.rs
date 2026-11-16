@@ -1118,6 +1118,33 @@ fn reconcile_conflict_copies(
     Ok(())
 }
 
+/// v0.6.3 (C1): a LOCAL write pays the same reconciliation the arrival
+/// fast path pays (the call in `arrive`, above). A local body write is the
+/// NEWEST operation of its note and its `base` is the head of its log —
+/// `execute_op` builds exactly that — so its losers are the body writes
+/// between the head and itself, and there are none. The conflict copies a
+/// cell derives are then a function of the SET it holds: a copy left by an
+/// earlier, smaller set (a winner the fleet has since moved past) goes
+/// NOW, on the writer itself — before, only the copies that received the
+/// new winner as an ARRIVAL re-derived it, and the two sides of one sync
+/// diverged (the reviewer's witnesses, once every few thousand fleet
+/// cases).
+pub(crate) fn reconcile_after_local_write(
+    tx: &rusqlite::Transaction<'_>,
+    op: &Op,
+) -> Result<(), CellError> {
+    for object in ops::objects_of(op) {
+        if let Some(nid) = object.strip_prefix("note:")
+            && let Ok(nid) = Ulid::from_string(nid)
+            && is_body_write(op, &nid)
+            && op.base.is_some()
+        {
+            reconcile_conflict_copies(tx, &nid, &[])?;
+        }
+    }
+    Ok(())
+}
+
 /// The policy object: `init` and `set_policy` in total order — last write
 /// wins, the whole history of the meta keys replays.
 fn materialize_policy(tx: &rusqlite::Transaction<'_>) -> Result<(), CellError> {

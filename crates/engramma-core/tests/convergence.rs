@@ -1328,24 +1328,38 @@ fn a_local_write_rederives_the_conflict_set() {
     }
     let mut by_total: Vec<Op> = union.into_values().collect();
     by_total.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
-    let c = copy_of("c", &by_total);
+    let (c, _) = cell_with("c");
     let mut arrival_order: Vec<Op> = vec![init.clone()];
     for op in b.ops().unwrap(/* t */) {
         if op.op_id != init.op_id {
             arrival_order.push(op);
         }
     }
-    let d = copy_of("d", &arrival_order);
+    let (d, _) = cell_with("d");
+    for op in &by_total {
+        c.ingest_op(op).unwrap(/* t */);
+    }
+    // D receives them in B's own arrival order — W as an ARRIVAL, the path
+    // that always re-derived
+    for op in &arrival_order {
+        d.ingest_op(op).unwrap(/* t */);
+    }
     let (db, dc, dd) = (
         b.replicated_digest().unwrap(/* t */),
         c.replicated_digest().unwrap(/* t */),
         d.replicated_digest().unwrap(/* t */),
     );
     assert_eq!(db, dc, "the writer's copy equals the total-order reference");
-    assert_eq!(dc, dd, "the arrival-order copy equals the total-order reference");
+    assert_eq!(
+        dc, dd,
+        "the arrival-order copy equals the total-order reference"
+    );
     assert_eq!(copies_of(&c), 0, "the final set derives no conflict copy");
     let (rebuilt, _) = b.rematerialize_for_test().unwrap(/* t */);
-    assert_eq!(db, rebuilt, "the writer's copy equals its own reconstruction");
+    assert_eq!(
+        db, rebuilt,
+        "the writer's copy equals its own reconstruction"
+    );
 }
 
 // v0.6.3 (C1): the differential oracle — for every fleet, every copy's
