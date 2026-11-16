@@ -218,6 +218,9 @@ struct PlannedCopy {
     copy_id: Ulid,
     /// The loser's applied state — the copy's content.
     note: Note,
+    /// The stored derivation row omits the body (the loser's payload
+    /// is its home); `note` still carries it for the notes row.
+    state_json_without_body: bool,
     quarantined: bool,
     visible: bool,
     /// False for a closed-with-operations loser: the row stays as the
@@ -540,6 +543,7 @@ pub(crate) fn after_replay(
                 loser_actor: row.actor.clone(),
                 copy_id,
                 note,
+                state_json_without_body: true,
                 quarantined,
                 visible: false,
                 open: false,
@@ -603,6 +607,10 @@ pub(crate) fn after_replay(
                 loser_actor: rows[loser].actor.clone(),
                 copy_id,
                 note,
+                // the derivation row keeps everything but the BODY —
+                // measured (D5): the body twice was a fourth of a copy's
+                // cost, and the loser's payload is the body's home
+                state_json_without_body: true,
                 quarantined,
                 visible: false,
                 open,
@@ -707,6 +715,13 @@ fn apply(tx: &Transaction<'_>, original: &Ulid, plan: &Plan) -> Result<(), CellE
         )?;
     }
     for copy in &plan.copies {
+        let stored = if copy.state_json_without_body {
+            let mut lean = copy.note.clone();
+            lean.body.clear();
+            lean
+        } else {
+            copy.note.clone()
+        };
         tx.execute(
             "INSERT INTO conflict_copies (copy_id, original_id, loser_op, state_json,
                                           loser_actor, loser_hlc, open, visible)
@@ -718,7 +733,7 @@ fn apply(tx: &Transaction<'_>, original: &Ulid, plan: &Plan) -> Result<(), CellE
                 copy.copy_id.to_string(),
                 original.to_string(),
                 copy.loser_op.to_string(),
-                copy.note.to_json().to_string(),
+                stored.to_json().to_string(),
                 copy.loser_actor,
                 copy.loser_hlc,
                 i64::from(copy.visible),
@@ -963,11 +978,16 @@ pub(crate) fn after_body_write(
         let mut out = HashMap::new();
         for row in &rows {
             if let Some(json) = by_op.get(&row.op_id.to_string())
-                && let Ok(note) = Note::from_json(
+                && let Ok(mut note) = Note::from_json(
                     &serde_json::from_str::<serde_json::Value>(json)
                         .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?,
                 )
             {
+                // the stored state has no body: the loser's payload is
+                // its home, and it is here (a loser is a body write)
+                if let Some(facts) = row.body.as_ref() {
+                    note.body = facts.text.clone();
+                }
                 out.insert(row.hash.clone(), note);
             }
         }
@@ -1048,11 +1068,15 @@ pub(crate) fn rederive_note(tx: &Transaction<'_>, original: &Ulid) -> Result<(),
             needs_full = true;
             break;
         };
-        let note = Note::from_json(
+        let mut note = Note::from_json(
             &serde_json::from_str::<serde_json::Value>(json)
                 .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?,
         )
         .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?;
+        // the stored state has no body: the loser's payload is its home
+        if let Some(facts) = rows[loser].body.as_ref() {
+            note.body = facts.text.clone();
+        }
         states.insert(rows[loser].hash.clone(), note);
     }
     if needs_full {
@@ -1264,18 +1288,30 @@ pub(crate) fn rederive_original_of(tx: &Transaction<'_>, copy: &Ulid) -> Result<
     let original = match original {
         Some(original) => Ulid::from_string(&original)
             .map_err(|_| CellError::Db(format!("bad conflict original {original}")))?,
-        // the birth row does not exist HERE (this copy never opened on
-        // this device — its loser was the winner, or it never derived):
-        // find the original by walking the copy id back over every
-        // note's body writes (the id is blake3 of the loser — not
-        // invertible, but the cell is small and orphan copy ops are
-        // rare). Found by the oracle, seed 15192944291106605994
-        None => match original_of_copy(tx, copy)? {
+        // an ORPHAN copy op: the birth row does not exist HERE and the
+        // note itself does not either (the op parked on a missing note —
+        // a copy this device never derived, its loser was the winner
+        // somewhere else). Only then is the walk over the cell's body
+        // writes worth its cost (the id is blake3 of the loser, not
+        // invertible): gated on the missing row, a fresh note never
+        // pays it. Found by the oracle, seed 15192944291106605994
+        None if note_row_is_absent(tx, copy)? => match original_of_copy(tx, copy)? {
             Some(original) => original,
             None => return Ok(()),
         },
+        None => return Ok(()),
     };
     rederive_note(tx, &original)
+}
+
+/// Does this note id have a notes row? (the orphan gate)
+fn note_row_is_absent(tx: &Transaction<'_>, id: &Ulid) -> Result<bool, CellError> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM notes WHERE id = ?1",
+        [id.to_string()],
+        |r| r.get(0),
+    )?;
+    Ok(n == 0)
 }
 
 /// Which note's body writes mint this copy id, when no derivation row

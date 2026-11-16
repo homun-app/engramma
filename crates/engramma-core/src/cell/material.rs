@@ -887,11 +887,27 @@ pub(crate) fn conflict_copy_state(
     };
     let original = Ulid::from_string(&original)
         .map_err(|_| CellError::Db(format!("bad conflict original {original}")))?;
-    let note = crate::format::Note::from_json(
+    let mut note = crate::format::Note::from_json(
         &serde_json::from_str::<serde_json::Value>(&json)
             .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?,
     )
     .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?;
+    // v0.6.4 (D5): the stored state has no body — the loser's payload
+    // is its home, and a loser is always a body write with its payload
+    // (above the compaction cut, where the tips live)
+    if note.body.is_empty()
+        && let Some(body) = tx
+            .query_row(
+                "SELECT json_extract(p.body, '$.set.body') FROM op_payloads p
+                 JOIN conflict_copies cc ON cc.loser_op = p.op_id
+                 WHERE cc.copy_id = ?1 AND json_extract(p.body, '$.set.body') IS NOT NULL",
+                [id.to_string()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+    {
+        note.body = body;
+    }
     Ok(Some((original, note)))
 }
 

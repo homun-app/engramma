@@ -98,9 +98,36 @@ Un estraneo che si finge un dispositivo: la connessione si chiude **prima di qua
 
 **Quello che il dispositivo aveva già lo tiene**: la revoca non cancella i dischi altrui. Le sei cifre e il biglietto monouso sono le difese dell'**abbinamento**; la rotazione è la difesa del **dopo**.
 
+## La versione delle regole (v0.6.4)
+
+L'ALPN **è** la versione delle regole di materializzazione:
+`engramma/sync/2` (e `engramma/mailbox/2` per la casella postale). Un
+dispositivo v0.6.3 e uno v0.6.4, davanti allo stesso insieme di
+operazioni, derivano stati diversi — quindi non devono scambiare
+nemmeno un'operazione. Il rifiuto avviene all'handshake: chi chiama
+riceve `PEER_OUTDATED` (in JS, con il nome del dispositivo da
+aggiornare), chi risponde non vede nemmeno la connessione. Ogni futuro
+cambio della derivazione alza la versione: la v0.7 delle organizzazioni
+sarà `engramma/sync/3`.
+
 ## I conflitti
 
-Le modifiche concorrenti non si perdono mai: vince l'ultima nell'ordine totale, e la perdente diventa una **copia di conflitto** — una nota attiva, col tag `conflitto` e un arco verso l'originale, identica su ogni copia. `engramma sync conflicts` le elenca; le tue correzioni su una copia sono operazioni normali. Una lapide vince sulle modifiche che non l'avevano vista; chi l'aveva vista può scrivere e la nota si riapre. La `purge` domina su tutto.
+Le modifiche concorrenti del **corpo** non si perdono mai (v0.6.4):
+vince la punta col la chiave più alta — **(classe dell'autore, hlc,
+op_id)**: la mano umana batte l'agente anche più vecchia — e ogni
+perdente tiene una **copia di conflitto durevole**: una nota col tag
+`conflitto` e un arco verso l'originale, identica su ogni copia. La
+copia si chiude **solo con un testimone nell'insieme**: un'operazione
+sul suo id (la correzione, il `delete` che la risolve), o una scrittura
+del corpo che la contiene (il diff3 rigoroso dalla biforcazione) o che
+da lei discende. Un ritocco al titolo non chiude niente, e non crea
+niente: solo il corpo confligge. Il perdente **dell'agente** nasce in
+quarantena, nella coda delle proposte; il tetto tiene tre copie aperte
+visibili per nota. `engramma conflicts <cella>` le elenca,
+`engramma conflicts resolve <cella> <copia> --keep original|copy|merged`
+le risolve. Una lapide vince sulle modifiche che non l'avevano vista;
+chi l'aveva vista può scrivere e la nota si riapre. La `purge` domina
+su tutto.
 
 ## Che cosa non si promette
 

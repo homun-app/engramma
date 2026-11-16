@@ -1740,11 +1740,28 @@ impl Cell {
         let Some(json) = json else {
             return Ok(None);
         };
-        let note = crate::format::Note::from_json(
+        let mut note = crate::format::Note::from_json(
             &serde_json::from_str::<serde_json::Value>(&json)
                 .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?,
         )
         .map_err(|e| CellError::Db(format!("corrupt conflict state: {e}")))?;
+        // the stored state has no body (D5): the loser's payload is its
+        // home
+        if note.body.is_empty() {
+            if let Some(body) = inner
+                .conn
+                .query_row(
+                    "SELECT json_extract(p.body, '$.set.body') FROM op_payloads p
+                     JOIN conflict_copies cc ON cc.loser_op = p.op_id
+                     WHERE cc.copy_id = ?1 AND json_extract(p.body, '$.set.body') IS NOT NULL",
+                    [copy_id.to_string()],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                note.body = body;
+            }
+        }
         Ok(Some(note.body))
     }
 

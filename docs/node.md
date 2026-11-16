@@ -308,6 +308,40 @@ Notevoli:
   base diversa può solo consegnare gli **stessi** byte o fallire, mai
   cambiare il contenuto.
 
+### I conflitti da risolvere (v0.6.4)
+
+- `cell.conflicts(): Promise<ConflictEntry[]>` — ogni copia di conflitto
+  **aperta**: `{ copyId, originalId, loserActor, loserClass: 'human' | 'agent',
+  loserAt, quarantined, visible }`. Nessun testo nell'elenco: la copia è
+  una nota, si legge con `get` come ogni nota (una copia in quarantena
+  risponde `null` — l'oracolo chiuso vale per lei come per ogni nota
+  nascosta; la sua superficie è la coda). `visible: false` è una copia
+  oltre il tetto di tre: resta aperta, appare quando una visibile si
+  chiude.
+- `cell.resolveConflict(copyId, { keep: 'original' | 'copy' | 'merged',
+  body? }): Promise<string>` — operazioni normali con l'actor della
+  cella: `original` è un `delete` sull'id della copia; `copy` e `merged`
+  prima patchano l'originale (col corpo della copia, o col corpo dato) e
+  poi chiudono. La risoluzione con `copy` può chiudere la copia già con
+  la patch (il corpo uguale contiene il perdente): il delete diventa
+  inutile, e non è un errore. Due risoluzioni concorrenti con corpi
+  uguali non creano nulla; con corpi diversi nasce un conflitto nuovo,
+  ed è giusto così. Errori: `NOT_FOUND` per un id che non è una copia
+  (o una copia chiusa senza operazioni sue), `CONFLICT` per una copia
+  chiusa che tiene la sua riga (risolta con un delete, modificata).
+- `PEER_OUTDATED` (D4): il pari parla regole di materializzazione
+  diverse — l'ALPN `engramma/sync/2` è la versione delle regole — e
+  **nessuna operazione passa**; il messaggio nomina il dispositivo da
+  aggiornare (o dice di aggiornare questo).
+- **La convenzione degli actor** (D2): umano è `user`, ogni actor che
+  finisce in `:user` (`homun:user`), ogni actor che comincia con `user@`
+  (`user@mcp:<etichetta>`); tutto il resto è agente (`homun:bot-<id>`,
+  `homun:story`, `mcp:<etichetta>`). Su due punte concorrenti vince
+  l'umana anche se più vecchia, e il perdente d'agente nasce in
+  quarantena, nella coda. L'actor è dichiarato e non firmato: nella
+  sync personale basta (tutti gli scrittori sono sui dispositivi del
+  proprietario); nelle organizzazioni la classe sarà legata a una firma.
+
 ## Un assistente che ricorda
 
 ```js
