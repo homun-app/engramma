@@ -428,7 +428,7 @@ pub fn sync_serve_cmd(
                                         Tick::Clock => ("clock", Vec::new(), true),
                                         Tick::Write => ("write", Vec::new(), true),
                                     };
-                                    let mut received;
+                                    let mut received: Vec<(String, i64)>;
                                     let mut first = true;
                                     loop {
                                         // the first round obeys the tick
@@ -441,7 +441,7 @@ pub fn sync_serve_cmd(
                                         } else {
                                             (true, Vec::new())
                                         };
-                                        received = 0;
+                                        received = Vec::new();
                                         if run {
                                             if std::env::var("ENGRAMMA_TRACE").is_ok() {
                                                 eprintln!("worker: passo {label}");
@@ -451,8 +451,10 @@ pub fn sync_serve_cmd(
                                                     received = report
                                                         .cells
                                                         .iter()
-                                                        .map(|c| c.received)
-                                                        .sum();
+                                                        .map(|c| {
+                                                            (c.name.clone(), c.received as i64)
+                                                        })
+                                                        .collect();
                                                     if std::env::var("ENGRAMMA_TRACE").is_ok() {
                                                         for p in &report.peers {
                                                             eprintln!(
@@ -476,7 +478,7 @@ pub fn sync_serve_cmd(
                                         // is handed to another pass — the
                                         // settle must not swallow it
                                         let again = if let Ok(mut w) = watch.lock() {
-                                            w.finish_pass(received).unwrap_or(false)
+                                            w.finish_pass(&received).unwrap_or(false)
                                         } else {
                                             false
                                         };
@@ -526,14 +528,24 @@ pub fn sync_serve_cmd(
                                 let book = serve::peer_addr_of_conn(&conn).ok();
                                 if let Ok(report) = serve::answer_session(&root, conn).await {
                                     // the guard learns what this session
-                                    // ingested and from WHOM (K1): those
-                                    // rows are the sessions' own work, and
-                                    // the pass they may trigger goes toward
-                                    // the others, never back to this device
-                                    let rows: usize =
-                                        report.cells.iter().map(|c| c.received).sum();
+                                    // ingested and from WHOM (K1), PER CELL
+                                    // (v0.6.2): those rows are the sessions'
+                                    // own work, and the pass they may
+                                    // trigger goes toward the others, never
+                                    // back to this device
+                                    let rows: Vec<(String, i64)> = report
+                                        .cells
+                                        .iter()
+                                        .filter_map(|c| {
+                                            let id: [u8; 32] =
+                                                c.sync_id.as_slice().try_into().ok()?;
+                                            let name =
+                                                serve::cell_name(&root, &id).ok()?;
+                                            Some((name, c.received as i64))
+                                        })
+                                        .collect();
                                     if let Ok(mut w) = watch.lock() {
-                                        w.note_session(&device, rows);
+                                        w.note_session(&device, &rows);
                                     }
                                     // the book keeps only what it has: the
                                     // minimal row when none exists

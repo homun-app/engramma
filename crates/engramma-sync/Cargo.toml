@@ -22,12 +22,20 @@ base64ct = "1"
 hkdf.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# v0.6.2 (S1): the serve loop's stop token. Already in the lock (the CLI
+# used it): declaring it here adds no crate.
+tokio-util = "0.7"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ulid.workspace = true
 blake3.workspace = true
 rusqlite.workspace = true
+
+# v0.6.2 (S1): the exclusive root lock (`<root>/sync.lock`) is flock, via
+# libc — already in the lock (iroh, tokio): no new crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # a local iroh relay server for the tests (offline, loopback only)

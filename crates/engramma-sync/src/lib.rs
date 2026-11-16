@@ -17,6 +17,7 @@ pub mod protocol;
 pub mod registry;
 pub mod relay;
 pub mod serve;
+pub mod service;
 pub mod sharedcell;
 pub mod wire;
 pub mod words;

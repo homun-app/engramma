@@ -514,8 +514,11 @@ pub struct DataVersionWatch {
     last: Vec<(String, i64)>,
     marker: Vec<(String, (i64, i64))>,
     /// The rows the serve's own sessions ingested since the last settle,
-    /// per device that fed them — the sources a triggered pass must skip.
-    fed: std::collections::HashMap<String, usize>,
+    /// per device that fed them, PER CELL (v0.6.2, S1) — the sums of the
+    /// v0.6.1 guard let one cell's purge cover another cell's write, and
+    /// a refused-but-counted envelope in one cell read a local write in
+    /// another as session work.
+    fed: std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
     /// A pass is armed or running: the baselines settle when it ends.
     busy: bool,
     /// The log's marker as the armed pass BEGAN: what the pass may count
@@ -621,12 +624,16 @@ impl DataVersionWatch {
     }
 
     /// Note what one of the serve's own sessions ingested (K1): the rows
-    /// the session's report counts, and the device that fed them. The
-    /// next evaluation subtracts them from the log's delta — what is left
-    /// is local work, and the sources are the pass's exclusions.
-    pub fn note_session(&mut self, device: &str, rows: usize) {
-        if rows > 0 {
-            *self.fed.entry(device.to_string()).or_insert(0) += rows;
+    /// the session's report counts, PER CELL, and the device that fed
+    /// them. The next evaluation subtracts them from each cell's own
+    /// delta — what is left is local work, and the sources are the pass's
+    /// exclusions.
+    pub fn note_session(&mut self, device: &str, cell_rows: &[(String, i64)]) {
+        let per = self.fed.entry(device.to_string()).or_default();
+        for (cell, rows) in cell_rows {
+            if *rows > 0 {
+                *per.entry(cell.clone()).or_insert(0) += *rows;
+            }
         }
     }
 
@@ -646,7 +653,7 @@ impl DataVersionWatch {
             .zip(&self.marker)
             .map(|(a, b)| a.1.0 - b.1.0)
             .sum();
-        let sessions: i64 = self.fed.values().sum::<usize>() as i64;
+        let sessions: i64 = self.fed.values().flat_map(|per| per.values()).sum::<i64>();
         let decision = if delta <= 0 {
             PassDecision::None
         } else if delta > sessions {
@@ -690,13 +697,18 @@ impl DataVersionWatch {
     ///
     /// # Errors
     /// [`Error::Db`] on SQL failure.
-    pub fn finish_pass(&mut self, pass_received: usize) -> Result<bool> {
+    pub fn finish_pass(&mut self, pass_received: &[(String, i64)]) -> Result<bool> {
         let now = Self::read_markers(&self.cells, &self.root)?;
         let start = self.pass_start.clone().unwrap_or_else(|| now.clone());
         let delta: i64 = now.iter().zip(&start).map(|(a, b)| a.1.0 - b.1.0).sum();
         // the sessions' own work during the pass: what the inbound
         // sessions noted in the ledger, and what the pass itself ingested
-        let sessions: i64 = self.fed.values().sum::<usize>() as i64 + pass_received as i64;
+        let sessions: i64 = self
+            .fed
+            .values()
+            .flat_map(|per| per.values())
+            .sum::<i64>()
+            + pass_received.iter().map(|(_, n)| *n).sum::<i64>();
         let again = delta > sessions;
         self.last = Self::read(&self.cells, &self.root)?;
         self.marker = now;
