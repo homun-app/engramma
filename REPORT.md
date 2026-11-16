@@ -7578,3 +7578,104 @@ corsa è verde, e `mcp` è verde anche su macOS.
 - `2683db5` test(C5.3+C5.4), `e978915` fix(C5.3)
 - `c75d8f0` refactor(C5.5): la conferma SAS è un Future, runtime a un filo
 - `4322736` docs: DESIGN §4.3 e §12, node.md, il seme chiuso nelle regressioni
+
+## Verifica v0.6.3 (revisore, 2026-11-16)
+
+Sul tag `fase-v0.6.3` (`a236e2d`), main pulito. La macchina **non** era
+ferma: le app sul desktop (ZCode al 133% di CPU) tenevano il carico fra
+10 e 20, e lo si vede nel banco.
+
+### Cosa regge
+
+- **C1, la convergenza:** `the_fleet_converges` ed
+  `every_copy_equals_its_reconstruction` a **20 000 casi ciascuna**, in
+  release, insieme ai due testimoni e alla sequenza minima: verdi,
+  1592 s. Una corsa indipendente da quella di GLM: altri semi, stesso
+  esito. La causa scritta nel REPORT torna col codice: il percorso di
+  scrittura locale (`execute_op`) non riconciliava mai, e
+  `reconcile_after_local_write` gli fa pagare la stessa chiamata del
+  percorso d'arrivo. L'oracolo `rematerialize_for_test` ricostruisce dal
+  solo registro, materializzando oggetto per oggetto fino al punto fisso:
+  è un oracolo vero per il percorso incrementale, ma condivide con lui
+  `materialize`, quindi non giudica la regola dei perdenti in sé (vedi il
+  difetto 1).
+- **C2:** un mio figlio Node, `onEvent` **senza** rimozione e poi
+  `close()`: il processo esce in **2–3 ms**, sia a servizio spento sia
+  dopo `start()`.
+- **C3:** `test:electron-main` verde tre volte, 0,9–1,3 s dal lato del
+  chiamante; nessun `app.exit` nel file.
+- **C4:** `npm run build` verde, l'artefatto si carica; `engramma
+  --version` della CLI in release risponde `engramma 0.1.0-dev`.
+- **Il contratto JS:** `npm test` **51/51**, `test:electron` **51/51**.
+- **Gli artefatti:** gli SHA256 di `engramma.darwin-arm64.node`,
+  `index.js` e `index.d.ts` coincidono con quelli dichiarati, anche dopo
+  una ricostruzione.
+- **Linux:** `scripts/linux.sh` verde, uscita 0, **61 suite**.
+- **C5:** letti nel codice. Il pid si scrive dopo la flock con
+  `set_len(0)`; il SAS è un tratto `SasConfirm` che restituisce un
+  Future, e il runtime dell'abbinamento è `current_thread`; il cancello
+  del firmatario usa il timbro (mtime, lunghezza) di `devices.db`, che è
+  in journal rollback: ogni scrittura del registro lo muove.
+- **L'inserimento:** coppie alternate, `--notes 10000 --runs 5`,
+  `ENGRAMMA_SKIP_MODEL_TESTS=1`, note/s viva / uniform e p95
+  testo+grafo:
+
+  | corsa | viva | uniform | p95 | |
+  |---|---|---|---|---|
+  | base-1 | 2575 | 2515 | 2,1 | pulita |
+  | fase-1 | 2634 | 2666 | 2,0 / 1,9 | pulita |
+  | base-2 | 1085 | 1010 | 6,3 | disturbata |
+  | fase-2 | 2591 | 2612 | 2,1 | pulita |
+  | base-3 | 939 | 2395 | 6,8 / 5,9 | disturbata |
+  | fase-3 | 2258 | 2744 | 2,1 / 1,9 | carico 18 |
+
+  Le corse pulite danno la fase **pari o più veloce** della base
+  (coppia 1: +2,3% e +6,0% di note/s), col p95 uguale. Con la macchina
+  rumorosa non firmo un numero più fine; insieme alle tre coppie di GLM
+  (media +1,6%) non c'è segno di un peggioramento oltre il +5%.
+- **Disco:** `target/` 20 G all'inizio e alla fine (il worktree e il
+  target della base cancellati).
+
+### I difetti
+
+1. **La copia di conflitto converge, ma la regola dei perdenti la rende
+   effimera** (alto, **preesistente**, di disegno). Il perdente è «ogni
+   scrittura del corpo dopo la base del vincitore finale»
+   (`final_losers`), e ogni `patch_note` conta come scrittura del corpo
+   (`is_body_write` guarda il payload, non il campo `body`). Provato con
+   un test temporaneo, due celle A e B:
+   - A e B cambiano il corpo in concorrenza: una copia, su tutti e due.
+   - Poi A cambia **solo il titolo** dell'originale: la copia **sparisce
+     su tutti e due**. Il testo del perdente resta solo nel registro.
+   - Un **titolo** di A concorrente a un **corpo** di B produce una
+     **copia spuria** che contiene il corpo vecchio, quello di prima di
+     tutte e due le modifiche.
+
+   Sui riceventi accadeva già dalla v0.6.1 (la scorciatoia d'arrivo
+   svuota l'insieme); la v0.6.3 l'ha resa coerente anche su chi scrive.
+   È contro il DESIGN § 4.3 («una copia di conflitto visibile
+   all'utente, come fanno i sistemi di sincronizzazione maturi»), e con
+   Homun, i cui bot ritoccano spesso tag e titoli, la perdita sarebbe
+   frequente. **Va nella v0.6.4, prima della sync agli utenti.**
+
+2. **Il cancello del firmatario non è misurato dal banco** (basso). Il
+   banco d'inserimento passa per il core, che non ha cancello; la stat
+   di `devices.db` per scrittura la paga solo il binding. Il costo
+   atteso è ~1 µs su ~380 µs, ma la frase «il banco non se ne accorge»
+   non prova nulla.
+
+3. **Numeri del REPORT** (basso). Il `.node` con lo SHA dichiarato
+   misura **50 358 872 B**, non 50 380 088. E le cartelle `.tmp*` alla
+   fine erano **9**, non 0: vuote, nate fra le 16:26 e le 17:24 (le
+   corse di C5.3/C5.4), cancellate dal revisore.
+
+### Verdetto
+
+**La v0.6.3 è consegnata**: C1–C5 reggono, la convergenza tiene a
+20 000 casi su due proprietà, il contratto JS è intatto, Linux è verde.
+
+Resta il difetto 1, che è di regola e non di convergenza. **Homun può
+agganciare la v0.6.3 per lo sviluppo, ma non offrire la sync agli
+utenti prima della v0.6.4** (copie durevoli, solo il corpo crea
+conflitti, la copia si spegne quando il vincitore la contiene, la mano
+umana prima dell'agente).
