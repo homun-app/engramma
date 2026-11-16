@@ -178,3 +178,83 @@ test('a second Engine on the same root answers SYNC_BUSY at start', async () => 
   await e1.close();
   await e2.close();
 });
+
+// ---------------------------------------------------------------------------
+// v0.6.3 (C2): a listener must not keep a Node process alive. The child
+// below registers onEvent, closes the engine and lets its script END: the
+// process must exit by itself, and the unsubscribe must not throw after
+// close. Before the fix the ThreadsafeFunction was referenced and close()
+// left it in the hub: the child never exited.
+// ---------------------------------------------------------------------------
+
+const { spawn } = require('node:child_process');
+
+/**
+ * One child that registers onEvent, (maybe) starts, closes and ends.
+ * `unsubscribe` says whether it ever calls the off function — the hang the
+ * fix closes is the child that NEVER removes its listener.
+ */
+async function listenerChild(withStart, unsubscribe) {
+  const dir = fs.mkdtempSync(path.join(TMP, 'c2-'));
+  const script = `
+    const { Engine } = require(${JSON.stringify(require.resolve('..'))});
+    (async () => {
+      const e = await Engine.open({
+        root: ${JSON.stringify(dir)}, embedder: 'none', actor: 't',
+      });
+      const sync = await e.sync({ deviceName: 'laptop', relay: 'none' });
+      const off = sync.onEvent(() => {});
+      ${withStart ? 'await sync.start();' : ''}
+      await e.close();
+      ${unsubscribe ? 'off(); // after close() the unsubscribe must not throw' : '/* no removal: the listener stays */'}
+      console.log('CLOSED');
+    })().catch((err) => {
+      console.error(err && err.stack ? err.stack : err);
+      process.exitCode = 3;
+    });
+  `;
+  const child = spawn(process.execPath, ['-e', script], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  let closedAt = null;
+  child.stdout.on('data', (d) => {
+    if (String(d).includes('CLOSED')) closedAt = Date.now();
+  });
+  const exit = await new Promise((resolve, reject) => {
+    const killer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error('il figlio non è uscito da solo'));
+    }, 15000);
+    killer.unref?.();
+    child.on('exit', (code) => {
+      clearTimeout(killer);
+      resolve(code);
+    });
+    child.on('error', reject);
+  });
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { exit, closedAt };
+}
+
+test('onEvent + close(), WITHOUT removal: the process exits within 2 s', async () => {
+  const { exit, closedAt } = await listenerChild(false, false);
+  assert.equal(exit, 0, 'the child closed cleanly');
+  assert.ok(closedAt, 'the child reached the end of close()');
+  // from the end of close() the process owes nothing to anyone — the
+  // listener alone must not hold it (the reviewer measured a hang)
+  assert.ok(Date.now() - closedAt < 2000, `uscito in ${Date.now() - closedAt} ms dal close`);
+});
+
+test('onEvent + start() + close(), without removal: same exit within 2 s', async () => {
+  const { exit, closedAt } = await listenerChild(true, false);
+  assert.equal(exit, 0, 'the child closed cleanly');
+  assert.ok(closedAt, 'the child reached the end of close()');
+  assert.ok(Date.now() - closedAt < 2000, `uscito in ${Date.now() - closedAt} ms dal close`);
+});
+
+test('after close() the unsubscribe does not throw', async () => {
+  const { exit, closedAt } = await listenerChild(false, true);
+  assert.equal(exit, 0, 'off() after close() is not an error');
+  assert.ok(closedAt, 'the child reached the end of close()');
+  assert.ok(Date.now() - closedAt < 2000, `uscito in ${Date.now() - closedAt} ms dal close`);
+});
