@@ -7230,3 +7230,74 @@ Lo schema delle celle resta **20**; `devices.db` guadagna solo la riga
 
 **Verdetto: la v0.6.2 è chiusa.** S1–S4 consegnati, il contratto JS
 esteso senza rompere nulla (29+17), l'inserimento dentro la soglia.
+
+---
+
+## Verifica v0.6.2 (revisore, 2026-11-16)
+
+Sul tag `fase-v0.6.2` (`dd79a79`), main pulito, macchina altrimenti ferma.
+
+### Cosa regge
+
+- **Rust:** `cargo fmt --check` e `clippy -D warnings` puliti; `cargo test --workspace` **61 suite verdi**, nessun fallimento.
+- **Linux:** `scripts/linux.sh` verde, uscita 0, 61 suite.
+- **Il contratto JS:** `engine.test.js` identico a `fase-v0.6.1`; i test della CLI immutati da `eed2d7b` (si aggiunge solo `sync_lock_cli`). `npm test` **46/46**, `test:electron` **46/46**, `test:electron-main` verde.
+- **Gli artefatti:** gli SHA256 di `engramma.darwin-arm64.node`, `index.js` e `index.d.ts` coincidono con quelli dichiarati.
+- **S3:** `confirm` prima di `SasReady` risponde `INVALID_ARGUMENT` (letto nel codice: nessun altro stato porta a una conferma), e non esiste un'opzione che confermi da sé.
+- **S4, la latenza da JS:** 10 scritture `put` su A → evento `arrived` su B, due processi Node, loopback. **Mediana 2290 ms, massimo 2297 ms**: dentro i 5 s della spec (il test di GLM concede 25 s, il numero vero è molto sotto).
+- **S4, Electron:** un main process con il servizio acceso, una cella condivisa e una scrittura, poi **`app.quit()` vero**: il processo esce subito (anche con `onEvent` attivo, e anche con `close()` prima).
+- **L'inserimento:** due coppie alternate, `--notes 10000 --runs 5`, `ENGRAMMA_SKIP_MODEL_TESTS=1`.
+
+  | corsa | viva | uniform | p95 testo+grafo |
+  |---|---|---|---|
+  | base-1 | 2805 | 2830 | 1,8 / 1,8 |
+  | fase-1 | 2824 | 2815 | 1,8 / 1,8 |
+  | base-2 | 2822 | 2836 | 1,8 / 1,8 |
+  | fase-2 | 2758 | 2770 | 1,8 / 1,8 |
+
+  Tempo d'inserimento: coppia 1 −0,1%, coppia 2 +2,4%, **media +1,1%**: dentro il +5%. Il p95 è identico.
+
+### I difetti
+
+1. **Il difetto di convergenza è vero, e preesistente** (alto). I due testimoni di GLM riprodotti chiamando direttamente la flotta: `(7348206116156780080, 2, 19)` e `(7729712691107302376, 2, 25)` divergono, con le **stesse digestioni** dichiarate (`e86485bb…` contro `00cf8382…`). Il codice di `engramma-core/src` è **identico** fra `fase-v0.6.1` e `fase-v0.6.2`: il difetto c'era già. La mia verifica della v0.6.1 (2048 + 512×5 verdi) non l'aveva pescato per pura statistica.
+
+   **Cosa diverge** (diff di `replicated_dump`): le due copie hanno **lo stesso numero di operazioni** (15 e 15, 13 e 13). Una sola delle due ha materializzato la **copia di conflitto** (la nota `conflitto`, «il corpo di 1 su …», col suo link e le sue righe d'indice). La copia di conflitto quindi **non è funzione dell'insieme delle operazioni**: dipende dall'ordine d'arrivo. Il punto da guardare è `cell/material.rs` (`write_conflict_copy`, `reconcile_conflict_copies`).
+
+   **Peso:** nessuna operazione dell'utente si perde, ma due dispositivi mostrano memorie diverse (una nota in più, che la ricerca trova). Va chiuso prima di offrire la sync agli utenti di Homun.
+
+   Nota: `PROPTEST_RNG_SEED` con quei numeri **non** riproduce, perché sono il parametro `seed` della flotta, non il seme del generatore. I testimoni vanno scritti come `#[test]` deterministici che chiamano `fleet_run`.
+
+2. **`onEvent` tiene vivo Node dopo `close()`** (medio). In Node puro, un processo che registra `sync.onEvent(cb)` e poi chiama `engine.close()` **non esce più** (provato con timeout di 15 s, con e senza `start`). Se l'ascoltatore viene tolto prima (`off()`), il processo esce in 0 ms.
+   - **Causa:** la `ThreadsafeFunction` di ogni ascoltatore è referenziata, e `CloseTask` ferma il servizio ma non svuota l'hub.
+   - **Electron con `app.quit()` non ne soffre**, quindi Homun in produzione no. Ne soffrono gli script, i test e qualunque host Node.
+   - **Correzione:** `close` (e la fine del servizio) svuota l'hub; le tsfn nascono non referenziate, come un `EventEmitter`: l'ascoltatore non deve tenere vivo il processo.
+
+3. **`test:electron-main` non prova S4.3** (medio). Il test chiude con `app.exit(code)`, che termina il processo di forza: non passa da `app.quit()` e non ha nessun limite di 10 s. Nei fatti S4.3 regge (vedi sopra), ma il test va rifatto con `app.quit()` e un limite misurato dal chiamante.
+
+4. **Il trucco del linker cura il sintomo** (medio). La causa non è il linker ma lo **`strip`**. Cargo in release applica `strip = "debuginfo"` di default, e rustc lancia `strip -S` di Xcode 27.2, che produce il «mis-aligned LINKEDIT string pool». La prova, sul codice di `dd79a79` **senza** le due righe di `arc4random`:
+   - build di default: **rifiutata** da dyld, con lo stesso messaggio;
+   - `CARGO_PROFILE_RELEASE_STRIP=none`: **si carica**, al costo di +1,9 MB (50,4 contro 48,4 MB).
+
+   Il trucco regge per la parità del numero di simboli, quindi per caso. **Correzione:** `[profile.release.package.engramma-node] strip = "none"` (o l'equivalente che Cargo accetta) e via `arc4random`. Il controllo «la build carica l'artefatto» resta: è una buona idea.
+
+5. **Le minori:**
+   - `normalize_ticket_input` ha un ramo morto con un refuso (`"ENGGRAMMA-INVITE-V1."`, poi `let _ = payload`). Va tolto, o reso vero (accettare la forma originale tutta maiuscola).
+   - `try_lock_root` scrive il pid **prima** di prendere il lucchetto, e senza troncare. Chi trova il lucchetto occupato sovrascrive il pid di chi lo tiene. Va scritto dopo `flock`, con `set_len(0)`.
+   - Il firmatario si arma all'apertura e alla `share` di **questo** Engine. Una cella condivisa da un altro processo (la CLI) mentre Homun la tiene aperta scrive senza firma (`unsent`) finché non si riapre. Da dichiarare in `docs/node.md`, o da armare alla prima scrittura su una radice con `devices.db`.
+   - «`stop()` durante una passata» gira su un Engine **senza pari**: la passata è vuota, il test non interrompe una sessione vera. Va rifatto con due processi e una sessione in corso.
+   - La conferma del SAS **blocca un lavoratore** del runtime, e i due lavoratori ne sono l'aggiramento. Lo stato dell'arte è una conferma asincrona (un `oneshot` atteso dentro `pairing_net`), che non parcheggia nessun filo. Non bloccante.
+   - Aggiunte oltre il contratto: `CANCELLED` e `Pairing.rounds`. Accettate: sono dichiarate e servono alla UI.
+
+### Disco
+
+- `target/`: 9,8 G all'inizio.
+- Le cartelle `.tmp*` in `$TMPDIR` restano a 1 prima e dopo le suite Node e i testimoni.
+- I worktree e i target temporanei del revisore (`target/nohack`, `target/base-target`) sono cancellati.
+
+### Verdetto
+
+**La v0.6.2 è consegnata**: S1–S4 reggono, il contratto JS è esteso senza rotture e l'inserimento sta dentro la soglia.
+
+Restano aperti il difetto di convergenza preesistente (1) e i difetti 2–4. Vanno nella **v0.6.3**, da chiudere prima di offrire la sync agli utenti di Homun.
+
+Homun **può agganciare la v0.6.2 per lo sviluppo** (l'API non cambierà forma). Non deve proporre la sync fra dispositivi agli utenti prima della v0.6.3.
