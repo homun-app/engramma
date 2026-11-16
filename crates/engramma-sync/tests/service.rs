@@ -583,7 +583,8 @@ fn the_second_lock_taker_leaves_the_holders_pid_alone() {
     );
     let content = std::fs::read_to_string(dir.path().join("sync.lock")).unwrap(/* t */);
     assert_eq!(
-        content.trim(), "424242",
+        content.trim(),
+        "424242",
         "who finds the lock busy writes nothing: {content:?}"
     );
     drop(holder);

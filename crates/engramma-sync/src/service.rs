@@ -664,10 +664,12 @@ pub fn normalize_ticket_input(text: &str) -> String {
         let lowered = payload.to_lowercase();
         return format!("engramma-invite-v1.{lowered}");
     }
-    // a fully-uppercase paste of the ORIGINAL form decodes too (base32 is
-    // case-insensitive here because we wrote it)
-    if let Some(payload) = t.strip_prefix("ENGGRAMMA-INVITE-V1.") {
-        let _ = payload;
+    // v0.6.3 (C5.1): a fully-uppercase paste of the ORIGINAL form decodes
+    // too (base32 is case-insensitive here because we wrote it) — the
+    // branch was dead before: its prefix had three Gs
+    if let Some(payload) = t.strip_prefix("ENGRAMMA-INVITE-V1.") {
+        let lowered = payload.to_lowercase();
+        return format!("engramma-invite-v1.{lowered}");
     }
     t.to_string()
 }
@@ -712,15 +714,20 @@ pub fn try_lock_root(root: &Path) -> SResult<RootLockGuard> {
         .truncate(false)
         .open(&path)
         .map_err(|e| ServiceError::io(format!("{}: {e}", path.display())))?;
-    let _ = writeln!(file, "{}", std::process::id());
     #[cfg(unix)]
     {
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
         let taken = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
         if taken != 0 {
+            // v0.6.3 (C5.2): who finds the lock busy writes NOTHING — the
+            // pid in the file stays the holder's, whoever asks
             return Err(ServiceError::Busy);
         }
     }
+    // the winner alone writes its pid, truncating what an earlier holder
+    // left (a shorter pid after a longer one must not keep the tail)
+    let _ = file.set_len(0);
+    let _ = writeln!(file, "{}", std::process::id());
     #[cfg(not(unix))]
     {
         // no flock off unix: the lock is the file's existence, best effort
