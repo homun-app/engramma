@@ -6979,3 +6979,254 @@ lasciato acceso.
 
 **Verdetto: la v0.6.1 è chiusa.** K1–K3 reggono; K4 resta NON raggiunta,
 dichiarata e accettata dall'utente.
+
+
+---
+
+# v0.6.2 — l'API JS della sincronizzazione
+
+La v0.6.1 sincronizzava; la v0.6.2 la rende usabile da Homun, dentro il
+processo, senza la CLI. Quattro punti (S1–S4), il primo commit di ognuno
+il test rosso. Ambiente: macOS 27.2, arm64, Xcode 27.2, Rust 1.95; il
+`node` locale è il **25.9.0** (il Node 24 non è installato come `node`
+nativo: come l'altra volta, lo dichiaro — l'Electron di Homun in modo
+Node riporta **Node 24.22.0** e la suite gira verde anche lì).
+
+## S1 — il servizio sta nella libreria
+
+**Cosa.** `engramma_sync::service::SyncService` (`service.rs`, ~2000
+righe): tutto ciò che la CLI faceva — invito, codice, ingresso (la
+conferma SAS è un parametro a stadi, non stdin), passata, ciclo continuo
+con il guardiano, condivisione, rimozione — con gli eventi
+(`Pass`/`Arrived`/`Device`/`RemovedSelf`/`Unsent`/`Error`) che escono da
+un canale. La CLI è un guscio: parse e stampa, righe e JSON identici, e
+**i test della CLI girano immutati** (`sync_cli` 5, `sync_serve_cli` 8,
+`sync_lock_cli` 2 nuova, relay e mailbox a fianco). `--name` su
+`devices invite` e `devices code` (predefinito `portatile`); da JS è
+`deviceName`.
+
+**Il lucchetto.** `<root>/sync.lock` (flock via libc, già nell'albero):
+copre il servizio continuo e ogni passata singola; si rilascia anche se
+il processo muore. `SYNC_BUSY` in JS, riga dedicata e uscita **7** nella
+CLI. Provato anche **fra due processi** (la CLI serve × il servizio in
+libreria, in entrambe le direzioni) e nello stesso processo (due Engine
+sulla stessa radice).
+
+**Il guardiano per cella.** I due casi limite dichiarati nella v0.6.1
+sono chiusi: `DataVersionWatch` ora confronta il segnaposto e la ricevuta
+**per cella** (il registro dei «nutriti» è device → cella → righe).
+Misura a monte, fatta col CLI e sqlite3: una `purge` **aggiunge** una
+riga al registro `ops` (3 → 4) e anche la compattazione tiene le righe
+(censura i payload) — il conteggio non scende mai; la copertura
+dichiarata («un purge copre una scrittura nell'altra cella») si
+materializza quindi nel gonfiarsi del registro (una busta rifiutata
+contata come ricevuta) e nella ricevuta attribuita alla cella sbagliata.
+I test divergenti sono rossi sulla logica sommata e verdi su quella per
+cella: `an_inflated_ledger_in_one_cell_covers_no_write_in_another` e
+`the_pass_receipt_is_per_cell`; la frase letterale della spec ha il suo
+test (`a_purge_in_one_cell_covers_no_write_in_another`). I cinque test
+del guardiano della v0.6.1 restano, adattati alle firme nuove.
+
+**Due difetti trovati col probe e chiusi** (il secondo dei quali avrebbe
+appeso ogni `sync serve` di sempre):
+
+1. **La chiusura SAS che blocca un runtime a filo singolo congela il
+   filo.** Il driver dell'abbinamento aspetta la risposta dell'umano
+   dentro una chiusura sincrona; su un runtime `current_thread` la coda
+   in uscita dell'endpoint smette di trasmettere — il PAKE di A non
+   finisce mai mentre quello di B sì, e la connessione muore di idle a
+   30 s. Il driver gira su un runtime a **due lavoratori**: la chiusura
+   ne parcheggia uno, l'altro tiene il filo. Il probe a due thread con
+   chiusure bloccanti falliva a 30 s e con due lavoratori chiude in
+   0,10 s.
+2. **`serve_stop` teneva il mutex del core oltre un `await`.** Il task
+   del ciclo, sullo stesso filo, tentava la stessa lock in sincrona: il
+   filo intero si bloccava e `stop()` non rispondeva mai. La regola «mai
+   il lock oltre un await, su un filo solo» ora è scritta nel codice.
+
+**La telefonata di cortesia.** Un rimosso non può più sentire la
+rimozione dal cancello (non è più vivo). `remove` chiama il rimosso con
+una sessione in più — il cancello controlla CHI CHIAMA, e chi chiama è
+il rimuovitore: la `remove` firmata arriva come riga di registro dentro
+lo scambio, il rimosso se lo applica, emette `RemovedSelf` e **ferma il
+proprio servizio da sé**. Provato in Rust e da JS (il test S4).
+
+## S2 — l'API JS
+
+`Engine.sync(opts?)` apre (una volta per Engine) il servizio; `Sync`
+risponde `status/devices/invite/code/join/remove/share/unshare/runOnce/
+start/stop/onEvent`; `Pairing` espone `ticket`, `ticketQr`, `code`,
+`expiresAt`, `relay`, `relayWarning` e i metodi `sas/confirm/done/
+cancel`. Ogni chiamata viaggia sul pool di libuv, il servizio sta sul
+suo thread: il ciclo a eventi di Node non si blocca mai.
+
+- **Codici stabili** attraverso il `reject`, come sempre: nuovi
+  `SYNC_BUSY`, `PAIRING_EXPIRED`, `PAIRING_REJECTED`, `PAIRING_TIMEOUT`,
+  `NO_MAILBOX`, `NOT_SHARED`, `LAST_DEVICE`, più `CANCELLED` (l'abbinamento
+  annullato — aggiunto oltre la lista della spec, documentato in
+  `index.d.ts` e `docs/node.md`).
+- **`dropCell` su una cella condivisa risponde `CONFLICT`** col consiglio
+  di chiamare prima `unshare`; dopo l'unshare l'oblio procede.
+- **Un irraggiungibile in `runOnce` è una riga** del `PassView`, mai un
+  errore.
+- `index.d.ts` documenta ogni metodo (nasce dai commenti Rust); l'unione
+  TS `SyncEvent` — che napi-derive non può generare — è integrata dopo
+  ogni build da `scripts/dts-append.js`.
+- **Un nome aggiunto oltre il contratto**: `Pairing.rounds` (quante volte
+  si confronta il SAS: 1 col biglietto, 2 col codice) e l'id completo in
+  `SyncDeviceView.device` — la UI ha bisogno di sapere quante battute
+  aspettarsi e il libro degli indirizzi chiave l'id intero.
+
+## S3 — l'abbinamento da una UI
+
+Il SAS non si salta: `confirm(true)` prima che `sas()` si risolva è
+`INVALID_ARGUMENT` (provato); non esiste opzione che confermi da sola.
+La finestra della risposta è di **2 minuti** (l'ambiente dei test la
+accorcia con `ENGRAMMA_SAS_TIMEOUT_MS`); scaduta, `PAIRING_TIMEOUT` da
+entrambi i lati e nessuno appeso. `cancel()` chiude l'endpoint: chi
+annulla sente `CANCELLED`, l'altro capo — appena il suo umano risponde —
+un rifiuto pulito. `ticketQr` è il biglietto nei panni alfanumerici del
+QR (maiuscole, cifre e `$%*+-./:`): un QR in modalità alfanumerica è più
+piccolo e più leggibile; `join` accetta **entrambe le forme** (e anche la
+CLI). Il QR lo disegna Homun: il motore non dipende da librerie QR. I
+test girano su **due processi Node** veri (`__test__/sync-peer.js`, RPC
+JSON su stdin/stdout): abbinamento completo col SAS confrontato dal
+test, QR che entra, SAS negato (nessuna `add`), timeout, confirm
+prematura, cancel.
+
+## S4 — eventi e ciclo di vita
+
+Il servizio gira sul suo thread (runtime proprio, come la CLI); le
+chiamate passano da un canale e le risposte tornano con la solita
+machineria `AsyncTask`. Gli eventi pompano da un thread dedicato a un
+hub che li sparge a JS (`ThreadsafeFunction`). Numeri e fatti misurati:
+
+- `put` su A → evento `arrived` su B e nota leggibile con `list`: **entro
+  i 25 s del test** (il ciclo: guardia ≤250 ms, rimbalzo 2 s, passata).
+  La scrittura viene dallo **stesso processo** di A (una connessione
+  diversa sullo stesso file: la lezione di C4, vista da JS).
+- **30 s di silenzio → zero passate** (il riposo di K1, guardato da JS).
+- `remove` di B da A → su B l'evento `removed` e `status().serving ==
+  false` (si ferma da sé).
+- `stop()` durante una passata: si conclude **entro 5 s** (misurato:
+  ~1 s nel test); `start()` due volte non fa nulla, `stop()` a freddo
+  pure.
+- `Engine.close()` col servizio acceso: l'app Electron esce —
+  `test:electron-main` finisce in **0,4 s** in totale.
+
+**Due difetti trovati e chiusi** (i test li hanno pizzicati):
+
+1. **Gli eventi attraversavano il tsfn con la forma sbagliata** (la
+   tupla, non il valore: `e.type` indefinito) — srotolata la tupla nel
+   callback.
+2. **Le scritture del binding erano senza firma**: il cancello dei pari
+   le rifiutava (`unsent: 1`, la nota non partiva mai). Il firmatario
+   del dispositivo si arma sull'apertura e sulla condivisione delle
+   celle condivise — come la CLI ha sempre fatto; una semplice `stat`
+   evita il costo sulle radici che non hanno mai sincronizzato (la corsa
+   dei 200 open/drop di v0.4.3 P2.3 passa da quella strada).
+
+## Il contratto
+
+- `npm test`: **46/46** (i **29 test vecchi identici** più 17 nuovi);
+  `test:electron`: 46/46; `test:electron-main`: verde.
+- `cargo test --workspace` verde: `engramma-sync` (service 11, guard 8,
+  protocolli), CLI (tutte le suite), core, vault, mcp.
+- Clippy e fmt puliti (`-D warnings`).
+
+## L'inserimento non peggiora (soglia +5%)
+
+`engramma-bench --notes 10000 --runs 5` con `ENGRAMMA_SKIP_MODEL_TESTS=1`,
+base `fase-v0.6.1` in un worktree col suo `target` dentro `target/`
+(cancellato alla fine), **due coppie alternate** (base, fase, base, fase),
+macchina altrimenti ferma:
+
+| corsa | viva (note/s) | uniform (note/s) | testo+grafo p95 (ms) |
+|---|---|---|---|
+| base-1 | 2798 | 2828 | 1,8 / 1,8 |
+| fase-1 | 2833 | 2760 | 1,8 / 1,9 |
+| base-2 | 2686 | 2621 | 1,8 / 2,0 |
+| fase-2 | 2649 | 2788 | 2,0 / 1,9 |
+
+Coppia 1 (base 2813 → fase 2796,5): **−0,6%**. Coppia 2 (base 2653,5 →
+fase 2718,5): **+2,4%**. Media delle coppie: **+0,9%**, dentro il +5%.
+p95 testo+grafo: base 1,85 ms, fase 1,90 ms (**+2,7%**, 0,05 ms in
+assoluto), dentro il +5%.
+
+## Convergenza — cinque corse verdi, e un difetto PREESISTENTE trovato
+
+`PROPTEST_CASES=2048 cargo test --release -p engramma-core --test
+convergence the_fleet_converges`, **cinque corse verdi** sul codice
+finale della fase: 145,7 / 149,1 / 91,9 / 111,1 / 137,1 s. Cartelle
+`.tmp*` in `$TMPDIR` prima e dopo le corse verdi: **0 → 0** (nessuna
+perdita; il percorso verde è quello sistemato in `19d2e9e`).
+
+**E poi, in verifica, una corsa in più ha pescato un seme che fallisce.**
+La proprietà ha ancora casi vivi che non convergono: testimone
+**seed 7348206116156780080 → ridotto a 2 dispositivi, 19 giri** (digest
+divergenti `e86485bb…` contro `00cf8382…`); rieseguito su **base
+`fase-v0.6.1` con esito IDENTICO** — stesso seme ridotto, stesse
+digestioni. Non è della v0.6.2: questa fase non tocca `engramma-core`.
+Nella sessione di verifica ho visto ~12 semi fallire (un altro: seed
+`7729712691107302376`, 2 dispositivi, 25 giri); a 2048 casi per corsa,
+le prime cinque sono passate e le successive hanno incontrato il
+difetto — la frequenza è dell'ordine di un caso ogni poche migliaia.
+Il file `convergence.proptest-regressions` tracciato nel repo tiene i
+semi delle regressioni GIÀ CHIUSE (riesegnano verdi in testa a ogni
+corsa); i semi nuovi NON sono stati committati (rosseggerebbero la
+suite) — stanno qui, come testimoni. È lavoro della prossima fase: la
+priorità di v0.6.2 era non peggiorare, e il banchetto alternato dice
+che non è peggiorato.
+
+**Perdita al fallimento, pure preesistente:** il percorso di shrink di
+proptest lascia le cartelle della flotta quando l'assertione salta — la
+corso fallita ne ha lasciate **2 319 (~4 GB)**, cancellate a mano (il
+percorso verde non perde nulla, come sopra).
+
+## Linux
+
+`scripts/linux.sh` (fmt + clippy `-D warnings` + `cargo test --workspace`,
+Debian bookworm arm64, rete chiusa, sorgente in sola lettura): **verde**,
+uscita 0 — fmt, clippy e tutta la suite dei test nel container.
+
+## La build e i tre file
+
+`npm run build` (che ora **carica l'artefatto appena collegato**: un
+capovolgimento futuro del registro del linker ferma la build, non
+Homun):
+
+- `engramma.darwin-arm64.node` — SHA256 `7ceebcc1795168c8a90a266cc9bb88ec0d31b170dc144727b58c4b7d7125dddb`
+- `index.js` — SHA256 `6a440672963f2da32989bd306a91863b9ca87df2e50c6d6d15d7049e9fce8053`
+- `index.d.ts` — SHA256 `341b084ce198d6f2a6a858e73069c2e6c89f35fd3990da3fe230abcba71ab92a` (**cambia per forza**: il contratto
+  è esteso)
+
+## Il difetto del linker, e la voce GOT
+
+La prima build di rilascio della fase produceva un dylib che dyld
+rifiutava: «mis-aligned LINKEDIT string pool». Misurato: il registro dei
+simboli indiretti della v0.6.2 è **dispari** (635 voci) e la tavola delle
+stringhe scade a 4 (mod 8); la v0.6.1 ci cascava sopra per pura
+geometria (registro pari, 81 139 simboli contro 121 684). Il linker di
+Xcode 27.2 allinea a 4 in quel caso e il dyld di darwin 27.2 rifiuta.
+Proati anche `-ld_classic` e `strip -x`: stesso 4 (mod 8). La
+soluzione minimale e semantica: **un indirizzo preso di `arc4random`**
+(`black_box` in `version()`) tiene il registro pari — 337 righe di
+simboli, stringa a 0 (mod 8), carica al primo colpo.
+
+## Nessuna migrazione
+
+Lo schema delle celle resta **20**; `devices.db` guadagna solo la riga
+`sync.lock` accanto (un file, non una tabella). Nessun formato cambia.
+
+## Disco e pulizia
+
+- `du -sh target`: **15 G all'inizio, 9,8 G alla fine** (il `target/debug`
+  dell'iterazione, 14 G, è stato rimosso a fine fase; il worktree della
+  base e `target/base-target` cancellati; `/tmp/bench` cancellato).
+- Nessun processo lasciato acceso: né `sync serve`, né Node, né Electron
+  (alcuni `sync-peer` dei test erano sfuggiti allo spegnimento, chiusi).
+- `$TMPDIR` pulito: 2 319 cartelle della corsa fallita cancellate, zero
+  prima e dopo le corse verdi.
+
+**Verdetto: la v0.6.2 è chiusa.** S1–S4 consegnati, il contratto JS
+esteso senza rompere nulla (29+17), l'inserimento dentro la soglia.

@@ -187,6 +187,8 @@ pub type SResult<T> = std::result::Result<T, ServiceError>;
 pub struct DeviceView {
     /// The name its owner chose.
     pub name: String,
+    /// The device id, hex (the signing public key).
+    pub device: String,
     /// The first 8 characters of the device id.
     pub short_id: String,
     /// Is it THIS device?
@@ -432,6 +434,7 @@ enum PairingState {
 ///    `timeout`, `expired`, `cancelled`);
 /// 5. `cancel` — any moment: the pairing endpoint closes and the other
 ///    side hears a clean refusal.
+#[derive(Clone)]
 pub struct PairingHandle {
     inner: Arc<PairingInner>,
 }
@@ -1227,6 +1230,7 @@ fn device_views(root: &Path) -> SResult<Vec<DeviceView>> {
         let (last_contact, via) = book_row(root, &row.device)?;
         out.push(DeviceView {
             name: row.name,
+            device: row.device.clone(),
             short_id: row.device.chars().take(8).collect(),
             is_self: row.device == self_id,
             last_contact,
@@ -1247,6 +1251,7 @@ fn self_view(root: &Path, rows: &[MemberRow]) -> DeviceView {
         let (last_contact, via) = book_row(root, &row.device).unwrap_or((None, None));
         return DeviceView {
             name: row.name.clone(),
+            device: self_id.clone(),
             short_id: self_id.chars().take(8).collect(),
             is_self: true,
             last_contact,
@@ -1258,6 +1263,7 @@ fn self_view(root: &Path, rows: &[MemberRow]) -> DeviceView {
     // does not know it
     DeviceView {
         name: String::new(),
+        device: self_id.clone(),
         short_id: self_id.chars().take(8).collect(),
         is_self: true,
         last_contact: None,

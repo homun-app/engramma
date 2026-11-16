@@ -410,6 +410,122 @@ migrate **non tornano indietro** a un binario più vecchio (il
 irrovocabile, con `verify` verde dopo.
 
 **L'API JS della sincronizzazione** (stato, abbinamento col QR del
-biglietto, elenco dei dispositivi) resta la v0.6.x, con l'interfaccia di
-Homun: questa fase ha consegnato il demone `sync serve`, `sync run` e la
-CLI completa (`devices`, `sync`, `mailbox`, docs/sync.md).
+biglietto, elenco dei dispositivi) è arrivata nella v0.6.2 — la sezione
+qui sotto; questa fase aveva consegnato il demone `sync serve`, `sync
+run` e la CLI completa (`devices`, `sync`, `mailbox`, docs/sync.md).
+
+## La sincronizzazione dentro il processo (v0.6.2)
+
+La v0.6.2 porta il servizio **dentro** il modulo: un oggetto per Engine,
+sul suo thread, senza CLI accanto. Il ciclo è quello provato della
+v0.6.1 (il cancello all'accettazione, la passata a ogni scrittura locale
+e ogni 5 minuti, il riposo di K1) — la CLI è diventata un guscio dello
+stesso servizio e i suoi test girano immutati.
+
+```ts
+export interface SyncOpts {
+  deviceName?: string              // il nome di questo dispositivo (alla prima creazione, e quello che un join presenta); predefinito 'portatile'
+  relay?: 'default' | 'none' | { url: string }   // come i flag della CLI; si salva nella radice
+}
+export class Engine {
+  sync(opts?: SyncOpts): Promise<Sync>   // un servizio per Engine: le chiamate successive restituiscono lo stesso
+}
+export class Sync {
+  status(): Promise<SyncStatusView>          // questo dispositivo, serving, relay, le celle condivise
+  devices(): Promise<SyncDeviceView[]>       // nome, id, è-questo, ultimo contatto, diretto/relay, vivo/rimosso
+
+  invite(): Promise<Pairing>                 // col biglietto (dieci minuti, un uso)
+  code(): Promise<Pairing>                   // col codice breve (serve il nodo cieco: altrimenti NO_MAILBOX)
+  join(ticketOrCode: string): Promise<Pairing>  // entra col biglietto (entrambe le forme) o col codice
+
+  remove(name: string): Promise<RemoveView>  // rimuove e ruota le chiavi; il rimosso lo sente e si ferma da sé
+  share(cell: string): Promise<ShareView>
+  unshare(cell: string): Promise<void>       // NOT_SHARED se non è condivisa
+
+  runOnce(): Promise<PassView>               // una passata: un irraggiungibile è una riga, mai un errore
+  start(): Promise<ServeInfoView>            // il servizio continuo (SYNC_BUSY se un altro lo tiene)
+  stop(): Promise<void>                      // si conclude entro 5 s, anche a metà sessione
+
+  onEvent(cb: (e: SyncEvent) => void): () => void   // l'ascoltatore e la funzione che lo toglie
+}
+export class Pairing {
+  readonly ticket?: string; readonly ticketQr?: string   // il biglietto nelle due forme
+  readonly code?: string
+  readonly expiresAt: string; readonly relay: string | null; readonly relayWarning?: string
+  readonly rounds: number                     // quante volte si confronta il SAS (1 col biglietto, 2 col codice)
+  sas(): Promise<string>                      // le sei cifre, quando entrambi le hanno
+  confirm(same: boolean): Promise<void>       // la risposta dell'umano; prima delle cifre è INVALID_ARGUMENT
+  done(): Promise<PairingResultView>          // l'esito: l'altro dispositivo e le celle
+  cancel(): void                              // chiude ora: l'altro capo sente un rifiuto pulito
+}
+```
+
+**L'abbinamento da una interfaccia**, per intero. Sul dispositivo che
+invita:
+
+```ts
+const sync = await engine.sync({ deviceName: 'portatile', relay: 'none' });
+await sync.share('memoria');                 // la cella da consegnare (dopo il primo invito se vuoi il nome tuo)
+const pairing = await sync.invite();         // si risolve col biglietto pronto
+showQr(pairing.ticketQr);                    // maiuscole, cifre e pochi simboli: QR alfanumerico, più piccolo e leggibile
+const digits = await pairing.sas();          // le sei cifre, quando l'altro è collegato
+if (await askHuman(digits)) await pairing.confirm(true);
+const done = await pairing.done();           // { peer: { name: 'mac', … }, cells: […] }
+```
+
+Sul dispositivo che entra:
+
+```ts
+const sync = await engine.sync({ deviceName: 'mac', relay: 'none' });
+const pairing = await sync.join(ticketScanned);   // accetta il testo E la forma QR
+const digits = await pairing.sas();
+if (await askHuman(digits)) await pairing.confirm(true);
+await pairing.done();
+```
+
+Il SAS non si salta: `confirm(true)` prima che `sas()` si sia risolta è
+`INVALID_ARGUMENT`, e non esiste opzione che confermi da sé. Se l'umano
+non risponde entro due minuti è `PAIRING_TIMEOUT` (l'altro capo riceve
+un rifiuto pulito, non un appeso); un `confirm(false)` è
+`PAIRING_REJECTED` da entrambi i lati e nessuna `add` finisce
+nell'elenco. Col **codice breve** le battute sono due (l'incontro sul
+nodo cieco e il flusso del biglietto): `pairing.rounds` lo dice, e
+`sas()`/`confirm()` si ripetono.
+
+**Gli eventi** escono da `onEvent`: `pass` (una passata finita, per
+dispositivo e per cella), `arrived` (operazioni nuove applicate: la UI
+aggiorna la vista e chiama `embedPending` — i vettori non viaggiano, si
+calcolano da chi riceve), `device` (uno entra o esce, sentito da un
+altro), `removed` (questo dispositivo è stato rimosso: il servizio si
+ferma da sé, le chiavi nuove non arriveranno), `unsent` (operazioni che
+non si possono sigillare), `error` (un errore del ciclo che non lo
+ferma). Nulla di tutto ciò porta testo di note, biglietti o codici.
+
+```ts
+const off = sync.onEvent((e) => {
+  if (e.type === 'arrived') refresh(e.cell).then(() => cell.embedPending());
+});
+// …
+off();
+```
+
+**Il ciclo di vita**: il servizio gira su un thread suo; il ciclo a
+riposo non fa passate (il test lo guarda per 30 s da JS). `start()` due
+volte non fa nulla la seconda, `stop()` a servizio spento altrettanto,
+`stop()` durante una passata si conclude entro 5 s. `Engine.close()`
+ferma il servizio: un'app Electron che esce col servizio acceso non si
+appende (provato in `test:electron-main`). Le scritture fatte con
+`Cell.put` dello stesso processo accendono il guardiano come quelle di
+un processo accanto: la firma del dispositivo si arma da sola sulle
+celle condivise. **Un solo servizio per radice**: un secondo
+`engramma sync serve` sulla stessa radice (o un altro servizio nello
+stesso processo) riceve `SYNC_BUSY` — un lucchetto esclusivo del sistema
+operativo, `<root>/sync.lock`.
+
+**I codici d'errore nuovi**: `SYNC_BUSY`, `PAIRING_EXPIRED`,
+`PAIRING_REJECTED`, `PAIRING_TIMEOUT`, `NO_MAILBOX`, `NOT_SHARED`,
+`LAST_DEVICE` (e `CANCELLED` per l'abbinamento annullato), accanto ai
+soliti `NOT_FOUND`, `INVALID_ARGUMENT`, `CONFLICT`, `CLOSED`, `IO`.
+`dropCell` su una cella condivisa risponde `CONFLICT` e dice di chiamare
+prima `unshare`. Il nodo cieco resta della CLI (`mailbox add/remove`):
+non si gestisce da JS in questa fase.

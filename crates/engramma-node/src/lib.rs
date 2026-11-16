@@ -40,13 +40,13 @@ use time::OffsetDateTime;
 use ulid::Ulid;
 
 use engramma_core::Cell as CoreCell;
-use engramma_sync::service::SyncService;
 use engramma_core::Status as NoteStatus;
 use engramma_core::format::{At, Note, NoteType};
 use engramma_core::search::{Mode, Query, Semantic};
 use engramma_core::{
     CellError, Confidence, Embedder, NotePatch, PurgeReport, SearchError, Validity, VerifyReport,
 };
+use engramma_sync::service::SyncService;
 
 // ---------------------------------------------------------------------------
 // errors
@@ -2897,7 +2897,6 @@ impl Task for VaultUnbindTask {
     reject_recode!();
 }
 
-
 // ---------------------------------------------------------------------------
 // the sync service (v0.6.2, S2–S4): the JS contract over the library's
 // own SyncService — one per Engine, on the service's own thread; every
@@ -3111,16 +3110,11 @@ pub struct EventHub {
 
 impl EventHub {
     fn add(&self, l: Listener) -> u64 {
-        let id = self
-            .next
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.listeners
             .lock()
+            .map(|mut ls| ls.push((id, l)))
             .map_err(|_| transport_err("IO", "lock degli eventi avvelenato"))
-            .and_then(|mut ls| {
-                ls.push((id, l));
-                Ok(())
-            })
             .ok();
         id
     }
@@ -3292,7 +3286,12 @@ impl Task for SyncOpenTask {
                 shared
             }
         };
-        Ok((Arc::clone(&shared.service), Arc::clone(&shared.hub), name, flag))
+        Ok((
+            Arc::clone(&shared.service),
+            Arc::clone(&shared.hub),
+            name,
+            flag,
+        ))
     }
 
     fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
@@ -3548,7 +3547,9 @@ impl Task for SyncServeStartTask {
     type JsValue = ServeInfoView;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        self.service.serve_start(self.relay.clone()).map_err(io_sync)
+        self.service
+            .serve_start(self.relay.clone())
+            .map_err(io_sync)
     }
 
     fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
@@ -3713,7 +3714,11 @@ impl Task for PairingStartTask {
                 self.service
                     .join(text, &self.name, self.relay.clone())
                     .map_err(io_sync)?,
-                if text.starts_with("engramma-invite-v1") { 1 } else { 2 },
+                if text.starts_with("engramma-invite-v1") {
+                    1
+                } else {
+                    2
+                },
             ),
         };
         // resolve when the ticket (the code) is ready: the relay wait
@@ -3742,7 +3747,6 @@ impl Task for PairingStartTask {
 
     reject_recode!();
 }
-
 
 #[napi]
 impl Sync {

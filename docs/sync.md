@@ -1,9 +1,11 @@
-# La sincronizzazione (v0.6.1)
+# La sincronizzazione (v0.6.1, con il servizio in libreria dalla v0.6.2)
 
 > La v0.6.1 chiude ciò che la v0.6 dichiarava e non era: l'abbinamento in
 > rete (biglietto e codice), `sync run` e `sync serve`, il nodo cieco che
 > serve davvero, e l'identità dell'operazione che non cambia più (DESIGN
-> § 4.3.1).
+> § 4.3.1). La v0.6.2 porta il ciclo **dentro la libreria**: la CLI è un
+> guscio del servizio, il binding Node lo usa da Homun — una sola copia
+> del ciclo, non due da tenere allineate.
 
 La stessa memoria sui **tuoi** dispositivi: il portatile, il Mac di casa, più avanti il telefono. La condivisione con altre persone arriva nella v0.6.x, sopra questa base.
 
@@ -19,6 +21,19 @@ Due modi, un esito.
 **Il codice, in pratica.** `mailbox add <biglietto del nodo>` una volta per radice; poi `engramma devices code` (chi invita) e `engramma devices join <codice> --name <nome>` (chi entra). Il nodo abbina i due lati del canale e **rimesce blob opachi**: SPAKE2 e conferma di chiave viaggiano in fondo al filo, il nodo non vede il codice. Un tentativo sbagliato **brucia il canale**: un tentativo per codice, il secondo col codice giusto è rifiutato. Dopo le sei cifre, un biglietto fresco passa **sigillato** dentro il relay: l'ingresso vero corre poi in diretta fra i due dispositivi.
 
 ## Il servizio: `sync run` e `sync serve`
+
+Il ciclo vive in `engramma-sync` (`service::SyncService`): la CLI analizza
+i flag e stampa, il modulo Node risponde a Homun, e i test della CLI
+girano immutati. Chi invita per primo nomina il proprio dispositivo:
+**`--name`** su `devices invite` e `devices code` (predefinito
+`portatile`, come sempre); da JS è `deviceName` in `sync()`.
+
+**Un solo servizio per radice**: un lucchetto esclusivo del sistema
+operativo (`<root>/sync.lock`, flock — si rilascia anche se il processo
+muore) copre il servizio continuo e ogni passata singola. Un secondo
+`sync serve` sulla stessa radice — un altro processo o un altro servizio
+nello stesso — riceve un rifiuto dedicato: riga a parte e uscita 7 nella
+CLI, `SYNC_BUSY` in JS.
 
 - **`engramma sync run`**: una passata con ogni dispositivo vivo raggiungibile (e col nodo cieco configurato). Il riepilogo JSON dice, per cella, operazioni inviate e ricevute, rifiuti al cancello, conflitti, **non speditibili** e frontiera; per dispositivo, se la sessione è avvenuta, per quale strada (diretta o via relay) e perché no. **Un irraggiungibile non è un errore**: è una riga.
 - **`engramma sync serve`**: ascolta (ALPN `engramma/sync/1`), applica il cancello a ogni accettazione, e sincronizza a ogni scrittura locale (`PRAGMA data_version`, rimbalzo 2 s) e ogni 5 minuti. Si ferma pulito su SIGINT/SIGTERM. Il demone gira **accanto** a Homun sulla stessa radice: due processi, un registro, la sessione che li attraversa è provata.

@@ -344,14 +344,17 @@ The human surface of the HTTP authorization flow (state in
 ## `engramma devices` (v0.6.1)
 
 - `init` — crea `device.key` (o mostra l'esistente) e il primo dispositivo dell'elenco
-- `invite [--relay <url>|--no-relay]` — lega l'endpoint, stampa il biglietto con l'indirizzo vero e resta in attesa (10 minuti, un uso); SPAKE2 sul segreto, conferma di chiave RFC 9382, sei cifre su entrambi gli schermi
-- `code [--relay <url>|--no-relay]` — apre il canale sul nodo cieco e stampa il codice breve (`7-tigre-lago`); dopo le sei cifre un biglietto fresco passa sigillato nel relay e l'ingresso corre in diretta
+- `invite [--name <nome>] [--relay <url>|--no-relay]` — lega l'endpoint, stampa il biglietto con l'indirizzo vero e resta in attesa (10 minuti, un uso); SPAKE2 sul segreto, conferma di chiave RFC 9382, sei cifre su entrambi gli schermi. `--name` (predefinito `portatile`) nomina questo dispositivo quando l'elenco nasce qui (v0.6.2)
+- `code [--name <nome>] [--relay <url>|--no-relay]` — apre il canale sul nodo cieco e stampa il codice breve (`7-tigre-lago`); dopo le sei cifre un biglietto fresco passa sigillato nel relay e l'ingresso corre in diretta. `--name` come sopra (v0.6.2)
 - `join <biglietto-o-codice> --name <nome> [--relay <url>|--no-relay]` — l'ingresso (biglietto in diretta, codice tramite il nodo); le sei cifre si confermano su entrambi
 - `list` — nome, id corto, chiave di trasporto
 - `remove <nome>` — la `remove` firmata con la radice e il conto dell'insieme accettato, l'epoca nuova di ogni cella condivisa, le chiavi avvolte per i rimasti; tutto raggiunge gli altri alla sessione successiva. Ciò che il rimosso aveva lo tiene
 - `log` — il registro dell'elenco, con le firme
 
 ## `engramma sync` (v0.6.1)
+
+Un solo servizio per radice (v0.6.2): un lucchetto esclusivo (`<radice>/sync.lock`) copre `serve` e ogni `run`; un secondo rifiuta con una riga dedicata e uscita 7.
+
 
 - `share <cella>` — `adopt` + epoca 0; dopo la conferma la cella viaggia verso tutti i dispositivi
 - `unshare <cella>` — smette da qui; le copie altrove restano (e lo dice)
