@@ -1953,6 +1953,67 @@ impl Cell {
         dump_tables(&inner.conn, &replicated_dump_tables())
     }
 
+    /// (v0.6.3, C1 — tests only) The differential oracle: the whole
+    /// replicated state rebuilt from the LOG ALONE. The log is stored
+    /// without applying a thing, then every object materializes from its
+    /// full set of operations — the from-set reconstruction the
+    /// incremental arrival path (own writes included) must equal, whatever
+    /// order the operations landed in. Returns the rebuilt `(digest,
+    /// dump)` so a failing property can show both sides.
+    ///
+    /// Covers cells WITHOUT a compaction cut (the convergence fleet's): a
+    /// cut freezes the below-cut state in payloads that are gone, and the
+    /// reconstruction would need the anchor snapshots — `verify`'s replay
+    /// is the oracle for those.
+    ///
+    /// # Errors
+    /// [`CellError::Invalid`] on a compacted cell; [`CellError::Db`] on
+    /// SQL failure.
+    pub fn rematerialize_for_test(&self) -> Result<(String, String), CellError> {
+        let inner = self.lock()?;
+        let cut: i64 = inner.conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM snapshots",
+            [],
+            |r| r.get(0),
+        )?;
+        if cut > 0 {
+            return Err(CellError::Invalid(
+                "the oracle covers cells without a compaction cut".into(),
+            ));
+        }
+        let mut rebuild = Connection::open_in_memory()?;
+        configure(&rebuild)?;
+        let tx = rebuild.transaction()?;
+        schema::migrate(&tx)?;
+        for op in ops::read_ops(&inner.conn)? {
+            ops::store_op(&tx, &op)?;
+        }
+        // one materialization per object, to a fixpoint: an original's
+        // replay derives its copies' rows, and a copy the user edited then
+        // materializes over its derivation — one more pass settles it
+        let objects: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT DISTINCT object FROM op_objects ORDER BY object")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut last_pending: i64 = -1;
+        for _ in 0..=objects.len() {
+            for object in &objects {
+                material::materialize(&tx, object)?;
+            }
+            let pending: i64 =
+                tx.query_row("SELECT COUNT(*) FROM pending_objects", [], |r| r.get(0))?;
+            if pending == 0 || pending == last_pending {
+                break;
+            }
+            last_pending = pending;
+        }
+        let digest = replicated_digest(&tx)?;
+        let dump = dump_tables(&tx, &replicated_dump_tables())?;
+        tx.commit()?;
+        Ok((digest, dump))
+    }
+
     /// The markdown view's reconciliation state: one view's rows (last
     /// scan), path order. v0.4 (P0.1): files belong to a view.
     ///

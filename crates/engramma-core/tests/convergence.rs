@@ -1104,6 +1104,278 @@ fn fleet_run(seed: u64, devices: u32, rounds: u32) -> Fleet {
     fleet
 }
 
+// ---------------------------------------------------------------------------
+// v0.6.3 (C1): the conflict copy is a function of the SET — the reviewer's
+// witnesses, the minimal sequence behind them, and the differential oracle
+// (every copy equals its own reconstruction from the log).
+// ---------------------------------------------------------------------------
+
+/// The reviewer's witnesses (v0.6.3, C1), deterministic: two fleets the
+/// convergence property found diverging — same op COUNT on both copies, but
+/// one holds a conflict copy the other does not derive. They must converge,
+/// and every copy must equal its own reconstruction from the log.
+#[test]
+fn the_witness_fleets_converge() {
+    for &(seed, devices, rounds) in &[
+        (7348206116156780080_u64, 2_u32, 19_u32),
+        (7729712691107302376_u64, 2_u32, 25_u32),
+    ] {
+        let fleet = fleet_run(seed, devices, rounds);
+        let digests: Vec<String> = fleet
+            .cells
+            .iter()
+            .map(|c| c.replicated_digest().unwrap(/* t */))
+            .collect();
+        assert!(
+            digests.iter().all(|d| *d == digests[0]),
+            "seed {seed} did not converge: {digests:?}"
+        );
+        for cell in &fleet.cells {
+            let (rebuilt, _) = cell.rematerialize_for_test().unwrap(/* t */);
+            assert_eq!(
+                cell.replicated_digest().unwrap(/* t */),
+                rebuilt,
+                "seed {seed}: a copy disagrees with its own reconstruction"
+            );
+        }
+    }
+}
+
+/// The MINIMAL arrival sequence behind the witnesses (v0.6.3, C1), built by
+/// hand so every clock and base is exact. Six body writes on one note, in
+/// total order P < Z < H < E < T < W with Z and H concurrent (same base P):
+///
+/// - the writer's copy receives T BEFORE H: T parks (its base is not here),
+///   and H's arrival replays {P, Z, H, E, T} — the winner is T (base H) and
+///   E sits between H and T, so E becomes a conflict copy. Correct for THAT
+///   set.
+/// - then the writer writes W ITSELF (`patch_note`, base T: the newest op
+///   in its log): in the final set the winner is W and its losers are
+///   EMPTY — the copy of E must GO. The local write path never re-derived
+///   the conflict set, and the copy stayed forever on the writing device
+///   while every copy that received W as an arrival dropped it: the
+///   divergence of the witnesses.
+#[test]
+fn a_local_write_rederives_the_conflict_set() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const K: u64 = 1_800_500_000_000;
+    let note = base_note(51, "il corpo iniziale");
+    let id = note.id;
+
+    // a cell with a hand-set wall clock and a deterministic mint
+    let cell_with = |name: &str| -> (Kept, Arc<AtomicU64>) {
+        let wall = Arc::new(AtomicU64::new(K));
+        let dir = tempfile::tempdir().unwrap(/* t */);
+        let cell = Cell::open_bare(&dir.path().join(format!("{name}.sqlite"))).unwrap(/* t */);
+        let w = Arc::clone(&wall);
+        cell.inject_clock(engramma_core::hlc::HlcClock::new(
+            format!("{name}000000000x"),
+            move || w.load(Ordering::SeqCst),
+        ))
+        .unwrap(/* t */);
+        let n = Arc::new(Mutex::new(0_u64));
+        let tag = name.to_string();
+        cell.inject_minter(Arc::new(move || {
+            let mut g = n.lock().map_err(|_| engramma_core::CellError::Db("mint".into()))?;
+            *g += 1;
+            let h = blake3::hash(format!("min/{tag}/{}", *g).as_bytes());
+            let b = h.as_bytes();
+            let mut randomness: u128 = 0;
+            for x in &b[..10] {
+                randomness = (randomness << 8) | u128::from(*x);
+            }
+            let op_id = Ulid::from_parts(K, randomness);
+            let mut salt = [0_u8; 16];
+            salt.copy_from_slice(&b[10..26]);
+            Ok((op_id, salt))
+        }))
+        .unwrap(/* t */);
+        (Kept { cell, _dir: dir }, wall)
+    };
+
+    // one shared init, hand-minted (a Cell::create would mint from the
+    // process CSPRNG)
+    let init = {
+        let h = blake3::hash(b"min/c1/init");
+        let b = h.as_bytes();
+        let mut randomness: u128 = 0;
+        for x in &b[..10] {
+            randomness = (randomness << 8) | u128::from(*x);
+        }
+        let cell_id = Ulid::from_parts(K, randomness);
+        let mut salt = [0_u8; 16];
+        salt.copy_from_slice(&b[10..26]);
+        engramma_core::cell::ops::make_op(engramma_core::cell::ops::OpParts {
+            op_id: cell_id,
+            hlc: engramma_core::hlc::Hlc {
+                physical_ms: K - 1,
+                counter: 0,
+                node: "b00000000000x".into(),
+            },
+            actor: "device-b".into(),
+            kind: engramma_core::cell::ops::OpKind::Init,
+            note_id: None,
+            base: None,
+            body: serde_json::json!({ "cell_id": cell_id.to_string(), "name": "conv" }),
+            salt: salt.to_vec(),
+            device: None,
+            sig: None,
+        })
+        .unwrap(/* t */)
+    };
+
+    let (b, wb) = cell_with("b");
+    let (a, wa) = cell_with("a");
+    b.ingest_op(&init).unwrap(/* t */);
+    a.ingest_op(&init).unwrap(/* t */);
+
+    let copies_of = |cell: &Cell| -> usize {
+        cell.debug_column(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM notes n JOIN note_tags t ON t.note_id = n.id
+             WHERE t.tag = 'conflitto'",
+        )
+        .unwrap(/* t */)[0]
+            .parse()
+            .unwrap(/* t */)
+    };
+
+    // P: B creates the note; A receives it
+    wb.store(K + 1, Ordering::SeqCst);
+    b.put_note(&note, "device-b").unwrap(/* t */);
+    let ops_b0: Vec<Op> = b.ops().unwrap(/* t */);
+    let p = ops_b0
+        .iter()
+        .find(|o| o.kind.as_str() == "put_note")
+        .unwrap(/* t */)
+        .clone();
+    a.ingest_op(&p).unwrap(/* t */);
+
+    // Z (B, base P), then H (A, base P): concurrent
+    wb.store(K + 2, Ordering::SeqCst);
+    b.patch_note(
+        &id,
+        &NotePatch { body: Some("il corpo di B in Z".into()), ..Default::default() },
+        "device-b",
+    )
+    .unwrap(/* t */);
+    wa.store(K + 3, Ordering::SeqCst);
+    a.patch_note(
+        &id,
+        &NotePatch { body: Some("il corpo di A in H".into()), ..Default::default() },
+        "device-a",
+    )
+    .unwrap(/* t */);
+
+    // E (B, base Z), then T (A, base H)
+    wb.store(K + 4, Ordering::SeqCst);
+    b.patch_note(
+        &id,
+        &NotePatch { body: Some("il corpo di B in E".into()), ..Default::default() },
+        "device-b",
+    )
+    .unwrap(/* t */);
+    wa.store(K + 5, Ordering::SeqCst);
+    a.patch_note(
+        &id,
+        &NotePatch { body: Some("il corpo di A in T".into()), ..Default::default() },
+        "device-a",
+    )
+    .unwrap(/* t */);
+
+    // B receives T first (it parks: H is not here), then H — the replay of
+    // {P, Z, H, E, T} makes E the loser of T
+    let ops_a: Vec<Op> = a.ops().unwrap(/* t */);
+    let patches_a: Vec<&Op> = ops_a
+        .iter()
+        .filter(|o| o.kind.as_str() == "patch_note")
+        .collect();
+    assert_eq!(patches_a.len(), 2, "A wrote H and T");
+    let (h_op, t_op) = if patches_a[0].hlc < patches_a[1].hlc {
+        (patches_a[0], patches_a[1])
+    } else {
+        (patches_a[1], patches_a[0])
+    };
+    b.ingest_op(t_op).unwrap(/* t */);
+    b.ingest_op(h_op).unwrap(/* t */);
+    assert_eq!(
+        copies_of(&b),
+        1,
+        "H's arrival replayed {{P, Z, H, E, T}}: E is T's loser, the copy is due"
+    );
+
+    // W: B writes it ITSELF (base T, the newest op in its log) — in the
+    // final set the winner is W and the conflict set is EMPTY
+    wb.store(K + 6, Ordering::SeqCst);
+    b.patch_note(
+        &id,
+        &NotePatch { body: Some("il corpo di B in W".into()), ..Default::default() },
+        "device-b",
+    )
+    .unwrap(/* t */);
+    assert_eq!(
+        copies_of(&b),
+        0,
+        "the local write re-derives the conflict set: W (base T) has no losers"
+    );
+
+    // fresh copies of the whole set: in total order, and in B's arrival
+    // order (W as an ARRIVAL this time) — all three must agree
+    let mut union = std::collections::BTreeMap::new();
+    for op in b.ops().unwrap(/* t */).iter().chain(a.ops().unwrap(/* t */).iter()) {
+        union.insert(op.op_id.to_string(), op.clone());
+    }
+    let mut by_total: Vec<Op> = union.into_values().collect();
+    by_total.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
+    let c = copy_of("c", &by_total);
+    let mut arrival_order: Vec<Op> = vec![init.clone()];
+    for op in b.ops().unwrap(/* t */) {
+        if op.op_id != init.op_id {
+            arrival_order.push(op);
+        }
+    }
+    let d = copy_of("d", &arrival_order);
+    let (db, dc, dd) = (
+        b.replicated_digest().unwrap(/* t */),
+        c.replicated_digest().unwrap(/* t */),
+        d.replicated_digest().unwrap(/* t */),
+    );
+    assert_eq!(db, dc, "the writer's copy equals the total-order reference");
+    assert_eq!(dc, dd, "the arrival-order copy equals the total-order reference");
+    assert_eq!(copies_of(&c), 0, "the final set derives no conflict copy");
+    let (rebuilt, _) = b.rematerialize_for_test().unwrap(/* t */);
+    assert_eq!(db, rebuilt, "the writer's copy equals its own reconstruction");
+}
+
+// v0.6.3 (C1): the differential oracle — for every fleet, every copy's
+// incremental state equals the state rebuilt from the LOG ALONE (one
+// materialization per object, the from-set reconstruction). The digest
+// first; on divergence the property shows the live dump against the
+// rebuilt one.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+    #[test]
+    fn every_copy_equals_its_reconstruction(
+        seed in any::<u64>(),
+        devices in 2_u32..=4,
+        rounds in 12_u32..=28,
+    ) {
+        let fleet = fleet_run(seed, devices, rounds);
+        for cell in &fleet.cells {
+            let live = cell.replicated_digest().unwrap(/* test-only */);
+            let (rebuilt, rebuilt_dump) = cell.rematerialize_for_test().unwrap(/* test-only */);
+            prop_assert_eq!(
+                live, rebuilt,
+                "the incremental state diverged from the reconstruction\n\
+                 --- live ---\n{}\n--- rebuilt ---\n{}",
+                cell.replicated_dump().unwrap(/* test-only */),
+                rebuilt_dump
+            );
+        }
+    }
+}
+
 /// The determinism the v0.6 test only claimed (v0.6.1, P0): the same
 /// `(seed, devices, rounds)` writes, byte for byte, the same set of
 /// operations — the serialized log of two independent runs is equal. A seed
