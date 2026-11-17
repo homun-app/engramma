@@ -8032,4 +8032,13 @@ copie; è il prezzo dichiarato della profondità.
 
 ### La build e i tre file
 
+`npm run build` verde sul commit finale, l'artefatto si carica,
+`version()` risponde `0.1.0-dev`:
+
+| file | byte | SHA256 |
+|---|---|---|
+| `engramma.darwin-arm64.node` | 50 547 880 | `eb485fd35a80ccc7f8ae4e00ab1bd53e6c15ffcb8b9610c9822f58feb1a0ed16` |
+| `index.js` | 36 188 | `6a440672963f2da32989bd306a91863b9ca87df2e50c6d6d15d7049e9fce8053` |
+| `index.d.ts` | 23 046 | `83a46439830d7478e6eebb8ecb8664806303e52e64946d52d228ea1e1e84b78c` |
+
 ### Disco e pulizia
