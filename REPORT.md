@@ -7983,16 +7983,19 @@ l'elenco a cella quieta, i due D3 fra due processi accoppiati);
 
 ### La caccia e le cinque corse
 
-La caccia ha GUIDATO la fase: cinque difetti trovati e chiusi uno per
-uno (i quattro del percorso incrementale e la purga che non raggiungeva
-le copie delle copie), più la guardia della purga sugli agganci (la
-proprietà del misto di `props.rs`, a 2048 casi, falliva con la purga
-forzata che si portava dietro la derivazione di una nota purgata: «la
-purga domina» anche lì). Sul commit finale, in release:
+La caccia ha GUIDATO la fase: **sette difetti trovati e chiusi uno per
+uno** — i quattro del percorso incrementale, la purga che non
+raggiungeva le copie delle copie, la guardia della purga sugli agganci
+(la proprietà del misto di `props.rs`, a 2048 casi: la purga forzata si
+portava dietro la derivazione di una nota purgata), e la riga-nascita
+di una copia vissuta il cui perdente la lapide aveva cancellato. Sul
+commit finale, in release:
 
-- `the_fleet_converges` a **20 000** casi;
-- `every_copy_equals_its_reconstruction` a **20 000** casi;
-- `no_copy_closes_without_a_witness` (la monotonia) a **20 000** casi;
+- `the_fleet_converges` a **20 000** casi — verde, 1054,7 s;
+- `every_copy_equals_its_reconstruction` a **20 000** casi — verde,
+  785,8 s;
+- `no_copy_closes_without_a_witness` (la monotonia) a **20 000** casi —
+  verde, 588,8 s;
 - `PROPTEST_CASES=2048` con **cinque corse** della suite del core:
   **257 verdi, 0 falliti, tutte e cinque**.
 
@@ -8042,3 +8045,11 @@ copie; è il prezzo dichiarato della profondità.
 | `index.d.ts` | 23 046 | `83a46439830d7478e6eebb8ecb8664806303e52e64946d52d228ea1e1e84b78c` |
 
 ### Disco e pulizia
+
+- `target/` **2,4 G** all'inizio (prima build dopo la cancellazione del
+  revisore) e **8,7 G** alla fine — il worktree della base e il suo
+  target cancellati, il volume Docker `engramma-linux-target` rimosso;
+- cartelle `.tmp*` alla fine: **0**;
+- nessun processo lasciato acceso: né `sync serve`, né Node, né
+  Electron (il demone di Homun che gira è quello dell'utente, non
+  nostro).
