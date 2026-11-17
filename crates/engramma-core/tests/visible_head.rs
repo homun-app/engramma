@@ -323,7 +323,11 @@ fn the_no_text_lost_judge_passes_the_r4_scenario() {
     let w_hash = patch_of("DUE-di-B", ("uno\ndue\ntre".into(), Some(put_hash.clone())));
     patch_of("quattro", (seen.clone(), Some(w_hash)));
     let _ = l_hash;
-    let model = FleetModel { writes, reads, ..Default::default() };
+    let model = FleetModel {
+        writes,
+        reads,
+        ..Default::default()
+    };
     let mut saved = vec![Default::default(); 2];
     // the cells themselves, as the fleet would hold them
     let dir_c = tempfile::tempdir().unwrap(/* t */);
