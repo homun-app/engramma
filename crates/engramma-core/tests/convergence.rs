@@ -20,8 +20,8 @@ use ulid::Ulid;
 // deterministic scenarios
 mod common;
 use common::{
-    actor_of_hash, classify, judge_no_text_lost, middle_replaced, newest_body_hash_of,
-    FleetModel,
+    actor_of_hash, classify, judge_no_text_lost, middle_replaced, read_of_shown,
+    shown_body_hash_of, FleetModel,
 };
 use engramma_core::cell::conflicts::ActorClass;
 
@@ -767,7 +767,7 @@ impl Fleet {
                 let n = base_note(90 + i, &body);
                 self.notes.push(n.id);
                 let _ = cell.put_note(&n, &actor_of(dev, rng));
-                self.model.record(dev, cell, &n.id, (String::new(), None));
+                self.model.record(dev, cell, &n.id, vec![(String::new(), None)]);
             }
             Write::Patch => {
                 // v0.6.5 (E4): the RETOUCH — one patch action in three,
@@ -841,9 +841,11 @@ impl Fleet {
                     if !seen.is_empty() && rng.below(3) == 0 {
                         let (.., original) =
                             seen[rng.below(seen.len() as u64) as usize];
-                        let body_visible =
-                            cell.get(&original).map(|n| n.body).unwrap_or_default();
-                        let read_hash = newest_body_hash_of(cell, &original);
+                        let read = read_of_shown(cell, &original);
+                        let body_visible = cell
+                            .get(&original)
+                            .map(|n| n.body)
+                            .unwrap_or_default();
                         let token = ["rosso", "blu", "verde", "giallo"]
                             [rng.below(4) as usize];
                         let rewritten = middle_replaced(&body_visible, dev, &token);
@@ -855,8 +857,7 @@ impl Fleet {
                             },
                             &actor_of(dev, rng),
                         );
-                        self.model
-                            .record(dev, cell, &original, (body_visible, read_hash));
+                        self.model.record(dev, cell, &original, read);
                         return;
                     }
                     if let Some((copy, _)) = seen.get(rng.below(seen.len() as u64) as usize)
@@ -871,8 +872,22 @@ impl Fleet {
                         // being PATCHED (the task's own parenthetical):
                         // that is what the base leans on, and what the
                         // judge calls seen
-                        let on_screen = cell.get(&original).map(|n| n.body).unwrap_or_default();
-                        let on_screen_hash = newest_body_hash_of(cell, &original);
+                        // the author of a merge reads TWO texts: the note
+                        // on their screen AND the copy they are merging
+                        let note_read = read_of_shown(cell, &original);
+                        let copy_read = {
+                            let body = note.body.clone();
+                            let hash = cell
+                                .debug_column(&format!(
+                                    "SELECT o.content_hash FROM ops o
+                                     JOIN conflict_copies cc ON cc.loser_op = o.op_id
+                                     WHERE cc.copy_id = '{copy}'"
+                                ))
+                                .unwrap_or_default()
+                                .into_iter()
+                                .next();
+                            vec![(body, hash)]
+                        };
                         let merged = format!("{}\nfuso da {dev}", note.body);
                         let _ = cell.patch_note(
                             &original,
@@ -882,8 +897,9 @@ impl Fleet {
                             },
                             &actor_of(dev, rng),
                         );
-                        self.model
-                            .record(dev, cell, &original, (on_screen, on_screen_hash));
+                        let mut reads = note_read;
+                        reads.extend(copy_read);
+                        self.model.record(dev, cell, &original, reads);
                         return;
                     }
                 }
@@ -909,7 +925,7 @@ impl Fleet {
                 let (body, read) = if rng.below(2) == 0 {
                     let seen = cell.get(&id).map(|n| n.body).unwrap_or_default();
                     let rewritten = middle_replaced(&seen, dev, &token);
-                    let read_hash = newest_body_hash_of(cell, &id);
+                    let read_hash = shown_body_hash_of(cell, &id, &seen);
                     // R1: an agent leaning on a body a HUMAN hand wrote
                     if classify(&actor) == ActorClass::Agent
                         && read_hash
@@ -926,7 +942,7 @@ impl Fleet {
                     // device shows the note (E1's own premise) — and the
                     // model records what a `get` would have answered
                     let on_screen = cell.get(&id).map(|n| n.body).unwrap_or_default();
-                    let on_screen_hash = newest_body_hash_of(cell, &id);
+                    let on_screen_hash = shown_body_hash_of(cell, &id, &on_screen);
                     let fixed = format!("prima riga\ncorpo di {dev} su {id}: {token}\nterza riga");
                     (fixed, (on_screen, on_screen_hash))
                 };
@@ -938,7 +954,7 @@ impl Fleet {
                     },
                     &actor,
                 );
-                let written_id = self.model.record(dev, cell, &id, read);
+                let written_id = self.model.record(dev, cell, &id, vec![read]);
             }
             Write::CloseCopy => {
                 let seen = open_copies_of(cell);
@@ -964,7 +980,7 @@ impl Fleet {
                     n.valid_from = Some(engramma_core::format::Validity(now().get().date(), None));
                     let _ = cell.supersede(&old, &n, None, &actor_of(dev, rng));
                     self.notes.push(n.id);
-                    self.model.record(dev, cell, &n.id, (String::new(), None));
+                    self.model.record(dev, cell, &n.id, vec![(String::new(), None)]);
                 }
             }
             Write::Link => {
@@ -1008,7 +1024,7 @@ impl Fleet {
                     && let Some(id) = out.id
                 {
                     self.proposals.push(id);
-                    self.model.record(dev, cell, &id, (String::new(), None));
+                    self.model.record(dev, cell, &id, vec![(String::new(), None)]);
                 }
             }
             Write::Decide => {
@@ -1886,4 +1902,6 @@ proptest! {
         }
     }
 }
+
+
 

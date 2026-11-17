@@ -245,7 +245,7 @@ fn the_no_text_lost_judge_passes_the_r4_scenario() {
     // the model: what each author had in front of them
     let mut writes: HashMap<String, (ulid::Ulid, String, String, (String, String))> =
         HashMap::new();
-    let mut reads: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let mut reads: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
     let put_hash = {
         let mut it = a
             .ops()
@@ -258,7 +258,7 @@ fn the_no_text_lost_judge_passes_the_r4_scenario() {
             put.op_id.to_string(),
             (id, "uno\ndue\ntre".into(), put.content_hash.clone(), key.clone()),
         );
-        reads.insert(put.op_id.to_string(), (String::new(), None));
+        reads.insert(put.op_id.to_string(), vec![(String::new(), None)]);
         put.content_hash.clone()
     };
     let mut patch_of = |needle: &str, read: (String, Option<String>)| {
@@ -285,7 +285,7 @@ fn the_no_text_lost_judge_passes_the_r4_scenario() {
             .unwrap_or_default()
             .to_string();
         let key = (op.hlc.to_string(), op.op_id.to_string());
-        reads.insert(op.op_id.to_string(), read);
+        reads.insert(op.op_id.to_string(), vec![read]);
         writes.insert(op.op_id.to_string(), (id, text, op.content_hash.clone(), key));
         op.content_hash.clone()
     };
@@ -306,4 +306,162 @@ fn the_no_text_lost_judge_passes_the_r4_scenario() {
     let cells = [&*a, &*b, &c];
     let verdict = judge_no_text_lost(&cells, &model, &mut saved, "r4");
     assert!(verdict.is_ok(), "the judge must save every body: {verdict:?}");
+}
+
+/// v0.6.5 (E4 hunt): the equal-bodied follow-up. A and B concurrent
+/// over the put; B (human) wins; F descends from A with A's SAME body
+/// (the author read A and rewrote the same middle line). A's copy
+/// closes by descent (seen); F — a loser, unfiltered, unwitnessed —
+/// must keep its OPEN copy.
+#[test]
+fn the_equal_bodied_followup_keeps_its_copy() {
+    let init = shared_init("e4-followup");
+    let (x, wx) = cell_with("x");
+    let (y, wy) = cell_with("y");
+    x.ingest_op(&init).unwrap(/* t */);
+    y.ingest_op(&init).unwrap(/* t */);
+    let note = base_note(12, "nota base\nriga di mezzo\nfine");
+    let id = note.id;
+    wx.store(K + 1, Ordering::SeqCst);
+    x.put_note(&note, "user").unwrap(/* t */);
+    for op in &union(&x, &y) {
+        y.ingest_op(op).unwrap(/* t */);
+    }
+    // A (agent, on x) and B (human, on y), concurrent over the put —
+    // neither crosses yet
+    wx.store(K + 2, Ordering::SeqCst);
+    x.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("nota base\nla stessa riga nuova\nfine".into()),
+            ..Default::default()
+        },
+        "homun:bot-1",
+    )
+    .unwrap(/* t */);
+    wy.store(K + 3, Ordering::SeqCst);
+    y.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("nota base\nla mano umana\nfine".into()),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    assert_eq!(
+        body_of(&x, &id),
+        "nota base\nla stessa riga nuova\nfine",
+        "x has not seen B"
+    );
+    // F: A's author still sees A (B has not arrived), reads it, and
+    // writes the very same body over the visible head — the read-modify
+    // hand that lands where it started
+    wx.store(K + 9, Ordering::SeqCst);
+    x.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("nota base\nla stessa riga nuova\nfine".into()),
+            ..Default::default()
+        },
+        "homun:bot-1",
+    )
+    .unwrap(/* t */);
+    // everything crosses
+    for op in &union(&x, &y) {
+        x.ingest_op(op).unwrap(/* t */);
+        y.ingest_op(op).unwrap(/* t */);
+    }
+    for (name, cell) in [("x", &x), ("y", &y)] {
+        let b = body_of(cell, &id);
+        assert_eq!(b, "nota base\nla mano umana\nfine", "{name}: the human hand won");
+        let copies = open_copies(cell, &id);
+        assert_eq!(
+            copies.len(),
+            1,
+            "{name}: exactly F's copy stays open (A's closes by descent): {copies:?}"
+        );
+        assert!(
+            copies[0].1.contains("la stessa riga nuova"),
+            "{name}: F's text lives in the open copy"
+        );
+    }
+}
+
+/// The same shape, with the OTHER arrival order: F reaches the judge's
+/// device before B. The set is the set — F's copy must open either way.
+#[test]
+fn the_equal_bodied_followup_in_the_other_order() {
+    let init = shared_init("e4-followup-b");
+    let (x, wx) = cell_with("x");
+    let (y, wy) = cell_with("y");
+    x.ingest_op(&init).unwrap(/* t */);
+    y.ingest_op(&init).unwrap(/* t */);
+    let note = base_note(13, "nota base\nriga di mezzo\nfine");
+    let id = note.id;
+    wx.store(K + 1, Ordering::SeqCst);
+    x.put_note(&note, "user").unwrap(/* t */);
+    for op in &union(&x, &y) {
+        y.ingest_op(op).unwrap(/* t */);
+    }
+    wx.store(K + 2, Ordering::SeqCst);
+    x.patch_note(
+        &id,
+        &NotePatch { body: Some("nota base\nla stessa riga nuova\nfine".into()), ..Default::default() },
+        "homun:bot-1",
+    )
+    .unwrap(/* t */);
+    wy.store(K + 3, Ordering::SeqCst);
+    y.patch_note(
+        &id,
+        &NotePatch { body: Some("nota base\nla mano umana\nfine".into()), ..Default::default() },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    // F on x, while x still shows A only
+    wx.store(K + 9, Ordering::SeqCst);
+    x.patch_note(
+        &id,
+        &NotePatch { body: Some("nota base\nla stessa riga nuova\nfine".into()), ..Default::default() },
+        "homun:bot-1",
+    )
+    .unwrap(/* t */);
+    // the judge's device: put, A, F first — B LAST
+    let (z, _) = cell_with("z");
+    z.ingest_op(&init).unwrap(/* t */);
+    let mut ops = union(&x, &y);
+    ops.sort_by(|a, b| a.op_id.cmp(&b.op_id));
+    for op in &ops {
+        let body = op
+            .body
+            .as_ref()
+            .and_then(|b| b.get("set"))
+            .and_then(|set| set.get("body"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if op.kind.as_str() == "put_note" || body.contains("la stessa riga nuova") {
+            z.ingest_op(op).unwrap(/* t */);
+        }
+    }
+    let b_op = ops
+        .iter()
+        .find(|o| {
+            o.body
+                .as_ref()
+                .and_then(|b| b.get("set"))
+                .and_then(|set| set.get("body"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|t| t.contains("la mano umana"))
+        })
+        .cloned()
+        .unwrap(/* t */);
+    let before = open_copies(&z, &id);
+    z.ingest_op(&b_op).unwrap(/* t */);
+    let after = open_copies(&z, &id);
+    assert_eq!(
+        after.len(),
+        1,
+        "B's late arrival opens F's copy (before: {before:?}, after: {after:?})"
+    );
+    assert!(after[0].1.contains("la stessa riga nuova"));
 }

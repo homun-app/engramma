@@ -165,9 +165,11 @@ pub fn open_copies(cell: &Cell, original: &Ulid) -> Vec<(String, String, String)
 /// are what "the author had seen it" means.
 #[derive(Default)]
 pub struct FleetModel {
-    /// op_id → (the body its author read, the content_hash of the op
-    /// whose body that was — the fork of the containment)
-    pub reads: std::collections::HashMap<String, (String, Option<String>)>,
+    /// op_id → the bodies its author read before writing: the `get` on
+    /// their device — and, for a hand merge, the copy's body too (the
+    /// author of a merge has TWO texts in front of them). Each entry is
+    /// (body, the op whose text that was — the containment's fork)
+    pub reads: std::collections::HashMap<String, Vec<(String, Option<String>)>>,
     /// every body write ever written: op_id → (note, text, hash, key)
     pub writes: std::collections::HashMap<String, (Ulid, String, String, (String, String))>,
     /// R4: a header-only patch written right after a body write on the
@@ -194,7 +196,7 @@ impl FleetModel {
         dev: usize,
         cell: &Cell,
         note: &Ulid,
-        read: (String, Option<String>),
+        read: Vec<(String, Option<String>)>,
     ) -> Option<String> {
         let Some(op) = last_op_of(cell, note) else {
             return None;
@@ -258,25 +260,38 @@ pub fn classify(actor: &str) -> ActorClass {
     engramma_core::cell::conflicts::classify_actor(actor)
 }
 
-/// The content_hash of the newest BODY write of a note on this device.
-pub fn newest_body_hash_of(cell: &Cell, id: &Ulid) -> Option<String> {
-    // a BODY WRITE OF THIS NOTE: a patch that sets its body, a put or a
-    // supersede whose NEW note is this one (a supersede over the note
-    // writes the OTHER side — its body belongs to the new note)
+/// The op whose text the note SHOWS — the winner's word, not merely the
+/// newest writer's (a newer write may have LOST the class, and then the
+/// screen still shows someone else's body).
+pub fn shown_body_hash_of(cell: &Cell, id: &Ulid, shown: &str) -> Option<String> {
     cell.debug_column(&format!(
         "SELECT o.content_hash FROM ops o
          JOIN op_objects oo ON oo.op_id = o.op_id
          JOIN op_payloads p ON p.op_id = o.op_id
          WHERE oo.object = 'note:{id}'
-           AND ((o.kind = 'patch_note' AND o.note_id = '{id}'
-                 AND json_extract(p.body, '$.set.body') IS NOT NULL)
-             OR (o.kind IN ('put_note', 'supersede')
-                 AND json_extract(p.body, '$.note.id') = '{id}'))
+           AND (json_extract(p.body, '$.set.body') = '{shown_escaped}'
+                OR json_extract(p.body, '$.note.body') = '{shown_escaped}')
+           AND ((o.kind = 'patch_note' AND o.note_id = '{id}')
+                OR (o.kind IN ('put_note', 'supersede')
+                    AND json_extract(p.body, '$.note.id') = '{id}'))
          ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
+        shown_escaped = shown.replace('\'', "''"),
     ))
     .unwrap_or_default()
     .into_iter()
     .next()
+}
+
+/// The read of an ordinary body write: the body the device shows, and
+/// the op whose text that is.
+pub fn read_of_shown(cell: &Cell, id: &Ulid) -> Vec<(String, Option<String>)> {
+    let shown = cell.get(id).map(|n| n.body).unwrap_or_default();
+    let hash = if shown.is_empty() {
+        None
+    } else {
+        shown_body_hash_of(cell, id, &shown)
+    };
+    vec![(shown, hash)]
 }
 
 /// Who wrote the op a hash names.
@@ -559,13 +574,20 @@ pub fn judge_no_text_lost(
                     .model
                     .writes
                     .iter()
-                    .filter(|(id, (_, t, _, _))| held.contains(id.as_str()) && *t == body)
+                    .filter(|(id, (n, t, _, _))| {
+                        held.contains(id.as_str()) && *n == *note && *t == body
+                    })
                     .max_by(|a, b| a.1 .3.cmp(&b.1 .3));
-                if let Some((_, (_, _, y_hash, _))) = target {
-                    if model_contains(&parent, &text_of, &(text.clone(), hash.clone()), &body, y_hash)
-                    {
-                        continue;
-                    }
+                if let Some((_, (_, _, y_hash, _))) = target
+                    && model_contains(
+                        &parent,
+                        &text_of,
+                        &(text.clone(), hash.clone()),
+                        &body,
+                        y_hash,
+                    )
+                {
+                    continue;
                 }
             }
             // (b) an open copy carries its body
@@ -596,17 +618,30 @@ pub fn judge_no_text_lost(
                 if x_note != note || !held.contains(x_id) || x_key <= key {
                     continue;
                 }
-                let Some((read_body, read_hash)) = fleet.model.reads.get(x_id) else {
+                let Some(reads) = fleet.model.reads.get(x_id) else {
                     continue;
                 };
-                let Some(read_hash) = read_hash else { continue };
-                if model_contains(&parent, &text_of, &(text.clone(), hash.clone()), read_body, read_hash)
-                {
-                    // the text was ON A SCREEN — seen; whatever the
-                    // writer then did with it is editing, not loss (the
-                    // spec's «e il suo testo contiene L» would condemn
-                    // every first body ever rewritten; the R4 closer
-                    // still fails here: its read never held the loser)
+                let mut hit = false;
+                for (read_body, read_hash) in reads {
+                    let Some(read_hash) = read_hash else { continue };
+                    if model_contains(
+                        &parent,
+                        &text_of,
+                        &(text.clone(), hash.clone()),
+                        read_body,
+                        read_hash,
+                    ) {
+                        // the text was ON A SCREEN — seen; whatever the
+                        // writer then did with it is editing, not loss
+                        // (the spec's «e il suo testo contiene L» would
+                        // condemn every first body ever rewritten; the
+                        // R4 closer still fails here: its read never
+                        // held the loser)
+                        hit = true;
+                        break;
+                    }
+                }
+                if hit {
                     preserved = true;
                     break;
                 }

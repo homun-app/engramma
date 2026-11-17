@@ -788,13 +788,19 @@ fn has_witness(
     if applied.iter().any(|&i| ancestry.contains(i, loser)) {
         return Ok(true);
     }
-    let loser_key = key_of(&rows[loser]);
+    // the witness is a LATER write, in the TOTAL ORDER — not in the
+    // class key: a HUMAN ancestor sorts above a later AGENT write there,
+    // and «contains» its own descendant by the inclusive fork, closing
+    // the copy of the very author who had read the text (found by the
+    // E4 judge: the equal-bodied follow-up). The class decides WHO
+    // WINS; the order of time decides who comes after.
+    let loser_key = (rows[loser].hlc.as_str(), rows[loser].op_id.to_string());
     let loser_text = rows[loser].body.as_ref().map(|b| b.text.as_str());
     let Some(loser_text) = loser_text else {
         return Ok(false);
     };
     for &i in applied {
-        let key = key_of(&rows[i]);
+        let key = (rows[i].hlc.as_str(), rows[i].op_id.to_string());
         if key <= loser_key {
             continue;
         }
