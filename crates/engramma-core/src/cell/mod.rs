@@ -1273,6 +1273,18 @@ impl Cell {
         } else {
             None
         };
+        // v0.6.6 (F3): the arriving purge optimizes the hidden index only
+        // when THIS copy holds quarantined rows of the family — the same
+        // before-the-op count of the local purge (the arrival applies the
+        // same tombstones a local purge would)
+        let hidden_touched = if purge_arrival {
+            match arrival.note_id {
+                Some(purged) => ops::hidden_rows_in_family(&tx, &purged)? > 0,
+                None => false,
+            }
+        } else {
+            false
+        };
         material::arrive(&tx, &arrival)?;
         for purged in &scrubbed_notes {
             ops::scrub_log(&tx, purged)?;
@@ -1298,10 +1310,13 @@ impl Cell {
             inner.conn.pragma_update(None, "secure_delete", before)?;
         }
         if purge_arrival {
-            inner.conn.execute_batch(
-                "INSERT INTO notes_fts(notes_fts) VALUES('optimize');
-                 INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
-            )?;
+            inner.conn
+                .execute_batch("INSERT INTO notes_fts(notes_fts) VALUES('optimize');")?;
+            if hidden_touched {
+                inner.conn.execute_batch(
+                    "INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
+                )?;
+            }
             inner.conn.execute_batch("VACUUM;")?;
             if !wal_checkpoint(&inner.conn).unwrap_or(false) {
                 inner.pending_scrub = vec!["wal"];
@@ -1335,6 +1350,17 @@ impl Cell {
         // a stray -wal next to a snapshot would survive the file's VACUUM:
         // fold it in and stay in rollback-journal mode
         conn.pragma_update(None, "journal_mode", "DELETE")?;
+        // v0.6.6 (F3): which indexes does this snapshot actually carry? The
+        // current compact writes them EMPTY by construction (`delete-all`
+        // at compact, rebuilt only in the restore's copy), so their
+        // `optimize` was a no-op; a v0.3.1 snapshot with rows keeps the
+        // dance. Counted before the scrub, like the live purge's own count
+        let rows: (i64, i64) = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM notes_fts_docsize),
+                    (SELECT COUNT(*) FROM notes_fts_hidden_docsize)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         let secure_before: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
         conn.pragma_update(None, "secure_delete", "ON")?;
         {
@@ -1343,10 +1369,14 @@ impl Cell {
             ops::scrub_log_snapshot(&tx, id, censorable)?;
             tx.commit()?;
         }
-        conn.execute_batch(
-            "INSERT INTO notes_fts(notes_fts) VALUES('optimize');
-             INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
-        )?;
+        if rows.0 > 0 {
+            conn.execute_batch("INSERT INTO notes_fts(notes_fts) VALUES('optimize');")?;
+        }
+        if rows.1 > 0 {
+            conn.execute_batch(
+                "INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
+            )?;
+        }
         conn.pragma_update(None, "secure_delete", secure_before)?;
         conn.execute_batch("VACUUM;")?;
         state_digest(&conn)
@@ -1402,6 +1432,13 @@ impl Cell {
             .conn
             .query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
         inner.conn.pragma_update(None, "secure_delete", "ON")?;
+        // v0.6.6 (F3): does this purge touch the HIDDEN index at all? An
+        // index the purge never wrote to holds none of the purged stems,
+        // and its `optimize` — an O(index) merge — is pure cost. Counted
+        // BEFORE the op: the FTS delete leaves a tombstone the count could
+        // no longer see, and checking after would turn the saving into a
+        // leak (the forgetting.rs case of the quarantined note).
+        let hidden_touched: bool = ops::hidden_rows_in_family(&inner.conn, id)? > 0;
         let purge_op_id = execute_op(
             &mut inner,
             OpKind::Purge,
@@ -1414,11 +1451,16 @@ impl Cell {
         // fuses the segments and discards the deleted entries, so the STEMS of
         // the purged body leave the index too (O(index): measured on the 100k
         // bench, REPORT §v0.3.1). It runs inside the `secure_delete` window:
-        // the pages the merge frees are zeroed.
-        inner.conn.execute_batch(
-            "INSERT INTO notes_fts(notes_fts) VALUES('optimize');
-             INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
-        )?;
+        // the pages the merge frees are zeroed. The hidden twin joins only
+        // when the purge touched it (v0.6.6, F3): a quarantined body's stems
+        // live nowhere else, but an untouched index holds nothing to forget.
+        inner.conn
+            .execute_batch("INSERT INTO notes_fts(notes_fts) VALUES('optimize');")?;
+        if hidden_touched {
+            inner.conn.execute_batch(
+                "INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
+            )?;
+        }
         // the in-memory vector index drops the note with its vectors
         if let Some(st) = &mut inner.index {
             st.idx.remove(&id.to_string());

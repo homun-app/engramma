@@ -1961,6 +1961,33 @@ fn apply_unlink(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     Ok(())
 }
 
+/// (v0.6.6, F3) How many rows of the note's family — itself and its
+/// conflict copies, the same transitive closure `purge_conflict_copies`
+/// walks — sit in the HIDDEN index right now. The purge's disk hygiene
+/// optimizes that index only when this is non-zero: an index the purge
+/// never wrote to holds none of the purged stems, and merging its
+/// segments is pure cost (the 10 000-note probe measured it, REPORT
+/// §v0.6.6). Counted BEFORE the purge op: the FTS `delete` leaves a
+/// tombstone the count could no longer see.
+///
+/// # Errors
+/// [`CellError::Db`] on SQL failure.
+pub(crate) fn hidden_rows_in_family(conn: &Connection, id: &Ulid) -> Result<i64, CellError> {
+    conn.query_row(
+        "WITH RECURSIVE fam(id) AS (
+             SELECT ?1
+             UNION
+             SELECT cc.copy_id FROM conflict_copies cc JOIN fam ON cc.original_id = fam.id
+         )
+         SELECT COUNT(*) FROM fam f
+         JOIN notes n ON n.id = f.id
+         JOIN notes_fts_hidden_docsize h ON h.id = n.rowid",
+        [id.to_string()],
+        |r| r.get(0),
+    )
+    .map_err(CellError::from)
+}
+
 /// The right to be forgotten (DESIGN §4.4). Removes the note, its versions,
 /// the edges it declares, its vectors and FTS row, the entities left with no
 /// references, and **forgets the payloads** of every operation about the
