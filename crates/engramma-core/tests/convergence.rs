@@ -998,6 +998,9 @@ proptest! {
             .map(|c| c.replicated_digest().unwrap(/* test-only */))
             .collect();
         let first = digests[0].clone();
+        if !digests.iter().all(|d| *d == first) {
+            eprintln!("CASE-FLEET seed {seed} devices {devices} rounds {rounds}");
+        }
         prop_assert!(
             digests.iter().all(|d| *d == first),
             "the fleet did not converge: {digests:?}"

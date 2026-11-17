@@ -503,7 +503,11 @@ pub(crate) fn after_replay(
     // own ops park forever (found by the oracle on the phased fleet)
     let mut planned: Vec<Ulid> = Vec::new();
     for (i, row) in rows.iter().enumerate() {
-        if row.body.is_none() || !applied.contains(&i) {
+        let _ = i;
+        // a birth row is a BASE, not a standing: the loser may even be
+        // one the lapide erased (its state arrives from the replay's
+        // erased_states) — the copy lived, its note replays over the row
+        if row.body.is_none() {
             continue;
         }
         let copy_id = material::conflict_copy_id(&row.hash, hlc_ms_of(&row.hlc));

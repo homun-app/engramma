@@ -504,6 +504,10 @@ fn materialize_note(
     // had applied
     let mut pending_since: Option<String> = None;
     let mut events: Vec<ReplayEvent> = Vec::new();
+    // v0.6.4: the states the lapide's rollback erases — a lived copy's
+    // birth row still wants its loser's state
+    let mut erased_states: std::collections::HashMap<String, crate::format::Note> =
+        std::collections::HashMap::new();
     let purged = note_purged_in_set(tx, id)?;
     for op in &all {
         // v0.6.1 (P0): an operation whose base is nowhere in the log has
@@ -583,8 +587,14 @@ fn materialize_note(
                 // conflict rules too: no tips, no copies. A body the user's
                 // delete explicitly discarded unseen must not come back as a
                 // "winner" the derivation resurrects over the tombstone.
+                // But a copy that LIVED (it has operations of its own) keeps
+                // its birth row — and the row's state comes from here, before
+                // the erasure (found by the 20 000 hunt, seed
+                // 9942741803736828218)
                 for e in events.iter_mut().skip(pos + 1) {
-                    e.body = None;
+                    if let Some((state, _)) = e.body.take() {
+                        erased_states.insert(e.hash.clone(), state);
+                    }
                 }
             }
             match ops::apply_scoped(tx, op, Scope::Note(*id)) {
@@ -617,7 +627,7 @@ fn materialize_note(
         .filter(|e| e.body.is_some())
         .map(|e| e.hash.clone())
         .collect();
-    let states: std::collections::HashMap<String, crate::format::Note> = events
+    let mut states: std::collections::HashMap<String, crate::format::Note> = events
         .iter()
         .filter_map(|e| {
             e.body
@@ -625,6 +635,7 @@ fn materialize_note(
                 .map(|(state, _)| (e.hash.clone(), state.clone()))
         })
         .collect();
+    states.extend(erased_states);
     super::conflicts::after_replay(tx, id, &applied, &states)?;
     restore_hlc_watermark(tx, watermark, None)?;
     Ok(())
