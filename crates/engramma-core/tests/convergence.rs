@@ -2040,13 +2040,32 @@ proptest! {
                 }
                 // absent → present (v0.6.5, E2): a closed copy that is
                 // open again — only a winner-following rebirth may come
-                // back; a witnessed close never does
-                for (copy, _, _) in is {
+                // back; a witnessed close never does. v0.6.6 (F1): ONE
+                // more declared exception, symmetric to the close
+                // direction's own lapide clause — the original holds a
+                // LAPIDE. Wherever it does, «la regola della lapide…
+                // domina anche sulla durabilità» (DESIGN § 4.3) and the
+                // conflict set follows the lapide line, not the
+                // witnesses: a rebirth there follows rules of the
+                // lapide's own, whether it was already there at the
+                // close or arrived after it. Found by the restored
+                // property itself, twice: at 20 000 cases (seed
+                // 3753902730771729170 — the copy closes when the second
+                // delete lands, reopens while the note stays deleted,
+                // the witness still in the set, every device agreeing)
+                // and in the first teeth run against the v0.6.4 class
+                // key (seed 11196124333436581516, 6 018 successes — that
+                // flap was lapide-driven too: the E2 ledger had simply
+                // never met a lapide-note rebirth in 512–3 000 cases).
+                // On a note the lapide never touched, a witnessed close
+                // still never reopens.
+                for (copy, original, _) in is {
                     if let Some((witnessed_close, deserved_close)) =
                         closed_at[dev].remove(copy)
                     {
                         prop_assert!(
-                            !witnessed_close && !deserved_close,
+                            (!witnessed_close && !deserved_close)
+                                || lapide_active(&runner.fleet.cells[dev], original),
                             "seed {seed}: copy {copy} reopened — it closed \
                              witnessed ({witnessed_close}) or deserved ({deserved_close})"
                         );
