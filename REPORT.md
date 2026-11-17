@@ -8053,3 +8053,107 @@ copie; è il prezzo dichiarato della profondità.
 - nessun processo lasciato acceso: né `sync serve`, né Node, né
   Electron (il demone di Homun che gira è quello dell'utente, non
   nostro).
+
+## Verifica v0.6.4 (revisore, 2026-11-17)
+
+Sul tag `fase-v0.6.4` (`a8322cd`), build e test rifatti sulla macchina del
+revisore. Le prove dei difetti stanno in un test di scarto
+(`zz_review_v064.rs`, tolto dal repo, copia nello scratchpad del revisore).
+
+### Cosa regge
+
+- **La build** riproduce i tre SHA256 e la dimensione del `.node`
+  dichiarati (50 547 880 B): i numeri questa volta sono quelli misurati.
+- **I due difetti della verifica v0.6.3 sono chiusi**: un titolo
+  sull'originale non chiude la copia, un titolo concorrente a un corpo non
+  crea copie spurie (test deterministici, e il revisore li ha rifatti a
+  mano).
+- **D2, D3, D4** fanno quello che la spec chiede: la classe dell'autore, la
+  quarantena nella coda, `conflicts`/`resolveConflict` da JS e CLI con
+  `NOT_FOUND`/`CONFLICT`, l'ALPN `sync/2` e `mailbox/2` con `PEER_OUTDATED`.
+- **D5** si è fermato alla soglia mancata e l'ha scritto, come chiesto.
+- **D6**: il cancello del firmatario a +1,68%, entro soglia.
+- **L'inserimento** a −2,5%, p95 pari; la caccia come guida della fase ha
+  trovato e chiuso sette difetti veri del percorso incrementale.
+- **La pulizia**: zero `.tmp*`, nessun processo nostro acceso.
+
+**Le corse del revisore.** `npm run build` riproduce gli stessi tre SHA.
+`npm test` e `test:electron` danno 54/54. La suite del core in release è
+verde, `protocol_version` è verde, e alla fine restano 0 `.tmp*`. La
+caccia a 20 000 casi non è stata rifatta: i difetti qui sotto vengono da
+scenari deterministici, non dalla flotta.
+
+### I difetti
+
+1. **Il testo di un perdente si perde ancora, anche senza classi
+   (bloccante).** La `base` di una scrittura locale è «l'ultima operazione
+   della nota per HLC», non l'operazione **il cui corpo l'autore stava
+   guardando**. Con le copie durevoli le due cose divergono: il perdente L
+   è applicato (vive come copia), ma il corpo visibile è del vincitore W.
+   Il testimone «discendente» (aggiunto nella fase, REPORT «Dove le regole
+   si toccano», punto 2) prende la catena di `base` per «l'ha visto», e
+   chiude la copia di L senza che il suo testo sia da nessuna parte.
+   - *Prova R4, solo `homun:user`:* A scrive il corpo L, poi **solo il
+     titolo** (più nuovo di W); B scrive il corpo W in mezzo. Dopo la sync
+     la nota mostra W e la copia di L è aperta: giusto. B aggiunge una riga
+     al corpo che vede: la sua `base` è la patch del titolo, che discende
+     da L. **La copia di L chiude su tutti e due i dispositivi, e «DUE-di-A»
+     non è più in nessuna nota.** È il difetto dell'effimera della v0.6.3
+     rientrato dalla porta del discendente, e con Homun è frequente: i bot
+     ritoccano titoli e tag dopo aver scritto il corpo.
+   - *Prova R1, con le classi:* la mano umana vince più vecchia, il bot
+     rilegge la nota (vede il corpo umano) e aggiunge una riga. La sua
+     `base` è la sua vecchia scrittura (più nuova per HLC): la scrittura
+     nuova resta concorrente all'umana, **finisce in quarantena**, e la
+     nota non cambia. Ogni scrittura successiva del bot su quella nota fa
+     la stessa fine finché un umano non risolve. In più la copia della
+     prima scrittura del bot chiude per «discendente», ma il suo testo
+     non c'è più da nessuna parte.
+   - *Perché la caccia non l'ha visto:* la proprietà di monotonia accetta
+     il discendente come testimone, quindi giudica con la stessa premessa
+     sbagliata del codice. Serve un giudice che non legga la `base`.
+2. **Una copia chiusa si riapre (la spec diceva il contrario).** La
+   biforcazione del test di contenimento è `F = nca(perdente, vincitore)`.
+   Quando il vincitore cambia (una punta umana che arriva tardi), F si
+   sposta, e una scrittura che conteneva il perdente rispetto alla F di
+   prima non lo contiene più.
+   - *Prova R2:* la copia di L chiusa dalla fusione a mano W2 **si riapre
+     con lo stesso id** quando arriva la punta umana H.
+   - *La colpa è anche della spec*, che definiva F rispetto al vincitore.
+     La proprietà di monotonia guarda solo presente→assente, mai
+     assente→presente, e il DESIGN § 4.3 scrive «aggiungere operazioni non
+     riapre mai una copia chiusa», che oggi è falso.
+3. **Il diff3 è quadratico in tempo e in memoria.** È una tabella LCS
+   (n+1)×(m+1) di `u32`, e gira per ogni coppia (perdente, scrittura
+   successiva) a ogni riderivazione.
+   - *Prova R3:* una nota da 20 000 righe costa **1,4 s e 1,68 GB di RSS
+     per un solo diff3**; a 5 000 righe sono 108 ms.
+   - Engramma non ha un tetto alla dimensione del corpo: un documento
+     importato in conflitto può far morire il processo per memoria, anche
+     all'arrivo di una sync.
+4. **D5: la crescita «delle righe derivate» è stimata, non misurata.** Il
+   banco confronta la flotta in conflitto con una flotta che non ha le due
+   scritture in più per nota. Il «~9–10 punti» per le righe della copia è
+   quindi una stima. Le stesse misure dicono anche che una copia di un
+   corpo di ~70 B costa nell'ordine di 3 KB di righe derivate: va vista
+   tabella per tabella.
+5. **Il testo di una copia in quarantena non si legge da JS.** Il
+   contratto dice «la copia è una nota, leggila con `get`», ma `get`
+   risponde `null` per le note in quarantena, e in JS non c'è nessuna
+   API della coda. Le copie in quarantena sono 126 su 138 nella flotta.
+   Homun può elencare i conflitti, ma non può mostrare all'utente che
+   cosa sta scegliendo (si arriva al testo solo con
+   `list({status:['quarantined']})` e un filtro per id).
+6. **Minori.**
+   - Il DESIGN § 12 ha una riga vuota fra v0.6.3 e v0.6.4, che spezza la
+     tabella, e una colonna in più. Refusi: «scritura», «differsca».
+   - La purga rallenta del 24% (290 → ~360 ms): è dichiarata, ma non era
+     in nessuna soglia. Va tenuta d'occhio.
+
+### Verdetto
+
+**v0.6.4 non consegnata.** D2–D6 reggono e la caccia ha fatto un lavoro
+vero. Ma la promessa della fase, «un conflitto si chiude solo con qualcosa
+che l'ha visto», è ancora rotta: il testo di un perdente si perde con una
+patch di titolo sul ramo perdente, cioè proprio il caso d'uso di Homun. La
+sync resta chiusa agli utenti di Homun. Correzione nella v0.6.5.
