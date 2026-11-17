@@ -7983,12 +7983,18 @@ l'elenco a cella quieta, i due D3 fra due processi accoppiati);
 
 ### La caccia e le cinque corse
 
-Su questo commit finale, in release:
+La caccia ha GUIDATO la fase: cinque difetti trovati e chiusi uno per
+uno (i quattro del percorso incrementale e la purga che non raggiungeva
+le copie delle copie), più la guardia della purga sugli agganci (la
+proprietà del misto di `props.rs`, a 2048 casi, falliva con la purga
+forzata che si portava dietro la derivazione di una nota purgata: «la
+purga domina» anche lì). Sul commit finale, in release:
 
 - `the_fleet_converges` a **20 000** casi;
 - `every_copy_equals_its_reconstruction` a **20 000** casi;
 - `no_copy_closes_without_a_witness` (la monotonia) a **20 000** casi;
-- `PROPTEST_CASES=2048` con **cinque corse** della suite del core.
+- `PROPTEST_CASES=2048` con **cinque corse** della suite del core:
+  **257 verdi, 0 falliti, tutte e cinque**.
 
 ### Linux
 
