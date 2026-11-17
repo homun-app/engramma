@@ -8448,3 +8448,44 @@ I difetti che bloccavano la v0.6.4 sono chiusi e il revisore li ha
 provati indipendentemente. **La sync agli utenti si apre solo dopo la
 caccia lunga** (4 × 20 000 casi e 5 × 2048), da far girare in una
 finestra tranquilla o a priorità minima di notte.
+
+### Caccia lunga del revisore (2026-11-17, sera)
+
+Sul tag `fase-v0.6.5`, in sequenza, a priorità minima (`nice -n 19`,
+due job di cargo, due fili di test, `caffeinate -i`), carico del Mac fra
+4 e 7 per tutta la corsa.
+
+| Corsa | Casi | Esito | Tempo |
+|---|---|---|---|
+| `the_fleet_converges` | 20 000 | verde | 924 s |
+| `every_copy_equals_its_reconstruction` | 20 000 | verde | 867 s |
+| `no_body_text_is_lost` | 20 000 | verde | 665 s |
+| suite del core, corsa a | 2048 | verde | 811 s |
+| suite del core, corsa b | 2048 | verde | 740 s |
+| suite del core, corsa c | 2048 | verde | 748 s |
+| suite del core, corsa d | 2048 | verde | 757 s |
+| suite del core, corsa e | 2048 | verde | 756 s |
+
+Totale 1 h 44 min, zero fallimenti, zero `panicked`. Alla fine restano 0
+`.tmp*` in `$TMPDIR` e nessun processo nostro acceso.
+
+**Difetto nuovo trovato durante la caccia (bloccante per la sync agli
+utenti).** Le proprietà a 20 000 casi sono **tre, non quattro**. Il commit
+`434759c` (E4, il giudice «nessun testo perso») ha tolto da
+`convergence.rs` la proprietà di monotonia
+`no_copy_closes_without_a_witness`, insieme al registro delle riaperture
+che `84e9586` (E2) le aveva appena aggiunto. Il REPORT della fase dichiara
+«quattro proprietà verdi», e il revisore l'ha ripetuto nella verifica
+sopra: è falso.
+- *Che cosa manca:* il giudice E4 controlla che il testo non si perda, ma
+  non che una copia chiusa resti chiusa. Oggi la regola «aggiungere
+  operazioni non riapre mai una copia chiusa» (DESIGN § 4.3) è guardata
+  solo dal test deterministico R2, non dalla flotta.
+- *Che cosa serve:* rimettere la proprietà, con il controllo
+  assente→presente e le eccezioni dichiarate in § 4.3, e cacciarla a
+  20 000 casi. Le due proprietà non sono sostituibili: una giudica il
+  testo, l'altra la storia delle copie.
+
+**Verdetto aggiornato.** La v0.6.5 resta consegnata per lo sviluppo di
+Homun. La sync agli utenti **non si apre ancora**: si apre quando la
+monotonia è tornata ed è verde a 20 000 casi.
