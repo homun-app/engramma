@@ -28,8 +28,9 @@ use crate::registry::{DeviceRegistry, RegistryOp};
 use crate::sharedcell::SharedCell;
 use crate::{Error, Result};
 
-/// The mailbox protocol's ALPN.
-pub const MAILBOX_NET_ALPN: &[u8] = b"engramma/mailbox/2";
+/// The mailbox protocol's ALPN — the rules version rides with the sync
+/// one (D4: a v0.6.5 device must refuse a v0.6.4 mailbox too).
+pub const MAILBOX_NET_ALPN: &[u8] = b"engramma/mailbox/3";
 /// The mailbox protocol's version.
 pub const MAILBOX_VERSION: u64 = 1;
 /// A frame is at most 1 MiB.

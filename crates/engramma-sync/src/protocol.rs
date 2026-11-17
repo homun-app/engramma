@@ -28,13 +28,15 @@ use crate::registry::DeviceRegistry;
 use crate::{Error, Result};
 
 /// The ALPN of the sync protocol — and the version of the
-/// materialization rules (v0.6.4, D4): every change of the derivation
-/// bumps it, and peers on different versions refuse each other before a
-/// single operation moves.
-pub const ALPN: &[u8] = b"engramma/sync/2";
+/// materialization rules (v0.6.4, D4; v0.6.5 brings the 3): every change
+/// of the derivation bumps it, and peers on different versions refuse
+/// each other before a single operation moves. The v0.6.5 changes: the
+/// `base` of a local write is the visible head, the containment witness
+/// forks per pair, the lapide's reopening judges the closed line.
+pub const ALPN: &[u8] = b"engramma/sync/3";
 /// The protocol version this build speaks (kept in the hello as a
 /// belt-and-braces check: the ALPN already gates the rules).
-pub const PROTOCOL_VERSION: u64 = 2;
+pub const PROTOCOL_VERSION: u64 = 3;
 /// A message is at most 1 MiB.
 pub const MAX_MESSAGE: usize = 1024 * 1024;
 

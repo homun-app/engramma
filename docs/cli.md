@@ -359,13 +359,14 @@ Un solo servizio per radice (v0.6.2): un lucchetto esclusivo (`<radice>/sync.loc
 - `share <cella>` — `adopt` + epoca 0; dopo la conferma la cella viaggia verso tutti i dispositivi
 - `unshare <cella>` — smette da qui; le copie altrove restano (e lo dice)
 - `run [--relay <url>|--no-relay]` — una passata con ogni dispositivo vivo raggiungibile e il nodo cieco configurato, poi esce; il riepilogo JSON dice inviate/ricevute/rifiuti/conflitti/frontiera per cella, e per dispositivo se la sessione è avvenuta e per quale strada (diretta o via relay) — un irraggiungibile è una riga, non un errore
-- `serve [--relay <url>|--no-relay]` — in ascolto (ALPN `engramma/sync/1`), cancello all'accettazione, sincronizza a ogni scrittura locale (rimbalzo 2 s) e ogni 5 minuti; stop pulito su SIGINT/SIGTERM; convive con un altro processo che scrive sulla stessa radice. La scelta del relay si salva nella radice: la si dà una volta, non a ogni avvio (un flag esplicito vince)
+- `serve [--relay <url>|--no-relay]` — in ascolto (ALPN `engramma/sync/3`), cancello all'accettazione, sincronizza a ogni scrittura locale (rimbalzo 2 s) e ogni 5 minuti; stop pulito su SIGINT/SIGTERM; convive con un altro processo che scrive sulla stessa radice. La scelta del relay si salva nella radice: la si dà una volta, non a ogni avvio (un flag esplicito vince)
 - `status` — per cella: dispositivi, ultima sessione, operazioni in attesa, frontiera stabile, epoca
 - `conflicts` — le copie di conflitto che questa copia tiene
+- `conflicts show <cella> <copia>` (v0.6.5) — una copia per intero: il corpo dell'originale, il corpo alla biforcazione e il corpo della copia — anche per una copia in quarantena, che `get` non mostra mai; una copia inesistente o chiusa risponde «non è una copia di conflitto aperta»
 
 ## `engramma mailbox` (v0.6.1)
 
-- `serve --root <dir> [--relay <url>|--no-relay]` — il nodo cieco in esecuzione (ALPN `engramma/mailbox/1`, ritenzione 180 giorni): stampa il proprio biglietto, deposito/enumerazione/consegna, purge firmata, incontro dei codici
+- `serve --root <dir> [--relay <url>|--no-relay]` — il nodo cieco in esecuzione (ALPN `engramma/mailbox/3`, ritenzione 180 giorni): stampa il proprio biglietto, deposito/enumerazione/consegna, purge firmata, incontro dei codici
 - `add <biglietto del nodo>` — registra il nodo e gli consegna l'elenco firmato
 - `status` — ultimo contatto, buste conservate (conteggio e byte, chiesti al nodo), ritenzione
 - `remove` — la radice lo dimentica

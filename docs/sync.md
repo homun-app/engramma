@@ -98,17 +98,20 @@ Un estraneo che si finge un dispositivo: la connessione si chiude **prima di qua
 
 **Quello che il dispositivo aveva già lo tiene**: la revoca non cancella i dischi altrui. Le sei cifre e il biglietto monouso sono le difese dell'**abbinamento**; la rotazione è la difesa del **dopo**.
 
-## La versione delle regole (v0.6.4)
+## La versione delle regole (v0.6.5)
 
 L'ALPN **è** la versione delle regole di materializzazione:
-`engramma/sync/2` (e `engramma/mailbox/2` per la casella postale). Un
-dispositivo v0.6.3 e uno v0.6.4, davanti allo stesso insieme di
-operazioni, derivano stati diversi — quindi non devono scambiare
+`engramma/sync/3` (e `engramma/mailbox/3` per la casella postale). Un
+dispositivo con regole diverse, davanti allo stesso insieme di
+operazioni, deriva stati diversi — quindi non devono scambiare
 nemmeno un'operazione. Il rifiuto avviene all'handshake: chi chiama
 riceve `PEER_OUTDATED` (in JS, con il nome del dispositivo da
-aggiornare), chi risponde non vede nemmeno la connessione. Ogni futuro
-cambio della derivazione alza la versione: la v0.7 delle organizzazioni
-sarà `engramma/sync/3`.
+aggiornare), chi risponde non vede nemmeno la connessione. Ogni cambio
+della derivazione alza la versione: la v0.6.5 porta la `3` perché
+cambiano la `base` di una scrittura locale (la testa visibile), il
+testimone di contenimento (la biforcazione è fra perdente e testimone)
+e la riapertura della lapide (la linea chiusa); la v0.7 delle
+organizzazioni alzerà ancora.
 
 ## I conflitti
 

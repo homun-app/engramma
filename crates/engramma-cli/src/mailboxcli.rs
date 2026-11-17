@@ -50,7 +50,7 @@ pub fn serve(json: bool, dir: &Path, flag: Option<RelayChoice>) -> Result<(), Cl
                         "serving": dir.display().to_string(),
                         "ticket": serde_json::from_str::<serde_json::Value>(&ticket)
                             .unwrap_or(serde_json::Value::Null),
-                        "alpn": "engramma/mailbox/1",
+                        "alpn": "engramma/mailbox/3",
                         "retention_days": engramma_sync::mailbox::RETENTION_DAYS,
                         "relay": minted.relay,
                     });
@@ -62,7 +62,7 @@ pub fn serve(json: bool, dir: &Path, flag: Option<RelayChoice>) -> Result<(), Cl
                     print_json(&out);
                 } else {
                     println!(
-                        "casella postale cieca in {} (ALPN engramma/mailbox/1, \
+                        "casella postale cieca in {} (ALPN engramma/mailbox/3, \
                          conserva {} giorni)",
                         dir.display(),
                         engramma_sync::mailbox::RETENTION_DAYS

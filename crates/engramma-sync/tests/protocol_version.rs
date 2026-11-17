@@ -11,8 +11,10 @@ use engramma_sync::protocol::{self, PROTOCOL_VERSION, connect};
 use engramma_sync::relay::RelayChoice;
 use engramma_sync::serve::PeerAddr;
 
-/// The old rules' ALPN — what a v0.6.3 device still speaks.
-const V1_ALPN: &[u8] = b"engramma/sync/1";
+/// The old rules' ALPN — what a v0.6.4 device still speaks (the v0.6.5
+/// derivation moves the base to the visible head and the witness fork
+/// to the pair: rules 2 against rules 3 must refuse each other).
+const V1_ALPN: &[u8] = b"engramma/sync/2";
 
 fn unhex32(s: &str) -> [u8; 32] {
     let mut out = [0_u8; 32];
@@ -31,10 +33,10 @@ fn unhex32(s: &str) -> [u8; 32] {
 async fn a_peer_of_the_old_rules_is_refused_before_any_exchange() {
     assert_eq!(
         protocol::ALPN,
-        b"engramma/sync/2",
-        "this build speaks rules 2"
+        b"engramma/sync/3",
+        "this build speaks rules 3"
     );
-    assert_eq!(PROTOCOL_VERSION, 2);
+    assert_eq!(PROTOCOL_VERSION, 3);
 
     let key_old = DeviceKey::from_seed([7_u8; 32]);
     let key_new = DeviceKey::from_seed([9_u8; 32]);

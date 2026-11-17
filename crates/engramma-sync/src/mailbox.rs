@@ -19,8 +19,8 @@ use crate::device::DeviceKey;
 use crate::registry::DeviceRegistry;
 use crate::{Error, Result};
 
-/// The mailbox's ALPN.
-pub const MAILBOX_ALPN: &[u8] = b"engramma/mailbox/2";
+/// The mailbox's ALPN — the rules version rides with the sync one.
+pub const MAILBOX_ALPN: &[u8] = b"engramma/mailbox/3";
 /// Default retention: 180 days.
 pub const RETENTION_DAYS: i64 = 180;
 
