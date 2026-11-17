@@ -16,6 +16,15 @@ use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
+// v0.6.5 (E4): the model and the judge live in `common`, shared with the
+// deterministic scenarios
+mod common;
+use common::{
+    actor_of_hash, classify, judge_no_text_lost, middle_replaced, newest_body_hash_of,
+    FleetModel,
+};
+use engramma_core::cell::conflicts::ActorClass;
+
 fn now() -> At {
     At(OffsetDateTime::from_unix_timestamp(1_810_000_000).unwrap(/* fixed */))
 }
@@ -707,15 +716,6 @@ impl Rng {
 }
 
 /// One simulated cell fleet. Each device holds its own copy; writes go
-/// through the public API; deliveries carry the sender's operations.
-struct Fleet {
-    cells: Vec<Cell>,
-    notes: Vec<Ulid>,
-    edges: Vec<String>,
-    proposals: Vec<Ulid>,
-    /// the folders of `cells`: declared last, so they go after the cells
-    _dirs: Vec<tempfile::TempDir>,
-}
 
 /// v0.6.4: the actor of one write — both classes, so the fleet hunts
 /// the human-before-agent rule. Two hands in five are human.
@@ -737,6 +737,20 @@ fn open_copies_of(cell: &Cell) -> Vec<(Ulid, Ulid)> {
         .collect()
 }
 
+/// One simulated cell fleet. Each device holds its own copy; writes go
+/// through the public API; deliveries carry the sender's operations.
+struct Fleet {
+    cells: Vec<Cell>,
+    notes: Vec<Ulid>,
+    edges: Vec<String>,
+    proposals: Vec<Ulid>,
+    /// v0.6.5 (E4): the model — what each author had in front of them.
+    /// OUTSIDE the cells: the judge's own truth, never the engine's.
+    model: FleetModel,
+    /// the folders of `cells`: declared last, so they go after the cells
+    _dirs: Vec<tempfile::TempDir>,
+}
+
 impl Fleet {
     fn write(&mut self, dev: usize, w: &Write, rng: &mut Rng) {
         let cell = &self.cells[dev];
@@ -753,8 +767,47 @@ impl Fleet {
                 let n = base_note(90 + i, &body);
                 self.notes.push(n.id);
                 let _ = cell.put_note(&n, &actor_of(dev, rng));
+                self.model.record(dev, cell, &n.id, (String::new(), None));
             }
             Write::Patch => {
+                // v0.6.5 (E4): the RETOUCH — one patch action in three,
+                // when THIS device still holds an unsynced body write,
+                // spends itself on a title-only patch over that note
+                // (the bots' habit: the body first, the title some
+                // actions later, before anything syncs). Under the old
+                // base rule the retouch is newer than every concurrent
+                // word, and the next writer leans on it — the
+                // reviewer's R4, clocks and all
+                if rng.below(3) == 0
+                    && let Some(idx) = self
+                        .model
+                        .unsynced
+                        .iter()
+                        .rposition(|(d, _)| *d == dev)
+                {
+                    let (_, note) = self.model.unsynced.remove(idx);
+                    let _ = cell.patch_note(
+                        &note,
+                        &NotePatch {
+                            title: Some(Some(format!("il titolo ritoccato da {dev}"))),
+                            ..Default::default()
+                        },
+                        &actor_of(dev, rng),
+                    );
+                    // the body write the retouch leans above
+                    let body_op = self
+                        .model
+                        .writes
+                        .iter()
+                        .filter(|(_, (n, _, _, _))| *n == note)
+                        .max_by(|a, b| a.1 .3.cmp(&b.1 .3))
+                        .map(|(id, _)| id.clone());
+                    if let Some(op) = body_op {
+                        self.model.r4_bursts += 1;
+                        self.model.r4_ops.push(op);
+                    }
+                    return;
+                }
                 // the notes THIS device holds (a patch on a note it
                 // does not hold is a usage error that rolls back — the
                 // writer must have seen the note), the OLDEST few, so
@@ -780,11 +833,46 @@ impl Fleet {
                 // CONTAINS the loser, the diff3 closes the copy
                 if rng.below(2) == 0 {
                     let seen = open_copies_of(cell);
+                    // v0.6.5 (E4): one write in three with a copy in view
+                    // IGNORES it — a plain read-modify on the ORIGINAL
+                    // (the user who never opens the side panel: Homun's
+                    // most common hand). Under the old base rule this is
+                    // the R4 closer; the judge must watch it
+                    if !seen.is_empty() && rng.below(3) == 0 {
+                        let (.., original) =
+                            seen[rng.below(seen.len() as u64) as usize];
+                        let body_visible =
+                            cell.get(&original).map(|n| n.body).unwrap_or_default();
+                        let read_hash = newest_body_hash_of(cell, &original);
+                        let token = ["rosso", "blu", "verde", "giallo"]
+                            [rng.below(4) as usize];
+                        let rewritten = middle_replaced(&body_visible, dev, &token);
+                        let _ = cell.patch_note(
+                            &original,
+                            &NotePatch {
+                                body: Some(rewritten),
+                                ..Default::default()
+                            },
+                            &actor_of(dev, rng),
+                        );
+                        self.model
+                            .record(dev, cell, &original, (body_visible, read_hash));
+                        return;
+                    }
                     if let Some((copy, _)) = seen.get(rng.below(seen.len() as u64) as usize)
                         && let Ok(note) = cell.get(copy)
                         && let Some(original) =
                             seen.iter().find(|(c, _)| c == copy).map(|(_, o)| *o)
                     {
+                        // v0.6.5 (E4): the merge author had TWO texts in
+                        // front of them — the copy they opened (whose
+                        // lines they merge in) and the note on their
+                        // screen. The model records the get on the note
+                        // being PATCHED (the task's own parenthetical):
+                        // that is what the base leans on, and what the
+                        // judge calls seen
+                        let on_screen = cell.get(&original).map(|n| n.body).unwrap_or_default();
+                        let on_screen_hash = newest_body_hash_of(cell, &original);
                         let merged = format!("{}\nfuso da {dev}", note.body);
                         let _ = cell.patch_note(
                             &original,
@@ -794,6 +882,8 @@ impl Fleet {
                             },
                             &actor_of(dev, rng),
                         );
+                        self.model
+                            .record(dev, cell, &original, (on_screen, on_screen_hash));
                         return;
                     }
                 }
@@ -810,18 +900,45 @@ impl Fleet {
                     );
                     return;
                 }
-                // the body write: a MIDDLE-LINE change — the shape a
-                // later merge can contain
+                // v0.6.5 (E4): the body write READS FIRST — half the
+                // writes change a middle line of the body THIS device
+                // shows (what Homun's agents do: they edit what they
+                // see), half rewrite the fixed shape (the imports)
+                let actor = actor_of(dev, rng);
                 let token = ["rosso", "blu", "verde", "giallo"][rng.below(4) as usize];
-                let body = format!("prima riga\ncorpo di {dev} su {id}: {token}\nterza riga");
+                let (body, read) = if rng.below(2) == 0 {
+                    let seen = cell.get(&id).map(|n| n.body).unwrap_or_default();
+                    let rewritten = middle_replaced(&seen, dev, &token);
+                    let read_hash = newest_body_hash_of(cell, &id);
+                    // R1: an agent leaning on a body a HUMAN hand wrote
+                    if classify(&actor) == ActorClass::Agent
+                        && read_hash
+                            .as_ref()
+                            .and_then(|h| actor_of_hash(cell, h))
+                            .is_some_and(|a| classify(&a) == ActorClass::Human)
+                    {
+                        self.model.r1_agent_on_human += 1;
+                    }
+                    (rewritten, (seen, read_hash))
+                } else {
+                    // the import-shaped rewrite: the writer may not have
+                    // READ the body, but it WAS on their screen — the
+                    // device shows the note (E1's own premise) — and the
+                    // model records what a `get` would have answered
+                    let on_screen = cell.get(&id).map(|n| n.body).unwrap_or_default();
+                    let on_screen_hash = newest_body_hash_of(cell, &id);
+                    let fixed = format!("prima riga\ncorpo di {dev} su {id}: {token}\nterza riga");
+                    (fixed, (on_screen, on_screen_hash))
+                };
                 let _ = cell.patch_note(
                     &id,
                     &NotePatch {
                         body: Some(body),
                         ..Default::default()
                     },
-                    &actor_of(dev, rng),
+                    &actor,
                 );
+                let written_id = self.model.record(dev, cell, &id, read);
             }
             Write::CloseCopy => {
                 let seen = open_copies_of(cell);
@@ -847,6 +964,7 @@ impl Fleet {
                     n.valid_from = Some(engramma_core::format::Validity(now().get().date(), None));
                     let _ = cell.supersede(&old, &n, None, &actor_of(dev, rng));
                     self.notes.push(n.id);
+                    self.model.record(dev, cell, &n.id, (String::new(), None));
                 }
             }
             Write::Link => {
@@ -890,6 +1008,7 @@ impl Fleet {
                     && let Some(id) = out.id
                 {
                     self.proposals.push(id);
+                    self.model.record(dev, cell, &id, (String::new(), None));
                 }
             }
             Write::Decide => {
@@ -1172,6 +1291,7 @@ impl FleetRunner {
             notes: Vec::new(),
             edges: Vec::new(),
             proposals: Vec::new(),
+            model: FleetModel::default(),
             _dirs: dirs,
         };
         fleet
@@ -1197,6 +1317,8 @@ impl FleetRunner {
         let n = self.n;
         self.round += 1;
         if self.round.is_multiple_of(5) {
+            // the sync round: everything flows, nothing stays unsynced
+            self.fleet.model.unsynced.clear();
             for from in 0..n {
                 for to in 0..n {
                     if from != to {
@@ -1729,262 +1851,39 @@ fn concurrent_creates_case(authors: u32) {
 // v0.6.4 (D1.6): the MONOTONITY property — a copy open at round r and
 // closed at round r+1 has a closure witness in the round r+1 set. Never
 // a closure without one.
-// ---------------------------------------------------------------------------
-
-/// The open copies of one device, with the loser op the derivation
-/// names (the witness check's key).
-fn open_copies_with_loser(cell: &Cell) -> Vec<(Ulid, Ulid, Ulid)> {
-    let rows = cell
-        .debug_column(
-            "SELECT copy_id || ' ' || original_id || ' ' || loser_op FROM conflict_copies
-             WHERE open = 1",
-        )
-        .unwrap(/* test-only */);
-    rows.into_iter()
-        .filter_map(|row| {
-            let mut it = row.split(' ');
-            let (Some(c), Some(o), Some(l)) = (it.next(), it.next(), it.next()) else {
-                return None;
-            };
-            Some((
-                Ulid::from_string(c).unwrap(/* test-only */),
-                Ulid::from_string(o).unwrap(/* test-only */),
-                Ulid::from_string(l).unwrap(/* test-only */),
-            ))
-        })
-        .collect()
-}
-
-/// The purge dominates with a rule of its own (D1.6 has no say there):
-/// a purged original takes its copies without a witness.
-fn original_purged(cell: &Cell, original: &Ulid) -> bool {
-    cell.debug_column(&format!(
-        "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
-         JOIN op_objects oo ON oo.op_id = o.op_id
-         WHERE oo.object = 'note:{original}' AND o.kind = 'purge'"
-    ))
-    .unwrap_or_default()
-    .first()
-    .is_some_and(|n| n != "0")
-}
-
-/// The lapide closes without a D1.6 witness too — its rule is today's
-/// own, kept by this phase (REPORT, «prima della correzione», punto 1):
-/// a body write that did not see the delete wins nothing and leaves the
-/// tip set; a write the rollback erased is gone; and a tip the lapide
-/// held can hand the winnership to a former loser, whose copy closes
-/// with it. Wherever the original holds a delete, the conflict set
-/// follows the lapide, not the witnesses — the property hunts the
-/// derivation on the notes the lapide never touched.
-/// The original's derivation row is GONE. Only the purge ever removes
-/// the row of a copy that carries operations (every other path keeps it
-/// as the note's replay base): its absence says the purge took it — and
-/// the purge reaches the copies of copies, transitively.
-fn original_row_gone(cell: &Cell, original: &Ulid) -> bool {
-    cell.debug_column(&format!(
-        "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE original_id = '{original}'"
-    ))
-    .unwrap_or_default()
-    .first()
-    .is_some_and(|n| n == "0")
-        && cell
-            .debug_column(&format!(
-                "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
-                 JOIN op_objects oo ON oo.op_id = o.op_id
-                 WHERE oo.object = 'note:{original}'"
-            ))
-            .unwrap_or_default()
-            .first()
-            .is_some_and(|n| n != "0")
-}
-
-fn lapide_active(cell: &Cell, original: &Ulid) -> bool {
-    cell.debug_column(&format!(
-        "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
-         JOIN op_objects oo ON oo.op_id = o.op_id
-         WHERE oo.object = 'note:{original}' AND o.kind = 'delete_note'"
-    ))
-    .unwrap_or_default()
-    .first()
-    .is_some_and(|n| n != "0")
-}
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
     #[test]
-    fn no_copy_closes_without_a_witness(
+    fn no_body_text_is_lost(
         seed in any::<u64>(),
         devices in 2_u32..=4,
         rounds in 12_u32..=28,
     ) {
         let mut runner = FleetRunner::new(seed, devices);
-        let mut prev: Vec<Vec<(Ulid, Ulid, Ulid)>> =
-            runner.fleet.cells.iter().map(open_copies_with_loser).collect();
-        // v0.6.5 (E2): the reopen ledger — for every copy that closed,
-        // whether its close had a WITNESS and whether the set still
-        // DESERVED it. A copy open at round r+1 that was closed at r is
-        // a failure unless it closed undeserved (the winner-following
-        // rebirth: the filters and the winner's ancestry are the one
-        // closure and reopening that follow the winner — DESIGN § 4.3).
-        // A WITNESSED close never reopens: the witness is an existence,
-        // and with E2's fork it is monotone in the set.
-        let mut closed_at: Vec<std::collections::HashMap<Ulid, (bool, bool)>> =
-            runner.fleet.cells.iter().map(|_| std::collections::HashMap::new()).collect();
-        for _ in 0..rounds {
+        let mut saved: Vec<std::collections::HashSet<String>> =
+            runner.fleet.cells.iter().map(|_| std::collections::HashSet::new()).collect();
+        for r in 0..rounds {
             runner.one_round();
-            let now: Vec<Vec<(Ulid, Ulid, Ulid)>> =
-                runner.fleet.cells.iter().map(open_copies_with_loser).collect();
-            for (dev, (was, is)) in prev.iter().zip(&now).enumerate() {
-                let held: std::collections::HashSet<Ulid> =
-                    is.iter().map(|(c, _, _)| *c).collect();
-                for (copy, original, loser) in was {
-                    if held.contains(copy) {
-                        continue;
-                    }
-                    // admitted without a D1.6 witness: the purge and the
-                    // lapide (their own rules), and a set that no longer
-                    // DESERVES the copy (a graph an out-of-order arrival
-                    // completed made the loser the winner, or an ancestor
-                    // of it — the text lives in the note itself)
-                    let witnessed = runner.fleet.cells[dev]
-                        .conflict_witness_for_test(original, loser)
-                        .unwrap_or(false);
-                    let deserved = runner.fleet.cells[dev]
-                        .conflict_deserved_for_test(original, loser)
-                        .unwrap_or(true);
-                    prop_assert!(
-                        witnessed
-                            || original_purged(&runner.fleet.cells[dev], original)
-                            || lapide_active(&runner.fleet.cells[dev], original)
-                            || !deserved,
-                        "seed {seed}: copy {copy} closed without a witness"
-                    );
-                    closed_at[dev].insert(*copy, (witnessed, deserved));
-                }
-                // absent → present (v0.6.5, E2): a closed copy that is
-                // open again — only a winner-following rebirth may come
-                // back; a witnessed close never does
-                for (copy, _, _) in is {
-                    if let Some((witnessed_close, deserved_close)) =
-                        closed_at[dev].remove(copy)
-                    {
-                        prop_assert!(
-                            !witnessed_close && !deserved_close,
-                            "seed {seed}: copy {copy} reopened — it closed \
-                             witnessed ({witnessed_close}) or deserved ({deserved_close})"
-                        );
-                    }
-                }
+            let cell_refs: Vec<&Cell> = runner.fleet.cells.iter().collect();
+            if let Err(why) = judge_no_text_lost(
+                &cell_refs,
+                &runner.fleet.model,
+                &mut saved,
+                &format!("seed {seed} dev {devices} rounds {rounds} r{r}"),
+            ) {
+                prop_assert!(false, "{why}");
             }
-            prev = now;
         }
-        // the tail (propose, decide, maybe purge, settles) closes copies
-        // too — the purge by its own dominance, the rest by witness
         runner.finish();
-        let now: Vec<Vec<(Ulid, Ulid, Ulid)>> =
-            runner.fleet.cells.iter().map(open_copies_with_loser).collect();
-        for (dev, (was, is)) in prev.iter().zip(&now).enumerate() {
-            let held: std::collections::HashSet<Ulid> = is.iter().map(|(c, _, _)| *c).collect();
-            for (copy, original, loser) in was {
-                if held.contains(copy) {
-                    continue;
-                }
-                prop_assert!(
-                    runner.fleet.cells[dev]
-                        .conflict_witness_for_test(original, loser)
-                        .unwrap_or(false)
-                        || original_purged(&runner.fleet.cells[dev], original)
-                        || original_row_gone(&runner.fleet.cells[dev], original)
-                        || lapide_active(&runner.fleet.cells[dev], original)
-                        || !runner.fleet.cells[dev]
-                            .conflict_deserved_for_test(original, loser)
-                            .unwrap_or(true),
-                    "seed {seed}: copy {copy} closed in the tail without a witness"
-                );
-            }
+        let cell_refs: Vec<&Cell> = runner.fleet.cells.iter().collect();
+        if let Err(why) = judge_no_text_lost(
+            &cell_refs,
+            &runner.fleet.model,
+            &mut saved,
+            &format!("seed {seed} dev {devices} rounds {rounds} tail"),
+        ) {
+            prop_assert!(false, "{why}");
         }
     }
 }
 
-/// v0.6.4 (measurement, `--ignored`): the generator's case frequencies
-/// over 1000 fleets — both actor classes, header-only patches, hand
-/// merges, deletes on copy ids. The numbers go in the REPORT.
-#[test]
-#[ignore = "a measurement, not an assertion"]
-fn generator_frequencies_1000_fleets() {
-    let mut ops = 0_u64;
-    let mut human = 0_u64;
-    let mut agent = 0_u64;
-    let mut header_only = 0_u64;
-    let mut hand_merges = 0_u64;
-    let mut body_writes = 0_u64;
-    let mut copy_deletes = 0_u64;
-    let mut open_copies = 0_u64;
-    let mut quarantined_copies = 0_u64;
-    for seed in 0..1000_u64 {
-        let fleet = fleet_run(seed, 3, 20);
-        for cell in &fleet.cells {
-            let rows = cell
-                .debug_column(
-                    "SELECT o.kind || ' ' || o.actor || ' ' || COALESCE(json_extract(p.body, '$.set.body'), '') FROM ops o
-                     LEFT JOIN op_payloads p ON p.op_id = o.op_id",
-                )
-                .unwrap_or_default();
-            for row in &rows {
-                let mut it = row.splitn(3, ' ');
-                let (kind, actor, body) = (
-                    it.next().unwrap_or_default(),
-                    it.next().unwrap_or_default(),
-                    it.next().unwrap_or_default(),
-                );
-                ops += 1;
-                match engramma_core::cell::conflicts::classify_actor(actor) {
-                    engramma_core::cell::conflicts::ActorClass::Human => human += 1,
-                    engramma_core::cell::conflicts::ActorClass::Agent => agent += 1,
-                }
-                if kind == "patch_note" && body.is_empty() {
-                    header_only += 1;
-                }
-                if kind == "patch_note" && body.contains("fuso da ") {
-                    hand_merges += 1;
-                }
-                if matches!(kind, "put_note" | "patch_note") && !body.is_empty() {
-                    body_writes += 1;
-                }
-            }
-            copy_deletes += cell
-                .debug_column(
-                    "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
-                     JOIN op_objects oo ON oo.op_id = o.op_id
-                     JOIN conflict_copies cc ON cc.copy_id = substr(oo.object, 6)
-                     WHERE o.kind = 'delete_note'",
-                )
-                .unwrap_or_default()
-                .first()
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0);
-            open_copies += cell
-                .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE open = 1")
-                .unwrap_or_default()
-                .first()
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0);
-            quarantined_copies += cell
-                .debug_column(
-                    "SELECT CAST(COUNT(*) AS TEXT) FROM notes n JOIN conflict_copies cc ON cc.copy_id = n.id
-                     WHERE cc.open = 1 AND n.status = 'quarantined'",
-                )
-                .unwrap_or_default()
-                .first()
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0);
-        }
-    }
-    eprintln!(
-        "frequenze/1000 flotte: operazioni {ops}, umane {human} ({:.1}%), agente {agent} ({:.1}%), \
-         scritture corpo {body_writes}, patch sola intestazione {header_only}, fusioni a mano {hand_merges}, \
-         delete su copie {copy_deletes}, copie aperte a fine corsa {open_copies}, in quarantena {quarantined_copies}",
-        100.0 * human as f64 / ops as f64,
-        100.0 * agent as f64 / ops as f64,
-    );
-}

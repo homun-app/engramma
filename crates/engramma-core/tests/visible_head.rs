@@ -176,3 +176,134 @@ fn the_agent_edits_the_visible_human_body_and_wins_the_line() {
         assert_eq!(copies[0].2, "quarantined", "{name}: and it is the quarantined one");
     }
 }
+
+/// v0.6.5 (E4): the judge's teeth, on the reviewer's own R4 told as a
+/// fleet. The model records what each author read; the judge must find
+/// every body write saved — with the visible head the closer leans on
+/// the WINNER, the copy of L stays open and carries its text. (Against
+/// the v0.6.4 base rule this same judge FAILS: the closer leans on the
+/// title patch, the copy closes, and «DUE-di-A» is nowhere — proven on
+/// the pre-fix code in the worktree run of the REPORT.)
+#[test]
+fn the_no_text_lost_judge_passes_the_r4_scenario() {
+    use std::collections::HashMap;
+    // the whole scenario is `a_header_patch_on_the_losing_branch…`, told
+    // once more with the model at the side
+    let init = shared_init("e4-r4");
+    let (a, wa) = cell_with("a");
+    let (b, wb) = cell_with("b");
+    a.ingest_op(&init).unwrap(/* t */);
+    b.ingest_op(&init).unwrap(/* t */);
+    let note = base_note(9, "uno\ndue\ntre");
+    let id = note.id;
+    wa.store(K + 1, Ordering::SeqCst);
+    a.put_note(&note, "homun:user").unwrap(/* t */);
+    for op in &union(&a, &b) {
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    wa.store(K + 2, Ordering::SeqCst);
+    a.patch_note(
+        &id,
+        &NotePatch { body: Some("uno\nDUE-di-A\ntre".into()), ..Default::default() },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    wa.store(K + 8, Ordering::SeqCst);
+    a.patch_note(
+        &id,
+        &NotePatch {
+            title: Some(Some("il titolo ritoccato da A".into())),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    wb.store(K + 5, Ordering::SeqCst);
+    b.patch_note(
+        &id,
+        &NotePatch { body: Some("uno\nDUE-di-B\ntre".into()), ..Default::default() },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    let seen = body_of(&b, &id);
+    wb.store(K + 20, Ordering::SeqCst);
+    b.patch_note(
+        &id,
+        &NotePatch { body: Some(format!("{seen}\nquattro")), ..Default::default() },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+
+    // the model: what each author had in front of them
+    let mut writes: HashMap<String, (ulid::Ulid, String, String, (String, String))> =
+        HashMap::new();
+    let mut reads: HashMap<String, (String, Option<String>)> = HashMap::new();
+    let put_hash = {
+        let mut it = a
+            .ops()
+            .unwrap(/* t */)
+            .into_iter()
+            .filter(|o| o.kind.as_str() == "put_note");
+        let put = it.next().unwrap(/* t */);
+        let key = (put.hlc.to_string(), put.op_id.to_string());
+        writes.insert(
+            put.op_id.to_string(),
+            (id, "uno\ndue\ntre".into(), put.content_hash.clone(), key.clone()),
+        );
+        reads.insert(put.op_id.to_string(), (String::new(), None));
+        put.content_hash.clone()
+    };
+    let mut patch_of = |needle: &str, read: (String, Option<String>)| {
+        let op = a
+            .ops()
+            .unwrap(/* t */)
+            .into_iter()
+            .find(|o| {
+                o.kind.as_str() == "patch_note"
+                    && o.body
+                        .as_ref()
+                        .and_then(|b| b.get("set"))
+                        .and_then(|s| s.get("body"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|t| t.contains(needle))
+            })
+            .unwrap(/* t */);
+        let text = op
+            .body
+            .as_ref()
+            .and_then(|b| b.get("set"))
+            .and_then(|s| s.get("body"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let key = (op.hlc.to_string(), op.op_id.to_string());
+        reads.insert(op.op_id.to_string(), read);
+        writes.insert(op.op_id.to_string(), (id, text, op.content_hash.clone(), key));
+        op.content_hash.clone()
+    };
+    let l_hash = patch_of("DUE-di-A", ("uno\ndue\ntre".into(), Some(put_hash.clone())));
+    let w_hash = patch_of("DUE-di-B", ("uno\ndue\ntre".into(), Some(put_hash.clone())));
+    patch_of("quattro", (seen.clone(), Some(w_hash)));
+    let _ = l_hash;
+    let mut model = FleetModel::default();
+    model.writes = writes;
+    model.reads = reads;
+    let mut saved = vec![Default::default(); 2];
+    // the cells themselves, as the fleet would hold them
+    let dir_c = tempfile::tempdir().unwrap(/* t */);
+    let c = engramma_core::Cell::open_bare(&dir_c.path().join("c.sqlite")).unwrap(/* t */);
+    for op in b.ops().unwrap(/* t */).iter().chain(a.ops().unwrap(/* t */).iter()) {
+        let _ = c.ingest_op(op);
+    }
+    let cells = [&*a, &*b, &c];
+    let verdict = judge_no_text_lost(&cells, &model, &mut saved, "r4");
+    assert!(verdict.is_ok(), "the judge must save every body: {verdict:?}");
+}
