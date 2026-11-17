@@ -224,8 +224,10 @@ impl FleetModel {
         };
         let key = (op.hlc.to_string(), op.op_id.to_string());
         self.reads.insert(op.op_id.to_string(), read);
-        self.writes
-            .insert(op.op_id.to_string(), (*note, text, op.content_hash.clone(), key));
+        self.writes.insert(
+            op.op_id.to_string(),
+            (*note, text, op.content_hash.clone(), key),
+        );
         self.unsynced.push((dev, *note));
         Some(op.op_id.to_string())
     }
@@ -243,8 +245,7 @@ pub fn last_op_of(cell: &Cell, note: &Ulid) -> Option<Op> {
 /// writer's own — the read-modify hand (what an editor does), or the
 /// empty body born full.
 pub fn middle_replaced(seen: &str, dev: usize, token: &str) -> String {
-    let mut lines: Vec<String> =
-        seen.split('\n').map(str::to_string).collect();
+    let mut lines: Vec<String> = seen.split('\n').map(str::to_string).collect();
     let mid = lines.len() / 2;
     if lines.len() < 3 {
         lines.push(format!("corpo di {dev}: {token}"));
@@ -577,7 +578,7 @@ pub fn judge_no_text_lost(
                     .filter(|(id, (n, t, _, _))| {
                         held.contains(id.as_str()) && *n == *note && *t == body
                     })
-                    .max_by(|a, b| a.1 .3.cmp(&b.1 .3));
+                    .max_by(|a, b| a.1.3.cmp(&b.1.3));
                 if let Some((_, (_, _, y_hash, _))) = target
                     && model_contains(
                         &parent,
@@ -591,10 +592,13 @@ pub fn judge_no_text_lost(
                 }
             }
             // (b) an open copy carries its body
-            if open_copies
-                .iter()
-                .any(|loser| fleet.model.writes.get(loser).is_some_and(|(_, t, _, _)| t == text))
-            {
+            if open_copies.iter().any(|loser| {
+                fleet
+                    .model
+                    .writes
+                    .get(loser)
+                    .is_some_and(|(_, t, _, _)| t == text)
+            }) {
                 continue;
             }
             // (c) an operation lives on its copy's id
@@ -657,4 +661,3 @@ pub fn judge_no_text_lost(
     }
     Ok(())
 }
-

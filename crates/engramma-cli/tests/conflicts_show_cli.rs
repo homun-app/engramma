@@ -51,7 +51,11 @@ fn run(root: &std::path::Path, args: &[&str]) -> (bool, String, String) {
             .expect(/* child */ "wait")
         {
             Some(status) => {
-                let out = guard.child.take().expect(/* set */ "child").wait_with_output();
+                let out = guard
+                    .child
+                    .take()
+                    .expect(/* set */ "child")
+                    .wait_with_output();
                 let (ok, stdout, stderr) = match out {
                     Ok(out) => (
                         out.status.success(),
@@ -62,10 +66,9 @@ fn run(root: &std::path::Path, args: &[&str]) -> (bool, String, String) {
                 };
                 return (ok, stdout, stderr);
             }
-            None if std::time::Instant::now() > deadline => panic!(
-                "`engramma {}` non è finito in 60 s",
-                args.join(" ")
-            ),
+            None if std::time::Instant::now() > deadline => {
+                panic!("`engramma {}` non è finito in 60 s", args.join(" "))
+            }
             None => std::thread::sleep(Duration::from_millis(50)),
         }
     }
@@ -156,15 +159,25 @@ fn conflicts_show_reads_the_quarantined_copy() {
     // the CLI reads it: the original's body, the copy's body, the fork's
     let (ok, out, err) = run(root.path(), &["--json", "conflicts", "show", "a", &copy_id]);
     assert!(ok, "conflicts show failed: {err}");
-    let v: serde_json::Value = serde_json::from_str(&out).expect(/* json */ "the CLI answers json");
+    let v: serde_json::Value =
+        serde_json::from_str(&out).expect(/* json */ "the CLI answers json");
     assert_eq!(v["conflict"]["copyId"], serde_json::json!(copy_id));
-    assert_eq!(v["conflict"]["originalBody"], serde_json::json!("la mano umana al lavoro"));
+    assert_eq!(
+        v["conflict"]["originalBody"],
+        serde_json::json!("la mano umana al lavoro")
+    );
     assert_eq!(v["conflict"]["copyBody"], serde_json::json!("uno\nX\ntre"));
-    assert_eq!(v["conflict"]["forkBody"], serde_json::json!("uno\ndue\ntre"));
+    assert_eq!(
+        v["conflict"]["forkBody"],
+        serde_json::json!("uno\ndue\ntre")
+    );
     assert_eq!(v["conflict"]["quarantined"], serde_json::json!(true));
 
     // an unknown copy answers NOT_FOUND
-    let (ok, out, err) = run(root.path(), &["conflicts", "show", "a", "01AAAAAAAAAAAAAAAAAAAAAAAA"]);
+    let (ok, out, err) = run(
+        root.path(),
+        &["conflicts", "show", "a", "01AAAAAAAAAAAAAAAAAAAAAAAA"],
+    );
     assert!(!ok, "an unknown copy must not be found: {out}");
     assert!(
         err.contains("non è una copia di conflitto"),

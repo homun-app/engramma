@@ -20,8 +20,8 @@ use ulid::Ulid;
 // deterministic scenarios
 mod common;
 use common::{
-    actor_of_hash, classify, judge_no_text_lost, middle_replaced, read_of_shown,
-    shown_body_hash_of, FleetModel,
+    FleetModel, actor_of_hash, classify, judge_no_text_lost, middle_replaced, read_of_shown,
+    shown_body_hash_of,
 };
 use engramma_core::cell::conflicts::ActorClass;
 
@@ -767,7 +767,8 @@ impl Fleet {
                 let n = base_note(90 + i, &body);
                 self.notes.push(n.id);
                 let _ = cell.put_note(&n, &actor_of(dev, rng));
-                self.model.record(dev, cell, &n.id, vec![(String::new(), None)]);
+                self.model
+                    .record(dev, cell, &n.id, vec![(String::new(), None)]);
             }
             Write::Patch => {
                 // v0.6.5 (E4): the RETOUCH — one patch action in three,
@@ -779,11 +780,7 @@ impl Fleet {
                 // word, and the next writer leans on it — the
                 // reviewer's R4, clocks and all
                 if rng.below(3) == 0
-                    && let Some(idx) = self
-                        .model
-                        .unsynced
-                        .iter()
-                        .rposition(|(d, _)| *d == dev)
+                    && let Some(idx) = self.model.unsynced.iter().rposition(|(d, _)| *d == dev)
                 {
                     let (_, note) = self.model.unsynced.remove(idx);
                     let _ = cell.patch_note(
@@ -800,7 +797,7 @@ impl Fleet {
                         .writes
                         .iter()
                         .filter(|(_, (n, _, _, _))| *n == note)
-                        .max_by(|a, b| a.1 .3.cmp(&b.1 .3))
+                        .max_by(|a, b| a.1.3.cmp(&b.1.3))
                         .map(|(id, _)| id.clone());
                     if let Some(op) = body_op {
                         self.model.r4_bursts += 1;
@@ -839,15 +836,10 @@ impl Fleet {
                     // most common hand). Under the old base rule this is
                     // the R4 closer; the judge must watch it
                     if !seen.is_empty() && rng.below(3) == 0 {
-                        let (.., original) =
-                            seen[rng.below(seen.len() as u64) as usize];
+                        let (.., original) = seen[rng.below(seen.len() as u64) as usize];
                         let read = read_of_shown(cell, &original);
-                        let body_visible = cell
-                            .get(&original)
-                            .map(|n| n.body)
-                            .unwrap_or_default();
-                        let token = ["rosso", "blu", "verde", "giallo"]
-                            [rng.below(4) as usize];
+                        let body_visible = cell.get(&original).map(|n| n.body).unwrap_or_default();
+                        let token = ["rosso", "blu", "verde", "giallo"][rng.below(4) as usize];
                         let rewritten = middle_replaced(&body_visible, dev, &token);
                         let _ = cell.patch_note(
                             &original,
@@ -980,7 +972,8 @@ impl Fleet {
                     n.valid_from = Some(engramma_core::format::Validity(now().get().date(), None));
                     let _ = cell.supersede(&old, &n, None, &actor_of(dev, rng));
                     self.notes.push(n.id);
-                    self.model.record(dev, cell, &n.id, vec![(String::new(), None)]);
+                    self.model
+                        .record(dev, cell, &n.id, vec![(String::new(), None)]);
                 }
             }
             Write::Link => {
@@ -1024,7 +1017,8 @@ impl Fleet {
                     && let Some(id) = out.id
                 {
                     self.proposals.push(id);
-                    self.model.record(dev, cell, &id, vec![(String::new(), None)]);
+                    self.model
+                        .record(dev, cell, &id, vec![(String::new(), None)]);
                 }
             }
             Write::Decide => {
@@ -1902,9 +1896,6 @@ proptest! {
         }
     }
 }
-
-
-
 
 /// v0.6.4 (measurement, `--ignored`): the generator's case frequencies
 /// over 1000 fleets — both actor classes, header-only patches, hand

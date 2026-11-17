@@ -344,7 +344,10 @@ fn rederivation_with_ten_open_copies_and_fifty_writes() {
     let open = cell
         .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE open = 1")
         .unwrap_or_default();
-    eprintln!("E3 banco: copie aperte {}", open.first().cloned().unwrap_or_default());
+    eprintln!(
+        "E3 banco: copie aperte {}",
+        open.first().cloned().unwrap_or_default()
+    );
     // fifty SEQUENTIAL body writes on the winner's line, each applied here
     for i in 0..50_u32 {
         wall.store(K + 100 + u64::from(i), Ordering::SeqCst);
@@ -371,7 +374,10 @@ fn rederivation_with_ten_open_copies_and_fifty_writes() {
             "user",
         )
         .unwrap(/* t */);
-        eprintln!("E3 banco: una riderivazione, {tag}: {:?}", started.elapsed());
+        eprintln!(
+            "E3 banco: una riderivazione, {tag}: {:?}",
+            started.elapsed()
+        );
     };
     measure_once("10 copie e 50 scritture");
     for i in 50..100_u32 {
@@ -394,7 +400,10 @@ fn rederivation_with_ten_open_copies_and_fifty_writes() {
     for op in &all {
         fresh.ingest_op(op).unwrap(/* t */);
     }
-    eprintln!("E3 banco: la flotta intera rigiocata da zero: {:?}", started.elapsed());
+    eprintln!(
+        "E3 banco: la flotta intera rigiocata da zero: {:?}",
+        started.elapsed()
+    );
 }
 
 /// v0.6.5 (E6, measurement — `--ignored`): the cost of the copies ALONE.
@@ -426,7 +435,7 @@ fn d5_the_copies_alone_table_by_table() {
         wall_a.store(K + 2, Ordering::SeqCst);
         a.patch_note(
             &id,
-            &NotePatch { body: Some(winner_body), ..Default::default() },
+            &NotePatch { body: Some(winner_body.clone()), ..Default::default() },
             "user",
         )
         .unwrap(/* t */);
@@ -518,7 +527,11 @@ fn d5_the_copies_alone_table_by_table() {
             total_c.saturating_sub(total_s)
         );
         for (name, bytes_c) in &ct {
-            let bytes_s = st.iter().find(|(nb, _)| nb == name).map(|(_, v)| *v).unwrap_or(0);
+            let bytes_s = st
+                .iter()
+                .find(|(nb, _)| nb == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(0);
             if *bytes_c != bytes_s {
                 eprintln!(
                     "D6 {tag}: tabella {name}: {bytes_s} → {bytes_c} B (+{})",
@@ -645,7 +658,11 @@ fn d6_ten_percent_conflicted_against_sequential() {
             .unwrap_or_default();
         eprintln!(
             "D6 flotta {} ({} conflitti): file {size} B ({} B/nota), copie {}, passata {:.2} s",
-            if sequential_flavor { "sequenziale" } else { "in conflitto" },
+            if sequential_flavor {
+                "sequenziale"
+            } else {
+                "in conflitto"
+            },
             if sequential_flavor { 0 } else { conflicted_n },
             size / u64::from(n_notes),
             copies.first().map(String::as_str).unwrap_or("?"),
@@ -655,8 +672,6 @@ fn d6_ten_percent_conflicted_against_sequential() {
     }
     if sizes.len() == 2 {
         let growth = 100.0 * (sizes[0].0 as f64 / sizes[1].0 as f64 - 1.0);
-        eprintln!(
-            "D6 soglia: crescita al 10% di note in conflitto: {growth:.1}% (soglia 15%)"
-        );
+        eprintln!("D6 soglia: crescita al 10% di note in conflitto: {growth:.1}% (soglia 15%)");
     }
 }

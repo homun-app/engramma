@@ -72,7 +72,11 @@ fn a_header_patch_on_the_losing_branch_does_not_swallow_the_copy() {
     }
     // the sync: W won, L's copy is open — as v0.6.4 already had it
     assert_eq!(body_of(&b, &id), "uno\nDUE-di-B\ntre", "W won the body");
-    assert_eq!(open_copies(&b, &id).len(), 1, "L's copy is open before the append");
+    assert_eq!(
+        open_copies(&b, &id).len(),
+        1,
+        "L's copy is open before the append"
+    );
 
     // b appends a line to the body it SEES (W's)
     let seen = body_of(&b, &id);
@@ -94,7 +98,11 @@ fn a_header_patch_on_the_losing_branch_does_not_swallow_the_copy() {
             "{name}: the append landed on the visible body: {body:?}"
         );
         let copies = open_copies(cell, &id);
-        assert_eq!(copies.len(), 1, "{name}: L's copy is still open: {copies:?}");
+        assert_eq!(
+            copies.len(),
+            1,
+            "{name}: L's copy is still open: {copies:?}"
+        );
         assert!(
             copies[0].1.contains("DUE-di-A"),
             "{name}: the copy holds L's text: {copies:?}"
@@ -143,10 +151,17 @@ fn the_agent_edits_the_visible_human_body_and_wins_the_line() {
     }
     // the human class wins even older: the note shows the human body,
     // the bot's first write is an open QUARANTINED copy
-    assert_eq!(body_of(&b, &id), "alpha\nUMANO\ngamma", "the human hand won");
+    assert_eq!(
+        body_of(&b, &id),
+        "alpha\nUMANO\ngamma",
+        "the human hand won"
+    );
     let copies = open_copies(&b, &id);
     assert_eq!(copies.len(), 1, "the bot's first write is a copy");
-    assert_eq!(copies[0].2, "quarantined", "an agent's copy is born in quarantine");
+    assert_eq!(
+        copies[0].2, "quarantined",
+        "an agent's copy is born in quarantine"
+    );
 
     // the bot RE-READS the note and appends to what it sees
     let seen = body_of(&b, &id);
@@ -168,12 +183,19 @@ fn the_agent_edits_the_visible_human_body_and_wins_the_line() {
             "{name}: the bot's write on the visible body became the note's body: {body:?}"
         );
         let copies = open_copies(cell, &id);
-        assert_eq!(copies.len(), 1, "{name}: no second copy, no quarantine: {copies:?}");
+        assert_eq!(
+            copies.len(),
+            1,
+            "{name}: no second copy, no quarantine: {copies:?}"
+        );
         assert!(
             copies[0].1.contains("alpha\nbeta\nBOT"),
             "{name}: the first bot write keeps its open copy: {copies:?}"
         );
-        assert_eq!(copies[0].2, "quarantined", "{name}: and it is the quarantined one");
+        assert_eq!(
+            copies[0].2, "quarantined",
+            "{name}: and it is the quarantined one"
+        );
     }
 }
 
@@ -256,7 +278,12 @@ fn the_no_text_lost_judge_passes_the_r4_scenario() {
         let key = (put.hlc.to_string(), put.op_id.to_string());
         writes.insert(
             put.op_id.to_string(),
-            (id, "uno\ndue\ntre".into(), put.content_hash.clone(), key.clone()),
+            (
+                id,
+                "uno\ndue\ntre".into(),
+                put.content_hash.clone(),
+                key.clone(),
+            ),
         );
         reads.insert(put.op_id.to_string(), vec![(String::new(), None)]);
         put.content_hash.clone()
@@ -286,7 +313,10 @@ fn the_no_text_lost_judge_passes_the_r4_scenario() {
             .to_string();
         let key = (op.hlc.to_string(), op.op_id.to_string());
         reads.insert(op.op_id.to_string(), vec![read]);
-        writes.insert(op.op_id.to_string(), (id, text, op.content_hash.clone(), key));
+        writes.insert(
+            op.op_id.to_string(),
+            (id, text, op.content_hash.clone(), key),
+        );
         op.content_hash.clone()
     };
     let l_hash = patch_of("DUE-di-A", ("uno\ndue\ntre".into(), Some(put_hash.clone())));
@@ -305,7 +335,10 @@ fn the_no_text_lost_judge_passes_the_r4_scenario() {
     }
     let cells = [&*a, &*b, &c];
     let verdict = judge_no_text_lost(&cells, &model, &mut saved, "r4");
-    assert!(verdict.is_ok(), "the judge must save every body: {verdict:?}");
+    assert!(
+        verdict.is_ok(),
+        "the judge must save every body: {verdict:?}"
+    );
 }
 
 /// v0.6.5 (E4 hunt): the equal-bodied follow-up. A and B concurrent
@@ -374,7 +407,10 @@ fn the_equal_bodied_followup_keeps_its_copy() {
     }
     for (name, cell) in [("x", &x), ("y", &y)] {
         let b = body_of(cell, &id);
-        assert_eq!(b, "nota base\nla mano umana\nfine", "{name}: the human hand won");
+        assert_eq!(
+            b, "nota base\nla mano umana\nfine",
+            "{name}: the human hand won"
+        );
         let copies = open_copies(cell, &id);
         assert_eq!(
             copies.len(),

@@ -112,7 +112,10 @@ fn diff3_merge_v064(base: &str, a: &str, b: &str) -> Option<String> {
 #[test]
 fn the_twenty_thousand_line_diff3_stays_fast() {
     let n = 20_000_usize;
-    let base: String = (0..n).map(|i| format!("riga {i}")).collect::<Vec<_>>().join("\n");
+    let base: String = (0..n)
+        .map(|i| format!("riga {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut a = base.clone();
     a.push_str("\nA");
     let mut l = String::from("L\n");
@@ -179,8 +182,14 @@ fn the_diff3_edge_cases_hold() {
     // empty base, equal sides: identical changes are one change
     assert_eq!(diff3_merge("", "x", "x"), Some("x".into()));
     // one side is the base itself: the other side's word wins whole
-    assert_eq!(diff3_merge("a\nb", "a\nb", "a\nX\nb"), Some("a\nX\nb".into()));
-    assert_eq!(diff3_merge("a\nb", "a\nX\nb", "a\nb"), Some("a\nX\nb".into()));
+    assert_eq!(
+        diff3_merge("a\nb", "a\nb", "a\nX\nb"),
+        Some("a\nX\nb".into())
+    );
+    assert_eq!(
+        diff3_merge("a\nb", "a\nX\nb", "a\nb"),
+        Some("a\nX\nb".into())
+    );
     // both empty against an empty base
     assert_eq!(diff3_merge("", "", ""), Some("".into()));
     // a side empty, the base not: a deletion from one side only
@@ -200,7 +209,11 @@ fn the_diff3_edge_cases_hold() {
     assert_eq!(diff3_merge("m", "a\nm", "m\na"), Some("a\nm\na".into()));
     // over the cap (E3): «does not contain», whatever the texts say
     let huge: String = (0..40_000).map(|i| format!("riga {i}\n")).collect();
-    assert_eq!(diff3_merge(&huge, &huge, &huge), None, "the cap refuses, prudently");
+    assert_eq!(
+        diff3_merge(&huge, &huge, &huge),
+        None,
+        "the cap refuses, prudently"
+    );
     let long_line = "x".repeat(5 * 1024 * 1024);
     assert_eq!(
         diff3_merge(&long_line, &long_line, &long_line),
@@ -216,7 +229,10 @@ fn the_diff3_edge_cases_hold() {
 #[ignore = "a measurement, not an assertion"]
 fn r3_cost_at_5k_and_20k() {
     for n in [5_000_usize, 20_000] {
-        let base: String = (0..n).map(|i| format!("riga {i}")).collect::<Vec<_>>().join("\n");
+        let base: String = (0..n)
+            .map(|i| format!("riga {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut a = base.clone();
         a.push_str("\nA");
         let mut l = String::from("L\n");
@@ -225,10 +241,17 @@ fn r3_cost_at_5k_and_20k() {
         let r = diff3_merge(&base, &a, &l);
         eprintln!("R3 n={n} merge ok={} in {:?}", r.is_some(), t.elapsed());
         // the worst honest shape too: two unrelated 5 000-line texts
-        let other: String = (0..n).map(|i| format!("diversa {i}")).collect::<Vec<_>>().join("\n");
+        let other: String = (0..n)
+            .map(|i| format!("diversa {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let t = std::time::Instant::now();
         let r = diff3_merge(&base, &other, &l);
-        eprintln!("R3 n={n} unrelated merge ok={} in {:?}", r.is_some(), t.elapsed());
+        eprintln!(
+            "R3 n={n} unrelated merge ok={} in {:?}",
+            r.is_some(),
+            t.elapsed()
+        );
     }
 }
 

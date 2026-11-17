@@ -2858,14 +2858,12 @@ fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliE
             let full = cell
                 .resolve_note_id(id)
                 .map_err(|e| CliError::internal(e.to_string()))?;
-            let d = cell
-                .conflict(&full)
-                .map_err(|e| match e {
-                    CellError::NoteNotFound(_) => CliError::not_found(format!(
-                        "{full} non è una copia di conflitto aperta"
-                    )),
-                    other => CliError::internal(other.to_string()),
-                })?;
+            let d = cell.conflict(&full).map_err(|e| match e {
+                CellError::NoteNotFound(_) => {
+                    CliError::not_found(format!("{full} non è una copia di conflitto aperta"))
+                }
+                other => CliError::internal(other.to_string()),
+            })?;
             if cli.json {
                 print_json(&serde_json::json!({
                     "cell": name,
@@ -2873,16 +2871,28 @@ fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliE
                 }));
             } else {
                 println!("copia {}  contro l'originale {}", d.copy_id, d.original_id);
-                println!("  {}  {}  {}", match d.loser_class {
-                    engramma_core::cell::conflicts::ActorClass::Human => "umano",
-                    engramma_core::cell::conflicts::ActorClass::Agent => "agente",
-                }, d.loser_actor, d.loser_at);
+                println!(
+                    "  {}  {}  {}",
+                    match d.loser_class {
+                        engramma_core::cell::conflicts::ActorClass::Human => "umano",
+                        engramma_core::cell::conflicts::ActorClass::Agent => "agente",
+                    },
+                    d.loser_actor,
+                    d.loser_at
+                );
                 if d.quarantined {
                     println!("  in quarantena (si legge qui, non con get)");
                 }
                 println!("--- l'originale ---");
                 println!("{}", d.original_body.as_deref().unwrap_or("(assente)"));
-                println!("--- alla biforcazione{} ---", if d.fork_body.is_none() { " (sotto il taglio)" } else { "" });
+                println!(
+                    "--- alla biforcazione{} ---",
+                    if d.fork_body.is_none() {
+                        " (sotto il taglio)"
+                    } else {
+                        ""
+                    }
+                );
                 println!("{}", d.fork_body.as_deref().unwrap_or(""));
                 println!("--- la copia ---");
                 println!("{}", d.copy_body.as_deref().unwrap_or("(assente)"));

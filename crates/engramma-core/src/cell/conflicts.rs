@@ -210,11 +210,12 @@ fn middle_snake(a: &[&str], b: &[&str]) -> Option<(usize, usize, usize, usize)> 
         // the forward D-paths; k walks DOWN so vf[k+1] is this round's
         let mut k = d;
         while k >= -d {
-            let mut x = if k == -d || (k != d && vf[(off + k - 1) as usize] < vf[(off + k + 1) as usize]) {
-                vf[(off + k + 1) as usize]
-            } else {
-                vf[(off + k - 1) as usize] + 1
-            };
+            let mut x =
+                if k == -d || (k != d && vf[(off + k - 1) as usize] < vf[(off + k + 1) as usize]) {
+                    vf[(off + k + 1) as usize]
+                } else {
+                    vf[(off + k - 1) as usize] + 1
+                };
             let mut y = x - k;
             let (xs, ys) = (x, y);
             while x < n && y < m && a[x as usize] == b[y as usize] {
@@ -237,11 +238,12 @@ fn middle_snake(a: &[&str], b: &[&str]) -> Option<(usize, usize, usize, usize)> 
         // the reverse D-paths, measured from the far corner
         let mut k = d;
         while k >= -d {
-            let mut x = if k == -d || (k != d && vr[(off + k - 1) as usize] < vr[(off + k + 1) as usize]) {
-                vr[(off + k + 1) as usize]
-            } else {
-                vr[(off + k - 1) as usize] + 1
-            };
+            let mut x =
+                if k == -d || (k != d && vr[(off + k - 1) as usize] < vr[(off + k + 1) as usize]) {
+                    vr[(off + k + 1) as usize]
+                } else {
+                    vr[(off + k - 1) as usize] + 1
+                };
             let mut y = x - k;
             let (xs, ys) = (x, y);
             while x < n && y < m && a[(n - 1 - x) as usize] == b[(m - 1 - y) as usize] {
@@ -368,7 +370,6 @@ struct NoteOpRow {
     /// `Some` iff this op is a body write whose payload is here.
     body: Option<BodyFacts>,
 }
-
 
 struct BodyFacts {
     text: String,
@@ -544,7 +545,9 @@ impl Ancestry {
 
     /// Is `what` a strict ancestor of `of`?
     fn contains(&self, of: usize, what: usize) -> bool {
-        self.anc[of].get(what / 64).is_some_and(|w| w >> (what % 64) & 1_u64 == 1)
+        self.anc[of]
+            .get(what / 64)
+            .is_some_and(|w| w >> (what % 64) & 1_u64 == 1)
     }
 
     /// The containment's fork (E2, both ends included): when one of the
@@ -1667,7 +1670,12 @@ pub fn conflict(tx: &Transaction<'_>, copy_id: &Ulid) -> Result<ConflictDetail, 
             [copy_id.to_string()],
             |r| {
                 Ok((
-                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
                 ))
             },
         )
