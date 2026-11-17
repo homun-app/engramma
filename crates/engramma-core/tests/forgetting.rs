@@ -134,6 +134,39 @@ fn purge_scrubs_the_stems_from_the_file() {
     assert_forgotten(dir.path(), "oblio", &needles);
 }
 
+/// v0.6.6 (F3): the purge of a note that lived in QUARANTINE — the
+/// hidden index. This phase skips the hidden index's `optimize` when the
+/// purge never touched it; this is the case where it DID, and the
+/// oblivion must not follow the saving: a quarantined body is exactly
+/// one whose stems only the hidden index carries. The visible innocent
+/// note keeps the base index busy, so the two indexes part ways here.
+#[test]
+fn purge_of_a_quarantined_note_scrubs_the_hidden_index() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let path = dir.path().join("oblio-nascosto.sqlite");
+    let cell = Cell::create(&path, "oblio", "tester").unwrap(/* test-only */);
+    let mut secret = note_of(1, "quokkaviolaceo zibellinotremante ovoviviparo");
+    secret.confidence = Confidence::External;
+    secret.source = "import:web".into();
+    secret.status = Status::Quarantined;
+    cell.put_note(&secret, "tester").unwrap(/* test-only */);
+    let innocent = note_of(2, "passeggiata lungo larghissimo fiume");
+    cell.put_note(&innocent, "tester").unwrap(/* test-only */);
+    let hidden: i64 = cell
+        .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes_fts_hidden_docsize")
+        .unwrap(/* test-only */)
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(-1);
+    assert_eq!(hidden, 1, "la nota segregata sta nell'indice nascosto");
+
+    let needles = roots_of(&secret.body, Some(Lang::It));
+    cell.purge(&secret.id, "diritto all'oblio", "tester")
+        .unwrap(/* test-only */);
+    drop(cell);
+    assert_forgotten(dir.path(), "oblio-nascosto", &needles);
+}
+
 /// P0.2: with another connection holding an open read transaction (the MCP
 /// server, Homun) the WAL cannot be truncated. Purge must NOT say "done":
 /// `scrubbed = false`, `pending` holds `"wal"`, the roots are still in the
