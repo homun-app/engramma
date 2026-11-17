@@ -3593,8 +3593,14 @@ fn execute_op(
         .unwrap_or((0, ops::GENESIS_HASH.to_string()));
     // v0.6 (P1): an operation that modifies a note carries `base` — the
     // wire identity of the last operation of that note this author had
-    // applied (the local log holds exactly what was applied, in total
-    // order). Two operations with the same base are concurrent.
+    // applied. Two operations with the same base are concurrent.
+    // v0.6.5 (E1): what the author had applied is the VISIBLE HEAD — the
+    // newest operation on the winner's line, the text that was on the
+    // screen — not the newest operation of the note (a header patch above
+    // a losing branch never saw the winner, and leaning on it made the
+    // loser's copy close without its text living anywhere: the reviewer's
+    // R4 and R1). The derivation writes the head (schema 22); the write
+    // reads it with one indexed probe.
     let base = if let Some(id) = note_id {
         // a note that does not exist yet has nothing to lean on: the
         // indexed probe skips the join for every fresh note (the common
@@ -3606,14 +3612,26 @@ fn execute_op(
         if exists == 0 {
             None
         } else {
-            tx.prepare_cached(
-                "SELECT o.content_hash FROM ops o
-                 JOIN op_objects oo ON oo.op_id = o.op_id
-                 WHERE oo.object = ?1
-                 ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
-            )?
-            .query_row([format!("note:{id}")], |r| r.get(0))
-            .optional()?
+            let head: Option<String> = tx
+                .prepare_cached("SELECT content_hash FROM note_heads WHERE note_id = ?1")?
+                .query_row([id.to_string()], |r| r.get(0))
+                .optional()?;
+            match head {
+                Some(h) => Some(h),
+                // no derivation row: the note holds ONE operation (the
+                // derivation first writes a head at the second) and the
+                // newest operation IS the visible head — today's rule,
+                // exact there, and indexed all the same
+                None => tx
+                    .prepare_cached(
+                        "SELECT o.content_hash FROM ops o
+                         JOIN op_objects oo ON oo.op_id = o.op_id
+                         WHERE oo.object = ?1
+                         ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
+                    )?
+                    .query_row([format!("note:{id}")], |r| r.get(0))
+                    .optional()?,
+            }
         }
     } else {
         None

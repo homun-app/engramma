@@ -845,15 +845,41 @@ fn tombstone_rule(
     let Some(base) = op.base.as_deref() else {
         return Ok(TombstoneOutcome::Wins);
     };
-    // the head before this write, above the cut or below it as a skeleton
-    // (`head_hash_before`): a writer whose base is the note's newest
-    // operation saw the lapide and reopens the note
-    let head = head_hash_before(
-        tx,
-        &format!("note:{id}"),
-        &op.hlc.to_string(),
-        &op.op_id.to_string(),
-    )?;
+    // v0.6.5 (E1): the writer saw the deletion iff it chained onto the
+    // CLOSED LINE — the lapide, or whoever after her left the note closed
+    // (the same head the derivation lends a local write). The note's
+    // NEWEST operation is not that: a concurrent loser newer than the
+    // lapide never saw it, and demanding its hash kept the note closed
+    // for every writer that had (the reviewer's shape, on the lapide).
+    // The walk is over the SET (a recursive descent of the lapides
+    // before this write), so the answer never depends on the arrival
+    // order — the replay asks it at any position
+    let head: Option<String> = tx
+        .query_row(
+            "WITH RECURSIVE closed_line(hash) AS (
+                 SELECT o.content_hash FROM ops o
+                 JOIN op_objects oo ON oo.op_id = o.op_id
+                 WHERE oo.object = ?1 AND o.kind = 'delete_note'
+                   AND (o.hlc < ?2 OR (o.hlc = ?2 AND o.op_id < ?3))
+                 UNION
+                 SELECT o2.content_hash FROM ops o2
+                 JOIN op_objects oo2 ON oo2.op_id = o2.op_id
+                 JOIN closed_line ON o2.base = closed_line.hash
+                 WHERE oo2.object = ?1
+             )
+             SELECT o.content_hash FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = ?1 AND o.content_hash IN (SELECT hash FROM closed_line)
+               AND (o.hlc < ?2 OR (o.hlc = ?2 AND o.op_id < ?3))
+             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
+            rusqlite::params![
+                format!("note:{id}"),
+                op.hlc.to_string(),
+                op.op_id.to_string()
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
     if head.as_deref() == Some(base) {
         Ok(TombstoneOutcome::Reopens)
     } else {
@@ -1045,6 +1071,9 @@ pub(crate) fn purge_conflict_copies(
         };
         delete_note_state(tx, &cid)?;
         super::vectors::delete_note_vectors(tx, &cid)?;
+        // v0.6.5 (E1): a purged note's visible head goes with it — nothing
+        // leans on a note that will never materialize again
+        tx.execute("DELETE FROM note_heads WHERE note_id = ?1", [id])?;
         let next: Vec<String> = {
             let mut stmt =
                 tx.prepare("SELECT copy_id FROM conflict_copies WHERE original_id = ?1")?;

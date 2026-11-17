@@ -402,6 +402,106 @@ fn body_at_fork(rows: &[NoteOpRow], fork: Option<usize>) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// the visible head (v0.6.5, E1): what a local write leans on
+// ---------------------------------------------------------------------------
+
+/// `qualifies[i] = seeds[i] || qualifies[parent(i)]`, for every row, in
+/// one walk: each parent edge is visited once, whatever order the rows
+/// sit in (a base may name an operation that sorts after its child when
+/// two nodes share a physical millisecond).
+fn inherits_flag(rows: &[NoteOpRow], seeds: &[bool]) -> Vec<bool> {
+    let mut memo: Vec<Option<bool>> = vec![None; rows.len()];
+    for start in 0..rows.len() {
+        if memo[start].is_some() {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut cur = start;
+        let value = loop {
+            if seeds[cur] {
+                break true;
+            }
+            match rows[cur].parent {
+                Some(p) => match memo[p] {
+                    Some(v) => break v,
+                    None => {
+                        path.push(cur);
+                        cur = p;
+                    }
+                },
+                None => break false,
+            }
+        };
+        memo[start] = Some(value);
+        for i in path {
+            memo[i] = Some(value);
+        }
+    }
+    memo.into_iter().map(|m| m.unwrap_or(false)).collect()
+}
+
+/// The index of the VISIBLE HEAD: the newest operation in the total
+/// order that DESCENDS from the winner of the body (or is the winner) —
+/// the line the note shows, header patches above the winner included,
+/// the losing branches out. A note closed by a lapide leans on the
+/// lapide, or on whoever after it left it closed (its own rule, kept).
+/// No applied body write at all (the degenerate note, or a lapide that
+/// erased them): today's rule, the newest operation of the note.
+fn visible_head_index(rows: &[NoteOpRow], winner: Option<usize>, deleted: bool) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    let qualifies: Vec<bool> = if deleted {
+        let seeds: Vec<bool> = rows.iter().map(|r| r.kind == OpKind::DeleteNote).collect();
+        inherits_flag(rows, &seeds)
+    } else if let Some(w) = winner {
+        let mut seeds = vec![false; rows.len()];
+        seeds[w] = true;
+        inherits_flag(rows, &seeds)
+    } else {
+        vec![true; rows.len()]
+    };
+    rows.iter()
+        .enumerate()
+        .filter(|(i, _)| qualifies[*i])
+        .max_by(|(ia, a), (ib, b)| {
+            (a.hlc.as_str(), a.op_id.to_string())
+                .cmp(&(b.hlc.as_str(), b.op_id.to_string()))
+                .then(ia.cmp(ib))
+        })
+        .map(|(i, _)| i)
+}
+
+/// Write the note's visible head (schema 22): the derivation's word,
+/// one indexed row the local write reads. The purge takes the row with
+/// the note (nothing leans on a purged note ever again).
+pub(crate) fn write_note_head(
+    tx: &Transaction<'_>,
+    original: &Ulid,
+    rows: &[NoteOpRow],
+    winner: Option<usize>,
+) -> Result<(), CellError> {
+    let deleted = ops::read_note_row(tx, original)?
+        .is_some_and(|row| row.note.status == crate::format::Status::Deleted);
+    match visible_head_index(rows, winner, deleted) {
+        Some(h) => {
+            tx.execute(
+                "INSERT INTO note_heads (note_id, content_hash) VALUES (?1, ?2)
+                 ON CONFLICT(note_id) DO UPDATE SET content_hash = ?2",
+                rusqlite::params![original.to_string(), rows[h].hash],
+            )?;
+        }
+        None => {
+            tx.execute(
+                "DELETE FROM note_heads WHERE note_id = ?1",
+                [original.to_string()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Does the SET hold a closure witness for this loser? (D1.6) An
 /// operation on the copy's id; an APPLIED body write after the loser
 /// in the total order that DESCENDS from it (its author had seen the
@@ -488,6 +588,9 @@ pub(crate) fn after_replay(
         .map(|(i, _)| i)
         .collect();
     let (winner, candidates) = winner_and_candidates(&rows, &applied);
+    // v0.6.5 (E1): the visible head — the local writer's `base` — rides
+    // with the same derivation, from the same set
+    write_note_head(tx, original, &rows, winner)?;
     let winner_body = winner.and_then(|w| rows[w].body.as_ref().map(|b| b.text.clone()));
     let mut plan = Plan {
         winner_body,

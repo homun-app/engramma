@@ -8,11 +8,11 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
-/// Ordered migrations; `MIGRATIONS[i]` brings a cell to version `i + 1`.
+/// Ordered migrations; `MIGRATIONS[i]` brings a cell to version i + 1.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 21] = [
+pub const MIGRATIONS: [&str; 22] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -355,6 +355,25 @@ ALTER TABLE conflict_copies ADD COLUMN loser_hlc TEXT NOT NULL DEFAULT '';
 ALTER TABLE conflict_copies ADD COLUMN open INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE conflict_copies ADD COLUMN visible INTEGER NOT NULL DEFAULT 1;
 "#,
+    r#"
+-- v22 (v0.6.5, E1): the VISIBLE HEAD of a note — the operation a LOCAL
+-- write leans on as its `base`. The newest operation of the note in the
+-- total order is NOT always the one whose body the author had in front
+-- of them: with durable conflict copies the loser stays applied (it
+-- lives as a copy) while the note shows the winner, and a header patch
+-- written above the loser is newer than the winner without ever seeing
+-- it. The head is the newest operation that DESCENDS from the winner of
+-- the body (or is the winner) — for a note closed by a lapide, the
+-- lapide or whoever after her left it closed. DERIVED from the set (the
+-- conflict derivation writes it at every pass), so it never enters the
+-- replicated digest; the table itself is created unversioned at
+-- bootstrap, before any migration runs, because the v21 rematerialization
+-- of an old cell already writes heads through the new derivation. This
+-- migration backfills the rows the past owes.
+CREATE TABLE IF NOT EXISTS note_heads (note_id TEXT PRIMARY KEY,
+                                       content_hash TEXT NOT NULL)
+WITHOUT ROWID;
+"#,
 ];
 
 /// Rust-side migration steps, run right after the SQL of version `v`.
@@ -395,6 +414,66 @@ fn migrate_rust(tx: &rusqlite::Transaction<'_>, v: i64) -> Result<(), crate::err
     }
     if v == 21 {
         migrate_conflicts_v21(tx)?;
+    }
+    if v == 22 {
+        migrate_heads_v22(tx)?;
+    }
+    Ok(())
+}
+
+/// The Rust side of migration v22 (v0.6.5, E1): backfill the visible
+/// head of every note that holds operations. Notes the v21
+/// rematerialization already replayed have their row (the derivation
+/// wrote it); a note with ONE operation needs no derivation — the head
+/// is that operation; the rest rematerialize and the derivation speaks.
+fn migrate_heads_v22(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
+    let objects: Vec<(String, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT oo.object, COUNT(*) FROM op_objects oo
+             WHERE oo.object LIKE 'note:%'
+             GROUP BY oo.object",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (object, n) in objects {
+        let Some(id) = object.strip_prefix("note:") else {
+            continue;
+        };
+        let have: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM note_heads WHERE note_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if have > 0 {
+            continue;
+        }
+        if n <= 1 {
+            // one operation: it is the head, whatever it is
+            let hash: Option<String> = tx
+                .query_row(
+                    "SELECT o.content_hash FROM ops o
+                     JOIN op_objects oo ON oo.op_id = o.op_id
+                     WHERE oo.object = ?1
+                     ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1",
+                    [&object],
+                    |r| r.get(0),
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    other => Err(other),
+                })?;
+            if let Some(hash) = hash {
+                tx.execute(
+                    "INSERT INTO note_heads (note_id, content_hash) VALUES (?1, ?2)
+                     ON CONFLICT(note_id) DO NOTHING",
+                    rusqlite::params![id, hash],
+                )?;
+            }
+        } else {
+            super::material::materialize(tx, &object)?;
+        }
     }
     Ok(())
 }
@@ -757,6 +836,15 @@ fn migrate_log_v2(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::Ce
 /// [`CellError::Db`] on SQL failure.
 pub fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
     tx.execute_batch("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);")?;
+    // v0.6.5 (E1): the visible heads exist before any migration runs — a
+    // migration that rematerializes notes (v21) goes through the new
+    // derivation, which writes them. Unversioned and additive, like
+    // `meta`: the numbered migration v22 backfills the rows of the past.
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS note_heads (note_id TEXT PRIMARY KEY,
+                                                content_hash TEXT NOT NULL)
+         WITHOUT ROWID;",
+    )?;
     let current: i64 = tx
         .query_row(
             "SELECT value FROM meta WHERE key = 'schema_version'",
