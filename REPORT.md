@@ -7980,3 +7980,33 @@ Misure (release, `dbstat` e file):
 `npm test` **54/54** (i 51 della v0.6.3 identici più i tre nuovi:
 l'elenco a cella quieta, i due D3 fra due processi accoppiati);
 `test:electron` **54/54**.
+
+### La caccia e le cinque corse
+
+Su questo commit finale, in release:
+
+- `the_fleet_converges` a **20 000** casi;
+- `every_copy_equals_its_reconstruction` a **20 000** casi;
+- `no_copy_closes_without_a_witness` (la monotonia) a **20 000** casi;
+- `PROPTEST_CASES=2048` con **cinque corse** della suite del core.
+
+### Linux
+
+`scripts/linux.sh` verde: fmt + clippy + 535 test nel contenitore, rete
+chiusa, volume `engramma-linux-target` ricostruito da zero (il revisore
+l'aveva cancellato: la prima corsa ha ricompilato tutto, come previsto).
+
+### Il contratto JS
+
+(la riga definitiva sta nella sezione D6 qui sopra: 54/54 due volte,
+Node ed Electron, addon ricostruito sul commit finale)
+
+### L'inserimento non peggiora (soglia +5%)
+
+Le due coppie alternate contro `fase-v0.6.3` (worktree con target suo),
+`--notes 10000 --runs 5`, `ENGRAMMA_SKIP_MODEL_TESTS=1`, `uptime`
+accanto a ogni corsa.
+
+### La build e i tre file
+
+### Disco e pulizia

@@ -899,6 +899,10 @@ pub(crate) fn after_body_write(
     original: &Ulid,
     arriving: &Op,
 ) -> Result<(), CellError> {
+    // the purge dominates (see rederive_note)
+    if material::note_purged_in_set(tx, original)? {
+        return Ok(());
+    }
     // the snapshot this op just wrote holds the PRE-arrival body — the
     // state a sequential replay would have snapshot only when the
     // correction was NOT in effect. Compare THAT (the post-apply body
@@ -1053,6 +1057,11 @@ pub(crate) fn after_body_write(
 /// of one fleet diverged (found by the phased fleet, seed
 /// 1421488054822918858).
 pub(crate) fn rederive_note(tx: &Transaction<'_>, original: &Ulid) -> Result<(), CellError> {
+    // the purge dominates: a purged note does not materialize and has
+    // no conflict set to derive (its copies went with it, purge_conflict_copies)
+    if material::note_purged_in_set(tx, original)? {
+        return Ok(());
+    }
     if needs_replay(tx, original, None)? {
         return material::materialize(tx, &format!("note:{original}"));
     }
