@@ -232,10 +232,10 @@ fn r3_cost_at_5k_and_20k() {
     }
 }
 
-/// Above the walk's base the alignment is Myers', and no equality with
-/// the table is contracted there — but the alignment still has to BE a
-/// longest common subsequence: pairs increasing on both sides, equal
-/// lines, and as many of them as the table finds.
+// Above the walk's base the alignment is Myers', and no equality with
+// the table is contracted there — but the alignment still has to BE a
+// longest common subsequence: pairs increasing on both sides, equal
+// lines, and as many of them as the table finds.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
     #[test]

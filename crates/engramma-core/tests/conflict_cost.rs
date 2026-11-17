@@ -396,3 +396,267 @@ fn rederivation_with_ten_open_copies_and_fifty_writes() {
     }
     eprintln!("E3 banco: la flotta intera rigiocata da zero: {:?}", started.elapsed());
 }
+
+/// v0.6.5 (E6, measurement — `--ignored`): the cost of the copies ALONE.
+/// The conflicted fleet and the sequential one write THE SAME operations
+/// — a put and two body patches per note — but the sequential one
+/// delivers A's write to B BEFORE B writes: no conflict, no copy. The
+/// difference between the two files is the copy's cost, and only it.
+/// Table by table (`dbstat`), for a 70 B, a 1 KB and a 10 KB note; the
+/// saving that passes a fifth of the copy's cost, with the numbers
+/// before and after.
+#[test]
+#[ignore = "a measurement, not an assertion"]
+fn d5_the_copies_alone_table_by_table() {
+    for (tag, note_size) in [("70 B", 70_usize), ("1 KB", 1_024), ("10 KB", 10_240)] {
+        let body = body_of(note_size);
+        // --- the conflicted fleet: put, then two concurrent patches
+        let dir = tempfile::tempdir().unwrap(/* t */);
+        let (a, wall_a) = bench_cell("a", dir.path());
+        let (b, wall_b) = bench_cell("b", dir.path());
+        let n = note(61, &body);
+        let id = n.id;
+        wall_a.store(K + 1, Ordering::SeqCst);
+        a.put_note(&n, "user").unwrap(/* t */);
+        for op in a.ops().unwrap(/* t */).iter().skip(1) {
+            b.ingest_op(op).unwrap(/* t */);
+        }
+        let mut winner_body = body.clone();
+        winner_body.push_str("\ne la frase della mano umana");
+        wall_a.store(K + 2, Ordering::SeqCst);
+        a.patch_note(
+            &id,
+            &NotePatch { body: Some(winner_body), ..Default::default() },
+            "user",
+        )
+        .unwrap(/* t */);
+        let mut loser_body = body.clone();
+        loser_body.push_str("\ne la mano dell'agente");
+        wall_b.store(K + 3, Ordering::SeqCst);
+        b.patch_note(
+            &id,
+            &NotePatch { body: Some(loser_body), ..Default::default() },
+            "homun:bot-1",
+        )
+        .unwrap(/* t */);
+        // --- the sequential fleet: the SAME ops, but B sees A's first
+        let (a2, wall_a2) = bench_cell("a2", dir.path());
+        let (b2, wall_b2) = bench_cell("b2", dir.path());
+        wall_a2.store(K + 1, Ordering::SeqCst);
+        a2.put_note(&n, "user").unwrap(/* t */);
+        for op in a2.ops().unwrap(/* t */).iter().skip(1) {
+            b2.ingest_op(op).unwrap(/* t */);
+        }
+        wall_a2.store(K + 2, Ordering::SeqCst);
+        a2.patch_note(
+            &id,
+            &NotePatch { body: Some(winner_body.clone()), ..Default::default() },
+            "user",
+        )
+        .unwrap(/* t */);
+        for op in a2.ops().unwrap(/* t */).iter().skip(2) {
+            b2.ingest_op(op).unwrap(/* t */);
+        }
+        wall_b2.store(K + 3, Ordering::SeqCst);
+        b2.patch_note(
+            &id,
+            &NotePatch {
+                body: Some(format!("{}\ne la mano dell'agente, dopo", body)),
+                ..Default::default()
+            },
+            "homun:bot-1",
+        )
+        .unwrap(/* t */);
+        // both settle into a fresh copy of the union, in total order
+        let union_of = |x: &Cell, y: &Cell| -> Vec<Op> {
+            let mut u: Vec<Op> = x.ops().unwrap(/* t */);
+            u.extend(y.ops().unwrap(/* t */));
+            u.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
+            let mut seen = std::collections::BTreeMap::new();
+            for op in u {
+                seen.insert(op.op_id.to_string(), op);
+            }
+            seen.into_values().collect()
+        };
+        let (conflicted, _fc) = bench_cell("fc", dir.path());
+        for op in &union_of(&a, &b) {
+            conflicted.ingest_op(op).unwrap(/* t */);
+        }
+        let (sequential, _fs) = bench_cell("fs", dir.path());
+        for op in &union_of(&a2, &b2) {
+            sequential.ingest_op(op).unwrap(/* t */);
+        }
+        let copies = conflicted
+            .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE open = 1")
+            .unwrap_or_default();
+        let sequential_copies = sequential
+            .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies")
+            .unwrap_or_default();
+        let tables_of = |cell: &Cell| -> Vec<(String, u64)> {
+            cell.debug_column(
+                "SELECT name || char(1) || SUM(pgsize) FROM dbstat GROUP BY name ORDER BY name",
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| {
+                let (nb, bytes) = row.split_once('\u{1}')?;
+                Some((nb.to_string(), bytes.parse().ok()?))
+            })
+            .collect()
+        };
+        let ct = tables_of(&conflicted);
+        let st = tables_of(&sequential);
+        let total_c: u64 = ct.iter().map(|(_, v)| v).sum();
+        let total_s: u64 = st.iter().map(|(_, v)| v).sum();
+        eprintln!(
+            "D6 {tag}: copie {} (la sequenziale {})",
+            copies.first().map(String::as_str).unwrap_or("?"),
+            sequential_copies.first().map(String::as_str).unwrap_or("?")
+        );
+        eprintln!(
+            "D6 {tag}: dbstat tot {total_c} B (sequenziale {total_s} B, differenza {} B = la copia)",
+            total_c.saturating_sub(total_s)
+        );
+        for (name, bytes_c) in &ct {
+            let bytes_s = st.iter().find(|(nb, _)| nb == name).map(|(_, v)| *v).unwrap_or(0);
+            if *bytes_c != bytes_s {
+                eprintln!(
+                    "D6 {tag}: tabella {name}: {bytes_s} → {bytes_c} B (+{})",
+                    bytes_c.saturating_sub(bytes_s)
+                );
+            }
+        }
+        // the saving that passes a fifth of the copy's cost: the body
+        // back in the derivation row, before and after
+        let state_len = state_len_with_body(&conflicted);
+        let lean: u64 = conflicted
+            .debug_column("SELECT CAST(SUM(LENGTH(state_json)) AS TEXT) FROM conflict_copies")
+            .unwrap_or_default()
+            .first()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        eprintln!(
+            "D6 {tag}: la riga di derivazione è {lean} B senza corpo, ~{state_len} B col corpo (il risparmio D5)"
+        );
+    }
+}
+
+/// The stored derivation rows' length with the body back in, computed
+/// from the rows themselves (the counterfactual of the D5 saving).
+fn state_len_with_body(cell: &Cell) -> u64 {
+    let rows: Vec<String> = cell
+        .debug_column(
+            "SELECT state_json || char(1) || COALESCE(json_extract(p.body, '$.set.body'), '') \
+             FROM conflict_copies cc LEFT JOIN op_payloads p ON p.op_id = cc.loser_op",
+        )
+        .unwrap_or_default();
+    rows.into_iter()
+        .map(|row| {
+            row.split_once('\u{1}')
+                .map(|(sj, b)| sj.len() as u64 + b.len() as u64 + 3)
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+/// v0.6.5 (E6, measurement — `--ignored`): the file-growth threshold. A
+/// fleet of 10 000 notes with the 10% conflicted, against the SAME
+/// fleet sequential: the derived rows of the copies may grow the file
+/// by at most the 15% — the number the REPORT carries.
+#[test]
+#[ignore = "a measurement, not an assertion"]
+fn d6_ten_percent_conflicted_against_sequential() {
+    let n_notes = 10_000_u32;
+    let conflicted_n = 1_000_u32;
+    let body = body_of(70);
+    let mut sizes: Vec<(u64, f64)> = Vec::new();
+    for sequential_flavor in [false, true] {
+        let dir = tempfile::tempdir().unwrap(/* t */);
+        let (a, wall_a) = bench_cell("a", dir.path());
+        let (b, wall_b) = bench_cell("b", dir.path());
+        let mut ids: Vec<Ulid> = Vec::new();
+        for i in 1..=n_notes {
+            let n = note(i, &format!("nota {i} del banco: {body}"));
+            ids.push(n.id);
+            wall_a.store(K + i as u64, Ordering::SeqCst);
+            a.put_note(&n, "user").unwrap(/* t */);
+        }
+        for op in a.ops().unwrap(/* t */).iter().skip(1) {
+            b.ingest_op(op).unwrap(/* t */);
+        }
+        for (i, id) in ids.iter().enumerate() {
+            if (i as u32) >= conflicted_n {
+                break;
+            }
+            wall_a.store(K + 100_000 + i as u64, Ordering::SeqCst);
+            a.patch_note(
+                id,
+                &NotePatch {
+                    body: Some(format!("nota {} ritoccata dalla mano umana", i + 1)),
+                    ..Default::default()
+                },
+                "user",
+            )
+            .unwrap(/* t */);
+            if sequential_flavor {
+                // B sees A's word BEFORE writing its own: no conflict
+                let patch = a
+                    .ops()
+                    .unwrap(/* t */)
+                    .into_iter()
+                    .rev()
+                    .find(|o| o.kind.as_str() == "patch_note")
+                    .expect(/* just written */ "the human patch");
+                b.ingest_op(&patch).unwrap(/* t */);
+            }
+            wall_b.store(K + 200_000 + i as u64, Ordering::SeqCst);
+            b.patch_note(
+                id,
+                &NotePatch {
+                    body: Some(format!(
+                        "nota {} riscritta dall'agente{}",
+                        i + 1,
+                        if sequential_flavor { ", dopo" } else { ", in concorrenza" }
+                    )),
+                    ..Default::default()
+                },
+                "homun:bot-1",
+            )
+            .unwrap(/* t */);
+        }
+        let (fresh, _fw) = bench_cell("f", dir.path());
+        let mut union: Vec<Op> = a.ops().unwrap(/* t */);
+        let held: std::collections::HashSet<String> =
+            union.iter().map(|o| o.content_hash.clone()).collect();
+        for op in b.ops().unwrap(/* t */) {
+            if !held.contains(&op.content_hash) {
+                union.push(op);
+            }
+        }
+        union.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
+        let started = Instant::now();
+        for op in &union {
+            fresh.ingest_op(op).unwrap(/* t */);
+        }
+        let pass = started.elapsed();
+        let size = file_bytes(&fresh);
+        let copies = fresh
+            .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE open = 1")
+            .unwrap_or_default();
+        eprintln!(
+            "D6 flotta {} ({} conflitti): file {size} B ({} B/nota), copie {}, passata {:.2} s",
+            if sequential_flavor { "sequenziale" } else { "in conflitto" },
+            if sequential_flavor { 0 } else { conflicted_n },
+            size / u64::from(n_notes),
+            copies.first().map(String::as_str).unwrap_or("?"),
+            pass.as_secs_f64()
+        );
+        sizes.push((size, pass.as_secs_f64()));
+    }
+    if sizes.len() == 2 {
+        let growth = 100.0 * (sizes[0].0 as f64 / sizes[1].0 as f64 - 1.0);
+        eprintln!(
+            "D6 soglia: crescita al 10% di note in conflitto: {growth:.1}% (soglia 15%)"
+        );
+    }
+}

@@ -308,16 +308,25 @@ Notevoli:
   base diversa può solo consegnare gli **stessi** byte o fallire, mai
   cambiare il contenuto.
 
-### I conflitti da risolvere (v0.6.4)
+### I conflitti da risolvere (v0.6.4; la lettura in v0.6.5)
 
 - `cell.conflicts(): Promise<ConflictEntry[]>` — ogni copia di conflitto
   **aperta**: `{ copyId, originalId, loserActor, loserClass: 'human' | 'agent',
-  loserAt, quarantined, visible }`. Nessun testo nell'elenco: la copia è
-  una nota, si legge con `get` come ogni nota (una copia in quarantena
-  risponde `null` — l'oracolo chiuso vale per lei come per ogni nota
-  nascosta; la sua superficie è la coda). `visible: false` è una copia
+  loserAt, quarantined, visible }`. Nessun testo nell'elenco: il testo si
+  legge con `conflict` (sotto). `visible: false` è una copia
   oltre il tetto di tre: resta aperta, appare quando una visibile si
   chiude.
+- `cell.conflict(copyId): Promise<ConflictDetail>` (v0.6.5, E5) — una
+  copia per intero, i tre testi della scelta:
+  `{ ...ConflictEntry, originalBody, copyBody, forkBody }`.
+  `originalBody` è il corpo dell'originale com'è; `copyBody` è il corpo
+  del perdente (il suo payload ne è la casa); `forkBody` è il corpo alla
+  biforcazione fra il perdente e il vincitore (`null` sotto il taglio di
+  compattazione) — la colonna di mezzo di una vista a tre colonne.
+  **La copia in quarantena si legge qui e solo qui**: `get` resta
+  l'oracolo chiuso e risponde `null` per ogni nota nascosta, copie
+  comprese. Errori: `NOT_FOUND` per un id che non è una copia aperta
+  (inesistente o chiusa).
 - `cell.resolveConflict(copyId, { keep: 'original' | 'copy' | 'merged',
   body? }): Promise<string>` — operazioni normali con l'actor della
   cella: `original` è un `delete` sull'id della copia; `copy` e `merged`
@@ -330,8 +339,9 @@ Notevoli:
   (o una copia chiusa senza operazioni sue), `CONFLICT` per una copia
   chiusa che tiene la sua riga (risolta con un delete, modificata).
 - `PEER_OUTDATED` (D4): il pari parla regole di materializzazione
-  diverse — l'ALPN `engramma/sync/2` è la versione delle regole — e
-  **nessuna operazione passa**; il messaggio nomina il dispositivo da
+  diverse — l'ALPN `engramma/sync/3` è la versione delle regole (v0.6.5:
+  la testa visibile e il testimone per coppia cambiano la derivazione) —
+  e **nessuna operazione passa**; il messaggio nomina il dispositivo da
   aggiornare (o dice di aggiornare questo).
 - **La convenzione degli actor** (D2): umano è `user`, ogni actor che
   finisce in `:user` (`homun:user`), ogni actor che comincia con `user@`
