@@ -8009,9 +8009,26 @@ Node ed Electron, addon ricostruito sul commit finale)
 
 ### L'inserimento non peggiora (soglia +5%)
 
-Le due coppie alternate contro `fase-v0.6.3` (worktree con target suo),
-`--notes 10000 --runs 5`, `ENGRAMMA_SKIP_MODEL_TESTS=1`, `uptime`
-accanto a ogni corsa.
+Le due coppie alternate contro `fase-v0.6.3` (worktree con target suo,
+dismesso alla fine), `--notes 10000 --runs 5`,
+`ENGRAMMA_SKIP_MODEL_TESTS=1`, carico accanto a ogni corsa:
+
+| corsa | carico | note/s | p95 testo+grafo |
+|---|---|---|---|
+| base-A | 3,3 | 2952 | 1,8 |
+| fase-A | 2,0 | **2885** | 1,8 |
+| base-B | 1,8 | 2955 | 1,8 |
+| fase-B | 1,7 | **2872** | 1,8 |
+
+**Media −2,5%** (−2,3% e −2,8%), p95 identico: **entro la soglia del
++5%**. La prima misura della fase, prima della correzione, era
+**2511/2527 note/s (−14%)**: la derivazione pagava il scan completo
+anche sulla nota fresca. La nota con **una sola operazione** non deriva
+niente — un corpo solo, l'unica punta, il vincitore per costruzione,
+nessun perdente, nessuna correzione possibile — e il cortocircuito
+(un COUNT indicizzato) riporta l'inserimento in soglia. Il purge
+rallenta (290 → ~360 ms, +24%): la purga transitoria attraversa le
+copie; è il prezzo dichiarato della profondità.
 
 ### La build e i tre file
 
