@@ -1631,6 +1631,20 @@ impl Cell {
         Ok(out)
     }
 
+    /// v0.6.5 (E5): one conflict copy IN FULL — the three texts a
+    /// choice is about: the original's body, the copy's body and the
+    /// body at the fork. The quarantined copies are readable here and
+    /// only here (`get` answers `null` for them, as for every hidden
+    /// note).
+    ///
+    /// # Errors
+    /// [`CellError::NoteNotFound`] when the id is no OPEN conflict copy.
+    pub fn conflict(&self, copy_id: &Ulid) -> Result<conflicts::ConflictDetail, CellError> {
+        let inner = self.lock()?;
+        let tx = inner.conn.unchecked_transaction()?;
+        conflicts::conflict(&tx, copy_id)
+    }
+
     /// v0.6.4 (D3): resolve one conflict copy. Ordinary operations with
     /// the cell's own actor — nothing new for the log: `original` is a
     /// `delete` on the copy's id (the witness (a) that closes it);

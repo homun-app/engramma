@@ -1829,6 +1829,34 @@ pub struct ConflictEntry {
     pub visible: bool,
 }
 
+/// One open conflict copy WITH ITS TEXTS (v0.6.5, E5): what a choice is
+/// about. The quarantined copies are readable here and only here — `get`
+/// answers `null` for them, as for every hidden note.
+#[napi(object)]
+pub struct ConflictDetailEntry {
+    /// The copy's note id.
+    pub copy_id: String,
+    /// The original the copy lost against.
+    pub original_id: String,
+    /// Who wrote the losing body.
+    pub loser_actor: String,
+    /// `human` | `agent`.
+    pub loser_class: String,
+    /// The loser's HLC, RFC 3339.
+    pub loser_at: String,
+    /// An agent's copy is born in quarantine, in the queue.
+    pub quarantined: bool,
+    /// Inside the cap's window of three.
+    pub visible: bool,
+    /// The ORIGINAL's body as it stands (the left column).
+    pub original_body: Option<String>,
+    /// The LOSER's body — the copy's own text (the right column).
+    pub copy_body: Option<String>,
+    /// The body at the fork between the loser and the winner (the middle
+    /// column); `null` under the compaction cut.
+    pub fork_body: Option<String>,
+}
+
 #[napi(js_name = "Cell")]
 pub struct Cell {
     cell: CoreCell,
@@ -2382,6 +2410,43 @@ impl Task for ConflictsTask {
     reject_recode!();
 }
 
+/// `conflict(copyId)`: one copy in full (v0.6.5, E5).
+pub struct ConflictTask {
+    cell: CoreCell,
+    copy_id: String,
+    _open: CellPermits,
+}
+
+impl Task for ConflictTask {
+    type Output = engramma_core::cell::conflicts::ConflictDetail;
+    type JsValue = ConflictDetailEntry;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let id = parse_ulid(&self.copy_id)?;
+        self.cell.conflict(&id).map_err(cell_error)
+    }
+
+    fn resolve(&mut self, _env: Env, d: Self::Output) -> Result<Self::JsValue> {
+        Ok(ConflictDetailEntry {
+            copy_id: d.copy_id.to_string(),
+            original_id: d.original_id.to_string(),
+            loser_actor: d.loser_actor.clone(),
+            loser_class: match d.loser_class {
+                engramma_core::cell::conflicts::ActorClass::Human => "human".into(),
+                engramma_core::cell::conflicts::ActorClass::Agent => "agent".into(),
+            },
+            loser_at: d.loser_at.clone(),
+            quarantined: d.quarantined,
+            visible: d.visible,
+            original_body: d.original_body,
+            copy_body: d.copy_body,
+            fork_body: d.fork_body,
+        })
+    }
+
+    reject_recode!();
+}
+
 /// `keep`: `original` (the delete), `copy` (the loser's body), `merged`
 /// (the body given).
 #[napi(object)]
@@ -2731,6 +2796,19 @@ impl Cell {
     pub fn conflicts(&self, env: Env) -> Result<AsyncTask<ConflictsTask>> {
         Ok(AsyncTask::new(ConflictsTask {
             cell: self.cell.clone(),
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// v0.6.5 (E5): one conflict copy in full — the original's body, the
+    /// copy's body and the fork's, for the screen that asks the user to
+    /// choose. The quarantined copies are readable here and only here
+    /// (`get` answers `null` for them).
+    #[napi(ts_return_type = "Promise<ConflictDetailEntry>")]
+    pub fn conflict(&self, env: Env, copy_id: String) -> Result<AsyncTask<ConflictTask>> {
+        Ok(AsyncTask::new(ConflictTask {
+            cell: self.cell.clone(),
+            copy_id,
             _open: self.enter(env)?,
         }))
     }

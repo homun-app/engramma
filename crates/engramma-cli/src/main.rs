@@ -443,6 +443,15 @@ enum ProposalsAction {
 
 #[derive(Subcommand)]
 enum ConflictsAction {
+    /// Read one copy in full (v0.6.5): the original's body, the copy's
+    /// body and the fork's — the quarantined copies too, which `get`
+    /// never shows
+    Show {
+        /// The cell that holds the conflict
+        cell: String,
+        /// The copy's id (or prefix)
+        id: String,
+    },
     /// Resolve one copy: `--keep original` (the delete), `--keep copy`
     /// (the copy's body wins), `--keep merged --body-file <f>` (the hand
     /// merge; `-` = stdin)
@@ -2841,6 +2850,45 @@ fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliE
             }
             Ok(())
         }
+        Some(ConflictsAction::Show { cell: name, id }) => {
+            // the cell is a positional here (the task's own shape):
+            // `engramma conflicts show <cella> <copia>`
+            let path = cell_path(cli, name)?;
+            let cell = open_cell_armed(&path)?;
+            let full = cell
+                .resolve_note_id(id)
+                .map_err(|e| CliError::internal(e.to_string()))?;
+            let d = cell
+                .conflict(&full)
+                .map_err(|e| match e {
+                    CellError::NoteNotFound(_) => CliError::not_found(format!(
+                        "{full} non è una copia di conflitto aperta"
+                    )),
+                    other => CliError::internal(other.to_string()),
+                })?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "cell": name,
+                    "conflict": conflict_detail_json(&d),
+                }));
+            } else {
+                println!("copia {}  contro l'originale {}", d.copy_id, d.original_id);
+                println!("  {}  {}  {}", match d.loser_class {
+                    engramma_core::cell::conflicts::ActorClass::Human => "umano",
+                    engramma_core::cell::conflicts::ActorClass::Agent => "agente",
+                }, d.loser_actor, d.loser_at);
+                if d.quarantined {
+                    println!("  in quarantena (si legge qui, non con get)");
+                }
+                println!("--- l'originale ---");
+                println!("{}", d.original_body.as_deref().unwrap_or("(assente)"));
+                println!("--- alla biforcazione{} ---", if d.fork_body.is_none() { " (sotto il taglio)" } else { "" });
+                println!("{}", d.fork_body.as_deref().unwrap_or(""));
+                println!("--- la copia ---");
+                println!("{}", d.copy_body.as_deref().unwrap_or("(assente)"));
+            }
+            Ok(())
+        }
         Some(ConflictsAction::Resolve {
             id,
             keep,
@@ -2876,6 +2924,24 @@ fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliE
             Ok(())
         }
     }
+}
+
+fn conflict_detail_json(d: &engramma_core::cell::conflicts::ConflictDetail) -> serde_json::Value {
+    serde_json::json!({
+        "copyId": d.copy_id.to_string(),
+        "originalId": d.original_id.to_string(),
+        "loserActor": d.loser_actor,
+        "loserClass": match d.loser_class {
+            engramma_core::cell::conflicts::ActorClass::Human => "human",
+            engramma_core::cell::conflicts::ActorClass::Agent => "agent",
+        },
+        "loserAt": d.loser_at,
+        "quarantined": d.quarantined,
+        "visible": d.visible,
+        "originalBody": d.original_body,
+        "copyBody": d.copy_body,
+        "forkBody": d.fork_body,
+    })
 }
 
 fn conflict_json(r: &engramma_core::cell::conflicts::ConflictInfo) -> serde_json::Value {

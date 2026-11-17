@@ -103,6 +103,18 @@ fn lcs_matches(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
     out
 }
 
+/// (v0.6.5, tests only) the deterministic id of one loser's conflict
+/// copy — the E4 judge asks whether an operation lives on it.
+#[must_use]
+pub fn conflict_copy_id_for_test(loser_hash: &str, loser_hlc: &str) -> Ulid {
+    material::conflict_copy_id(
+        loser_hash,
+        crate::hlc::Hlc::parse(loser_hlc)
+            .map(|h| h.physical_ms)
+            .unwrap_or(0),
+    )
+}
+
 /// (v0.6.5, tests only) the alignment itself — the long-text property
 /// checks it is a longest common subsequence, valid and maximal, above
 /// the walk's base where Myers rules.
@@ -1600,6 +1612,150 @@ pub fn conflicts(tx: &Transaction<'_>) -> Result<Vec<ConflictInfo>, CellError> {
         with_status.push(info);
     }
     Ok(with_status)
+}
+
+/// One conflict copy IN FULL (v0.6.5, E5): everything [`conflicts`]
+/// lists, plus the three texts a choice is about — the original's body,
+/// the copy's body and the body at the fork between the loser and the
+/// winner (`null` under the compaction cut). The quarantined copies
+/// are readable HERE and only here: `get` stays the closed oracle, and
+/// a quarantined note answers `null` to it.
+#[derive(Debug, Clone)]
+pub struct ConflictDetail {
+    /// The copy's note id (deterministic, a function of the loser).
+    pub copy_id: Ulid,
+    /// The original the copy lost against.
+    pub original_id: Ulid,
+    /// Who wrote the losing body.
+    pub loser_actor: String,
+    /// Human or agent — the class that lost.
+    pub loser_class: ActorClass,
+    /// The loser's HLC, the copy's own birth time.
+    pub loser_at: String,
+    /// An agent's copy is born in quarantine, in the queue.
+    pub quarantined: bool,
+    /// Inside the cap's window of three: a notes row of its own.
+    pub visible: bool,
+    /// The ORIGINAL's body as it stands.
+    pub original_body: Option<String>,
+    /// The LOSER's body (the loser's payload is its home).
+    pub copy_body: Option<String>,
+    /// The body at the fork between the loser and the winner — what a
+    /// three-column view shows in the middle.
+    pub fork_body: Option<String>,
+}
+
+/// One conflict copy in full, by its id (v0.6.5, E5): the read for the
+/// screen that asks the user to choose. A copy that is missing or
+/// CLOSED answers [`CellError::NoteNotFound`]: a closed copy is no
+/// longer a choice.
+///
+/// # Errors
+/// [`CellError::Db`] on SQL failure; [`CellError::NoteNotFound`] when
+/// the id is no OPEN conflict copy.
+pub fn conflict(tx: &Transaction<'_>, copy_id: &Ulid) -> Result<ConflictDetail, CellError> {
+    let row: Option<(String, String, String, String, i64, i64)> = tx
+        .query_row(
+            "SELECT copy_id, original_id, loser_actor, loser_hlc, open, visible
+             FROM conflict_copies WHERE copy_id = ?1",
+            [copy_id.to_string()],
+            |r| {
+                Ok((
+                    r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((_, original_id, loser_actor, loser_hlc, open, visible)) = row else {
+        return Err(CellError::NoteNotFound(copy_id.to_string()));
+    };
+    if open == 0 {
+        // closed: no longer a choice
+        return Err(CellError::NoteNotFound(copy_id.to_string()));
+    }
+    let original = Ulid::from_string(&original_id)
+        .map_err(|_| CellError::Db(format!("bad conflict original {original_id}")))?;
+    let loser_op: String = tx.query_row(
+        "SELECT loser_op FROM conflict_copies WHERE copy_id = ?1",
+        [copy_id.to_string()],
+        |r| r.get(0),
+    )?;
+    // the original's body as it stands
+    let original_body = ops::read_note_row(tx, &original)?.map(|row| row.note.body);
+    // the loser's body: its payload is the home (a patch's set.body, a
+    // put's note.body); the copy's own notes row is the fallback
+    let copy_body: Option<String> = {
+        let from_payload: Option<String> = tx
+            .query_row(
+                "SELECT json_extract(p.body, '$.set.body') FROM op_payloads p
+                 WHERE p.op_id = ?1 AND json_extract(p.body, '$.set.body') IS NOT NULL",
+                [&loser_op],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match from_payload {
+            Some(b) => Some(b),
+            None => tx
+                .query_row(
+                    "SELECT json_extract(p.body, '$.note.body') FROM op_payloads p
+                     WHERE p.op_id = ?1",
+                    [&loser_op],
+                    |r| r.get(0),
+                )
+                .optional()?,
+        }
+    };
+    // the fork's body, from the same derivation the set speaks
+    let fork_body = {
+        let rows = scan(tx, &original)?;
+        let loser = rows.iter().position(|r| r.op_id.to_string() == loser_op);
+        let applied: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.body.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        let (winner, _) = winner_and_candidates(&rows, &applied);
+        match (loser, winner) {
+            (Some(l), Some(w)) => {
+                let fork = nearest_common_ancestor(&rows, l, w);
+                body_at_fork(&rows, fork)
+            }
+            _ => None,
+        }
+    };
+    let at = crate::hlc::Hlc::parse(&loser_hlc)
+        .map(|h| {
+            let t = time::OffsetDateTime::UNIX_EPOCH
+                + time::Duration::milliseconds(h.physical_ms as i64);
+            crate::format::At(t).to_db_string()
+        })
+        .unwrap_or_else(|_| loser_hlc.clone());
+    let loser_class = classify_actor(&loser_actor);
+    // the quarantine lives in the copy's own note state (derived)
+    let status: Option<String> = tx
+        .query_row(
+            "SELECT status FROM notes WHERE id = ?1",
+            [copy_id.to_string()],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    Ok(ConflictDetail {
+        copy_id: *copy_id,
+        original_id: original,
+        loser_actor,
+        loser_class,
+        loser_at: at,
+        quarantined: status.as_deref() == Some("quarantined"),
+        visible: visible != 0,
+        original_body,
+        copy_body,
+        fork_body,
+    })
 }
 
 /// (v0.6.4, tests only) Does the SET hold a closure witness for the
