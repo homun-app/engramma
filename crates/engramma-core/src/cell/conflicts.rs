@@ -226,7 +226,7 @@ fn middle_snake(a: &[&str], b: &[&str]) -> Option<(usize, usize, usize, usize)> 
             if odd {
                 let rk = delta - k;
                 if -(d - 1) <= rk
-                    && rk <= d - 1
+                    && rk < d
                     && x + vr[(off + rk) as usize] >= n
                     && (xs != x || (xs != 0 && ys != 0) || (xs != n && ys != m))
                 {
@@ -520,8 +520,8 @@ impl Ancestry {
                     let bit = 1u64 << (i % 64);
                     for &p in &path {
                         anc[p][i / 64] |= bit;
-                        for w in 0..words {
-                            anc[p][w] |= anc[i][w];
+                        for (a_row, done_row) in anc[p].iter_mut().zip(&anc[i]) {
+                            *a_row |= *done_row;
                         }
                     }
                     break;

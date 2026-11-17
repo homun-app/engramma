@@ -11,7 +11,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(20_000);
     let shape = std::env::args().nth(2).unwrap_or_else(|| "r3".into());
-    let base: String = (0..n).map(|i| format!("riga {i}")).collect::<Vec<_>>().join("\n");
+    let base: String = (0..n)
+        .map(|i| format!("riga {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let (a, b) = match shape.as_str() {
         "unrelated" => {
             let other: String = (0..n)
