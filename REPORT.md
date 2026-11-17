@@ -8644,7 +8644,7 @@ resta dov'è, con questa correzione accanto.
 - **La misura finale** (stessa sonda, ordine ruotato, sei giri, carico
   5,3–7,3): v0.6.3 mediana **129,9 ms**, v0.6.5 mediana **190,2 ms**,
   fase mediana **130,6 ms** — **+0,5%, dentro la soglia del +10%** con
-  margine (il bersaglio era 144 ms). Nella colonna purga del banco
+  margine (il bersaglio era ≈143 ms). Nella colonna purga del banco
   intero (corpus pieno, istantanea presente): +4,5% medio in coppia.
 - **L'inserimento non peggiora** (due coppie alternate, `--notes 10000
   --runs 5`, `ENGRAMMA_SKIP_MODEL_TESTS=1`, carico accanto):
