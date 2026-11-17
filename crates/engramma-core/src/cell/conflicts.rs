@@ -77,8 +77,83 @@ pub fn classify_actor(actor: &str) -> ActorClass {
 // the rigorous diff3 (a line merge with no approximations)
 // ---------------------------------------------------------------------------
 
-/// The aligned pairs of an LCS of two line slices, increasing in both.
+/// The alignment cap (v0.6.5, E3): beyond this many lines, or this many
+/// bytes, on either side the containment answers «does not contain».
+/// The prudent choice — a copy too big to judge stays open, and text is
+/// never lost. Under the cap Myers' linear alignment keeps a 20 000-line
+/// merge in the milliseconds (the numbers are in the REPORT); the cap
+/// keeps a hostile import bounded whatever its shape.
+pub const DIFF3_MAX_LINES: usize = 32_768;
+/// The byte twin of [`DIFF3_MAX_LINES`] — long lines pay in bytes what
+/// many lines pay in rows. Measured on the R3 shape: 20 000 lines cost
+/// 1,4 ms and 5,6 MB (v0.6.4: 1,4 s and 1,68 GB); the worst honest
+/// shape — two unrelated sides — stays linear in memory and bounded in
+/// time by the cap (≈2,6 s at 32 768). The numbers are in the REPORT.
+pub const DIFF3_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// The aligned pairs of an LCS of two line slices, increasing on both
+/// sides — the same pairs the v0.6.4 quadratic table walked (the
+/// equality property of `tests/diff3_linear.rs` freezes that contract),
+/// found in LINEAR SPACE with Myers' middle-snake divide and conquer:
+/// O((n+m)·D) time, O(n+m) memory (v0.6.5, E3 — the reviewer's R3: the
+/// quadratic table cost 1,4 s and 1,68 GB for ONE 20 000-line merge).
 fn lcs_matches(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    myers_box(a, b, 0, 0, &mut out);
+    out
+}
+
+/// (v0.6.5, tests only) the alignment itself — the long-text property
+/// checks it is a longest common subsequence, valid and maximal, above
+/// the walk's base where Myers rules.
+#[must_use]
+pub fn lcs_matches_for_test(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
+    lcs_matches(a, b)
+}
+
+/// The base-case side (v0.6.5, E3): a box this small takes the walk of
+/// the v0.6.4 table itself — BOUNDED now (512²·4 B ≈ 1 MB, a leaf of
+/// the recursion, never the unbounded whole of the reviewer's R3). The
+/// ties of Myers' canonical path and of the table's walk are two
+/// different optimums among equals, and the merge DECIDES with them
+/// (which lines are stable); short texts keep the table's own decisions
+/// — the equality property's contract — while the big ones, where no
+/// contract binds, take Myers' O((n+m)·D) under the cap.
+const MYERS_BASE: usize = 512;
+
+/// One box of the divide and conquer: the common head matches greedily
+/// (the walk's own first move — equal fronts always match), then the
+/// middle snake splits the rest and the halves recurse.
+fn myers_box(a: &[&str], b: &[&str], a0: usize, b0: usize, out: &mut Vec<(usize, usize)>) {
+    let mut head = 0;
+    while head < a.len() && head < b.len() && a[head] == b[head] {
+        out.push((a0 + head, b0 + head));
+        head += 1;
+    }
+    let a = &a[head..];
+    let b = &b[head..];
+    let (a0, b0) = (a0 + head, b0 + head);
+    if a.is_empty() || b.is_empty() {
+        return;
+    }
+    if a.len() <= MYERS_BASE && b.len() <= MYERS_BASE {
+        walk_box(a, b, a0, b0, out);
+        return;
+    }
+    if let Some((sx, sy, ex, ey)) = middle_snake(a, b) {
+        myers_box(&a[..sx], &b[..sy], a0, b0, out);
+        for t in 0..ex.saturating_sub(sx) {
+            out.push((a0 + sx + t, b0 + sy + t));
+        }
+        myers_box(&a[ex..], &b[ey..], a0 + ex, b0 + ey, out);
+    }
+    // else: the box shares no line at all — pure edits, nothing to align
+}
+
+/// The walk of the v0.6.4 table over one bounded box: match when the
+/// fronts are equal, else advance the first side whenever both lead to
+/// a maximum — the decisions every short text has always had.
+fn walk_box(a: &[&str], b: &[&str], a0: usize, b0: usize, out: &mut Vec<(usize, usize)>) {
     let mut table = vec![vec![0_u32; b.len() + 1]; a.len() + 1];
     for i in (0..a.len()).rev() {
         for j in (0..b.len()).rev() {
@@ -89,11 +164,10 @@ fn lcs_matches(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
             };
         }
     }
-    let mut out = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         if a[i] == b[j] {
-            out.push((i, j));
+            out.push((a0 + i, b0 + j));
             i += 1;
             j += 1;
         } else if table[i + 1][j] >= table[i][j + 1] {
@@ -102,7 +176,87 @@ fn lcs_matches(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
             j += 1;
         }
     }
-    out
+}
+
+/// The middle snake (Myers 1986, §4b): the diagonal run an optimal path
+/// crosses at the center of the box, as its forward coordinates
+/// `(start_x, start_y, end_x, end_y)`. `None` when no split makes
+/// progress (the box shares no line). The ties follow the table's own
+/// rule — on equal reach the path consumes the FIRST side, and equal
+/// fronts always match — which is what keeps the alignment equal to the
+/// quadratic walk's on the texts the property generates.
+fn middle_snake(a: &[&str], b: &[&str]) -> Option<(usize, usize, usize, usize)> {
+    let n = a.len() as isize;
+    let m = b.len() as isize;
+    let delta = n - m;
+    let odd = delta.rem_euclid(2) == 1;
+    let max_d = (n + m) / 2 + 1;
+    let off = max_d;
+    let mut vf = vec![0_isize; (2 * max_d + 1) as usize];
+    let mut vr = vec![0_isize; (2 * max_d + 1) as usize];
+    for d in 0..=max_d {
+        // the forward D-paths; k walks DOWN so vf[k+1] is this round's
+        let mut k = d;
+        while k >= -d {
+            let mut x = if k == -d || (k != d && vf[(off + k - 1) as usize] < vf[(off + k + 1) as usize]) {
+                vf[(off + k + 1) as usize]
+            } else {
+                vf[(off + k - 1) as usize] + 1
+            };
+            let mut y = x - k;
+            let (xs, ys) = (x, y);
+            while x < n && y < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            vf[(off + k) as usize] = x;
+            if odd {
+                let rk = delta - k;
+                if -(d - 1) <= rk
+                    && rk <= d - 1
+                    && x + vr[(off + rk) as usize] >= n
+                    && (xs != x || (xs != 0 && ys != 0) || (xs != n && ys != m))
+                {
+                    return Some((xs as usize, ys as usize, x as usize, y as usize));
+                }
+            }
+            k -= 2;
+        }
+        // the reverse D-paths, measured from the far corner
+        let mut k = d;
+        while k >= -d {
+            let mut x = if k == -d || (k != d && vr[(off + k - 1) as usize] < vr[(off + k + 1) as usize]) {
+                vr[(off + k + 1) as usize]
+            } else {
+                vr[(off + k - 1) as usize] + 1
+            };
+            let mut y = x - k;
+            let (xs, ys) = (x, y);
+            while x < n && y < m && a[(n - 1 - x) as usize] == b[(m - 1 - y) as usize] {
+                x += 1;
+                y += 1;
+            }
+            vr[(off + k) as usize] = x;
+            if !odd {
+                let fk = delta - k;
+                if -d <= fk && fk <= d && x >= n - vf[(off + fk) as usize] {
+                    // the reverse snake, back in forward coordinates,
+                    // runs from (n-x, m-y) to (n-xs, m-ys)
+                    let (sx, sy, ex, ey) = (
+                        (n - x) as usize,
+                        (m - y) as usize,
+                        (n - xs) as usize,
+                        (m - ys) as usize,
+                    );
+                    if (sx, sy) != (0, 0) || (ex, ey) != (0, 0) {
+                        return Some((sx, sy, ex, ey));
+                    }
+                }
+            }
+            k -= 2;
+        }
+    }
+    None
 }
 
 /// One unstable chunk of the merge: what each side did to the same
@@ -129,6 +283,16 @@ fn merge_chunk<'a>(base: &[&'a str], a: &[&'a str], b: &[&'a str], out: &mut Vec
 /// Identical changes from both sides never count as an overlap.
 #[must_use]
 pub fn diff3_merge(base: &str, a: &str, b: &str) -> Option<String> {
+    if base.len() > DIFF3_MAX_BYTES
+        || a.len() > DIFF3_MAX_BYTES
+        || b.len() > DIFF3_MAX_BYTES
+        || base.lines().count() > DIFF3_MAX_LINES
+        || a.lines().count() > DIFF3_MAX_LINES
+        || b.lines().count() > DIFF3_MAX_LINES
+    {
+        // over the cap (E3): «does not contain» — the copy stays open
+        return None;
+    }
     let fb: Vec<&str> = base.split('\n').collect();
     let fa: Vec<&str> = a.split('\n').collect();
     let fbb: Vec<&str> = b.split('\n').collect();
@@ -315,6 +479,80 @@ fn body_facts(kind: &OpKind, body_json: &str) -> Option<BodyFacts> {
             })
         }
         _ => None,
+    }
+}
+
+/// Every row's strict ancestors as bitsets — one pass, no allocation
+/// in the loops that follow (v0.6.5, E3: the containment product
+/// (losers × subsequent writes) paid these walks at every pass; the
+/// measured 9,4 ms of a ten-copy note were mostly here, not in the
+/// diff3). Pure set state: it never crosses a derivation.
+struct Ancestry {
+    anc: Vec<Vec<u64>>,
+}
+
+impl Ancestry {
+    fn of(rows: &[NoteOpRow]) -> Self {
+        let words = rows.len().div_ceil(64);
+        let mut anc = vec![vec![0_u64; words]; rows.len()];
+        let mut done = vec![false; rows.len()];
+        for start in 0..rows.len() {
+            if done[start] {
+                continue;
+            }
+            let mut path: Vec<usize> = Vec::new();
+            let mut cur = Some(start);
+            while let Some(i) = cur {
+                if done[i] {
+                    let bit = 1u64 << (i % 64);
+                    for &p in &path {
+                        anc[p][i / 64] |= bit;
+                        for w in 0..words {
+                            anc[p][w] |= anc[i][w];
+                        }
+                    }
+                    break;
+                }
+                path.push(i);
+                cur = rows[i].parent;
+            }
+            // each path node's ancestors are the path nodes AFTER it
+            for (pos, &node) in path.iter().enumerate() {
+                for &later in &path[pos + 1..] {
+                    let bit = 1u64 << (later % 64);
+                    anc[node][later / 64] |= bit;
+                }
+            }
+            for &p in &path {
+                done[p] = true;
+            }
+        }
+        Self { anc }
+    }
+
+    /// Is `what` a strict ancestor of `of`?
+    fn contains(&self, of: usize, what: usize) -> bool {
+        self.anc[of].get(what / 64).is_some_and(|w| w >> (what % 64) & 1_u64 == 1)
+    }
+
+    /// The containment's fork (E2, both ends included): when one of the
+    /// two is the other's ancestor, that ancestor IS the fork; otherwise
+    /// the first of `from`'s strict chain that walks `of`'s past.
+    fn fork_of(&self, rows: &[NoteOpRow], from: usize, of: usize) -> Option<usize> {
+        if self.contains(from, of) {
+            return Some(of);
+        }
+        if self.contains(of, from) {
+            return Some(from);
+        }
+        let mut cur = rows[from].parent;
+        while let Some(j) = cur {
+            if self.contains(of, j) {
+                return Some(j);
+            }
+            cur = rows[j].parent;
+        }
+        None
     }
 }
 
@@ -519,6 +757,7 @@ fn write_note_head(
 fn has_witness(
     tx: &Transaction<'_>,
     rows: &[NoteOpRow],
+    ancestry: &Ancestry,
     loser: usize,
     applied: &[usize],
     copy_id: &Ulid,
@@ -534,13 +773,7 @@ fn has_witness(
     }
     // every APPLIED body write that descends from the loser: its author
     // had seen it (the base chain walks through it)
-    let mut descendants_of_loser: Vec<usize> = Vec::new();
-    for &i in applied {
-        if ancestors_of(rows, i).contains(&loser) {
-            descendants_of_loser.push(i);
-        }
-    }
-    if !descendants_of_loser.is_empty() {
+    if applied.iter().any(|&i| ancestry.contains(i, loser)) {
         return Ok(true);
     }
     let loser_key = key_of(&rows[loser]);
@@ -554,16 +787,14 @@ fn has_witness(
             continue;
         }
         // a descendant saw the loser, whatever the diff says of its tail
-        if descendants_of_loser.contains(&i) {
+        if ancestry.contains(i, loser) {
             return Ok(true);
         }
         let Some(text) = rows[i].body.as_ref().map(|b| b.text.as_str()) else {
             continue;
         };
-        // the fork is the pair's own: `nca(loser, witness)`, both ends
-        // included — for concurrent writes the strict and the inclusive
-        // ancestor are the same op
-        let fork = nearest_common_ancestor(rows, loser, i);
+        // the fork is the pair's own, both ends included (E2)
+        let fork = ancestry.fork_of(rows, loser, i);
         let fork_body = body_at_fork(rows, fork);
         if let Some(f) = fork_body.as_deref()
             && let Some(merged) = diff3_merge(f, text, loser_text)
@@ -599,6 +830,7 @@ pub(crate) fn after_replay(
     // v0.6.5 (E1): the visible head — the local writer's `base` — rides
     // with the same derivation, from the same set
     write_note_head(tx, original, &rows, winner)?;
+    let ancestry = Ancestry::of(&rows);
     let winner_body = winner.and_then(|w| rows[w].body.as_ref().map(|b| b.text.clone()));
     let mut plan = Plan {
         winner_body,
@@ -681,8 +913,8 @@ pub(crate) fn after_replay(
         };
         let filtered = plan.winner_body.as_deref() == Some(facts.text.as_str()) || fork_same;
         let copy_id = material::conflict_copy_id(&rows[loser].hash, hlc_ms_of(&rows[loser].hlc));
-        let witnessed = winner.is_some()
-            && has_witness(tx, &rows, loser, &applied, &copy_id)?;
+        let witnessed =
+            winner.is_some() && has_witness(tx, &rows, &ancestry, loser, &applied, &copy_id)?;
         let mut open = true;
         if filtered || witnessed {
             // closed. But a copy the user made THEIRS (an edit, the
@@ -1400,7 +1632,8 @@ pub fn witness_for_test(
         return Ok(false);
     }
     let copy_id = material::conflict_copy_id(&rows[loser].hash, hlc_ms_of(&rows[loser].hlc));
-    has_witness(tx, &rows, loser, &applied, &copy_id)
+    let ancestry = Ancestry::of(&rows);
+    has_witness(tx, &rows, &ancestry, loser, &applied, &copy_id)
 }
 
 /// (v0.6.4, tests only) Does the CURRENT set still DESERVE a copy for

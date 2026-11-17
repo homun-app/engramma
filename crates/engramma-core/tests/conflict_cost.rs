@@ -271,3 +271,128 @@ fn fleet_ten_thousand_notes_one_and_ten_percent() {
         }
     }
 }
+
+/// v0.6.5 (E3, measurement — `--ignored`): the rederivation cost on a
+/// note with TEN open copies and FIFTY subsequent body writes — the
+/// product (losers × subsequent writes) the containment loop pays at
+/// every pass. The number goes in the REPORT; the containment cache
+/// exists only if this demands it.
+#[test]
+#[ignore = "a measurement, not an assertion"]
+fn rederivation_with_ten_open_copies_and_fifty_writes() {
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let (cell, wall) = bench_cell("r", dir.path());
+    let body = "prima riga\nil corpo condiviso della nota del banco\nterza riga";
+    let n = note(41, body);
+    let id = n.id;
+    wall.store(K + 1, Ordering::SeqCst);
+    cell.put_note(&n, "user").unwrap(/* t */);
+    let put: Vec<Op> = cell
+        .ops()
+        .unwrap(/* t */)
+        .into_iter()
+        .filter(|o| o.kind.as_str() == "put_note")
+        .collect();
+    // ten concurrent losers, one per fresh device (each saw only the put)
+    let mut losers: Vec<Op> = Vec::new();
+    for i in 0..10_u32 {
+        let (dev, dev_wall) = bench_cell(&format!("l{i}"), dir.path());
+        dev.ingest_op(&put[0]).unwrap(/* t */);
+        dev_wall.store(K + 2 + u64::from(i), Ordering::SeqCst);
+        dev.patch_note(
+            &id,
+            &NotePatch {
+                body: Some(format!("prima riga\nla mano dell'agente {i}\nterza riga")),
+                ..Default::default()
+            },
+            "homun:bot-1",
+        )
+        .unwrap(/* t */);
+        losers.push(
+            dev.ops()
+                .unwrap(/* t */)
+                .into_iter()
+                .find(|o| o.kind.as_str() == "patch_note")
+                .expect(/* it just wrote one */ "the loser"),
+        );
+    }
+    for op in &losers {
+        cell.ingest_op(op).unwrap(/* t */);
+    }
+    // the human winner: concurrent to every loser — written on a device
+    // that saw ONLY the put (the older human hand that wins, D2)
+    let (h, hw) = bench_cell("h", dir.path());
+    h.ingest_op(&put[0]).unwrap(/* t */);
+    hw.store(K + 40, Ordering::SeqCst);
+    let human = {
+        h.patch_note(
+            &id,
+            &NotePatch {
+                body: Some("prima riga\nla mano umana che vince\nterza riga".into()),
+                ..Default::default()
+            },
+            "user",
+        )
+        .unwrap(/* t */);
+        h.ops()
+            .unwrap(/* t */)
+            .into_iter()
+            .find(|o| o.kind.as_str() == "patch_note")
+            .expect(/* it just wrote one */ "the human winner")
+    };
+    cell.ingest_op(&human).unwrap(/* t */);
+    let open = cell
+        .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE open = 1")
+        .unwrap_or_default();
+    eprintln!("E3 banco: copie aperte {}", open.first().cloned().unwrap_or_default());
+    // fifty SEQUENTIAL body writes on the winner's line, each applied here
+    for i in 0..50_u32 {
+        wall.store(K + 100 + u64::from(i), Ordering::SeqCst);
+        cell.patch_note(
+            &id,
+            &NotePatch {
+                body: Some(format!("prima riga\nla mano umana che vince, volta {i}\nterza riga")),
+                ..Default::default()
+            },
+            "user",
+        )
+        .unwrap(/* t */);
+    }
+    // the measure: ONE more local write — the derivation it triggers
+    let measure_once = |tag: &str| {
+        wall.store(K + 500 + (tag.len() as u64), Ordering::SeqCst);
+        let started = Instant::now();
+        cell.patch_note(
+            &id,
+            &NotePatch {
+                body: Some("prima riga\nla mano umana che vince, l'ultima\nterza riga".into()),
+                ..Default::default()
+            },
+            "user",
+        )
+        .unwrap(/* t */);
+        eprintln!("E3 banco: una riderivazione, {tag}: {:?}", started.elapsed());
+    };
+    measure_once("10 copie e 50 scritture");
+    for i in 50..100_u32 {
+        wall.store(K + 100 + u64::from(i), Ordering::SeqCst);
+        cell.patch_note(
+            &id,
+            &NotePatch {
+                body: Some(format!("prima riga\nla mano umana che vince, volta {i}\nterza riga")),
+                ..Default::default()
+            },
+            "user",
+        )
+        .unwrap(/* t */);
+    }
+    measure_once("10 copie e 100 scritture");
+    // and the whole-history rebuild, for scale
+    let all: Vec<Op> = cell.ops().unwrap(/* t */);
+    let (fresh, _fw) = bench_cell("f2", dir.path());
+    let started = Instant::now();
+    for op in &all {
+        fresh.ingest_op(op).unwrap(/* t */);
+    }
+    eprintln!("E3 banco: la flotta intera rigiocata da zero: {:?}", started.elapsed());
+}

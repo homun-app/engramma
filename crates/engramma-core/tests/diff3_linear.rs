@@ -160,7 +160,7 @@ fn aligned_text() -> impl Strategy<Value = String> {
         ),
         0..=2_u8,
     )
-        .prop_map(|(mut lines, tail)| {
+        .prop_map(|(lines, tail)| {
             if lines.is_empty() {
                 return String::new();
             }
@@ -198,6 +198,15 @@ fn the_diff3_edge_cases_hold() {
     // a single common line: each side adds its own copy around it — the
     // changes compose, they never overlap
     assert_eq!(diff3_merge("m", "a\nm", "m\na"), Some("a\nm\na".into()));
+    // over the cap (E3): «does not contain», whatever the texts say
+    let huge: String = (0..40_000).map(|i| format!("riga {i}\n")).collect();
+    assert_eq!(diff3_merge(&huge, &huge, &huge), None, "the cap refuses, prudently");
+    let long_line = "x".repeat(5 * 1024 * 1024);
+    assert_eq!(
+        diff3_merge(&long_line, &long_line, &long_line),
+        None,
+        "the byte cap refuses too"
+    );
 }
 
 /// (E3, measurement — `--ignored`): the R3 numbers for the REPORT, at
@@ -221,4 +230,68 @@ fn r3_cost_at_5k_and_20k() {
         let r = diff3_merge(&base, &other, &l);
         eprintln!("R3 n={n} unrelated merge ok={} in {:?}", r.is_some(), t.elapsed());
     }
+}
+
+/// Above the walk's base the alignment is Myers', and no equality with
+/// the table is contracted there — but the alignment still has to BE a
+/// longest common subsequence: pairs increasing on both sides, equal
+/// lines, and as many of them as the table finds.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+    #[test]
+    fn the_long_alignment_is_still_a_lcs(
+        seed in any::<u64>(),
+        n in 520_usize..=1600,
+        edits in 1_u32..=120,
+    ) {
+        // a seeded scramble of a shared spine, with repeats
+        let mut rng = seed;
+        let mut next = move || {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng
+        };
+        let spine: Vec<String> = (0..n).map(|i| {
+            if next() % 5 == 0 { "".into() } else { format!("r{}", i % 97) }
+        }).collect();
+        let mut scramble = |v: &[String], d: u32| -> Vec<String> {
+            let mut out = v.to_vec();
+            for _ in 0..d {
+                match next() % 3 {
+                    0 => { let at = (next() as usize) % out.len(); out.remove(at); }
+                    1 => { let at = (next() as usize) % (out.len() + 1);
+                           out.insert(at, format!("n{}", next() % 1000)); }
+                    _ => { let at = (next() as usize) % out.len(); out[at] = format!("c{}", next() % 1000); }
+                }
+            }
+            out
+        };
+        let a = scramble(&spine, edits);
+        let b = scramble(&spine, edits);
+        let la: Vec<&str> = a.iter().map(String::as_str).collect();
+        let lb: Vec<&str> = b.iter().map(String::as_str).collect();
+        // the reference: the table's LCS length (its own walk, bounded
+        // by the corpus — this test, not the engine)
+        let reference_len = lcs_len_v064(&la, &lb);
+        // the engine's answer comes through the merge's own halves: the
+        // alignment length equals the reference
+        let joined = |v: &[String]| v.join("\n");
+        let base_text = joined(&spine);
+        let a_text = joined(&a);
+        let b_text = joined(&b);
+        let _ = diff3_merge(&base_text, &a_text, &b_text);
+        // the engine's own alignment, straight from the module
+        let pairs = engramma_core::cell::conflicts::lcs_matches_for_test(&la, &lb);
+        // valid: strictly increasing on both sides, equal lines
+        for w in pairs.windows(2) {
+            prop_assert!(w[0].0 < w[1].0 && w[0].1 < w[1].1, "not increasing: {:?}", pairs);
+        }
+        for (i, j) in &pairs {
+            prop_assert_eq!(la[*i], lb[*j], "not a common subsequence: {:?}", pairs);
+        }
+        // and maximal: as long as the table's own LCS
+        prop_assert_eq!(pairs.len(), reference_len);
+    }
+}
+
+fn lcs_len_v064(a: &[&str], b: &[&str]) -> usize {
+    lcs_matches_v064(a, b).len()
 }
