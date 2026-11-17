@@ -1820,6 +1820,16 @@ proptest! {
         let mut runner = FleetRunner::new(seed, devices);
         let mut prev: Vec<Vec<(Ulid, Ulid, Ulid)>> =
             runner.fleet.cells.iter().map(open_copies_with_loser).collect();
+        // v0.6.5 (E2): the reopen ledger — for every copy that closed,
+        // whether its close had a WITNESS and whether the set still
+        // DESERVED it. A copy open at round r+1 that was closed at r is
+        // a failure unless it closed undeserved (the winner-following
+        // rebirth: the filters and the winner's ancestry are the one
+        // closure and reopening that follow the winner — DESIGN § 4.3).
+        // A WITNESSED close never reopens: the witness is an existence,
+        // and with E2's fork it is monotone in the set.
+        let mut closed_at: Vec<std::collections::HashMap<Ulid, (bool, bool)>> =
+            runner.fleet.cells.iter().map(|_| std::collections::HashMap::new()).collect();
         for _ in 0..rounds {
             runner.one_round();
             let now: Vec<Vec<(Ulid, Ulid, Ulid)>> =
@@ -1836,17 +1846,34 @@ proptest! {
                     // DESERVES the copy (a graph an out-of-order arrival
                     // completed made the loser the winner, or an ancestor
                     // of it — the text lives in the note itself)
+                    let witnessed = runner.fleet.cells[dev]
+                        .conflict_witness_for_test(original, loser)
+                        .unwrap_or(false);
+                    let deserved = runner.fleet.cells[dev]
+                        .conflict_deserved_for_test(original, loser)
+                        .unwrap_or(true);
                     prop_assert!(
-                        runner.fleet.cells[dev]
-                            .conflict_witness_for_test(original, loser)
-                            .unwrap_or(false)
+                        witnessed
                             || original_purged(&runner.fleet.cells[dev], original)
                             || lapide_active(&runner.fleet.cells[dev], original)
-                            || !runner.fleet.cells[dev]
-                                .conflict_deserved_for_test(original, loser)
-                                .unwrap_or(true),
+                            || !deserved,
                         "seed {seed}: copy {copy} closed without a witness"
                     );
+                    closed_at[dev].insert(*copy, (witnessed, deserved));
+                }
+                // absent → present (v0.6.5, E2): a closed copy that is
+                // open again — only a winner-following rebirth may come
+                // back; a witnessed close never does
+                for (copy, _, _) in is {
+                    if let Some((witnessed_close, deserved_close)) =
+                        closed_at[dev].remove(copy)
+                    {
+                        prop_assert!(
+                            !witnessed_close && !deserved_close,
+                            "seed {seed}: copy {copy} reopened — it closed \
+                             witnessed ({witnessed_close}) or deserved ({deserved_close})"
+                        );
+                    }
                 }
             }
             prev = now;

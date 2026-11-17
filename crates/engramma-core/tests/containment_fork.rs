@@ -76,6 +76,8 @@ fn a_late_winner_does_not_reopen_a_merged_copy() {
         1,
         "L lost to W1: its copy is open"
     );
+    // L's copy id — the one the hand merge is about to close
+    let l_copy = open_copies(&y, &id)[0].0.clone();
 
     // W2 on y merges L by hand: it contains L, the copy closes
     wy.store(K + 6, Ordering::SeqCst);
@@ -89,20 +91,21 @@ fn a_late_winner_does_not_reopen_a_merged_copy() {
         x.ingest_op(op).unwrap(/* t */);
         y.ingest_op(op).unwrap(/* t */);
     }
-    assert!(
-        open_copies(&y, &id).is_empty(),
-        "the hand merge closed L's copy: {:?}",
-        open_copies(&y, &id)
-    );
-    assert!(
-        open_copies(&x, &id).is_empty(),
-        "on x too: {:?}",
-        open_copies(&x, &id)
-    );
+    let l_row_of = |cell: &engramma_core::Cell| -> Vec<String> {
+        cell.debug_column(&format!(
+            "SELECT 'open=' || open FROM conflict_copies WHERE copy_id = '{l_copy}'"
+        ))
+        .unwrap_or_default()
+    };
+    let closed = |rows: &[String]| rows.is_empty() || rows == ["open=0"];
+    assert!(closed(&l_row_of(&y)), "the hand merge closed L's copy on y");
+    assert!(closed(&l_row_of(&x)), "and on x");
 
-    // the human tip of z arrives, late: it WINS (the human class), but
-    // the closed copy must stay closed — the witness is a fact about
-    // (L, W2) and their past, not about the winner
+    // the human tip of z arrives, late: it WINS (the human class) and a
+    // NEW loser may take its copy (W2 itself, now beaten: the one
+    // closure and reopening that follow the winner, declared in DESIGN
+    // § 4.3) — but L's CLOSED copy must stay closed: the witness is a
+    // fact about (L, W2) and their past, not about the winner
     for op in &union(&z, &y) {
         y.ingest_op(op).unwrap(/* t */);
         x.ingest_op(op).unwrap(/* t */);
@@ -112,13 +115,24 @@ fn a_late_winner_does_not_reopen_a_merged_copy() {
         .unwrap(/* t */);
     assert_eq!(body[0], "0\na\n2\nb\nH", "the late human tip won the body");
     assert!(
-        open_copies(&y, &id).is_empty(),
-        "a late winner does not reopen a merged copy: {:?}",
+        closed(&l_row_of(&y)),
+        "a late winner does not reopen the merged copy: {:?}",
         open_copies(&y, &id)
     );
     assert!(
-        open_copies(&x, &id).is_empty(),
+        closed(&l_row_of(&x)),
         "nor on x: {:?}",
         open_copies(&x, &id)
     );
+    // and no open copy carries L's own body: its text lives in the note
+    // (the merge), not needed again
+    for cell in [&y, &x] {
+        assert!(
+            open_copies(cell, &id)
+                .iter()
+                .all(|(_, body, _)| *body != "1\na\nL\nb\n3"),
+            "L's own body is not reopened as a copy: {:?}",
+            open_copies(cell, &id)
+        );
+    }
 }

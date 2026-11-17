@@ -193,6 +193,7 @@ struct NoteOpRow {
     body: Option<BodyFacts>,
 }
 
+
 struct BodyFacts {
     text: String,
     updated_at: String,
@@ -476,7 +477,7 @@ fn visible_head_index(rows: &[NoteOpRow], winner: Option<usize>, deleted: bool) 
 /// Write the note's visible head (schema 22): the derivation's word,
 /// one indexed row the local write reads. The purge takes the row with
 /// the note (nothing leans on a purged note ever again).
-pub(crate) fn write_note_head(
+fn write_note_head(
     tx: &Transaction<'_>,
     original: &Ulid,
     rows: &[NoteOpRow],
@@ -502,21 +503,25 @@ pub(crate) fn write_note_head(
     Ok(())
 }
 
-/// Does the SET hold a closure witness for this loser? (D1.6) An
+/// Does the SET hold a closure witness for this loser? (D1.6, E2) An
 /// operation on the copy's id; an APPLIED body write after the loser
 /// in the total order that DESCENDS from it (its author had seen the
-/// loser); or an applied later body write that CONTAINS it — the
-/// rigorous diff3 from the fork returns the writer without overlaps.
-/// A later write with the very same text contains it (two identical
-/// changes are one change), which is how equal-bodied losers collapse
-/// into a single copy.
+/// loser — the containment's special case with the fork taken at the
+/// loser itself, kept its own arm because it needs no payload); or an
+/// applied later body write that CONTAINS it — the rigorous diff3 from
+/// the fork between the LOSER and THAT WRITER returns the writer
+/// without overlaps. The fork never names the winner: a late arrival
+/// can move it, and a witness is a fact about the pair and their past
+/// (v0.6.5, E2 — the reopened copies of the reviewer's R2). A later
+/// write with the very same text contains it (two identical changes
+/// are one change), which is how equal-bodied losers collapse into a
+/// single copy.
 fn has_witness(
     tx: &Transaction<'_>,
     rows: &[NoteOpRow],
     loser: usize,
     applied: &[usize],
     copy_id: &Ulid,
-    winner: usize,
 ) -> Result<bool, CellError> {
     // (a) an operation on the copy's id
     let on_copy: i64 = tx.query_row(
@@ -538,8 +543,6 @@ fn has_witness(
     if !descendants_of_loser.is_empty() {
         return Ok(true);
     }
-    let fork = nearest_common_ancestor(rows, loser, winner);
-    let fork_body = body_at_fork(rows, fork);
     let loser_key = key_of(&rows[loser]);
     let loser_text = rows[loser].body.as_ref().map(|b| b.text.as_str());
     let Some(loser_text) = loser_text else {
@@ -557,7 +560,12 @@ fn has_witness(
         let Some(text) = rows[i].body.as_ref().map(|b| b.text.as_str()) else {
             continue;
         };
-        if let (Some(f), true) = (fork_body.as_deref(), rows[i].body.is_some())
+        // the fork is the pair's own: `nca(loser, witness)`, both ends
+        // included — for concurrent writes the strict and the inclusive
+        // ancestor are the same op
+        let fork = nearest_common_ancestor(rows, loser, i);
+        let fork_body = body_at_fork(rows, fork);
+        if let Some(f) = fork_body.as_deref()
             && let Some(merged) = diff3_merge(f, text, loser_text)
             && merged == text
         {
@@ -673,10 +681,8 @@ pub(crate) fn after_replay(
         };
         let filtered = plan.winner_body.as_deref() == Some(facts.text.as_str()) || fork_same;
         let copy_id = material::conflict_copy_id(&rows[loser].hash, hlc_ms_of(&rows[loser].hlc));
-        let witnessed = match winner {
-            Some(w) => has_witness(tx, &rows, loser, &applied, &copy_id, w)?,
-            None => false,
-        };
+        let witnessed = winner.is_some()
+            && has_witness(tx, &rows, loser, &applied, &copy_id)?;
         let mut open = true;
         if filtered || witnessed {
             // closed. But a copy the user made THEIRS (an edit, the
@@ -1390,11 +1396,11 @@ pub fn witness_for_test(
         .map(|(i, _)| i)
         .collect();
     let (winner, _) = winner_and_candidates(&rows, &applied);
-    let Some(winner) = winner else {
+    if winner.is_none() {
         return Ok(false);
-    };
+    }
     let copy_id = material::conflict_copy_id(&rows[loser].hash, hlc_ms_of(&rows[loser].hlc));
-    has_witness(tx, &rows, loser, &applied, &copy_id, winner)
+    has_witness(tx, &rows, loser, &applied, &copy_id)
 }
 
 /// (v0.6.4, tests only) Does the CURRENT set still DESERVE a copy for
