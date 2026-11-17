@@ -1856,9 +1856,9 @@ fn concurrent_creates_case(authors: u32) {
 }
 
 // ---------------------------------------------------------------------------
-// v0.6.4 (D1.6): the MONOTONITY property — a copy open at round r and
-// closed at round r+1 has a closure witness in the round r+1 set. Never
-// a closure without one.
+// v0.6.5 (E4): the TEXT judge — every body an author wrote is somewhere:
+// the note, an open copy, an operation on the copy's id, or a later
+// write that READ it. It watches the TEXT, not the history of the copies.
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
     #[test]
@@ -1891,6 +1891,195 @@ proptest! {
             &format!("seed {seed} dev {devices} rounds {rounds} tail"),
         ) {
             prop_assert!(false, "{why}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.6.6 (F1): the MONOTONITY property is BACK, next to the text judge —
+// the two are not substitutes (one watches the text, the other the
+// HISTORY of the copies). `434759c` (E4) had replaced it instead of
+// adding its judge alongside, and the v0.6.5 REPORT said «four green
+// properties» over three: the inventory of F2 now guards the count. The
+// text below is the one `84e9586` (E2) wrote; the engine's own test
+// helpers (`conflict_witness_for_test`, `conflict_deserved_for_test`)
+// still judge through the derivation's live predicates — the witness
+// AFTER the loser in the TOTAL ORDER, the fork at `nca` with both ends
+// included — so the property hunts under today's rules unchanged.
+// ---------------------------------------------------------------------------
+
+/// The open copies of one device, with the loser op the derivation
+/// names (the witness check's key).
+fn open_copies_with_loser(cell: &Cell) -> Vec<(Ulid, Ulid, Ulid)> {
+    let rows = cell
+        .debug_column(
+            "SELECT copy_id || ' ' || original_id || ' ' || loser_op FROM conflict_copies
+             WHERE open = 1",
+        )
+        .unwrap(/* test-only */);
+    rows.into_iter()
+        .filter_map(|row| {
+            let mut it = row.split(' ');
+            let (Some(c), Some(o), Some(l)) = (it.next(), it.next(), it.next()) else {
+                return None;
+            };
+            Some((
+                Ulid::from_string(c).unwrap(/* test-only */),
+                Ulid::from_string(o).unwrap(/* test-only */),
+                Ulid::from_string(l).unwrap(/* test-only */),
+            ))
+        })
+        .collect()
+}
+
+/// The purge dominates with a rule of its own (D1.6 has no say there):
+/// a purged original takes its copies without a witness.
+fn original_purged(cell: &Cell, original: &Ulid) -> bool {
+    cell.debug_column(&format!(
+        "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
+         JOIN op_objects oo ON oo.op_id = o.op_id
+         WHERE oo.object = 'note:{original}' AND o.kind = 'purge'"
+    ))
+    .unwrap_or_default()
+    .first()
+    .is_some_and(|n| n != "0")
+}
+
+/// The lapide closes without a D1.6 witness too — its rule is today's
+/// own, kept by this phase (REPORT, «prima della correzione», punto 1):
+/// a body write that did not see the delete wins nothing and leaves the
+/// tip set; a write the rollback erased is gone; and a tip the lapide
+/// held can hand the winnership to a former loser, whose copy closes
+/// with it. Wherever the original holds a delete, the conflict set
+/// follows the lapide, not the witnesses — the property hunts the
+/// derivation on the notes the lapide never touched.
+/// The original's derivation row is GONE. Only the purge ever removes
+/// the row of a copy that carries operations (every other path keeps it
+/// as the note's replay base): its absence says the purge took it — and
+/// the purge reaches the copies of copies, transitively.
+fn original_row_gone(cell: &Cell, original: &Ulid) -> bool {
+    cell.debug_column(&format!(
+        "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE original_id = '{original}'"
+    ))
+    .unwrap_or_default()
+    .first()
+    .is_some_and(|n| n == "0")
+        && cell
+            .debug_column(&format!(
+                "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
+                 JOIN op_objects oo ON oo.op_id = o.op_id
+                 WHERE oo.object = 'note:{original}'"
+            ))
+            .unwrap_or_default()
+            .first()
+            .is_some_and(|n| n != "0")
+}
+
+fn lapide_active(cell: &Cell, original: &Ulid) -> bool {
+    cell.debug_column(&format!(
+        "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
+         JOIN op_objects oo ON oo.op_id = o.op_id
+         WHERE oo.object = 'note:{original}' AND o.kind = 'delete_note'"
+    ))
+    .unwrap_or_default()
+    .first()
+    .is_some_and(|n| n != "0")
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+    #[test]
+    fn no_copy_closes_without_a_witness(
+        seed in any::<u64>(),
+        devices in 2_u32..=4,
+        rounds in 12_u32..=28,
+    ) {
+        let mut runner = FleetRunner::new(seed, devices);
+        let mut prev: Vec<Vec<(Ulid, Ulid, Ulid)>> =
+            runner.fleet.cells.iter().map(open_copies_with_loser).collect();
+        // v0.6.5 (E2): the reopen ledger — for every copy that closed,
+        // whether its close had a WITNESS and whether the set still
+        // DESERVED it. A copy open at round r+1 that was closed at r is
+        // a failure unless it closed undeserved (the winner-following
+        // rebirth: the filters and the winner's ancestry are the one
+        // closure and reopening that follow the winner — DESIGN § 4.3).
+        // A WITNESSED close never reopens: the witness is an existence,
+        // and with E2's fork it is monotone in the set.
+        let mut closed_at: Vec<std::collections::HashMap<Ulid, (bool, bool)>> =
+            runner.fleet.cells.iter().map(|_| std::collections::HashMap::new()).collect();
+        for _ in 0..rounds {
+            runner.one_round();
+            let now: Vec<Vec<(Ulid, Ulid, Ulid)>> =
+                runner.fleet.cells.iter().map(open_copies_with_loser).collect();
+            for (dev, (was, is)) in prev.iter().zip(&now).enumerate() {
+                let held: std::collections::HashSet<Ulid> =
+                    is.iter().map(|(c, _, _)| *c).collect();
+                for (copy, original, loser) in was {
+                    if held.contains(copy) {
+                        continue;
+                    }
+                    // admitted without a D1.6 witness: the purge and the
+                    // lapide (their own rules), and a set that no longer
+                    // DESERVES the copy (a graph an out-of-order arrival
+                    // completed made the loser the winner, or an ancestor
+                    // of it — the text lives in the note itself)
+                    let witnessed = runner.fleet.cells[dev]
+                        .conflict_witness_for_test(original, loser)
+                        .unwrap_or(false);
+                    let deserved = runner.fleet.cells[dev]
+                        .conflict_deserved_for_test(original, loser)
+                        .unwrap_or(true);
+                    prop_assert!(
+                        witnessed
+                            || original_purged(&runner.fleet.cells[dev], original)
+                            || lapide_active(&runner.fleet.cells[dev], original)
+                            || !deserved,
+                        "seed {seed}: copy {copy} closed without a witness"
+                    );
+                    closed_at[dev].insert(*copy, (witnessed, deserved));
+                }
+                // absent → present (v0.6.5, E2): a closed copy that is
+                // open again — only a winner-following rebirth may come
+                // back; a witnessed close never does
+                for (copy, _, _) in is {
+                    if let Some((witnessed_close, deserved_close)) =
+                        closed_at[dev].remove(copy)
+                    {
+                        prop_assert!(
+                            !witnessed_close && !deserved_close,
+                            "seed {seed}: copy {copy} reopened — it closed \
+                             witnessed ({witnessed_close}) or deserved ({deserved_close})"
+                        );
+                    }
+                }
+            }
+            prev = now;
+        }
+        // the tail (propose, decide, maybe purge, settles) closes copies
+        // too — the purge by its own dominance, the rest by witness
+        runner.finish();
+        let now: Vec<Vec<(Ulid, Ulid, Ulid)>> =
+            runner.fleet.cells.iter().map(open_copies_with_loser).collect();
+        for (dev, (was, is)) in prev.iter().zip(&now).enumerate() {
+            let held: std::collections::HashSet<Ulid> =
+                is.iter().map(|(c, _, _)| *c).collect();
+            for (copy, original, loser) in was {
+                if held.contains(copy) {
+                    continue;
+                }
+                prop_assert!(
+                    runner.fleet.cells[dev]
+                        .conflict_witness_for_test(original, loser)
+                        .unwrap_or(false)
+                        || original_purged(&runner.fleet.cells[dev], original)
+                        || original_row_gone(&runner.fleet.cells[dev], original)
+                        || lapide_active(&runner.fleet.cells[dev], original)
+                        || !runner.fleet.cells[dev]
+                            .conflict_deserved_for_test(original, loser)
+                            .unwrap_or(true),
+                    "seed {seed}: copy {copy} closed in the tail without a witness"
+                );
+            }
         }
     }
 }
