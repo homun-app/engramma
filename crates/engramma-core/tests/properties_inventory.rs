@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! v0.6.6 (F2): the machine-checked inventory of the suite's proptest
+//! properties. A property removed from the sources (the v0.6.5 defect:
+//! `434759c` replaced `no_copy_closes_without_a_witness` instead of
+//! adding a judge next to it) must fail HERE, in a file the reviewer
+//! reads — the same principle as an insta snapshot or a CI-compared
+//! `--list`.
+//!
+//! The parser is deliberately simple and honest about what it sees: it
+//! walks the integration tests of every crate (`crates/*/tests/**/*.rs`),
+//! finds `proptest! {` blocks by counting braces, and records every
+//! `fn name(` declared inside. What it does NOT see (declared in the
+//! REPORT): properties made by macros other than `proptest!`, blocks
+//! nested inside another macro invocation, and unbalanced braces inside
+//! strings or comments of a block's body (every brace in this suite's
+//! property bodies is balanced, format strings included).
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+/// One inventory line: `path-from-the-workspace-root property_name`.
+fn parse_inventory(text: &str) -> BTreeSet<(String, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (path, name) = l
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("riga d'inventario malformata: «{l}»"));
+            (path.to_string(), name.trim().to_string())
+        })
+        .collect()
+}
+
+/// Every `crates/*/tests/**/*.rs` of the workspace, sorted — the same
+/// order the inventory lists them in.
+fn test_sources(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(crates) = root.join("crates").read_dir().ok().map(|rd| {
+        rd.flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect::<Vec<_>>()
+    }) else {
+        return out;
+    };
+    for c in crates {
+        let tests = c.join("tests");
+        let mut stack = vec![tests];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = dir.read_dir() else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The properties one source file declares: every `fn` inside a
+/// `proptest! { … }` block, blocks found by brace counting.
+fn properties_of(src: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    // the FLOOR of each open proptest! block: the depth the line after
+    // its opening brace sits at. A line is inside the block while its
+    // starting depth is at or above the floor; the closing brace of the
+    // block is the line that brings the depth back below it
+    let mut floors: Vec<usize> = Vec::new();
+    let mut depth = 0_usize;
+    for line in src.lines() {
+        // a `//`-comment line can NAME `proptest! {` (this file's own doc
+        // does): it never opens one (block comments are a declared limit)
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        if line.contains("proptest!") && line.contains('{') {
+            floors.push(depth + line.matches('{').count() - line.matches('}').count());
+        }
+        // a `fn` name sits at the depth the line STARTS at — its own
+        // braces come after the name
+        let trimmed = line.trim_start();
+        for kind in ["fn ", "async fn "] {
+            if let Some(rest) = trimmed.strip_prefix(kind)
+                && let Some(name) = rest.split(['(', ':']).next()
+            {
+                let name = name.trim();
+                if !name.is_empty()
+                    && floors.iter().any(|&f| depth >= f)
+                    && !found.iter().any(|f| f == name)
+                {
+                    found.push(name.to_string());
+                }
+            }
+        }
+        depth = (depth + line.matches('{').count()).saturating_sub(line.matches('}').count());
+        floors.retain(|&f| depth >= f);
+    }
+    found
+}
+
+#[test]
+fn properties_inventory() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest.ancestors().nth(2).expect(
+        /* test-only */ "the workspace root sits two levels above engramma-core",
+    );
+    let inventory_text = std::fs::read_to_string(manifest.join("tests/properties.txt"))
+        .expect(/* test-only */ "properties.txt");
+    let inventory = parse_inventory(&inventory_text);
+
+    let mut sources: BTreeSet<(String, String)> = BTreeSet::new();
+    for file in test_sources(root) {
+        let rel = file
+            .strip_prefix(root)
+            .expect(/* test-only */ "sources live under the workspace root")
+            .to_string_lossy()
+            .into_owned();
+        let text = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+            panic!("lettura di {rel} fallita: {e}");
+        });
+        for name in properties_of(&text) {
+            sources.insert((rel.clone(), name));
+        }
+    }
+
+    let missing_from_inventory: Vec<_> = sources.difference(&inventory).collect();
+    let missing_from_sources: Vec<_> = inventory.difference(&sources).collect();
+    assert!(
+        missing_from_inventory.is_empty() && missing_from_sources.is_empty(),
+        "l'inventario delle proprietà non torna:\n  nei sorgenti ma NON nell'inventario (aggiungi la riga, o è una proprietà che il parser non vede — dichiara il limite): {missing_from_inventory:?}\n  nell'inventario ma NON nei sorgenti (la proprietà è stata tolta? v0.6.6, F2): {missing_from_sources:?}"
+    );
+}
