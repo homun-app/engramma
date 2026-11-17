@@ -861,7 +861,8 @@ impl Fleet {
                         return;
                     }
                     if let Some((copy, _)) = seen.get(rng.below(seen.len() as u64) as usize)
-                        && let Ok(note) = cell.get(copy)
+                        && let Ok(detail) = cell.conflict(copy)
+                        && let Some(copy_body) = detail.copy_body.clone()
                         && let Some(original) =
                             seen.iter().find(|(c, _)| c == copy).map(|(_, o)| *o)
                     {
@@ -876,7 +877,6 @@ impl Fleet {
                         // on their screen AND the copy they are merging
                         let note_read = read_of_shown(cell, &original);
                         let copy_read = {
-                            let body = note.body.clone();
                             let hash = cell
                                 .debug_column(&format!(
                                     "SELECT o.content_hash FROM ops o
@@ -886,9 +886,9 @@ impl Fleet {
                                 .unwrap_or_default()
                                 .into_iter()
                                 .next();
-                            vec![(body, hash)]
+                            vec![(copy_body.clone(), hash)]
                         };
-                        let merged = format!("{}\nfuso da {dev}", note.body);
+                        let merged = format!("{}\nfuso da {dev}", copy_body);
                         let _ = cell.patch_note(
                             &original,
                             &NotePatch {
@@ -1905,3 +1905,108 @@ proptest! {
 
 
 
+
+/// v0.6.4 (measurement, `--ignored`): the generator's case frequencies
+/// over 1000 fleets — both actor classes, header-only patches, hand
+/// merges, deletes on copy ids; and v0.6.5 (E4): the R4 and R1 shapes.
+/// The numbers go in the REPORT.
+#[test]
+#[ignore = "a measurement, not an assertion"]
+fn generator_frequencies_1000_fleets() {
+    let mut ops = 0_u64;
+    let mut human = 0_u64;
+    let mut agent = 0_u64;
+    let mut header_only = 0_u64;
+    let mut hand_merges = 0_u64;
+    let mut body_writes = 0_u64;
+    let mut copy_deletes = 0_u64;
+    let mut open_copies = 0_u64;
+    let mut quarantined_copies = 0_u64;
+    // v0.6.5 (E4): the R4 and R1 shapes, per 1000 fleets
+    let mut r4_bursts = 0_u64;
+    let mut r4_lost = 0_u64;
+    let mut r1_followups = 0_u64;
+    for seed in 0..1000_u64 {
+        let fleet = fleet_run(seed, 3, 20);
+        r4_bursts += fleet.model.r4_bursts;
+        r1_followups += fleet.model.r1_agent_on_human;
+        for op in &fleet.model.r4_ops {
+            let lost: Vec<String> = fleet.cells[0]
+                .debug_column(&format!(
+                    "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE loser_op = '{}'",
+                    op
+                ))
+                .unwrap_or_default();
+            if lost.first().map(String::as_str) == Some("1") {
+                r4_lost += 1;
+            }
+        }
+        for cell in &fleet.cells {
+            let rows = cell
+                .debug_column(
+                    "SELECT o.kind || ' ' || o.actor || ' ' || COALESCE(json_extract(p.body, '$.set.body'), '') FROM ops o
+                     LEFT JOIN op_payloads p ON p.op_id = o.op_id",
+                )
+                .unwrap_or_default();
+            for row in &rows {
+                let mut it = row.splitn(3, ' ');
+                let (kind, actor, body) = (
+                    it.next().unwrap_or_default(),
+                    it.next().unwrap_or_default(),
+                    it.next().unwrap_or_default(),
+                );
+                ops += 1;
+                match classify(actor) {
+                    ActorClass::Human => human += 1,
+                    ActorClass::Agent => agent += 1,
+                }
+                if kind == "patch_note" && body.is_empty() {
+                    header_only += 1;
+                }
+                if kind == "patch_note" && body.contains("fuso da ") {
+                    hand_merges += 1;
+                }
+                if matches!(kind, "put_note" | "patch_note") && !body.is_empty() {
+                    body_writes += 1;
+                }
+            }
+            copy_deletes += cell
+                .debug_column(
+                    "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
+                     JOIN op_objects oo ON oo.op_id = o.op_id
+                     JOIN conflict_copies cc ON cc.copy_id = substr(oo.object, 6)
+                     WHERE o.kind = 'delete_note'",
+                )
+                .unwrap_or_default()
+                .first()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            open_copies += cell
+                .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies WHERE open = 1")
+                .unwrap_or_default()
+                .first()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            quarantined_copies += cell
+                .debug_column(
+                    "SELECT CAST(COUNT(*) AS TEXT) FROM notes n JOIN conflict_copies cc ON cc.copy_id = n.id
+                     WHERE cc.open = 1 AND n.status = 'quarantined'",
+                )
+                .unwrap_or_default()
+                .first()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    eprintln!(
+        "frequenze/1000 flotte: operazioni {ops}, umane {human} ({:.1}%), agente {agent} ({:.1}%), \
+         scritture corpo {body_writes}, patch sola intestazione {header_only}, fusioni a mano {hand_merges}, \
+         delete su copie {copy_deletes}, copie aperte a fine corsa {open_copies}, in quarantena {quarantined_copies}",
+        100.0 * human as f64 / ops as f64,
+        100.0 * agent as f64 / ops as f64,
+    );
+    eprintln!(
+        "E4/1000 flotte: ritocchi R4 (titolo sopra una scrittura non ancora sincronizzata) {r4_bursts}, \
+         di cui il corpo ha perso {r4_lost}, scritture d'agente su corpo umano (R1) {r1_followups}"
+    );
+}

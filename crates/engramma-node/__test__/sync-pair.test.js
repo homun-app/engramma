@@ -551,42 +551,22 @@ test('D3: conflicts and resolveConflict across two devices', async () => {
     const copyId = (await a.cmd('conflicts', { cell: 'memoria' }))[0].copyId;
 
     // resolving with `copy`: the loser's body becomes the original's,
-    // and the OLD copy closes on both devices. The resolution is itself
-    // a body write that does not CONTAIN the pre-resolution human body —
-    // so that body, now a losing tip, opens ITS copy: durable means
-    // durable against a resolution too (the task's own «con corpi diversi
-    // nasce un conflitto nuovo, ed è giusto così»). A HUMAN loser: the
-    // copy is ACTIVE and readable with `get`, like every note.
+    // and the OLD copy closes on both devices. v0.6.5: the resolution
+    // leans on the VISIBLE HEAD (the human winner), so it is SEQUENTIAL
+    // — no spurious new conflict is born (v0.6.4's «conflitto nuovo»
+    // was the old base rule leaning on the loser, the R4 defect
+    // itself); the pre-resolution body was the user's explicit choice
+    // to discard. Quiet, and the note shows the copy's body.
     await a.cmd('resolve', { cell: 'memoria', id: copyId, keep: 'copy' });
     await a.cmd('runOnce');
     await b.cmd('runOnce');
     await a.cmd('runOnce');
     await b.cmd('runOnce');
-    await a.cmd('runOnce');
-    await b.cmd('runOnce');
     for (const peer of [a, b]) {
       const list = await peer.cmd('conflicts', { cell: 'memoria' });
-      assert.equal(list.length, 1, `the old copy closed, one new was born: ${JSON.stringify(list)}`);
-      assert.ok(!list.some((c) => c.copyId === copyId), 'the resolved copy is gone');
-      const reborn = list[0];
-      assert.equal(reborn.loserClass, 'human', 'the pre-resolution body was human');
-      assert.equal(reborn.quarantined, false, 'a human copy is active');
+      assert.equal(list.length, 0, `quiet after the resolution: ${JSON.stringify(list)}`);
       const original = await peer.cmd('get', { cell: 'memoria', id: put.id });
       assert.equal(original.body, 'alpha\nX\ngamma', "the copy's body won by hand");
-      const humanCopy = await peer.cmd('get', { cell: 'memoria', id: reborn.copyId });
-      assert.equal(humanCopy.there, true, 'an active copy is readable with get');
-      assert.equal(humanCopy.body, 'la mano umana al lavoro');
-    }
-    // and the reborn conflict resolves with `original`: quiet again
-    const rebornId = (await a.cmd('conflicts', { cell: 'memoria' }))[0].copyId;
-    await a.cmd('resolve', { cell: 'memoria', id: rebornId, keep: 'original' });
-    await a.cmd('runOnce');
-    await b.cmd('runOnce');
-    await a.cmd('runOnce');
-    await b.cmd('runOnce');
-    for (const peer of [a, b]) {
-      const list = await peer.cmd('conflicts', { cell: 'memoria' });
-      assert.equal(list.length, 0, `quiet after both resolutions: ${JSON.stringify(list)}`);
     }
 
     // v0.6.5 (E5): `conflict(copyId)` reads what the user is choosing —
@@ -637,16 +617,11 @@ test('D3: conflicts and resolveConflict across two devices', async () => {
       a.cmd('resolve', { cell: 'memoria', id: '01AAAAAAAAAAAAAAAAAAAAAAAA', keep: 'original' }),
       (err) => err.code === 'NOT_FOUND',
     );
-    // a copy closed WITHOUT operations of its own (the hand merge
-    // contained it) is GONE — NOT_FOUND. The one closed BY the delete of
-    // its resolution keeps its birth row: CONFLICT.
+    // a copy closed WITHOUT operations of its own (the resolution
+    // contained it) is GONE — NOT_FOUND for a second resolution.
     await assert.rejects(
       a.cmd('resolve', { cell: 'memoria', id: copyId, keep: 'original' }),
       (err) => err.code === 'NOT_FOUND',
-    );
-    await assert.rejects(
-      a.cmd('resolve', { cell: 'memoria', id: rebornId, keep: 'original' }),
-      (err) => err.code === 'CONFLICT',
     );
   } finally {
     await a.quit();
