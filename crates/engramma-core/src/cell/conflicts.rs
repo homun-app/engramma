@@ -1897,8 +1897,7 @@ pub(crate) fn rederive_original_of(tx: &Transaction<'_>, copy: &Ulid) -> Result<
         // gate every purge paid the whole-cell walk: 63 ms on the
         // 10 000-note probe, the bulk of the +46% the phase had to
         // attribute. No outcome moves — the hunt re-proves it.
-        None if note_row_is_absent(tx, copy)? && !material::note_purged_in_set(tx, copy)? =>
-        {
+        None if note_row_is_absent(tx, copy)? && !material::note_purged_in_set(tx, copy)? => {
             match original_of_copy(tx, copy)? {
                 Some(original) => original,
                 None => return Ok(()),

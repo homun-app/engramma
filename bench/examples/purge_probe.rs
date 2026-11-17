@@ -10,12 +10,9 @@ use std::time::Instant;
 fn main() {
     let n: usize = 10_000;
     let dir = tempfile::tempdir().expect(/* probe */ "tempdir");
-    let cell = engramma_core::Cell::create(
-        &dir.path().join("purge-probe.sqlite"),
-        "bench",
-        "bench",
-    )
-    .expect(/* probe */ "create");
+    let cell =
+        engramma_core::Cell::create(&dir.path().join("purge-probe.sqlite"), "bench", "bench")
+            .expect(/* probe */ "create");
     let t = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(/* fixed */);
     let mut first = ulid::Ulid::nil();
     let mut started = Instant::now();
@@ -52,11 +49,17 @@ fn main() {
         .first()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    cell.compact(head, &engramma_core::cell::CompactOptions { keep_snapshot: true, ..Default::default() })
-        .expect(/* probe */ "compact");
+    cell.compact(
+        head,
+        &engramma_core::cell::CompactOptions {
+            keep_snapshot: true,
+        },
+    )
+    .expect(/* probe */ "compact");
     eprintln!("PHASE compact {:?}", started.elapsed());
     started = Instant::now();
-    cell.purge(&first, "bench", "bench").expect(/* probe */ "purge");
+    cell.purge(&first, "bench", "bench")
+        .expect(/* probe */ "purge");
     eprintln!("PHASE purge {:?}", started.elapsed());
     eprintln!("PHASE done");
 }

@@ -1310,7 +1310,8 @@ impl Cell {
             inner.conn.pragma_update(None, "secure_delete", before)?;
         }
         if purge_arrival {
-            inner.conn
+            inner
+                .conn
                 .execute_batch("INSERT INTO notes_fts(notes_fts) VALUES('optimize');")?;
             if hidden_touched {
                 inner.conn.execute_batch(
@@ -1454,7 +1455,8 @@ impl Cell {
         // the pages the merge frees are zeroed. The hidden twin joins only
         // when the purge touched it (v0.6.6, F3): a quarantined body's stems
         // live nowhere else, but an untouched index holds nothing to forget.
-        inner.conn
+        inner
+            .conn
             .execute_batch("INSERT INTO notes_fts(notes_fts) VALUES('optimize');")?;
         if hidden_touched {
             inner.conn.execute_batch(
