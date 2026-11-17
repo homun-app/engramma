@@ -589,7 +589,50 @@ test('D3: conflicts and resolveConflict across two devices', async () => {
       assert.equal(list.length, 0, `quiet after both resolutions: ${JSON.stringify(list)}`);
     }
 
-    // the errors of the contract: unknown is NOT_FOUND, closed is CONFLICT
+    // v0.6.5 (E5): `conflict(copyId)` reads what the user is choosing —
+  // the quarantined copy included, which `get` can never show
+  {
+    const list = await a.cmd('conflicts', { cell: 'memoria' });
+    // (the scene is quiet here; rebuild one conflict for the read)
+    const put2 = await a.cmd('put', { cell: 'memoria', body: 'uno\ndue\ntre' });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await a.cmd('patch', { cell: 'memoria', id: put2.id, body: 'la seconda mano umana' });
+    await b.cmd('patch', { cell: 'memoria', id: put2.id, body: 'uno\nX\ntre' });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    const fresh = (await a.cmd('conflicts', { cell: 'memoria' })).find(
+      (c) => c.originalId === put2.id,
+    );
+    assert.ok(fresh, `the fresh conflict is there: ${JSON.stringify(await a.cmd('conflicts', { cell: 'memoria' }))}`);
+    const detail = await a.cmd('conflict', { cell: 'memoria', id: fresh.copyId });
+    assert.equal(detail.copyId, fresh.copyId);
+    assert.equal(detail.originalId, put2.id);
+    assert.equal(detail.originalBody, 'la seconda mano umana');
+    assert.equal(detail.copyBody, 'uno\nX\ntre');
+    assert.equal(detail.forkBody, 'uno\ndue\ntre');
+    assert.equal(detail.quarantined, true);
+    // a quarantined copy is readable HERE and only here
+    const hidden = await a.cmd('get', { cell: 'memoria', id: fresh.copyId });
+    assert.equal(hidden.there, false, 'get stays the closed oracle');
+    // an unknown copy is NOT_FOUND
+    await assert.rejects(
+      a.cmd('conflict', { cell: 'memoria', id: '01AAAAAAAAAAAAAAAAAAAAAAAA' }),
+      (err) => err.code === 'NOT_FOUND',
+    );
+    // a CLOSED copy is NOT_FOUND too: resolve it, then read it again
+    await a.cmd('resolve', { cell: 'memoria', id: fresh.copyId, keep: 'original' });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await assert.rejects(
+      a.cmd('conflict', { cell: 'memoria', id: fresh.copyId }),
+      (err) => err.code === 'NOT_FOUND',
+    );
+  }
+
+  // the errors of the contract: unknown is NOT_FOUND, closed is CONFLICT
     await assert.rejects(
       a.cmd('resolve', { cell: 'memoria', id: '01AAAAAAAAAAAAAAAAAAAAAAAA', keep: 'original' }),
       (err) => err.code === 'NOT_FOUND',

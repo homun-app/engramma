@@ -88,6 +88,8 @@ async function run(op, args) {
     }
     case 'conflicts':
       return await state[args.cell].conflicts();
+    case 'conflict':
+      return await state[args.cell].conflict(args.id);
     case 'resolve': {
       const original = await state[args.cell].resolveConflict(args.id, {
         keep: args.keep,
