@@ -20,7 +20,7 @@ fn main() {
     let t = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(/* fixed */);
     let mut ids: Vec<ulid::Ulid> = Vec::with_capacity(n);
     for i in 0..n {
-        let id = ulid::Ulid::from_string(&format!("01{:022}", i + 1)).unwrap(/* bench */);
+        let id = ulid::Ulid::from_string(&format!("01{:024}", i + 1)).unwrap(/* bench */);
         ids.push(id);
         let note = engramma_core::format::Note {
             id,

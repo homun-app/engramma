@@ -8157,3 +8157,222 @@ vero. Ma la promessa della fase, «un conflitto si chiude solo con qualcosa
 che l'ha visto», è ancora rotta: il testo di un perdente si perde con una
 patch di titolo sul ramo perdente, cioè proprio il caso d'uso di Homun. La
 sync resta chiusa agli utenti di Homun. Correzione nella v0.6.5.
+
+
+## v0.6.5 — chi scrive parte da ciò che ha visto (2026-11-17)
+
+La correzione della v0.6.4, che la verifica ha bocciato. La regola dei
+conflitti resta; cambia ciò su cui poggia: la `base` di una scrittura
+locale, la biforcazione del test di contenimento, il diff3. In più: la
+lettura del conflitto da JS e la misura di D5 fatta bene. Ogni punto E1–E7
+porta i numeri misurati; la caccia a 20 000 casi è sospesa su richiesta
+dell'utente (macchina carica) e resta da fare in una finestra tranquilla:
+le quattro proprietà sono verdi a 512–3 000 casi.
+
+### E1 — la `base` è la testa della linea visibile
+
+- **La regola:** un'operazione locale che modifica una nota esistente
+  porta come `base` l'operazione più recente che **ha il vincitore del
+  corpo fra i suoi antenati, o è il vincitore stesso** (patch
+  d'intestazione sopra il vincitore comprese, rami perdenti esclusi).
+  Nota chiusa da lapide: la **linea chiusa** (la lapide o chi la lasciò
+  chiusa) — ed è la stessa linea che la riapertura giudica, con la CTE
+  ricorsiva sull'insieme. Nota degenere (nessuna scrittura del corpo
+  applicata): la regola di ieri.
+- **Derivata e indicizzata:** la tabella `note_heads` (schema 22), scritta
+  da `after_replay` (una riga per nota con più di un'operazione), letta
+  dalla scrittura locale con una sola sonda sulla chiave; il fallback
+  (la query di ieri) è esatto per le note da una operazione. La
+  retrocompilazione della migrazione parte da `note_heads` vuota e
+  rematerializza le note che la vogliono.
+- **Rossi della verifica chiusi:** R4 (la patch di titolo sul ramo
+  perdente non inghiotte più la copia: «DUE-di-A» resta leggibile su
+  entrambi i dispositivi) e R1 (la scrittura dell'agente sul corpo umano
+  visibile è sequenziale, diventa il corpo della nota, non finisce in
+  quarantena, e la copia della prima scrittura resta aperta) —
+  `tests/visible_head.rs`. I test della riapertura della lapide restano
+  verdi; uno di essi ha guidato la correzione della linea chiusa (prima
+  la riapertura giudicava «l'ultima operazione», la stessa premessa
+  sbagliata della base).
+- **Le celle di sviluppo con basi vecchie:** la derivazione legge
+  l'insieme, quindi convergono comunque; le scritture vecchie restano
+  concorrenti come le scrissero i loro autori, e le copie che il
+  vecchio testimone-per-discendenza chiuse restano chiuse (il testimone
+  è un'esistenza). La regola nuova vale per le scritture che nascono da
+  qui.
+
+### E2 — la biforcazione è fra il perdente e il testimone
+
+- Il testimone di contenimento giudica da **F = nca(perdente, testimone)**,
+  estremi compresi: la coppia e il loro passato, mai il vincitore (che
+  un arrivo tardivo può spostare). R2 chiuso: la copia fusa a mano non
+  si riapre quando la punta umana vince (`tests/containment_fork.rs`).
+- **La monotonia allargata** controlla anche assente→presente, col
+  registro delle chiusure: una copia riaperta deve essere rinata dalle
+  sole eccezioni dichiarate (filtri che seguono il vincitore, grafo
+  completato, purga, lapide) — DESIGN § 4.3 corretto di conseguenza
+  («una copia chiusa con un testimone non si riapre mai»).
+- **Il difetto trovato dal giudice (sotto):** la chiave di classe rendeva
+  un antenato umano PRECEDENTE un testimone «successivo» di un
+  discendente d'agente più nuovo, e la biforcazione inclusiva lo faceva
+  «contenere» il discendente: la copia di chi aveva letto e riscritto lo
+  stesso corpo chiudeva e il testo spariva. Il testimone ora è successivo
+  **nell'ordine totale** (le parole del DESIGN), non nella chiave di
+  classe: la classe decide chi vince, il tempo decide chi viene dopo.
+  Seme 3142143418041393536, 1 856 successi prima del rosso; caso
+  deterministico in entrambi gli ordini d'arrivo in `visible_head.rs`.
+
+### E3 — il diff3 in spazio lineare, con un tetto
+
+- **Myers col serpente centrale** (O((n+m)·D), spazio lineare) sopra le
+  512 righe per lato; sotto resta la passeggiata della tabella v0.6.4,
+  ora limitata a ~1 MB per foglia — mai più l'intera tabella senza tetto.
+  **Tetto: 32 768 righe o 4 MiB per lato**, oltre il quale il
+  contenimento risponde «non contiene»: la scelta prudente, la copia
+  resta aperta e il testo non si perde (DESIGN § 4.3.1).
+- **Le misure** (`/usr/bin/time -l`, release, la forma R3 del revisore):
+  - 5 000 righe: **0,415 ms**, 3,0 MB RSS (v0.6.4: 108 ms);
+  - 20 000 righe: **1,40 ms**, **5,6 MB** (v0.6.4: 1,4 s e 1,68 GB) —
+    soglia 50 ms / 64 MB rispettata di 35× e 11×;
+  - il peggiore onesto (due lati non correlati, D massimo): 20 000 righe
+    in ~0,9 s e **5,4 MB** — la memoria resta lineare, il tempo è O(D).
+- **L'uguaglianza col diff3 v0.6.4** su testi generati brevi (vocabolario
+  con ripetizioni e righe vuote): **50 000 casi verdi**; sopra la base,
+  l'allineamento resta una LCS valida e massimale (2 000 casi). I casi
+  limite (vuoti, fine riga finale, righe vuote) in `tests/diff3_linear.rs`.
+- **La riderivazione non esplode col prodotto perdenti×scritture:** con
+  10 copie aperte e 50/100 scritture successive una riderivazione costa
+  **8,8 / 11,9 ms** (prima dei bitset: 9,4 / 15,8; gli ascendenti ora
+  vivono in bitset calcolati una volta per derivazione); la flotta intera
+  rigiocata da zero: 737 ms.
+- **La cache persistente dei verdetti NON c'è, e non può esserci:** il
+  verdetto dipende dal corpo alla biforcazione, che la compattazione può
+  redigere; una copia con la cache e una senza deriverebbero stati
+  diversi dallo stesso insieme — romperebbe la convergenza. Scritto qui
+  come decisione di design, non come lavoro mancante.
+
+### E4 — il giudice che non legge la base
+
+- **Il modello** (`FleetModel`, fuori dalle celle) registra per ogni
+  scrittura del corpo il corpo che l'autore aveva davanti: il `get` sul
+  suo dispositivo — e per una fusione a mano DUE corpi (la nota e la
+  copia che sta fondendo), letti con la nuova `conflict()` perché le
+  copie in quarantena sono invisibili a `get`.
+- **Il generatore produce R4 e R1 da solo:** il ritocco di titolo sopra
+  una scrittura non ancora sincronizzata (R4), le scritture read-modify
+  (ciò che gli agenti di Homun fanno), l'agente sul corpo umano (R1),
+  chi ignora la copia e patcha l'originale.
+- **La proprietà «nessun testo perso»**: per ogni scrittura del corpo che
+  un dispositivo tiene, a ogni giro, almeno una di: il corpo della nota
+  la contiene (diff3 dalla biforcazione **stretta**: la discesa non è
+  contenimento), una copia aperta ne porta il corpo, un'operazione vive
+  sull'id della copia, una scrittura successiva **l'ha letta** (il
+  testo era su uno schermo), purga o lapide. *Deviazione dichiarata:*
+  la seconda clausola dell'item 4 della spec («e il suo testo contiene
+  L») condannerebbe ogni prima stesura che venga riscritta — l'editing
+  sequenziale non è una perdita; il chiudente di R4 fallisce comunque,
+  perché la sua lettura non conteneva il perdente.
+- **I denti, provati sul motore v0.6.4** (worktree al commit dei rossi):
+  lo scenario deterministico R4 giudicato perso — `LOST the body …
+  ("uno\nDUE-di-A\ntre")` — mentre il motore nuovo lo salva. Il giudice
+  ha poi trovato il difetto vero di E2 (sopra) e tre buchi del modello
+  stesso (l'hash del corpo a schermo, le letture multiple della
+  fusione, il filtro per nota). **Verde a 2 000 flotte.**
+- **Le frequenze per 1000 flotte** (3 dispositivi, 20 giri): 24 270
+  operazioni, 21,7% umane, 1 944 scritture del corpo, 1 554 patch di
+  sola intestazione, 24 delete su copie, 102 copie aperte a fine corsa
+  (78 in quarantena). **E4: 78 ritocchi R4** (di cui 0 con il corpo
+  perdente a fine corsa: il difetto è chiuso), **108 scritture d'agente
+  su corpo umano (R1)**, 0 fusioni nel flusso random (le finestre di
+  copia visibile durano poco; la forma è coperta dai deterministici).
+
+### E5 — la lettura del conflitto da JS
+
+- **`cell.conflict(copyId)`** → `{ …ConflictEntry, originalBody,
+  copyBody, forkBody }`: i tre testi della scelta; `forkBody` è il corpo
+  alla biforcazione perdente/vincitore (`null` sotto il taglio di
+  compattazione), la colonna di mezzo di una vista a tre colonne. La
+  copia in quarantena si legge **qui e solo qui** (`get` resta l'oracolo
+  chiuso); copia inesistente o chiusa: `NOT_FOUND`. CLI: `engramma
+  conflicts show <cella> <copia>`. `docs/node.md` e `docs/cli.md` non
+  dicono più «leggila con get». Test: core, JS (dentro D3, in `npm
+  test` e `test:electron`) e CLI — tutti verdi.
+
+### E6 — D5 misurato, non stimato
+
+- **La flotta di confronto ha le stesse scritture in sequenza** (B vede
+  la parola di A prima di scrivere): la differenza è il costo delle
+  copie, e solo quello. Per tabella (`dbstat`), nota da 70 B / 1 KB /
+  10 KB: la copia costa **8 192 B a 1 KB e 24 576 B a 10 KB**, tutti in
+  `notes` (la riga della copia); a 70 B entra nelle pagine già libere
+  (differenza netta 0). Le altre tabelle (FTS visibile e nascosto,
+  versioni, tag, archi, indici) non spostano una pagina.
+- **Il risparmio già preso (il corpo fuori dalla riga di derivazione):**
+  la riga è 258 B senza corpo; col corpo sarebbe ~415 B (nota 70 B),
+  ~1 339 B (1 KB), ~10 579 B (10 KB) — superiore al quinto del costo
+  della copia a 1 KB e 10 KB: prima/dopo nel REPORT di v0.6.4, ora
+  misurato sulla riga vera.
+- **I vettori:** la finestra di `embed_pending` prende ogni nota non
+  cancellata — le copie in quarantena **visibili** hanno un vettore
+  quando l'indice si costruisce; le invisibili (oltre il tetto di tre)
+  non hanno riga `notes` e quindi nessun vettore. Il banco non incorpora
+  (vettori esclusi per progetto).
+- **La soglia:** al 10% di note in conflitto la flotta da 10 000 note
+  cresce il file del **6,2%** contro la sequenziale (26 337 280 B contro
+  24 788 992 B; soglia 15%). Passata completa: 4,08 s contro 4,06 s.
+
+### E7 — le minori
+
+1. DESIGN § 12: la riga vuota spezzatabella e la colonna in più tolte;
+   «scritura»→«scrittura», «differsca»→«differisca».
+2. **La purga** (soglia +10%): **non ci sta, ed è della v0.6.4.** Le due
+   coppie alternate del banco: base 2 634 note/s, fase 2 599 (−1,4%,
+   p95 pari); la purga 303 → 389 ms (**+28%**). La sonda dedicata
+   (10 000 note, compattazione con istantanea, una purga) lo isola:
+   v0.6.3 ≈ 131 ms, **v0.6.4 ≈ 190 ms**, v0.6.5 ≈ 195 ms. Il tempo va
+   nella coda della purga com'era già nel v0.6.4 (optimize dei due
+   indici FTS e VACUUM dentro la finestra `secure_delete`, più la
+   contabilità dei conflitti durevoli nella stessa transazione); la
+   v0.6.5 aggiunge un solo `DELETE` da `note_heads` per nota purgata.
+   Dichiarata in v0.6.4 (290→~360), confermata e attribuita qui; il
+   taglio dell'optimize dell'indice nascosto quando è vuoto è il
+   risparmio più probabile, lasciato alla prossima fase.
+3. **La versione delle regole:** ALPN `engramma/sync/3` ed
+   `engramma/mailbox/3` (testa visibile, testimone per coppia, lapide
+   per linea chiusa cambiano la derivazione); il test rifiuta il v2 con
+   `PEER_OUTDATED` prima di uno scambio; gli ALPN `/1` stantii nei
+   documenti corretti.
+
+### Le corse
+
+- **Suite del workspace in release: verde** (core, CLI, sync, node, MCP),
+  più `protocol_version`, `npm test` **54/54**, `test:electron` 54/54,
+  `scripts/linux.sh` verde (con fmt e clippy a `-D warnings`).
+- **I semì di regressione** nel file di proptest: verdi (la regola nuova
+  ne cambia i casi, non gli esiti).
+- **La caccia a 20 000 casi (4 proprietà) e le 5 corse a
+  `PROPTEST_CASES=2048` sono SOSPESSE su richiesta dell'utente**: la
+  macchina era al limite di carico (e c'è voluto il ripristino a
+  finestre). Le quattro proprietà sono verdi a 512–3 000 casi
+  (convergenza, ricostruzione, monotonia allargata, nessun testo
+  perso); la finestra per la corsa lunga resta da scegliere.
+- **La build** (`npm run build`, dalla pipeline automatica): tre file —
+  `engramma.darwin-arm64.node` 50 587 448 B, SHA256
+  `82744a89171d9707c790d62b219c59a5816b5526c45dfdaf05d0c9218e001df0`;
+  `index.js` 36 188 B, `6a440672963f2da32989bd306a91863b9ca87df2e50c6d6d15d7049e9fce8053`;
+  `index.d.ts` 24 359 B, `0819903ce1ecda97bbf19f324c3921def2d12e98c0c2e6028949c56a8e0d827c`.
+- **L'inserimento non peggiora** (soglia ±5%): media 2 634 → 2 599
+  note/s (−1,4%), p95 0,65 → 0,58 ms; uptime annotato a ogni corsa
+  (carico in discesa: 6,4 → 4,7).
+- **Le 10 000 patch di corpo su note esistenti** (E1 tocca la scrittura
+  locale; contro `fase-v0.6.4`, soglia ±5%): **1 384 → 1 324 patch/s
+  (−4,3%)**, p95 1,12 → 1,08 ms — dentro, stretto: la sonda indicizzata
+  della testa visibile costa quanto la query di ieri e la derivazione
+  scrive la riga in più.
+
+### L'ambiente, detto onestamente
+
+La macchina ha passato più di un'ora al limite dei processi per carico
+esterno al repo (fork rifiutati): le corse sono state raggruppate in una
+pipeline automatica a tentativi (`.tmp-e65-retry.log`, tutto verde) e i
+banchi rifatti a finestre. Nessun processo nostro resta acceso.
