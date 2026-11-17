@@ -518,9 +518,10 @@ impl Ancestry {
             while let Some(i) = cur {
                 if done[i] {
                     let bit = 1u64 << (i % 64);
+                    let done_rows = anc[i].clone();
                     for &p in &path {
                         anc[p][i / 64] |= bit;
-                        for (a_row, done_row) in anc[p].iter_mut().zip(&anc[i]) {
+                        for (a_row, done_row) in anc[p].iter_mut().zip(&done_rows) {
                             *a_row |= *done_row;
                         }
                     }
