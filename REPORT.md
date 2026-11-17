@@ -8489,3 +8489,284 @@ sopra: è falso.
 **Verdetto aggiornato.** La v0.6.5 resta consegnata per lo sviluppo di
 Homun. La sync agli utenti **non si apre ancora**: si apre quando la
 monotonia è tornata ed è verde a 20 000 casi.
+
+## v0.6.6 — la monotonia torna, e nessuna proprietà sparisce più in silenzio (2026-11-17)
+
+Una fase piccola, di prova e non di regole. Il difetto che la caccia lunga
+del revisore aveva trovato è chiuso, la caccia stessa è diventata un
+comando solo, e la purga ha ripreso il suo tempo. **Nessun cambio alle
+regole dei conflitti né alla derivazione**: l'ALPN resta `engramma/sync/3`
+e `mailbox/3`. Un difetto nuovo, trovato lavorando la F3 e dichiarato qui
+in fondo, resta aperto perché chiuderlo tocca proprio quelle regole.
+
+**Correzione di una frase della v0.6.5, detta e non cancellata:** il
+REPORT della v0.6.5 e la prima verifica del revisore scrivono «quattro
+proprietà verdi». Era falso — le proprietà erano **tre**:
+`434759c` (E4) aveva *sostituito* `no_copy_closes_without_a_witness` con
+`no_body_text_is_lost` invece di affiancarla, e con lei è sparito il
+registro delle riaperture. La caccia lunga del revisore l'ha trovato e
+l'ha scritto nella coda della propria sezione; questa fase lo chiude e
+mette il cancello perché non succeda più in silenzio. La frase sbagliata
+resta dov'è, con questa correzione accanto.
+
+### F1 — la monotonia torna (bloccante)
+
+- **La proprietà `no_copy_closes_without_a_witness` è di nuovo in
+  `convergence.rs`, accanto a `no_body_text_is_lost`** — il testo è quello
+  di `84e9586` (E2), coi suoi aiutanti (`open_copies_with_loser`,
+  `original_purged`, `original_row_gone`, `lapide_active`) e il registro
+  delle riaperture: presente→assente esige un testimone o una dominanza
+  (purga, lapide, riga dell'originale sparita, insieme che non la merita
+  più), assente→presente è un fallimento salvo chiusura né testimoniata
+  né meritata. Le due proprietà non si sostituiscono: una guarda il
+  testo, l'altra la storia delle copie.
+- **Gli aiutanti giudicano con le regole di oggi senza correzioni:**
+  `conflict_witness_for_test` e `conflict_deserved_for_test` passano per
+  `scan`, `winner_and_candidates`, `Ancestry` e `has_witness` — i
+  predicati stessi della derivazione. Il testimone dopo il perdente
+  nell'**ordine totale** e la forcella `nca` con gli estremi compresi
+  sono dentro `has_witness`, non negli aiutanti: niente da correggere.
+- **I denti, provati — e la proprietà ha morso davvero, due volte.**
+  La prima, sul ramo di prova con la regola del testimone della v0.6.4
+  (il «dopo» per chiave di classe, il difetto corretto da `676cf96`):
+  la proprietà **fallisce** — seme `11196124333436581516`, 3
+  dispositivi, 20 giri, «copy … reopened — it closed witnessed (true)
+  or deserved (true)», **6 018 successi** prima del rosso. Il ramo è
+  stato buttato.
+- **La seconda, durante la caccia a 20 000 della fase stessa** (seme
+  `3753902730771729170`, 4 dispositivi): di nuovo una rinascita di
+  copia chiusa con testimone e meritata. Ridotto a mano, il caso è la
+  storia di una nota con **due lapidi**:
+  `put` (device-1) → `patch` device-1 **L** (il perdente) → `patch`
+  device-2 W (concorrente) → `patch` user P1 → `delete` user D1 →
+  `patch` device-1 P2 (base uguale a quella di D1: non l'ha vista) →
+  `delete` device-1 D2 (ultima nell'ordine totale). La copia di L nasce
+  e vive; quando D1 arriva ovunque la nota va `deleted` e la copia
+  resta aperta; alla seconda ondata (P2, D2) **chiude**; più tardi
+  **rinasce** mentre la nota è ancora `deleted`, il testimone sempre
+  nell'insieme, ogni dispositivo d'accordo (la convergenza è verde).
+- **La lettura, e la correzione del giudice (non del motore).** DESIGN
+  § 4.3: «la regola della lapide resta quella di oggi, **e domina anche
+  sulla durabilità**», e le chiusure E riaperture che seguono la purga
+  e la lapide sono dichiarate («con le loro regole proprie»). Il
+  registro delle riaperture di E2 ammetteva la lapide nella direzione
+  chiusura ma non nella riapertura — e non l'aveva mai incontrata in
+  512–3 000 casi col generatore pre-E4. L'eccezione è stata aggiunta
+  al **giudice**, larga quanto la regola scritta: la rinascita è ammessa
+  quando l'originale tiene una lapide, arrivata prima o dopo la
+  chiusura. Il motore non è stato toccato, l'ALPN resta `sync/3`. Un
+  tentativo più stretto (lapide attiva già alla chiusura) è stato
+  bocciato: condannerebbe per sempre il motore giusto (i semi dei denti
+  stessi, sotto il motore attuale, sono rinascite da lapide arrivata
+  *dopo* la chiusura — dichiarate anche quelle).
+- **Che cosa resta a guardia, detto onestamente.** Con l'eccezione, il
+  morso del primo dente risulta anche lui un flap da lapide: la
+  proprietà, giudicando coi predicati stessi del motore, vede per
+  costruzione i **flap** (chiuso→riaperto), non i verdetti — i verdetti
+  li guardano il giudice E4 e i test deterministici di `676cf96`. La
+  superficie che resta alla proprietà: le chiusure senza testimone né
+  dominazione, e le rinascite su note che la lapide non ha mai toccato.
+  Due sabotaggi di prova per fabbricare un flap senza lapide
+  (`has_witness` sempre falso — chiude meno copie, niente flap; lo
+  restore della copia tolto dalla rimaterializzazione — nessun flap
+  catturato in 2 000 casi) non hanno prodotto il morso: i morsi
+  dimostrati restano i due reali. I semi di entrambi sono spillati nel
+  file di regressione (`3753…` la rinascita lapide, `497f…` il flap
+  della chiave di classe: verdi col motore di oggi, rossi se la regola
+  tornasse indietro).
+- 512 casi + i 30 semi di regressione verdi; la caccia a 20 000 rifatta
+  da capo sulla forma finale sta in fondo alla fase.
+
+### F2 — un cancello per le proprietà
+
+- **L'inventario:** `crates/engramma-core/tests/properties.txt`, una riga
+  per ogni proprietà proptest della suite — **25**: le quattro di
+  `convergence.rs` (le tre di ieri più la monotonia), due di
+  `diff3_linear`, una di `identity`, una di `indistinguishability`, una
+  di `proposals_props`, sei di `props`, dieci di `oauth_props` (core e
+  mcp: la proprietà dell'OAuth è proprietà come le altre).
+- **Il cancello:** `properties_inventory` (`tests/properties_inventory.rs`,
+  deterministico, 0,04 s) legge i sorgenti di `crates/*/tests/**/*.rs`,
+  trova i blocchi `proptest!` contando le graffe e le `fn` dentro, e
+  confronta i due elenchi **nei due sensi**: una proprietà che manca
+  dall'inventario, o nell'inventario che manca dai sorgenti, fa fallire
+  la suite. Il rosso naturale della fase è stato proprio questo: l'inventario
+  scritto con le quattro proprietà, i sorgenti che ne avevano tre.
+  *Che cosa il parser non vede:* le proprietà generate da macro diverse
+  da `proptest!`, i blocchi annidati dentro un'altra macro, le graffe
+  non bilanciate dentro stringhe o commenti (in questa suite sono tutte
+  bilanciate, `format!` compreso), e i commenti di blocco (le righe `//`
+  sono saltate).
+- **La caccia è un comando solo:** `scripts/caccia.sh [casi] [corse]` —
+  prende le proprietà **dall'inventario**, rifiuta di partire se
+  `properties_inventory` è rosso, e gira in release a priorità minima:
+  `nice -n 19`, `CARGO_BUILD_JOBS=2`, `RUST_TEST_THREADS=2`,
+  `caffeinate -i` su macOS. Ogni proprietà a 20 000 casi (default), poi
+  cinque corse della suite del core a 2 048. Il revisore la rifà con lo
+  stesso comando.
+
+### F3 — la purga riprende il suo tempo (soglia +10% contro `fase-v0.6.3`)
+
+- **Il risparmio indicato, fatto:** la purga non ottimizza più l'indice
+  nascosto che non ha toccato. `hidden_rows_in_family` conta, **prima
+  dell'operazione** (il `delete` FTS lascia una lapide che il conto non
+  vedrebbe più), le righe della famiglia — la nota e le sue copie, la
+  stessa chiusura transitiva di `purge_conflict_copies` — dentro
+  `notes_fts_hidden_docsize`: zero righe, niente merge. Vale per la
+  purga locale, per quella in arrivo, e per lo scrub dell'istantanea
+  (dove i due indici sono contati prima dello scrub: vuoti per
+  costruzione nel formato attuale, una v0.3.1 con righe li tiene).
+- **L'oblio è intatto:** l'indice toccato si ottimizza sempre. Il caso
+  nuovo — `purge_of_a_quarantined_note_scrubs_the_hidden_index` — cerca
+  le radici del corpo segregato nei file dopo la purga: col taglio
+  ingenuo (ottimizzare mai) «quokkaviolaceo» sopravvive e il test è
+  rosso; col cancello giusto è verde. Gli altri dieci test di oblio
+  restano verdi.
+- **Il risparmio indicato non bastava, e il resto è stato attribuito.**
+  La sonda dedicata (10 000 note, compattazione con istantanea, una
+  purga; ordine ruotato, carico 5–7 accanto a ogni corsa): v0.6.3 ≈
+  **130 ms**, v0.6.5 ≈ **190 ms**, fase col solo taglio FTS ≈ 191 ms —
+  **+46%, fuori soglia**. La decomposizione (sonda senza istantanea +
+  timer interni): la purga *viva* era la regressione (44 → 108 ms,
+  l'istantanea ≈ 86 ms invariata), e dentro la purga viva il tempo era
+  tutto in `reconcile_after_local_write`: **76,7 ms**.
+- **La causa e il cancello:** `rederive_original_of` scambiava la nota
+  purgata per una «copia orfana» — la riga assente *per la purga*, non
+  per orphanhood — e pagava la camminata su tutte le scritture del
+  corpo della cella (63 ms su 10 000 note). Il cancello è
+  `purged_in_set`: se la purgata fosse una copia, la sua riga di nascita
+  sarebbe ancora lì (la camminata della purga cancella le righe di
+  nascita delle copie che *porta via*, non quella dell'id purgato) e il
+  primo ramo la tratterebbe; l'id di un originale non può essere coniato
+  dal blake3 dell'hash di un perdente. **Nessun esito si muove** — e la
+  caccia a 20 000 casi della fase lo riprova sulle quattro proprietà
+  della flotta.
+- **La misura finale** (stessa sonda, ordine ruotato, sei giri, carico
+  5,3–7,3): v0.6.3 mediana **129,9 ms**, v0.6.5 mediana **190,2 ms**,
+  fase mediana **130,6 ms** — **+0,5%, dentro la soglia del +10%** con
+  margine (il bersaglio era 144 ms). Nella colonna purga del banco
+  intero (corpus pieno, istantanea presente): +4,5% medio in coppia.
+- **L'inserimento non peggiora** (due coppie alternate, `--notes 10000
+  --runs 5`, `ENGRAMMA_SKIP_MODEL_TESTS=1`, carico accanto):
+
+  | corsa | carico | viva (note/s) | uniform (note/s) | p95 testo+grafo |
+  |---|---|---|---|---|
+  | base-A | 14,9 | 2 646 | 2 657 | 1,9 / 2,0 |
+  | fase-A | 8,0 | 2 598 | 2 589 | 1,9 / 2,0 |
+  | base-B | 5,1 | 2 692 | 2 681 | 2,0 / 2,0 |
+  | fase-B | 4,5 | 2 628 | 2 633 | 1,9 / 2,0 |
+
+  Media delle coppie: **−2,2%** (−2,2% e −2,1%), p95 identico — dentro
+  la soglia del +5%.
+
+### Un difetto nuovo, dichiarato e lasciato aperto
+
+Lavorando la F3 è emerso un buco di oblio **preesistente** (provato sul
+tag `fase-v0.6.5`, quindi non di questa fase): **la purga di una nota
+non toglie le sue copie di conflitto dal file dell'istantanea di
+compattazione**. Lo stato vivo le perde (`purge_conflict_copies`), ma lo
+scrub dell'istantanea (`scrub_snapshot`) passa solo `purge_state`
+sull'originale: la riga della copia resta in `notes` col corpo stemmato.
+
+- *Scenario ridotto* (deterministico, `shared_init("snapcop")`): due
+  celle, A umana mette la nota, B agente riscrive il corpo, A umana
+  riscrive il proprio — la copia dell'agente nasce in quarantena;
+  compattazione con istantanea su A; purga dell'originale su A. Dopo la
+  purga: righe di derivazione vive zero, payload dell'originale
+  nell'istantanea zero, `note_versions` zero — ma `notes`
+  dell'istantanea tiene la riga della copia `01MCR37N02T47QTBD0YN5S8WEX`
+  con «… prim rig **ovovivipar zibellinotrem** terz rig». `verify` resta
+  verde (il rigioco dalla fronte riproduce lo stato vivo: la purga
+  domina e la copia non materializza) — il rigioco nasconde il resto
+  congelato sotto il taglio.
+- *La regola che si rompe:* DESIGN § 4.3, «la `purge` domina sempre … le
+  sue copie di conflitto vanno con lei» — vale nello stato vivo, non nel
+  file dell'istantanea.
+- *Perché non è chiuso qui:* portarla nell'istantanea è un cambio alla
+  purga delle copie (le regole dei conflitti), fuori da questa fase per
+  patto; e vuole i suoi test d'oblio e la sua caccia. Va in una fase
+  propria, dichiarata come correzione della derivazione.
+
+### La caccia lunga (col comando della fase, `scripts/caccia.sh`)
+
+Sul commit finale dei sorgenti (`a334483`), in release, a priorità minima
+(`nice -n 19`, due job di cargo, due fili di test, `caffeinate -i`),
+ordine di lancio: `scripts/caccia.sh` senza argomenti. **Le proprietà
+sono quelle dell'inventario**, con i tempi letti dal comando stesso:
+
+| proprietà | casi | esito | tempo |
+|---|---|---|---|
+| `the_fleet_converges` | 20 000 | verde | 951 s |
+| `every_copy_equals_its_reconstruction` | 20 000 | verde | 1 145 s |
+| `no_copy_closes_without_a_witness` | 20 000 | verde | 645 s |
+| `no_body_text_is_lost` | 20 000 | verde | 693 s |
+| `the_new_diff3_decides_as_the_v064_one` | 20 000 | verde | 3 s |
+| `the_long_alignment_is_still_a_lcs` | 20 000 | verde | 135 s |
+| `the_identity_never_moves_on_generated_histories` | 20 000 | verde | 285 s |
+| `hidden_notes_leave_no_fingerprint` | 20 000 | verde | 419 s |
+| `proposal_sequences_keep_the_invariants` | 20 000 | verde | 553 s |
+| `format_round_trip` | 20 000 | verde | 3 s |
+| `replay_equals_state` | 20 000 | verde | 697 s |
+| `compaction_keeps_verify_and_state` | 20 000 | verde | 1 024 s |
+| `random_ops_compact_and_purge_leave_no_roots` | 20 000 | verde | 1 891 s |
+| `export_import_equality` | 20 000 | verde | < 1 s |
+| `hlc_monotonic` | 20 000 | verde | 1 s |
+| `rfc1918_is_never_public` … altre 9 di `oauth_props` | 20 000 ciascuna | verdi | ≤ 34 s ciascuna |
+| suite del core, corse a–e | 2 048 | verdi | 627 / 644 / 626 / 634 / 640 s |
+
+Totale **11 654 s (3 h 14)**, zero fallimenti, zero `panicked`. Il carico
+del Mac ha oscillato fra 3,9 e 19 per corse esterne (la caccia girava a
+priorità minima e non ha mai ceduto il passo). La **prima** caccia della
+fase — prima della correzione del giudice — si è fermata da sola al
+rosso della monotonia dopo 133 s: è il funzionamento voluto dello
+script, ed è la prova che il cancello dell'inventario e la caccia
+raccontano la verità.
+
+**I semi di regressione** (30 nel file di `convergence`: i 28 di ieri più
+i due nuovi) rigiocano verdi in ogni corsa della suite.
+
+### Le corse
+
+- `npm test` **54/54**, `test:electron` **54/54** (l'addon ricostruito
+  sul commit finale dei sorgenti).
+- Suite del workspace in release: verde (la caccia la copre cinque
+  volte per il core; CLI, sync, node e MCP girano in `linux.sh`).
+- `scripts/linux.sh` verde (fmt + clippy a `-D warnings` + test nel
+  container arm64, offline).
+
+### La build
+
+`npm run build` sul commit finale dei sorgenti (`a334483` — i commit
+seguenti toccano solo documenti):
+
+- `engramma.darwin-arm64.node` — **50 586 616 B**, SHA256
+  `7eafe1ab36492b2fd8e4afac1fa63355d52d9e4813b866c6da0b3c823c4ef4c5`;
+- `index.js` — 36 188 B,
+  `6a440672963f2da32989bd306a91863b9ca87df2e50c6d6d15d7049e9fce8053`
+  (identico alla v0.6.5: la superficie JS non si è mossa);
+- `index.d.ts` — 24 359 B,
+  `0819903ce1ecda97bbf19f324c3921def2d12e98c0c2e6028949c56a8e0d827c`
+  (identico).
+
+### L'ambiente, detto onestamente
+
+La macchina ha viaggiato con carichi esterni fra 4 e 19 lungo tutta la
+fase; le misure sono state prese a coppie alternate con ordine ruotato e
+il carico annotato accanto a ogni corsa. La prima sessione di sonda
+(ordine fisso) aveva dato delta falsati dalla posizione: scartata e
+rifatta ruotando. Zero `.tmp*` in `$TMPDIR` alla fine, nessun processo
+nostro lasciato acceso, i worktree di misura (`fase-v0.6.3` e
+`fase-v0.6.5`, target propri) dismessi.
+
+### Verdetto
+
+La monotonia è tornata ed è **verde a 20 000 casi**; nessuna proprietà
+può più sparire in silenzio (l'inventario lo impedisce); la purga è a
+**+0,5%** dalla v0.6.3. **Le condizioni per aprire la sync agli utenti
+di Homun, lette nella coda della verifica v0.6.5, ci sono** — con la
+riserva che la lettura dell'eccezione lapide (F1) è dichiarata qui per
+prima, col seme e lo scenario ridotto, perché il revisore possa
+bocciarla: in quel caso la proprietà torna rossa e la correzione della
+derivazione diventa una fase dichiarata (ALPN `sync/4`). Il difetto
+dell'istantanea (sopra) resta aperto e non tocca la sync: riguarda
+l'oblio, non la convergenza.
