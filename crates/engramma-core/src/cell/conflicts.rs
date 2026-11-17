@@ -1888,10 +1888,22 @@ pub(crate) fn rederive_original_of(tx: &Transaction<'_>, copy: &Ulid) -> Result<
         // writes worth its cost (the id is blake3 of the loser, not
         // invertible): gated on the missing row, a fresh note never
         // pays it. Found by the oracle, seed 15192944291106605994
-        None if note_row_is_absent(tx, copy)? => match original_of_copy(tx, copy)? {
-            Some(original) => original,
-            None => return Ok(()),
-        },
+        // v0.6.6 (F3): a PURGED note's row is absent by the purge, not by
+        // orphanhood — and that walk is provably empty for it. If it were
+        // a copy, its birth row would still stand above (the purge's own
+        // copy-walk deletes the birth rows of the copies it TAKES, not
+        // the purged id's own) and the first branch would handle it; an
+        // original's id cannot be minted from a loser's hash. Without the
+        // gate every purge paid the whole-cell walk: 63 ms on the
+        // 10 000-note probe, the bulk of the +46% the phase had to
+        // attribute. No outcome moves — the hunt re-proves it.
+        None if note_row_is_absent(tx, copy)? && !material::note_purged_in_set(tx, copy)? =>
+        {
+            match original_of_copy(tx, copy)? {
+                Some(original) => original,
+                None => return Ok(()),
+            }
+        }
         None => return Ok(()),
     };
     rederive_note(tx, &original)
