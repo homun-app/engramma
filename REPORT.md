@@ -8376,3 +8376,75 @@ La macchina ha passato più di un'ora al limite dei processi per carico
 esterno al repo (fork rifiutati): le corse sono state raggruppate in una
 pipeline automatica a tentativi (`.tmp-e65-retry.log`, tutto verde) e i
 banchi rifatti a finestre. Nessun processo nostro resta acceso.
+
+## Verifica v0.6.5 (revisore, 2026-11-17)
+
+Fatta sul tag `fase-v0.6.5` (`4b50c76`). Tutte le corse girano a
+priorità minima (`nice -n 19`, due job di cargo, due fili di test), su
+richiesta dell'utente.
+
+### Cosa regge
+
+- **Le quattro prove della verifica v0.6.4, rifatte sul codice nuovo,
+  danno il risultato giusto:**
+  - R4: la copia «DUE-di-A» resta aperta su tutti e due i dispositivi;
+  - R1: la scrittura del bot sul corpo umano diventa il corpo della nota,
+    e la copia della prima scrittura resta;
+  - R2: la copia di L non si riapre più, e nasce solo la copia di W2, che
+    è il perdente vero contro H;
+  - R3: 20 000 righe in 1,4 ms e 6,75 MB di RSS (prima 1,4 s e 1,68 GB).
+- **Prova nuova del revisore (P11):** scritture in sequenza non creano mai
+  copie, né sullo stesso dispositivo (corpo e titolo alternati, umano e
+  bot) né fra due dispositivi alternati con la sync in mezzo. Quindi la
+  testa visibile segue ogni scrittura, e un dispositivo non va mai in
+  conflitto con se stesso.
+- **Le corse del revisore:**
+  - `npm run build` verde;
+  - `npm test` 54/54 e `test:electron` 54/54;
+  - suite del core in release verde, 0 falliti.
+- **Le scelte di GLM sono giuste e ben motivate:**
+  - il testimone è successivo nell'**ordine totale**, non nella chiave di
+    classe (difetto vero, trovato dal giudice E4);
+  - nessuna cache persistente dei verdetti, perché romperebbe la
+    convergenza sotto compattazione;
+  - la deviazione dichiarata nel giudice E4: chi ha letto e riscritto non
+    perde testo, è editing sequenziale.
+- **Le soglie misurate:**
+  - E6: +6,2% contro la flotta in sequenza (soglia 15%);
+  - inserimento −1,4%;
+  - patch di corpo −4,3%, dentro la soglia ma di poco.
+
+### I difetti
+
+1. **Lo SHA del `.node` nel REPORT non è quello del tag.** Il binario
+   dichiarato (`82744a89…`, 50 587 448 B) viene dalla pipeline delle
+   14:51, sul commit `676cf96`. Dopo sono arrivati i commit di clippy, che
+   cambiano i sorgenti (`let-else`, `sort_by_key`…).
+   - Sul tag la build dà `1bcf36229b0dca7c49d0f1c08e652d72ef8ae6aca404e05ccad6e5b094886976`
+     (50 587 496 B).
+   - `index.js` e `index.d.ts` coincidono.
+   - Per Homun vale lo SHA del revisore. È la stessa regola della v0.6.3:
+     i numeri si leggono dal file costruito sul commit finale.
+2. **La caccia lunga non è stata fatta.** Mancano le quattro proprietà a
+   20 000 casi e le cinque corse a 2048 casi, sospese su richiesta
+   dell'utente. È dichiarato in modo onesto, ma resta un requisito della
+   spec. Le proprietà sono verdi solo fra 512 e 3 000 casi.
+3. **Minori:**
+   - quattro cartelle `.tmp*` di banco (circa 4 MB, database di flotta)
+     erano rimaste in `$TMPDIR`; il REPORT non le contava. Le ha
+     cancellate il revisore;
+   - i file di servizio della pipeline (`.tmp-done-*` e un log di 6 969
+     righe) sono entrati nella storia con un `add -A` e sono stati tolti
+     dopo. È solo storia locale, senza danno;
+   - la purga è a +28%, sopra la soglia del +10%. La regressione è
+     ereditata dalla v0.6.4, e il REPORT la attribuisce e la misura come
+     chiesto. Il risparmio (l'optimize dell'indice nascosto quando è
+     vuoto) va in una fase prossima.
+
+### Verdetto
+
+**v0.6.5 consegnata per lo sviluppo di Homun**, con lo SHA del revisore.
+I difetti che bloccavano la v0.6.4 sono chiusi e il revisore li ha
+provati indipendentemente. **La sync agli utenti si apre solo dopo la
+caccia lunga** (4 × 20 000 casi e 5 × 2048), da far girare in una
+finestra tranquilla o a priorità minima di notte.
