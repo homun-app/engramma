@@ -50,7 +50,7 @@ fn run(root: &std::path::Path, args: &[&str]) -> (bool, String, String) {
             .try_wait()
             .expect(/* child */ "wait")
         {
-            Some(status) => {
+            Some(_) => {
                 let out = guard
                     .child
                     .take()

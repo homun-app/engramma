@@ -715,8 +715,6 @@ impl Rng {
     }
 }
 
-/// One simulated cell fleet. Each device holds its own copy; writes go
-
 /// v0.6.4: the actor of one write — both classes, so the fleet hunts
 /// the human-before-agent rule. Two hands in five are human.
 fn actor_of(dev: usize, rng: &mut Rng) -> String {
@@ -840,7 +838,7 @@ impl Fleet {
                         let read = read_of_shown(cell, &original);
                         let body_visible = cell.get(&original).map(|n| n.body).unwrap_or_default();
                         let token = ["rosso", "blu", "verde", "giallo"][rng.below(4) as usize];
-                        let rewritten = middle_replaced(&body_visible, dev, &token);
+                        let rewritten = middle_replaced(&body_visible, dev, token);
                         let _ = cell.patch_note(
                             &original,
                             &NotePatch {
@@ -916,7 +914,7 @@ impl Fleet {
                 let token = ["rosso", "blu", "verde", "giallo"][rng.below(4) as usize];
                 let (body, read) = if rng.below(2) == 0 {
                     let seen = cell.get(&id).map(|n| n.body).unwrap_or_default();
-                    let rewritten = middle_replaced(&seen, dev, &token);
+                    let rewritten = middle_replaced(&seen, dev, token);
                     let read_hash = shown_body_hash_of(cell, &id, &seen);
                     // R1: an agent leaning on a body a HUMAN hand wrote
                     if classify(&actor) == ActorClass::Agent
@@ -946,7 +944,7 @@ impl Fleet {
                     },
                     &actor,
                 );
-                let written_id = self.model.record(dev, cell, &id, vec![read]);
+                let _written_id = self.model.record(dev, cell, &id, vec![read]);
             }
             Write::CloseCopy => {
                 let seen = open_copies_of(cell);

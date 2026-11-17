@@ -323,9 +323,7 @@ fn the_no_text_lost_judge_passes_the_r4_scenario() {
     let w_hash = patch_of("DUE-di-B", ("uno\ndue\ntre".into(), Some(put_hash.clone())));
     patch_of("quattro", (seen.clone(), Some(w_hash)));
     let _ = l_hash;
-    let mut model = FleetModel::default();
-    model.writes = writes;
-    model.reads = reads;
+    let model = FleetModel { writes, reads, ..Default::default() };
     let mut saved = vec![Default::default(); 2];
     // the cells themselves, as the fleet would hold them
     let dir_c = tempfile::tempdir().unwrap(/* t */);
@@ -466,7 +464,7 @@ fn the_equal_bodied_followup_in_the_other_order() {
     let (z, _) = cell_with("z");
     z.ingest_op(&init).unwrap(/* t */);
     let mut ops = union(&x, &y);
-    ops.sort_by(|a, b| a.op_id.cmp(&b.op_id));
+    ops.sort_by_key(|a| a.op_id);
     for op in &ops {
         let body = op
             .body

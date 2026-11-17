@@ -6922,3 +6922,18 @@ help: consider using an iterator
     Checking sharded-slab v0.1.7
 error: could not compile `engramma-core` (lib) due to 2 previous errors
 warning: build failed, waiting for other jobs to finish...
+=== linux (try 7, 15:47:44) ===
+engramma-linux-target
+Diff in /src/crates/engramma-core/tests/visible_head.rs:323:
+     let w_hash = patch_of("DUE-di-B", ("uno\ndue\ntre".into(), Some(put_hash.clone())));
+     patch_of("quattro", (seen.clone(), Some(w_hash)));
+     let _ = l_hash;
+-    let model = FleetModel { writes, reads, ..Default::default() };
++    let model = FleetModel {
++        writes,
++        reads,
++        ..Default::default()
++    };
+     let mut saved = vec![Default::default(); 2];
+     // the cells themselves, as the fleet would hold them
+     let dir_c = tempfile::tempdir().unwrap(/* t */);

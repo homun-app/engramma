@@ -5,8 +5,6 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
-
 use engramma_core::cell::ops::Op;
 use engramma_core::format::{At, Note, NoteType};
 use engramma_core::{Cell, Confidence, Status};
@@ -198,9 +196,7 @@ impl FleetModel {
         note: &Ulid,
         read: Vec<(String, Option<String>)>,
     ) -> Option<String> {
-        let Some(op) = last_op_of(cell, note) else {
-            return None;
-        };
+        let op = last_op_of(cell, note)?;
         if !matches!(op.kind.as_str(), "put_note" | "patch_note") {
             return None;
         }
@@ -219,9 +215,7 @@ impl FleetModel {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
             });
-        let Some(text) = text else {
-            return None;
-        };
+        let text = text?;
         let key = (op.hlc.to_string(), op.op_id.to_string());
         self.reads.insert(op.op_id.to_string(), read);
         self.writes.insert(
@@ -501,6 +495,7 @@ pub fn judge_no_text_lost(
             .into_iter()
             .collect();
         // the device's held body writes, from the MODEL (not the engine)
+        #[allow(clippy::type_complexity)]
         let mine: Vec<(&String, &(Ulid, String, String, (String, String)))> = fleet
             .model
             .writes
@@ -618,7 +613,7 @@ pub fn judge_no_text_lost(
             // and whose text contains it — the facts are immutable, so
             // the save is forever
             let mut preserved = false;
-            for (x_id, (x_note, x_text, x_hash, x_key)) in &fleet.model.writes {
+            for (x_id, (x_note, _x_text, _x_hash, x_key)) in &fleet.model.writes {
                 if x_note != note || !held.contains(x_id) || x_key <= key {
                     continue;
                 }
