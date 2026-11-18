@@ -692,17 +692,19 @@ test('D3: a title patch neither closes nor creates copies', async () => {
 });
 
 // v0.6.7 (G2): the copies follow the lapide. A conflict is open on both
-// devices; the ORIGINAL is then deleted — and while the note stays in the
+// devices — the loser is a HUMAN hand that wrote EARLIER than the winner
+// (an agent loser, or any loser sorting AFTER the winner, is erased by the
+// lapide's own rollback rule: its row is gone, and NOT_FOUND is the honest
+// answer); the ORIGINAL is then deleted — and while the note stays in the
 // bin its copy is not in `conflicts()`, not searchable (the owner's wide
 // view included), and `conflict(copyId)` — a read by id, honest — answers
-// with `originalDeleted: true`. The reviewer's proof of the v0.6.6
-// verification, as the JS contract speaks it.
+// with `originalDeleted: true`.
 test('G2: a deleted note hides its copies; conflict(copyId) says originalDeleted', async () => {
   const a = new Peer();
   const b = new Peer();
   try {
     await a.cmd('open', { root: rootName(), name: 'laptop', actor: 'user' });
-    await b.cmd('open', { root: rootName(), name: 'mac' });
+    await b.cmd('open', { root: rootName(), name: 'mac', actor: 'user@peer' });
     await a.cmd('cell', { cell: 'memoria' });
     const put = await a.cmd('put', { cell: 'memoria', body: 'alpha\nbeta\ngamma' });
     const invite = await a.cmd('invite', { key: 'p' });
@@ -723,9 +725,10 @@ test('G2: a deleted note hides its copies; conflict(copyId) says originalDeleted
     await b.cmd('runOnce');
     await b.cmd('cell', { cell: 'memoria' });
 
-    // the conflict: A's human hand wins, B's loses — the copy is open
-    await a.cmd('patch', { cell: 'memoria', id: put.id, body: 'la mano umana al lavoro' });
-    await b.cmd('patch', { cell: 'memoria', id: put.id, body: 'occhiello turchino' });
+    // the conflict: A's EARLIER human hand loses, B's later wins — the
+    // copy is active and visible
+    await a.cmd('patch', { cell: 'memoria', id: put.id, body: 'occhiello turchino' });
+    await b.cmd('patch', { cell: 'memoria', id: put.id, body: 'la mano umana al lavoro' });
     await a.cmd('runOnce');
     await b.cmd('runOnce');
     await a.cmd('runOnce');
@@ -733,13 +736,7 @@ test('G2: a deleted note hides its copies; conflict(copyId) says originalDeleted
     const list = await a.cmd('conflicts', { cell: 'memoria' });
     assert.equal(list.length, 1, `one open copy: ${JSON.stringify(list)}`);
     const copyId = list[0].copyId;
-    // the loser is the agent's (the peer's own actor): quarantined, so
-    // the OWNER's wide view is the one that sees it before the delete
-    const found = await a.cmd('search', {
-      cell: 'memoria',
-      text: 'occhiello turchino',
-      wide: true,
-    });
+    const found = await a.cmd('search', { cell: 'memoria', text: 'occhiello turchino' });
     assert.ok(found.some((h) => h.id === copyId), 'before the delete the copy is searchable');
 
     // the bin: the original goes, and its copy follows the lapide
