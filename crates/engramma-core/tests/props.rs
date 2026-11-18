@@ -585,7 +585,7 @@ proptest! {
                     .map(|(id, _)| *id)
             };
             match next() % 8 {
-                0 | 1 | 2 => {
+                0..=2 => {
                     // a body write: on a note this device holds, half the
                     // time without any sync first — the concurrent branch
                     let fresh = living.is_empty() || next() % 3 == 0;
