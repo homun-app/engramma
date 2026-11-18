@@ -46,7 +46,6 @@ pub(crate) fn not_in_bin(note: &str) -> String {
     )
 }
 
-
 /// The same predicate from the ORIGINAL's side (the copies' listings
 /// ask it this way): does this original hold an active lapide?
 pub(crate) fn original_holds_lapide(original: &str) -> String {

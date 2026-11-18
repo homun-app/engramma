@@ -725,7 +725,10 @@ fn an_unreadable_snapshot_is_not_clean() {
         .unwrap(/* t */);
     let report = a.purge(&id, "diritto all'oblio", "homun:user").unwrap(/* t */);
     // restore whatever the report said: the file must not stay locked out
-    let _ = std::fs::set_permissions(cell_dir.join(&snap_path), <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644));
+    let _ = std::fs::set_permissions(
+        cell_dir.join(&snap_path),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+    );
     assert!(
         !report.scrubbed,
         "an unreadable snapshot is not clean: {report:?}"
@@ -917,7 +920,11 @@ fn the_conflitto_edge_counts_as_derived_in_the_checkpoint_check() {
         .unwrap(/* t */);
     assert!(report.snapshot.is_none(), "a checkpoint, no file");
     let vr = a.verify().unwrap(/* t */);
-    assert!(vr.ok(), "verify counts the conflitto edge: {:?}", vr.mismatch);
+    assert!(
+        vr.ok(),
+        "verify counts the conflitto edge: {:?}",
+        vr.mismatch
+    );
 
     // and the rule holds at the other end: the copy the user resolved
     // (a tombstone now) loses its notes row's life, and the edge with it
@@ -936,7 +943,9 @@ fn the_conflitto_edge_counts_as_derived_in_the_checkpoint_check() {
         .unwrap(/* t */);
     let _ = b.compact(
         head,
-        &engramma_core::cell::CompactOptions { keep_snapshot: false },
+        &engramma_core::cell::CompactOptions {
+            keep_snapshot: false,
+        },
     );
     let vr = b.verify().unwrap(/* t */);
     assert!(

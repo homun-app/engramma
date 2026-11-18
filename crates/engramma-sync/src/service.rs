@@ -1238,13 +1238,15 @@ async fn handle_command(
             // itself: a `devices` right after the call sees the name the
             // caller chose (the driver thread would race it)
             let first = ensure_first_device(root, &name);
-            let _ = reply
-                .send(first.and_then(|()| spawn_pairing(root, PairingKind::Invite, flag, events, core)));
+            let _ = reply.send(
+                first.and_then(|()| spawn_pairing(root, PairingKind::Invite, flag, events, core)),
+            );
         }
         Command::Code { name, flag, reply } => {
             let first = ensure_first_device(root, &name);
-            let _ = reply
-                .send(first.and_then(|()| spawn_pairing(root, PairingKind::Code, flag, events, core)));
+            let _ = reply.send(
+                first.and_then(|()| spawn_pairing(root, PairingKind::Code, flag, events, core)),
+            );
         }
         Command::Join {
             text,

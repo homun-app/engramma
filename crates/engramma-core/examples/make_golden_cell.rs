@@ -15,7 +15,7 @@
 //! schema adds its own golden cell and never touches the old ones
 //! (DESIGN § 8).
 
-use engramma_core::cell::ops::{make_op, Op, OpKind, OpParts};
+use engramma_core::cell::ops::{Op, OpKind, OpParts, make_op};
 use engramma_core::embed::{Embedder, TextKind};
 use engramma_core::error::EmbedError;
 use engramma_core::format::{At, Note, NoteType};
@@ -153,7 +153,8 @@ fn shared_init(tag: &str) -> Op {
 fn union(a: &Cell, b: &Cell) -> Vec<Op> {
     let mut out: std::collections::BTreeMap<String, Op> = std::collections::BTreeMap::new();
     for op in a.ops().unwrap(/* g */).iter().chain(b.ops().unwrap(/* g */).iter()) {
-        out.entry(op.op_id.to_string()).or_insert_with(|| op.clone());
+        out.entry(op.op_id.to_string())
+            .or_insert_with(|| op.clone());
     }
     let mut v: Vec<Op> = out.into_values().collect();
     v.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
@@ -186,7 +187,11 @@ fn main() {
     };
     let mut ids: Vec<Ulid> = Vec::new();
     for (i, note_type, body) in [
-        (1_u32, NoteType::Person, "Giulia lavora con [[Fabio]] a [[Milano]]"),
+        (
+            1_u32,
+            NoteType::Person,
+            "Giulia lavora con [[Fabio]] a [[Milano]]",
+        ),
         (2, NoteType::Place, "Milano, la città della [[Bicicletta]]"),
         (3, NoteType::Project, "il progetto oro raccoglie le prove"),
         (
@@ -364,7 +369,10 @@ fn main() {
             &engramma_core::cell::CompactOptions { keep_snapshot: true },
         )
         .unwrap(/* g */);
-    let snap = compacted.snapshot.clone().expect(/* asked */ "the snapshot file");
+    let snap = compacted
+        .snapshot
+        .clone()
+        .expect(/* asked */ "the snapshot file");
     let snap_name = snap.file_name().unwrap(/* our own */).to_string_lossy().into_owned();
 
     // close the cells, fold the WAL in, copy the two files

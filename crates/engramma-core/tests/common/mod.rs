@@ -888,7 +888,12 @@ pub fn ref_diff3_contains(fork: &str, witness: &str, loser: &str) -> bool {
 
 /// One unstable chunk by the rule: one side unchanged takes the other,
 /// identical changes never count as an overlap.
-pub fn ref_merge_chunk<'a>(base: &[&'a str], a: &[&'a str], b: &[&'a str], out: &mut Vec<&'a str>) -> bool {
+pub fn ref_merge_chunk<'a>(
+    base: &[&'a str],
+    a: &[&'a str],
+    b: &[&'a str],
+    out: &mut Vec<&'a str>,
+) -> bool {
     if a == b {
         out.extend_from_slice(a);
         true

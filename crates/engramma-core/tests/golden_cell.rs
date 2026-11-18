@@ -44,7 +44,8 @@ fn the_golden_cell_opens_verifies_and_holds_its_facts() {
             let file_name = entry.file_name().to_string_lossy().into_owned();
             if file_name.starts_with(&format!("{name}.sqlite"))
                 || (file_name.starts_with("b-snap-") && file_name.ends_with(".sqlite"))
-                || (file_name.starts_with(&format!("{name}-snap-")) && file_name.ends_with(".sqlite"))
+                || (file_name.starts_with(&format!("{name}-snap-"))
+                    && file_name.ends_with(".sqlite"))
             {
                 std::fs::copy(entry.path(), dir.path().join(&file_name)).unwrap(/* t */);
                 copied += 1;
@@ -61,7 +62,10 @@ fn the_golden_cell_opens_verifies_and_holds_its_facts() {
             report.mismatch
         );
         assert!(
-            matches!(report.replay, engramma_core::cell::Replay::FromSnapshot { .. }),
+            matches!(
+                report.replay,
+                engramma_core::cell::Replay::FromSnapshot { .. }
+            ),
             "the golden carries a compaction with a snapshot: {:?}",
             report.replay
         );

@@ -11,9 +11,8 @@ use std::time::Instant;
 fn main() {
     let n: usize = 10_000;
     let dir = tempfile::tempdir().expect(/* probe */ "tempdir");
-    let cell =
-        engramma_core::Cell::create(&dir.path().join("list-probe.sqlite"), "bench", "bench")
-            .expect(/* probe */ "create");
+    let cell = engramma_core::Cell::create(&dir.path().join("list-probe.sqlite"), "bench", "bench")
+        .expect(/* probe */ "create");
     let t = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(/* fixed */);
     for i in 0..n {
         let id = ulid::Ulid::from_string(&format!("01{:024}", i + 1)).unwrap(/* probe */);
@@ -70,7 +69,11 @@ fn main() {
         };
         let started = Instant::now();
         let hits = cell
-            .search(&engramma_core::search::Query::text(&needle).k(10).graph_hops(0))
+            .search(
+                &engramma_core::search::Query::text(&needle)
+                    .k(10)
+                    .graph_hops(0),
+            )
             .expect(/* probe */ "search");
         let _ = hits.len();
         text_only.push(started.elapsed().as_secs_f64() * 1000.0);

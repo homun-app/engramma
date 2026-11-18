@@ -387,8 +387,8 @@ impl GraphIndex {
             vis.insert(id, EdgeVisibility::from_status(&status));
         }
         drop(stmt);
-        let in_bin = crate::cell::bin::bin_note_ids(conn)
-            .map_err(|e| SearchError::Db(e.to_string()))?;
+        let in_bin =
+            crate::cell::bin::bin_note_ids(conn).map_err(|e| SearchError::Db(e.to_string()))?;
         for id in in_bin {
             if let Some(v) = vis.get_mut(&id) {
                 *v = EdgeVisibility::from_status("deleted");
@@ -817,7 +817,9 @@ impl GraphIndex {
             // edge a note the bin holds declares is nobody's step, and
             // every walk (neighbors, path, the search's push) passes
             // here
-            .filter(move |(_, a)| a.note == NO_NOTE || self.note_visible(a.note, include_quarantined))
+            .filter(move |(_, a)| {
+                a.note == NO_NOTE || self.note_visible(a.note, include_quarantined)
+            })
             .filter(move |(_, a)| rel_ids.is_empty() || rel_ids.contains(&a.rel))
             .filter(move |(_, a)| self.valid_at(a.validity, t_us))
             .map(move |(_, a)| Step {
@@ -954,7 +956,11 @@ impl GraphIndex {
         ) {
             let in_bin = crate::cell::bin::note_in_bin(conn, &id.to_string())
                 .map_err(|e| SearchError::Db(e.to_string()))?;
-            let status = if in_bin { "deleted" } else { note_status.as_str() };
+            let status = if in_bin {
+                "deleted"
+            } else {
+                note_status.as_str()
+            };
             if let Some(&n) = self.node_map.get(&format!("note:{id}"))
                 && let Some(v) = self.note_vis.get_mut(ix(n))
             {
@@ -974,11 +980,9 @@ impl GraphIndex {
                 // not in the bin: the copy's OWN state speaks (an
                 // agent's copy is quarantined, a human's is active)
                 let own: Option<String> = conn
-                    .query_row(
-                        "SELECT status FROM notes WHERE id = ?1",
-                        [&copy],
-                        |r| r.get(0),
-                    )
+                    .query_row("SELECT status FROM notes WHERE id = ?1", [&copy], |r| {
+                        r.get(0)
+                    })
                     .ok();
                 let status: &str = if in_bin {
                     "deleted"

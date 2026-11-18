@@ -19,8 +19,8 @@ use engramma_core::error::EmbedError;
 use engramma_core::search::{Query, Semantic};
 use engramma_core::{Cell, NotePatch};
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
@@ -323,8 +323,7 @@ fn the_bin_copy_appears_in_no_public_read() {
         let near = b.neighbors(start, 1, &[], false).unwrap(/* t */);
         assert!(
             near.iter().all(|n| {
-                n.note_id.as_deref() != Some(copy_s.as_str())
-                    && n.entity != format!("note:{copy}")
+                n.note_id.as_deref() != Some(copy_s.as_str()) && n.entity != format!("note:{copy}")
             }),
             "neighbors names the bin's copy from {start}"
         );
@@ -351,10 +350,7 @@ fn the_bin_copy_appears_in_no_public_read() {
             .iter()
             .map(|t| usize::try_from(t.note_count).unwrap_or(0))
             .sum();
-        assert_eq!(
-            zero, 0,
-            "tags counts the bin's copy (quarantine={include})"
-        );
+        assert_eq!(zero, 0, "tags counts the bin's copy (quarantine={include})");
     }
 
     // entities: the listing may know Namorio (the row stays, like a
@@ -362,7 +358,8 @@ fn the_bin_copy_appears_in_no_public_read() {
     walked.push("entities");
     let ents = b.entities("Namorio").unwrap(/* t */);
     assert!(
-        ents.iter().all(|e| e.note_id.as_deref() != Some(copy_s.as_str())),
+        ents.iter()
+            .all(|e| e.note_id.as_deref() != Some(copy_s.as_str())),
         "entities binds the bin's copy as an entity's note"
     );
 
@@ -383,12 +380,10 @@ fn the_bin_copy_appears_in_no_public_read() {
 
     // conflicts: the listing is empty (v0.6.7's own rule, kept)
     walked.push("conflicts");
-    assert!(
-        b.conflicts()
+    assert!(b.conflicts()
             .unwrap(/* t */)
             .iter()
-            .all(|c| c.copy_id != copy)
-    );
+            .all(|c| c.copy_id != copy));
 
     // conflict: the read BY ID stays honest — originalDeleted: true
     walked.push("conflict");
@@ -483,7 +478,8 @@ fn the_reopen_brings_the_copy_back_whole() {
         "the copy returns to conflicts()"
     );
     assert!(
-        b.get(&copy).is_ok_and(|n| n.tags.iter().any(|t| t == "conflitto")),
+        b.get(&copy)
+            .is_ok_and(|n| n.tags.iter().any(|t| t == "conflitto")),
         "the copy reads again, whole"
     );
     let hits = b
@@ -525,7 +521,10 @@ const READS_OTHER: &[(&str, &str)] = &[
     ("vault_view_by_root", "come sopra"),
     ("vault_view_by_id", "come sopra"),
     ("vault_views_of_note", "come sopra"),
-    ("vault_conflicts_of", "i conflitti di file della vista, locali"),
+    (
+        "vault_conflicts_of",
+        "i conflitti di file della vista, locali",
+    ),
     ("vault_conflicts_of_view", "come sopra"),
 ];
 
@@ -537,7 +536,10 @@ const INTERNAL: &[(&str, &str)] = &[
         "verify",
         "l'integrità legge tutto per nome, e deve restare verde",
     ),
-    ("state_digest", "il digest dello stato, per i test e la sync"),
+    (
+        "state_digest",
+        "il digest dello stato, per i test e la sync",
+    ),
     ("replicated_digest", "come sopra, lato insieme"),
     ("replicated_dump", "il dump delle tabelle logiche"),
     ("debug_column", "la lente dei test"),
@@ -659,7 +661,9 @@ fn cell_methods_of(src: &str) -> Vec<String> {
 #[test]
 fn every_public_read_is_classified() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest.ancestors().nth(2).expect(/* test-only */ "the workspace root sits two levels above engramma-core");
+    let root = manifest.ancestors().nth(2).expect(
+        /* test-only */ "the workspace root sits two levels above engramma-core",
+    );
     let mut methods: Vec<String> = Vec::new();
     for rel in IMPL_FILES {
         let text = std::fs::read_to_string(root.join(rel))

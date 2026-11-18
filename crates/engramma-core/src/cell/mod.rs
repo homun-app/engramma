@@ -6,8 +6,8 @@
 //! `BEGIN IMMEDIATE` transaction, so exactly one writer at a time. Readers
 //! (search, get) share the same connection in WAL mode.
 
-pub mod conflicts;
 pub(crate) mod bin;
+pub mod conflicts;
 pub(crate) mod material;
 pub mod ops;
 pub mod policy;
@@ -1583,8 +1583,7 @@ impl Cell {
     /// read-only — the numbers the FTS rows are counted by, taken BEFORE
     /// the scrub removes the rows they name.
     fn family_rowids_readonly(path: &Path, family: &[String]) -> Result<Vec<i64>, CellError> {
-        let conn =
-            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         Self::family_rowids(&conn, family)
     }
@@ -1628,7 +1627,11 @@ impl Cell {
 
     /// (v0.6.8, H3) The count itself, on any connection — the live
     /// purge's own check and every snapshot's run the same words.
-    fn holds_family(conn: &Connection, family: &[String], rowids: &[i64]) -> Result<i64, CellError> {
+    fn holds_family(
+        conn: &Connection,
+        family: &[String],
+        rowids: &[i64],
+    ) -> Result<i64, CellError> {
         let placeholders = vec!["?"; family.len()].join(",");
         // the FTS rows by rowid: empty only when the family had no notes
         // row here to begin with (a double purge) — then there is no
@@ -1653,7 +1656,8 @@ impl Cell {
                      WHERE NOT EXISTS (SELECT 1 FROM notes n WHERE n.rowid = d.id))
                   + (SELECT COUNT(*) FROM proposals WHERE note_id IN ({placeholders}))"
         );
-        let mut all: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(4 * family.len() + 2 * rowids.len());
+        let mut all: Vec<&dyn rusqlite::ToSql> =
+            Vec::with_capacity(4 * family.len() + 2 * rowids.len());
         for _ in 0..4 {
             for s in family {
                 all.push(s);
