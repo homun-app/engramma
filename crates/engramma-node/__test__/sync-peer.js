@@ -114,8 +114,10 @@ async function run(op, args) {
     case 'status':
       return await state.sync.status();
     case 'list': {
-      const notes = await state[args.cell].list({});
-      return notes.map((n) => ({ id: n.id, body: n.body }));
+      // v0.6.8 (H1): the caller may pass a filter — the bin's contract
+      // walks list() in both shapes
+      const notes = await state[args.cell].list(args.filter ?? {});
+      return notes.map((n) => ({ id: n.id, status: n.status, body: n.body }));
     }
     case 'remember': {
       // the loopback row a first session would write (the same hand the

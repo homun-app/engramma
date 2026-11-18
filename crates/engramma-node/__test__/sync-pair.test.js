@@ -768,3 +768,96 @@ test('G2: a deleted note hides its copies; conflict(copyId) says originalDeleted
     await b.quit();
   }
 });
+
+// v0.6.8 (H1): the bin has ONE predicate, and the binding speaks it —
+// `list()` (the living shape and the tombstone shape) and `get()` answer
+// a copy whose original holds a lapide exactly as they answer a deleted
+// note: nowhere, null. The same test watches the copy come back WHOLE
+// when the note reopens: one predicate, one flip.
+test('H1: list() and get() speak the bin; the reopen brings the copy back', async () => {
+  const a = new Peer();
+  const b = new Peer();
+  try {
+    await a.cmd('open', { root: rootName(), name: 'laptop', actor: 'user' });
+    await b.cmd('open', { root: rootName(), name: 'mac', actor: 'user@peer' });
+    await a.cmd('cell', { cell: 'memoria' });
+    const put = await a.cmd('put', { cell: 'memoria', body: 'alpha\nbeta\ngamma' });
+    const invite = await a.cmd('invite', { key: 'p' });
+    await a.cmd('share', { cell: 'memoria' });
+    await b.cmd('join', { ticketOrCode: invite.ticket, key: 'p' });
+    const sasA = (await a.cmd('sas', { key: 'p' })).sas;
+    const sasB = (await b.cmd('sas', { key: 'p' })).sas;
+    assert.equal(sasA, sasB);
+    await a.cmd('confirm', { same: true, key: 'p' });
+    await b.cmd('confirm', { same: true, key: 'p' });
+    await a.cmd('done', { key: 'p' });
+    await b.cmd('done', { key: 'p' });
+    const infoA = await a.cmd('start');
+    const infoB = await b.cmd('start');
+    await b.cmd('remember', { device: 'laptop', serve: infoA });
+    await a.cmd('remember', { device: 'mac', serve: infoB });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await b.cmd('cell', { cell: 'memoria' });
+
+    // the conflict: A's EARLIER human hand loses, B's later wins — the
+    // copy is active and visible, and list() counts it before the delete
+    await a.cmd('patch', { cell: 'memoria', id: put.id, body: 'occhiello turchino' });
+    await b.cmd('patch', { cell: 'memoria', id: put.id, body: 'la mano umana al lavoro' });
+    for (const peer of [a, b]) await peer.cmd('runOnce');
+    for (const peer of [a, b]) await peer.cmd('runOnce');
+    const list = await a.cmd('conflicts', { cell: 'memoria' });
+    assert.equal(list.length, 1, `one open copy: ${JSON.stringify(list)}`);
+    const copyId = list[0].copyId;
+    const before = await a.cmd('list', { cell: 'memoria' });
+    assert.ok(
+      before.some((n) => n.id === copyId && n.status === 'active'),
+      'before the delete the copy lists as a living note',
+    );
+
+    // the bin: the original goes, the copy follows the lapide
+    await a.cmd('delete', { cell: 'memoria', id: put.id });
+    for (const peer of [a, b]) await peer.cmd('runOnce');
+    for (const peer of [a, b]) await peer.cmd('runOnce');
+    for (const peer of [a, b]) {
+      const living = await peer.cmd('list', { cell: 'memoria' });
+      assert.ok(
+        living.every((n) => n.id !== copyId),
+        'list() hides the bin copy',
+      );
+      const tombstones = await peer.cmd('list', {
+        cell: 'memoria',
+        filter: { status: ['deleted'] },
+      });
+      assert.ok(
+        tombstones.some((n) => n.id === put.id),
+        'the deleted original lists as a tombstone',
+      );
+      assert.ok(
+        tombstones.every((n) => n.id !== copyId),
+        'the bin copy is not a tombstone to list',
+      );
+      const got = await peer.cmd('get', { cell: 'memoria', id: copyId });
+      assert.equal(got.there, false, 'get(copy) answers null, like a deleted note');
+      const gotOriginal = await peer.cmd('get', { cell: 'memoria', id: put.id });
+      assert.equal(gotOriginal.there, false, 'get(original) answers null too');
+    }
+
+    // the reopen: one write that saw the lapide, and everything the bin
+    // held comes back together
+    await a.cmd('patch', { cell: 'memoria', id: put.id, body: 'riaperta per prova' });
+    for (const peer of [a, b]) await peer.cmd('runOnce');
+    for (const peer of [a, b]) await peer.cmd('runOnce');
+    const back = await b.cmd('list', { cell: 'memoria' });
+    assert.ok(
+      back.some((n) => n.id === copyId && n.status === 'active'),
+      'the copy returns to list() after the reopen',
+    );
+    const again = await b.cmd('get', { cell: 'memoria', id: copyId });
+    assert.equal(again.there, true, 'the copy reads again by id');
+    assert.equal(again.body, 'occhiello turchino', 'the copy reads whole');
+  } finally {
+    await a.quit();
+    await b.quit();
+  }
+});
