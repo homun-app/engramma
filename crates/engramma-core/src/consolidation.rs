@@ -108,7 +108,10 @@ impl Cell {
         // the neighbour proposals come from the same index the search uses
         crate::search::ensure_index(&mut inner).map_err(|e| CellError::Db(e.to_string()))?;
         let dim = usize::try_from(ready.dim).unwrap_or(0);
-        // the exact vectors, in memory: pairs need the true cosine
+        // the exact vectors, in memory: pairs need the true cosine —
+        // v0.6.8 (H1): the bin's copies sit out (their vectors stay for
+        // the reopen, the candidates do not)
+        let in_bin = crate::cell::bin::bin_note_ids(&inner.conn)?;
         let mut vectors: std::collections::HashMap<String, Vec<Vec<f32>>> =
             std::collections::HashMap::new();
         {
@@ -120,6 +123,9 @@ impl Cell {
             })?;
             for row in rows {
                 let (id, blob) = row?;
+                if in_bin.contains(&id) {
+                    continue;
+                }
                 if let Ok(v) = crate::embed::decode_vec(&blob, dim) {
                     vectors.entry(id).or_default().push(v);
                 }
@@ -206,11 +212,14 @@ impl Cell {
             .lock()
             .map_err(|_| CellError::Db("cell mutex poisoned".into()))?;
         let placeholders = vec!["?"; cfg.functional_rels.len()].join(", ");
+        // v0.6.8 (H1): the bin's one predicate — an edge a bin's copy
+        // declares is nobody's contradiction
         let sql = format!(
             "SELECT e.src, e.rel, e.dst, e.note_id, e.valid_from, e.valid_to
              FROM edges e JOIN notes n ON n.id = e.note_id
-             WHERE e.rel IN ({placeholders}) AND e.status = 'active'
-             ORDER BY e.src, e.rel, e.dst"
+             WHERE e.rel IN ({placeholders}) AND e.status = 'active' AND {}
+             ORDER BY e.src, e.rel, e.dst",
+            crate::cell::bin::not_in_bin("n")
         );
         let mut stmt = inner.conn.prepare(&sql)?;
         let rels: Vec<String> = cfg.functional_rels.clone();

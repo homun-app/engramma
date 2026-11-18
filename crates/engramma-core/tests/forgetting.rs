@@ -950,6 +950,7 @@ fn a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint() {
              DROP TABLE IF EXISTS op_objects;
              DROP TABLE IF EXISTS pending_objects;
              DROP TABLE IF EXISTS conflict_copies;
+             DROP VIEW IF EXISTS notes_in_bin;  -- v0.6.8: una cella v9 vera non ha mai avuto la vista
              DROP TABLE IF EXISTS device_acks;  -- v18  -- v17
              UPDATE meta SET value = '9' WHERE key = 'schema_version';
              DELETE FROM meta WHERE key = 'dump_v13';",

@@ -371,7 +371,10 @@ impl GraphIndex {
         Ok(gi)
     }
 
-    /// v0.5.3 (P1): read the note statuses and file them under their nodes.
+    /// v0.5.3 (P1): read the note statuses and file them under their
+    /// nodes. v0.6.8 (H1): the bin's one predicate rides along — a copy
+    /// that follows a lapide walks like a deleted note (its edges stay
+    /// for the reopen, the walks do not see them).
     ///
     /// # Errors
     /// [`SearchError::Db`] on SQL failure.
@@ -384,6 +387,13 @@ impl GraphIndex {
             vis.insert(id, EdgeVisibility::from_status(&status));
         }
         drop(stmt);
+        let in_bin = crate::cell::bin::bin_note_ids(conn)
+            .map_err(|e| SearchError::Db(e.to_string()))?;
+        for id in in_bin {
+            if let Some(v) = vis.get_mut(&id) {
+                *v = EdgeVisibility::from_status("deleted");
+            }
+        }
         for node in 0..self.node_note.len() {
             if let Some(id) = self.node_note[node].as_ref() {
                 let v = vis
@@ -803,6 +813,11 @@ impl GraphIndex {
         base.chain(overlay)
             .filter(move |(_, a)| with_declared || !a.synthetic)
             .filter(move |(_, a)| a.status.walkable(include_quarantined))
+            // v0.6.8 (H1): the bin's one predicate in the walk — an
+            // edge a note the bin holds declares is nobody's step, and
+            // every walk (neighbors, path, the search's push) passes
+            // here
+            .filter(move |(_, a)| a.note == NO_NOTE || self.note_visible(a.note, include_quarantined))
             .filter(move |(_, a)| rel_ids.is_empty() || rel_ids.contains(&a.rel))
             .filter(move |(_, a)| self.valid_at(a.validity, t_us))
             .map(move |(_, a)| Step {
@@ -927,15 +942,55 @@ impl GraphIndex {
             self.live_edges += 1;
         }
         // v0.5.3 (P1): a rewrite may have changed the note's STATUS (a
-        // quarantine, a confirm): the output filter must see it
+        // quarantine, a confirm): the output filter must see it.
+        // v0.6.8 (H1): the bin's one predicate — the ORIGINAL's delete
+        // must hide the copy's node too, and a reopen must bring it
+        // back: this update runs after every derivation of the note's
+        // conflict set, so both flips land here
         if let Ok(note_status) = conn.query_row(
             "SELECT status FROM notes WHERE id = ?1",
             [id.to_string()],
             |r| r.get::<_, String>(0),
-        ) && let Some(&n) = self.node_map.get(&format!("note:{id}"))
-            && let Some(v) = self.note_vis.get_mut(ix(n))
-        {
-            *v = EdgeVisibility::from_status(&note_status);
+        ) {
+            let in_bin = crate::cell::bin::note_in_bin(conn, &id.to_string())
+                .map_err(|e| SearchError::Db(e.to_string()))?;
+            let status = if in_bin { "deleted" } else { note_status.as_str() };
+            if let Some(&n) = self.node_map.get(&format!("note:{id}"))
+                && let Some(v) = self.note_vis.get_mut(ix(n))
+            {
+                *v = EdgeVisibility::from_status(status);
+            }
+            // the copies of THIS original flip with it (their own rows
+            // did not change — the predicate did)
+            let mut copy_stmt = conn
+                .prepare("SELECT copy_id FROM conflict_copies WHERE original_id = ?1 AND open = 1")
+                .map_err(|e| SearchError::Db(e.to_string()))?;
+            let copies: Vec<String> = copy_stmt
+                .query_map([id.to_string()], |r| r.get::<_, String>(0))
+                .map_err(|e| SearchError::Db(e.to_string()))?
+                .flatten()
+                .collect();
+            for copy in copies {
+                // not in the bin: the copy's OWN state speaks (an
+                // agent's copy is quarantined, a human's is active)
+                let own: Option<String> = conn
+                    .query_row(
+                        "SELECT status FROM notes WHERE id = ?1",
+                        [&copy],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                let status: &str = if in_bin {
+                    "deleted"
+                } else {
+                    own.as_deref().unwrap_or(note_status.as_str())
+                };
+                if let Some(&n) = self.node_map.get(&format!("note:{copy}"))
+                    && let Some(v) = self.note_vis.get_mut(ix(n))
+                {
+                    *v = EdgeVisibility::from_status(status);
+                }
+            }
         }
         Ok(())
     }

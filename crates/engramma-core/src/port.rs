@@ -100,7 +100,17 @@ pub fn export(cell: &Cell, dir: &Path) -> Result<ExportSummary, PortError> {
         let ulid = Ulid::from_string(&id).map_err(|_| {
             PortError::Cell(crate::error::CellError::Db(format!("bad note id {id}")))
         })?;
-        let note = cell.get(&ulid).map_err(PortError::Cell)?;
+        // v0.6.8 (H1): a bin's COPY answers NotFound — it follows its
+        // lapide, and the folder says nothing of it (like a tombstone:
+        // the copy skips, counted with the tombstones)
+        let note = match cell.get(&ulid) {
+            Ok(note) => note,
+            Err(crate::error::CellError::NoteNotFound(_)) => {
+                summary.tombstones += 1;
+                continue;
+            }
+            Err(e) => return Err(PortError::Cell(e)),
+        };
         if note.status == Status::Deleted {
             summary.tombstones += 1;
             continue;

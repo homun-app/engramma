@@ -905,11 +905,13 @@ impl Cell {
             // while its original holds an active lapide — the bin keeps
             // its contents — but the LISTING hides it: the row is state
             // (a function of the set), the hiding is the bin's own rule
+            // (v0.6.8, H1: the one predicate's word, not a copy of it)
             if reason.as_deref() == Some("conflitto") && state == ProposalState::Pending {
                 let hidden: i64 = inner.conn.query_row(
                     "SELECT COUNT(*) FROM conflict_copies cc
-                     JOIN notes o ON o.id = cc.original_id
-                     WHERE cc.copy_id = ?1 AND o.status = 'deleted'",
+                     WHERE cc.copy_id = ?1
+                       AND EXISTS (SELECT 1 FROM notes_in_bin b
+                                   WHERE b.id = cc.original_id)",
                     [&note_id],
                     |r| r.get(0),
                 )?;

@@ -7,6 +7,7 @@
 //! (search, get) share the same connection in WAL mode.
 
 pub mod conflicts;
+pub(crate) mod bin;
 pub(crate) mod material;
 pub mod ops;
 pub mod policy;
@@ -2494,9 +2495,12 @@ impl Cell {
     /// [`CellError::Db`] on SQL failure.
     pub fn note_ids(&self) -> Result<Vec<Ulid>, CellError> {
         let inner = self.lock()?;
-        let mut stmt = inner
-            .conn
-            .prepare("SELECT id FROM notes WHERE status != 'deleted' ORDER BY id")?;
+        // v0.6.8 (H1): the bin's one predicate — deleted notes and the
+        // copies that follow a lapide, in one word. `list()` reads this.
+        let mut stmt = inner.conn.prepare(&format!(
+            "SELECT id FROM notes n WHERE {} ORDER BY id",
+            bin::not_in_bin("n")
+        ))?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -2516,7 +2520,15 @@ impl Cell {
     /// [`CellError::Db`] on SQL failure.
     pub fn note_ids_all(&self) -> Result<Vec<Ulid>, CellError> {
         let inner = self.lock()?;
-        let mut stmt = inner.conn.prepare("SELECT id FROM notes ORDER BY id")?;
+        // v0.6.8 (H1): every id, tombstones included — but a bin's COPY
+        // is not a note to list even here: it follows its original, and
+        // `list({status: ['deleted']})` shows the tombstone, not the
+        // copy (deleted notes are IN the bin view, so the first arm
+        // keeps them)
+        let mut stmt = inner.conn.prepare(&format!(
+            "SELECT id FROM notes n WHERE n.status = 'deleted' OR {} ORDER BY id",
+            bin::not_in_bin("n")
+        ))?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for row in rows {
@@ -3279,12 +3291,22 @@ impl Cell {
             )));
         }
         let inner = self.lock()?;
-        let mut stmt = inner.conn.prepare(if visible_only {
-            "SELECT id FROM notes WHERE (id LIKE ?1 || '%' OR id LIKE '%' || ?1)
-               AND status NOT IN ('quarantined', 'deleted') ORDER BY id"
+        // v0.6.8 (H1): the visible resolution speaks the bin's one
+        // predicate — a copy that follows a lapide is not there for the
+        // surfaces that must not reveal hidden notes
+        let sql = if visible_only {
+            format!(
+                "SELECT id FROM notes n
+                   WHERE (n.id LIKE ?1 || '%' OR n.id LIKE '%' || ?1)
+                     AND n.status NOT IN ('quarantined', 'deleted')
+                     AND {} ORDER BY id",
+                bin::not_in_bin("n")
+            )
         } else {
             "SELECT id FROM notes WHERE id LIKE ?1 || '%' OR id LIKE '%' || ?1 ORDER BY id"
-        })?;
+                .to_string()
+        };
+        let mut stmt = inner.conn.prepare(&sql)?;
         let ids: Vec<String> = stmt.query_map([input], |r| r.get(0))?.flatten().collect();
         drop(stmt);
         match ids.first() {
@@ -3301,14 +3323,24 @@ impl Cell {
         }
     }
 
-    /// Read a note (with its body).
+    /// Read a note (with its body). A bin's COPY answers
+    /// [`CellError::NoteNotFound`] — the same word as a missing note
+    /// (v0.6.8, H1: the binding maps it to `null`, as it already does
+    /// for a tombstone). A tombstone itself still reads here: restore
+    /// and the tombstone listings want it, and the JS `get` hides it.
     ///
     /// # Errors
-    /// [`CellError::NoteNotFound`] when missing.
+    /// [`CellError::NoteNotFound`] when missing or in the bin.
     pub fn get(&self, id: &Ulid) -> Result<Note, CellError> {
         let inner = self.lock()?;
         let tx = inner.conn.unchecked_transaction()?;
-        get_note_tx(&tx, id)
+        let note = get_note_tx(&tx, id)?;
+        if note.status != crate::format::Status::Deleted
+            && bin::note_in_bin(&tx, &id.to_string())?
+        {
+            return Err(CellError::NoteNotFound(id.to_string()));
+        }
+        Ok(note)
     }
 
     /// All versions of a note, oldest first.

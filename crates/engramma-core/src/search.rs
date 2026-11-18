@@ -627,10 +627,13 @@ fn match_expr_for(
 /// frequent-term and support decisions divide by count the visible notes
 /// only — a hidden note must not bend them).
 pub(crate) fn visible_note_count(conn: &rusqlite::Connection, include_quarantined: bool) -> i64 {
+    // v0.6.8 (H1): the totals speak the bin's one predicate — a copy
+    // that follows a lapide bends no denominator
     conn.query_row(
         &format!(
-            "SELECT COUNT(*) FROM notes WHERE status IN {}",
-            visible_statuses(include_quarantined)
+            "SELECT COUNT(*) FROM notes n WHERE n.status IN {} AND {}",
+            visible_statuses(include_quarantined),
+            crate::cell::bin::not_in_bin("n")
         ),
         [],
         |r| r.get(0),
@@ -794,18 +797,17 @@ fn bm25_from(
     limit: i64,
     statuses: &str,
 ) -> Result<Vec<(String, f64)>, SearchError> {
-    // v0.6.7 (G2): a conflict copy whose ORIGINAL holds an active
-    // lapide follows the lapide — the bin's contents answer no search,
-    // whatever the copy's own state (the `include_quarantined` owner's
-    // view included: it widens quarantine, not the bin)
+    // v0.6.8 (H1): the bin's one predicate — deleted notes and the
+    // copies that follow a lapide answer no search, whatever the copy's
+    // own state (the `include_quarantined` owner's view included: it
+    // widens quarantine, not the bin)
     let sql = format!(
         "SELECT n.id, bm25({table}, 10.0, 3.0, 2.0) FROM {table}
          JOIN notes n ON n.rowid = {table}.rowid
          WHERE {table} MATCH ?1 AND n.status IN {statuses}
-           AND NOT EXISTS (SELECT 1 FROM conflict_copies cc
-                           JOIN notes o ON o.id = cc.original_id
-                           WHERE cc.copy_id = n.id AND o.status = 'deleted')
-         ORDER BY bm25({table}, 10.0, 3.0, 2.0) LIMIT ?2"
+           AND {not_in_bin}
+         ORDER BY bm25({table}, 10.0, 3.0, 2.0) LIMIT ?2",
+        not_in_bin = crate::cell::bin::not_in_bin("n"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![match_expr, limit], |r| {
@@ -925,16 +927,15 @@ fn read_candidates(
     // lookups on notes. A plain JOIN let the planner drive from the status
     // filter — every active note in the cell probed against `cand`, 100k
     // probes per query (found profiling the probe at 100k, v0.2.1).
-    // v0.6.7 (G2): the bin's contents never become candidates — the same
-    // lapide filter the BM25 lists apply, so the vector arm (whose ids
-    // come from the index, not from FTS) cannot leak a hidden copy either.
+    // v0.6.8 (H1): the bin's contents never become candidates — the one
+    // predicate the BM25 lists apply, so the vector arm (whose ids come
+    // from the index, not from FTS) cannot leak a hidden copy either.
     let sql = format!(
         "SELECT n.id, n.frontmatter_json, n.body, n.body_norm, n.tags_text
          FROM cand c CROSS JOIN notes n ON n.id = c.id
          WHERE n.status IN {statuses}{type_clause}
-           AND NOT EXISTS (SELECT 1 FROM conflict_copies cc
-                           JOIN notes o ON o.id = cc.original_id
-                           WHERE cc.copy_id = n.id AND o.status = 'deleted')"
+           AND {not_in_bin}",
+        not_in_bin = crate::cell::bin::not_in_bin("n"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
@@ -1448,10 +1449,13 @@ impl Cell {
             .lock()
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
         let like = format!("{prefix}%");
+        // v0.6.8 (H1): the count speaks the bin's one predicate — a
+        // copy that follows a lapide carries no tag
+        let bin = crate::cell::bin::not_in_bin("n");
         let visible = if include_quarantined {
-            "n.id IS NULL OR n.status != 'deleted'"
+            format!("n.id IS NULL OR (n.status != 'deleted' AND {bin})")
         } else {
-            "n.id IS NULL OR n.status NOT IN ('quarantined', 'deleted')"
+            format!("n.id IS NULL OR (n.status NOT IN ('quarantined', 'deleted') AND {bin})")
         };
         let sql = format!(
             "SELECT t.name, t.parent, COUNT(CASE WHEN {visible} THEN 1 END)
@@ -1517,10 +1521,13 @@ impl Cell {
             .inner
             .lock()
             .map_err(|_| SearchError::Db("cell mutex poisoned".into()))?;
-        // notes declaring an edge on the entity, or the entity's own note
+        // notes declaring an edge on the entity, or the entity's own
+        // note — v0.6.8 (H1): both arms speak the bin's one predicate
+        // (the edge arm through `edge_visible`, the own-note arm here)
         let sql = format!(
             "SELECT DISTINCT n.id FROM notes n
-             WHERE n.id = (SELECT note_id FROM entities WHERE name = ?1 COLLATE NOCASE)
+             WHERE (n.id = (SELECT note_id FROM entities WHERE name = ?1 COLLATE NOCASE)
+                    AND {bin})
                 OR n.id IN (SELECT e.note_id FROM edges e
                             LEFT JOIN notes dn ON dn.id = e.note_id
                             WHERE e.note_id IS NOT NULL
@@ -1528,7 +1535,8 @@ impl Cell {
                                    OR e.src IN (SELECT 'note:' || note_id FROM entities WHERE name = ?1 COLLATE NOCASE))
                               AND {})
              ORDER BY n.valid_from IS NULL, n.valid_from, n.id",
-            edge_visible("e", "dn", include_quarantined)
+            edge_visible("e", "dn", include_quarantined),
+            bin = crate::cell::bin::not_in_bin("n"),
         );
         let mut stmt = inner.conn.prepare(&sql)?;
         let rows = stmt.query_map([entity], |r| r.get::<_, String>(0))?;
@@ -1607,10 +1615,11 @@ pub(crate) fn ensure_lang_hist(inner: &mut Inner) -> Result<Vec<crate::format::L
         // `body_norm` with: the explicit one, else the detection on its
         // title and body
         let mut tally: HashMap<crate::format::Lang, usize> = HashMap::new();
-        let mut stmt = inner.conn.prepare(
-            "SELECT frontmatter_json, title, body FROM notes
-             WHERE status IN ('active', 'superseded')",
-        )?;
+        let mut stmt = inner.conn.prepare(&format!(
+            "SELECT frontmatter_json, title, body FROM notes n
+             WHERE n.status IN ('active', 'superseded') AND {}",
+            crate::cell::bin::not_in_bin("n")
+        ))?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -2903,10 +2912,15 @@ fn passes_filters(note: &Note, f: &Filters, now: OffsetDateTime) -> bool {
 /// or deleted). Manual edges (`link`, no declaring note) always stay. `en` is
 /// the alias of the LEFT JOIN over `notes`.
 fn edge_visible(edge: &str, en: &str, include_quarantined: bool) -> String {
+    // v0.6.8 (H1): the bin's one predicate rides the edge's declaring
+    // note — an edge a bin's copy declares is not a fact the walks see
+    let bin = crate::cell::bin::not_in_bin(en);
     if include_quarantined {
-        format!("({edge}.note_id IS NULL OR {en}.status != 'deleted')")
+        format!("({edge}.note_id IS NULL OR ({en}.status != 'deleted' AND {bin}))")
     } else {
-        format!("({edge}.note_id IS NULL OR {en}.status NOT IN ('quarantined', 'deleted'))")
+        format!(
+            "({edge}.note_id IS NULL OR ({en}.status NOT IN ('quarantined', 'deleted') AND {bin}))"
+        )
     }
 }
 

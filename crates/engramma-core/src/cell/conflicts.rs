@@ -1585,11 +1585,14 @@ pub fn conflicts(tx: &Transaction<'_>) -> Result<Vec<ConflictInfo>, CellError> {
     // not listed here, whatever their own state. A read BY ID
     // (`conflict`) still answers: it is honest, and it says
     // `original_deleted`.
+    // v0.6.8 (H1): the same word every read speaks — the original is
+    // itself a deleted note, so it IS the bin view's first arm; the
+    // hand-written EXISTS goes.
     let mut stmt = tx.prepare(
         "SELECT copy_id, original_id, loser_actor, loser_hlc, open, visible FROM conflict_copies
          WHERE open = 1
-           AND NOT EXISTS (SELECT 1 FROM notes o
-                           WHERE o.id = conflict_copies.original_id AND o.status = 'deleted')
+           AND NOT EXISTS (SELECT 1 FROM notes_in_bin b
+                           WHERE b.id = conflict_copies.original_id)
          ORDER BY original_id, loser_hlc, loser_op",
     )?;
     let out: Vec<ConflictInfo> = stmt
@@ -1733,9 +1736,8 @@ pub fn conflict(tx: &Transaction<'_>, copy_id: &Ulid) -> Result<ConflictDetail, 
     let original_body = ops::read_note_row(tx, &original)?.map(|row| row.note.body);
     // v0.6.7 (G2): does the original hold an active lapide? The copy
     // then follows it (not listed, not searchable); this read by id
-    // stays honest and says so
-    let original_deleted = ops::read_note_row(tx, &original)?
-        .is_some_and(|row| row.note.status == crate::format::Status::Deleted);
+    // stays honest and says so — v0.6.8 (H1): with the bin's one word
+    let original_deleted = super::bin::note_in_bin(tx, &original.to_string())?;
     // the loser's body: its payload is the home (a patch's set.body, a
     // put's note.body); the copy's own notes row is the fallback
     let copy_body: Option<String> = {
