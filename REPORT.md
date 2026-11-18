@@ -9110,3 +9110,27 @@ vanno letti così.
   risparmio: nel caso comune il bit è spento e l'indice nascosto non
   viene fuso, quindi il risparmio della v0.6.6 resta (il bersaglio della
   v0.6.6 era ≈143 ms contro i 129,9 della v0.6.3; qui 127,8).
+
+### Le corse
+
+- **La build** (`npm run build`, dal commit finale dei sorgenti): i tre file,
+  letti dal disco dopo la build —
+  `engramma.darwin-arm64.node` **50 605 576 B**, SHA256
+  `b1cf0a4164716b448943628ae2f165b4ec9d46a8e3c075c17e1a0da7c8cd4e88`;
+  `index.js` 36 188 B, SHA256
+  `6a440672963f2da32989bd306a91863b9ca87df2e50c6d6d15d7049e9fce8053`;
+  `index.d.ts` 24 561 B, SHA256
+  `c2df4a9d1f3ccea71caeeb8c1773815c564c0fd1cb3f0a085714d35acb9d723b`.
+- **Il contratto JS**: `npm test` **55/55** e `test:electron` **55/55** — i
+  54 test della v0.6.6 identici, più il nuovo del cestino.
+- **Linux** (`scripts/linux.sh`, container con `--cpus=2`, volume del target
+  ricreato): fmt, clippy a `-D warnings` e l'intera suite del workspace in
+  rete chiusa — **verde, 71 suite**. Due note oneste: il primo giro ha
+  trovato un test flaky per ordine di esecuzione
+  (`the_production_binary_has_no_test_utils` leggeva il binario col feature
+  `test-relay` quando i test del biglietto erano girati prima — corretto:
+  il plain si costruisce nella sua directory, `87e2092`); il secondo ha
+  pescato artefatti stantii dal volume dopo la corsa di controllo sul tag
+  v0.6.6 (volume ricreato, terzo giro pulito). Il clippy 1.95 del container
+  chiedeva `0..=2` al posto di `0 | 1 | 2` nel match della proprietà nuova
+  (`d61bba4`).
