@@ -547,16 +547,28 @@ fn no_relay_does_not_wait() {
 }
 
 /// The production binary does NOT carry the test-relay feature: the
-/// reviewer's verification stays true after this change.
+/// reviewer's verification stays true after this change. The plain
+/// variant builds in its OWN target dir — reading the `test-relay` one
+/// (as this test did when it ran after the ticket tests) judged the
+/// FEATURE binary and failed on ordering alone (found by the Linux
+/// round of v0.6.7: same container, same volume, green on v0.6.6 only
+/// because the order had been kinder).
 #[test]
 fn the_production_binary_has_no_test_utils() {
-    let plain = std::env::temp_dir()
-        .join("engramma-cli-relay")
-        .join("debug")
-        .join("engramma");
-    if !plain.exists() {
-        return; // the plain debug binary is not built in this session
-    }
+    let target = std::env::temp_dir().join("engramma-cli-plain");
+    let status = Command::new(env!("CARGO"))
+        .arg("build")
+        .arg("-p")
+        .arg("engramma-cli")
+        .arg("--bin")
+        .arg("engramma")
+        .arg("--offline")
+        .arg("--target-dir")
+        .arg(&target)
+        .status()
+        .expect(/* cargo */ "cargo build");
+    assert!(status.success(), "la build del binario plain è fallita");
+    let plain = target.join("debug").join("engramma");
     let out = Command::new("strings")
         .arg(&plain)
         .output()
