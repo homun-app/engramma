@@ -3457,11 +3457,36 @@ impl Cell {
     pub fn get(&self, id: &Ulid) -> Result<Note, CellError> {
         let inner = self.lock()?;
         let tx = inner.conn.unchecked_transaction()?;
-        let note = get_note_tx(&tx, id)?;
-        if note.status != crate::format::Status::Deleted
-            && bin::note_in_bin(&tx, &id.to_string())?
+        let id_str = id.to_string();
+        // ONE plain read — the same columns the old two-query read
+        // fetched — then the bin's word only when the note wears the
+        // copy's mark
+        let row: (String, String) = tx
+            .query_row(
+                "SELECT frontmatter_json, body FROM notes WHERE id = ?1",
+                [&id_str],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|_| CellError::NoteNotFound(id_str.clone()))?;
+        let mut note = Note::from_json(
+            &serde_json::from_str::<Value>(&row.0)
+                .map_err(|e| CellError::Db(format!("corrupt frontmatter_json: {e}")))?,
+        )
+        .map_err(|e| CellError::Db(format!("corrupt frontmatter_json: {e}")))?;
+        note.body = row.1;
+        // the fast guard: only a CONFLICT COPY can follow a lapide, and
+        // every copy carries the `conflitto` tag by construction (the
+        // derivation re-tags its own) — a note without the mark answers
+        // without touching `conflict_copies` at all, and `list()`'s
+        // 10 000 reads pay nothing (measured: a per-get probe cost
+        // +34 ms on the list; the guard took it home). A tombstone
+        // reads here (restore and the tombstone listings want it); a
+        // marked copy whose original holds a lapide does not
+        if note.tags.iter().any(|t| t == "conflitto")
+            && note.status != crate::format::Status::Deleted
+            && bin::note_in_bin(&tx, &id_str)?
         {
-            return Err(CellError::NoteNotFound(id.to_string()));
+            return Err(CellError::NoteNotFound(id_str));
         }
         Ok(note)
     }

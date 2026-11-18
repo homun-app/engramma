@@ -890,14 +890,6 @@ pub fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellE
         "CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts_vocab USING fts5vocab(notes_fts, 'row');
          CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts_hidden_vocab USING fts5vocab(notes_fts_hidden, 'row');",
     )?;
-    // v0.6.8 (H1): the BIN's one predicate — a view, not a fifth
-    // hand-written filter. A note is in the bin when it is deleted, or
-    // when it is a conflict copy of a deleted note; every read path
-    // asks this view and nothing else (the four v0.6.7 filters are
-    // gone). Unversioned and additive like the vocabularies: a view is
-    // schema, not state — the dump, the digest and the replay never see
-    // it, and existing cells gain it on their next open.
-    tx.execute_batch(super::bin::BIN_VIEW_DDL)?;
     Ok(())
 }
 

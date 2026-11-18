@@ -1588,13 +1588,12 @@ pub fn conflicts(tx: &Transaction<'_>) -> Result<Vec<ConflictInfo>, CellError> {
     // v0.6.8 (H1): the same word every read speaks — the original is
     // itself a deleted note, so it IS the bin view's first arm; the
     // hand-written EXISTS goes.
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare(&format!(
         "SELECT copy_id, original_id, loser_actor, loser_hlc, open, visible FROM conflict_copies
-         WHERE open = 1
-           AND NOT EXISTS (SELECT 1 FROM notes_in_bin b
-                           WHERE b.id = conflict_copies.original_id)
+         WHERE open = 1 AND NOT ({})
          ORDER BY original_id, loser_hlc, loser_op",
-    )?;
+        super::bin::original_holds_lapide("conflict_copies.original_id")
+    ))?;
     let out: Vec<ConflictInfo> = stmt
         .query_map([], |r| {
             let copy_id: String = r.get(0)?;

@@ -908,10 +908,11 @@ impl Cell {
             // (v0.6.8, H1: the one predicate's word, not a copy of it)
             if reason.as_deref() == Some("conflitto") && state == ProposalState::Pending {
                 let hidden: i64 = inner.conn.query_row(
-                    "SELECT COUNT(*) FROM conflict_copies cc
-                     WHERE cc.copy_id = ?1
-                       AND EXISTS (SELECT 1 FROM notes_in_bin b
-                                   WHERE b.id = cc.original_id)",
+                    &format!(
+                        "SELECT COUNT(*) FROM conflict_copies cc
+                         WHERE cc.copy_id = ?1 AND {}",
+                        super::bin::original_holds_lapide("cc.original_id")
+                    ),
                     [&note_id],
                     |r| r.get(0),
                 )?;

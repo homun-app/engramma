@@ -628,12 +628,18 @@ fn match_expr_for(
 /// only — a hidden note must not bend them).
 pub(crate) fn visible_note_count(conn: &rusqlite::Connection, include_quarantined: bool) -> i64 {
     // v0.6.8 (H1): the totals speak the bin's one predicate — a copy
-    // that follows a lapide bends no denominator
+    // that follows a lapide bends no denominator. The count SUBTRACTS
+    // the bin's visible-status copies (one small join) instead of
+    // probing every row: this runs on every query, and the per-row
+    // probe cost 0,4 ms at 10 000 notes (measured, REPORT v0.6.8)
     conn.query_row(
         &format!(
-            "SELECT COUNT(*) FROM notes n WHERE n.status IN {} AND {}",
-            visible_statuses(include_quarantined),
-            crate::cell::bin::not_in_bin("n")
+            "SELECT (SELECT COUNT(*) FROM notes WHERE status IN {statuses})
+                   - (SELECT COUNT(*) FROM conflict_copies cc
+                      CROSS JOIN notes o ON o.id = cc.original_id
+                      CROSS JOIN notes n ON n.id = cc.copy_id
+                      WHERE o.status = 'deleted' AND n.status IN {statuses})",
+            statuses = visible_statuses(include_quarantined),
         ),
         [],
         |r| r.get(0),
