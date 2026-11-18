@@ -1511,6 +1511,20 @@ impl Cell {
             let Some(id) = id else {
                 continue;
             };
+            // v0.6.8 (H3): the family's rowids, read BEFORE the scrub —
+            // the FTS rows are counted BY ROWID, never through a join
+            // with `notes` (the most likely half-scrub takes the notes
+            // row and leaves the index row: a JOIN sees nothing). A
+            // file this process cannot even READ is not one the purge
+            // may call clean: it is named and left behind, and the scrub
+            // does not run half-blind against it.
+            let rowids = Self::family_rowids_readonly(&snap_path, family);
+            let Ok(rowids) = rowids else {
+                if !left_behind.contains(&file) {
+                    left_behind.push(file);
+                }
+                continue;
+            };
             let digest = Self::scrub_snapshot(&snap_path, &id, &censorable)?;
             let redacted = Self::redacted_by(&inner.conn, seq, purge_op_id)?;
             inner.conn.execute(
@@ -1523,7 +1537,12 @@ impl Cell {
             // a derivation row, an FTS row, a queue row of the family
             // means the scrub left something behind. A row-level check:
             // the bytes stay the tests' business.
-            if Self::snapshot_holds_family(&snap_path, family)? > 0 && !left_behind.contains(&file)
+            // v0.6.8 (H3): every answer but zero counts — an unopenable
+            // file answers `-1`, and `-1` is NOT clean — and the FTS
+            // rows are counted by the rowids read before, so an ORPHAN
+            // (its notes row gone, its index row left) is seen too.
+            if Self::snapshot_holds_family(&snap_path, family, &rowids)? != 0
+                && !left_behind.contains(&file)
             {
                 left_behind.push(file);
             }
@@ -1531,34 +1550,89 @@ impl Cell {
         Ok(left_behind)
     }
 
-    /// (v0.6.7, G3) How many rows of the family a snapshot file still
-    /// holds: notes, conflict copies, FTS rows (through the notes they
-    /// index) and queue rows. Read-only — the check never disturbs the
-    /// file it judges. An unopenable file answers `-1`: a snapshot the
-    /// purge cannot READ is not one it may call clean.
-    fn snapshot_holds_family(path: &Path, family: &[String]) -> Result<i64, CellError> {
+    /// (v0.6.8, H3) The `notes` rowids of the family in a file opened
+    /// read-only — the numbers the FTS rows are counted by, taken BEFORE
+    /// the scrub removes the rows they name.
+    fn family_rowids_readonly(path: &Path, family: &[String]) -> Result<Vec<i64>, CellError> {
+        let conn =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        Self::family_rowids(&conn, family)
+    }
+
+    /// (v0.6.8, H3) The `notes` rowids of the family, on any connection.
+    fn family_rowids(conn: &Connection, family: &[String]) -> Result<Vec<i64>, CellError> {
+        let placeholders = vec!["?"; family.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT rowid FROM notes WHERE id IN ({placeholders}) ORDER BY rowid"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(family), |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// (v0.6.7, G3; v0.6.8, H3) How many rows of the family a file still
+    /// holds: notes, conflict copies, FTS rows of the family — counted
+    /// BY ROWID, the numbers read before the scrub, so an orphan (its
+    /// notes row gone, its index row left) is seen — every ORPHAN
+    /// docsize row of the file, whatever family it belongs to, and the
+    /// queue rows. ONE function for the two files: the snapshots and the
+    /// live cell speak the same count. Read-only on the file it judges;
+    /// an unopenable file answers `-1`: a file the purge cannot READ is
+    /// not one it may call clean, and `-1 != 0`.
+    fn snapshot_holds_family(
+        path: &Path,
+        family: &[String],
+        rowids: &[i64],
+    ) -> Result<i64, CellError> {
         let Ok(conn) =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         else {
             return Ok(-1);
         };
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        Self::holds_family(&conn, family, rowids)
+    }
+
+    /// (v0.6.8, H3) The count itself, on any connection — the live
+    /// purge's own check and every snapshot's run the same words.
+    fn holds_family(conn: &Connection, family: &[String], rowids: &[i64]) -> Result<i64, CellError> {
         let placeholders = vec!["?"; family.len()].join(",");
+        // the FTS rows by rowid: empty only when the family had no notes
+        // row here to begin with (a double purge) — then there is no
+        // rowid to count, and the orphan arms below still speak
+        let rowid_arms = if rowids.is_empty() {
+            "0".to_string()
+        } else {
+            let rid = vec!["?"; rowids.len()].join(",");
+            format!(
+                "(SELECT COUNT(*) FROM notes_fts_docsize WHERE id IN ({rid}))
+                 + (SELECT COUNT(*) FROM notes_fts_hidden_docsize WHERE id IN ({rid}))"
+            )
+        };
         let sql = format!(
             "SELECT (SELECT COUNT(*) FROM notes WHERE id IN ({placeholders}))
                   + (SELECT COUNT(*) FROM conflict_copies WHERE copy_id IN ({placeholders})
                                                 OR original_id IN ({placeholders}))
-                  + (SELECT COUNT(*) FROM notes_fts_docsize d JOIN notes n ON n.rowid = d.id
-                     WHERE n.id IN ({placeholders}))
-                  + (SELECT COUNT(*) FROM notes_fts_hidden_docsize d JOIN notes n ON n.rowid = d.id
-                     WHERE n.id IN ({placeholders}))
+                  + ({rowid_arms})
+                  + (SELECT COUNT(*) FROM notes_fts_docsize d
+                     WHERE NOT EXISTS (SELECT 1 FROM notes n WHERE n.rowid = d.id))
+                  + (SELECT COUNT(*) FROM notes_fts_hidden_docsize d
+                     WHERE NOT EXISTS (SELECT 1 FROM notes n WHERE n.rowid = d.id))
                   + (SELECT COUNT(*) FROM proposals WHERE note_id IN ({placeholders}))"
         );
-        // six lists of the same names, one per IN above
-        let mut all: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(6 * family.len());
-        for _ in 0..6 {
+        let mut all: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(4 * family.len() + 2 * rowids.len());
+        for _ in 0..4 {
             for s in family {
                 all.push(s);
+            }
+        }
+        for _ in 0..2 {
+            for r in rowids {
+                all.push(r);
             }
         }
         conn.query_row(&sql, all.as_slice(), |r| r.get(0))
@@ -1630,6 +1704,10 @@ impl Cell {
         // takes them all, and the earned `scrubbed` check below needs
         // the names once the rows are gone
         let family: Vec<String> = ops::family_of(&inner.conn, id)?;
+        // v0.6.8 (H3): the family's rowids, read BEFORE the op too — the
+        // LIVE file's own check below counts the index rows by them,
+        // with the same function the snapshots speak
+        let family_rowids: Vec<i64> = Self::family_rowids(&inner.conn, &family)?;
         let purge_op_id = execute_op(
             &mut inner,
             OpKind::Purge,
@@ -1676,6 +1754,22 @@ impl Cell {
             inner.pending_scrub = vec!["wal"];
             vec!["wal".to_string()]
         };
+        // v0.6.8 (H3): the LIVE file gets the same check the snapshots
+        // get, with the same function — after the local purge the cell
+        // must hold nothing of the family: a note row, a derivation row,
+        // an FTS row of the family (by the rowids read before) or an
+        // orphan docsize row means the scrub left something behind, and
+        // the report says so instead of declaring itself done
+        if Self::holds_family(&inner.conn, &family, &family_rowids)? != 0 {
+            let live_name = self
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.path.display().to_string());
+            if !pending.contains(&live_name) {
+                pending.push(live_name);
+            }
+        }
         // v0.3.1 (P0.3; v0.6.7, G3): every registered snapshot is a full
         // copy made before the purge — it holds the note, its payloads
         // and its FTS entries. The same purge (state + log scrub +

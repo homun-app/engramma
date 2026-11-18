@@ -2106,14 +2106,21 @@ pub(crate) fn purge_state(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellErr
             |r| r.get(0),
         )?;
         if in_index > 0 {
-            fts_delete(
-                tx,
-                idx,
-                row.rowid,
-                row.note.title.as_deref().unwrap_or(""),
-                &row.body_norm,
-                &row.tags_text,
-            )?;
+            // (v0.6.8, H3 — the module's second test-only injection,
+            // same discipline as the snapshot-copy one: the env var
+            // fabricates the most likely half-scrub, the notes row gone
+            // and the index row left, so the earned `scrubbed` check can
+            // prove it SEES the orphan. It can never make a purge lie.)
+            if std::env::var("ENGRAMMA_TEST_SKIP_PURGE_FTS_DELETE").is_err() {
+                fts_delete(
+                    tx,
+                    idx,
+                    row.rowid,
+                    row.note.title.as_deref().unwrap_or(""),
+                    &row.body_norm,
+                    &row.tags_text,
+                )?;
+            }
         }
     }
     tx.execute("DELETE FROM notes WHERE id = ?1", [&id_str])?;
