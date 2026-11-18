@@ -9661,6 +9661,21 @@ test, zero fallimenti**. Una nota onesta: il primo giro è morto sul
 corrette con `cargo fmt` e commesse) — lo stesso tipo di rifiuto che la
 v0.6.7 chiamò «onesto»: il container fa il suo lavoro.
 
+## La pulizia
+
+`du -sh target`: **13 G all'inizio, 17 G alla fine** (le build di
+release, la caccia, i banchi). I worktree delle misure (`fase-v0.6.3` e
+`fase-v0.6.7`) e il volume Docker del giro Linux sono stati tolti.
+Nessun processo lasciato acceso. Le `.tmp*` in `$TMPDIR` alla fine sono
+**due**, e la diagnosi c'è: sono i reliquiati delle due riproduzioni
+manuali del difetto H5 fatte alle 20:30 e alle 20:44 del 18 novembre,
+PRIMA della correzione — `early-a` e `early-drop`, ricreate dal filo
+dell'invito sopravvissuto mentre la `TempDir` aveva già rinunciato. Il
+motore corretto le lascia zero: misurato sulla suite intera di
+`engramma-sync` in una `TMPDIR` isolata, contate prima e dopo. Le due
+vecchie restano al loro posto, diagnosticate: il cancellarle è affare
+di chi possiede la cartella.
+
 ## La chiusura della fase
 
 | punto | stato |
