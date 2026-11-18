@@ -9088,3 +9088,25 @@ non si vede da fuori.
   Per questo la proprietà nuova giudica l'oblio e non `verify` (il suo
   mandato); `verify` resta giudicato dalle proprietà e dai test che lo
   camminano su terreno sano.
+
+### Le misure, contro `fase-v0.6.3`
+
+Le due coppie alternate (base = worktree sul tag `fase-v0.6.3`, fase =
+`main` a fine fase), banco da 10 000 note e sonda dedicata della purga.
+Le build a priorità minima; le corse senza `nice` (falserebbero i
+numeri), `uptime` accanto a ogni corsa nel registro della macchina — la
+macchina era in carico (load 4,3–5,0: l'utente ci lavorava), e i numeri
+vanno letti così.
+
+- **Inserimento** (note/s, media dei due corpus per coppia):
+  base 2 594/2 605 (coppia 1), 2 839/2 823 (coppia 2) → **media 2 715**;
+  fase 2 529/2 478 (coppia 1), 2 770/2 596 (coppia 2) → **media 2 593**.
+  **−4,5%**, dentro il +5%. Le ricerche p50/p95 della tabella sono pari
+  (1,0–1,3 ms / 1,8–2,1 ms, la purga del banco 290–332 ms su entrambi i
+  lati).
+- **La sonda della purga** (10 000 note, compattazione con istantanea,
+  una purga): base 126,2 e 156,0 ms (media 141,1); fase 129,9 e
+  125,6 ms (media 127,8). **−9,5%** — dentro il +10%, e dalla parte del
+  risparmio: nel caso comune il bit è spento e l'indice nascosto non
+  viene fuso, quindi il risparmio della v0.6.6 resta (il bersaglio della
+  v0.6.6 era ≈143 ms contro i 129,9 della v0.6.3; qui 127,8).
