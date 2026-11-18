@@ -8882,3 +8882,65 @@ difetti di oblio, uno nuovo (l'indice nascosto) e uno vecchio
 (l'istantanea), e una proprietà di monotonia che oggi assolve proprio le
 rinascite che l'utente vedrebbe. **La sync agli utenti resta chiusa.**
 Per lo sviluppo di Homun resta valida la v0.6.5. Correzione nella v0.6.7.
+
+## Fase v0.6.7 — l'oblio è esatto, e la lapide si porta via i suoi conflitti
+
+Base: `main` @ `7be8f86` (tag `fase-v0.6.6` = `a83bf67` + REPORT). Le correzioni
+dei tre difetti della verifica (G1 l'indice nascosto, G2 la lapide e il
+testimone, G3 l'istantanea) e l'allargamento della caccia (G4). I numeri di
+misura stanno nelle sezioni di ogni punto; nessun numero è scritto prima di
+esser stato misurato.
+
+### G2, primo passo — la diagnosi del seme 3753902730771729170
+
+La corsa del seme (4 dispositivi, 20 giri, `FleetRunner` invariato) riproduce
+il flap: la copia `01MCC5RM0ZN3JDWRPT0YQ6FJ25` dell'originale
+`01000000000000000000000091` nasce al giro 15 su ogni dispositivo, **chiude**
+al giro 16 sul dispositivo 1, **rinasce** al giro 20 sul dispositivo 1 mentre
+la nota resta `deleted`. Le operazioni della nota, nell'ordine totale:
+
+| # | op | attore | base |
+|---|----|--------|------|
+| 1 | `put_note` | device-1 | — |
+| 2 | `patch_note` L (il perdente) | device-1 | il `put` |
+| 3 | `patch_note` W (concorrente) | device-2 | il `put` |
+| 4 | `patch_note` P1 (umana) | user | una testa sopra W |
+| 5 | `delete_note` D1 | user | la testa che P2 vedrà |
+| 6 | `patch_note` P2 | device-1 | **la base di D1: non l'ha vista** |
+| 7 | `delete_note` D2 (ultima) | device-1 | P2 |
+
+Arrivi che contano, sul dispositivo 1: al giro 16 tiene {put, L, W, P1, P2}
+senza D1; al giro 20 arrivano D1 (e con lei D2 già scritta in casa).
+
+**Il predicato che cambia è `has_witness`** (`conflicts.rs`), e cambia così:
+
+- *Alla chiusura* (insieme senza D1): P2 è una **scrittura del corpo
+  applicata**, successiva a L nell'ordine totale, e il suo testo contiene L
+  (l'autore di P2 è il dispositivo che aveva scritto L). `has_witness` scorre
+  le scritture applicate, trova P2, la copia chiude. Giusto.
+- *Alla rinascita* (insieme completo): D1, che P2 non ha visto, la batte —
+  nel rigioco P2 finisce nell'evento con `body: None` (la regola della
+  lapide, `TombstoneOutcome::Wins`) — e `applied` non la contiene più. Il
+  ciclo `for &i in applied` di `has_witness` non la vede: il testimone
+  evapora, L torna perdente meritata, la copia **rinasce**. La nota resta
+  `deleted` perché D2 è l'ultima.
+
+L'ipotesi del revisore è confermata parola per parola: **il testimone P2
+diventa «una scrittura battuta dalla lapide» quando arriva D1, e smette di
+contare.** La conferma più netta la dà il giudice stesso: `witness_for_test`
+calcola i candidati su TUTTE le scritture del corpo del registro (non solo
+quelle applicate) e al giro 20 risponde `true` — per il suo occhio il
+testimone c'è ancora — mentre la derivazione (`has_witness`, con l'insieme
+`applied`) risponde `false`. Le due regole non sono mai divergete finché
+nessuna lapide batteva una fusione; il seme 3753… le ha fatte divergere.
+
+Il difetto è nella direzione della derivazione, non nel giudice: un
+insieme che cresce (D1 arriva) non può ritrarre un'esistenza. Se D1 cancella
+la nota, cancella anche il testo di L che la copia conserva: è la scelta
+dell'utente, e le regole della lapide già lo dicono («una scrittura battuta
+dalla lapide non produce copia»). Ma quello che P2 attesta — qualcuno ha
+visto il perdente — resta vero anche quando la lapide batte P2. Le due regole
+della correzione nascono da qui: il testimone non dipende dalla lapide, e le
+copie di una nota nel cestino seguono la lapide (invisibili, non cercabili,
+fuori da `conflicts()`), così che una chiusura o una rinascita sotto lapide
+non si vede da fuori.
