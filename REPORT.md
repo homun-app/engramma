@@ -9143,3 +9143,26 @@ vanno letti così.
   3 271 s a 20 000 casi, la convergenza 2 166 s, la proprietà allargata
   `random_ops_compact…` 1 771 s, la monotonia 619 s; le cinque suite a
   2 048 casi da 940 a 1 407 s ciascuna. I semi di regressione verdi.
+
+### Chiusura
+
+I tre blocchi della verifica v0.6.6 sono chiusi: l'oblio dell'indice
+nascosto è esatto (G1), la lapide si porta via i suoi conflitti e il
+testimone non dipende più da lei (G2), l'istantanea perde le copie e
+`scrubbed` non mente (G3) — e la caccia guarda ora i percorsi veri
+(G4), con una proprietà in più che alla sua prima corsa ha già trovato
+un buco vero (l'istantanea del ricevente) e due difetti preesistenti
+dichiarati aperti con i loro semi. Le misure sono dentro le soglie
+(inserimento −4,5% contro la soglia +5%, sonda della purga −9,5%
+contro +10%), i 54 test del contratto JS identici e verdi con il
+nuovo del cestino, Linux verde. **La sync può aprire agli utenti
+sull'ALPN `engramma/sync/4`.**
+
+| | |
+|---|---|
+| Tag | `fase-v0.6.7` (annotato, solo locale) |
+| Base | `main` @ `7be8f86` (verifica v0.6.6 del revisore) |
+| Test | suite workspace 71 verdi in macOS e nel container Linux; `npm test` e `test:electron` 55/55 |
+| Caccia | 26 proprietà × 20 000 + 5 × suite a 2 048: 31/31 verdi, 19 389 s |
+| Misure | inserimento −4,5%; sonda purga 141,1 → 127,8 ms (−9,5%) |
+| Aperti | il rigioco da istantanea con taglio sotto la testa (seme `9012498534905088620`); i bordi «mentions» di una copia in quarantena (seme `9012498534642822410`) — entrambi difetti di coerenza del `verify`, nessuno dei due di oblio, entrambi preesistenti |
