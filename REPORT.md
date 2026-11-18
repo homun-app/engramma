@@ -9134,3 +9134,12 @@ vanno letti così.
   v0.6.6 (volume ricreato, terzo giro pulito). Il clippy 1.95 del container
   chiedeva `0..=2` al posto di `0 | 1 | 2` nel match della proprietà nuova
   (`d61bba4`).
+- **La caccia, sul commit finale** (`scripts/caccia.sh`, 26 proprietà a
+  20 000 casi + 5 corse della suite del core a 2 048, in release a
+  priorità minima): **tutta verde, 31 esiti su 31, 19 389 s** (5 h 23 —
+  la macchina era in carico per l'utente, load fino a 105 nel corso
+  della corsa; a `nice 19` con due fili, come sempre). Le più lunghe:
+  la proprietà nuova `purge_with_conflict_copies_leaves_no_roots`
+  3 271 s a 20 000 casi, la convergenza 2 166 s, la proprietà allargata
+  `random_ops_compact…` 1 771 s, la monotonia 619 s; le cinque suite a
+  2 048 casi da 940 a 1 407 s ciascuna. I semi di regressione verdi.
