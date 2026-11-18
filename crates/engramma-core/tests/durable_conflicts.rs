@@ -646,6 +646,133 @@ fn purge_takes_the_conflict_copies_out_of_the_snapshot() {
 /// and a purge running concurrently in the same binary would see it.
 static PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The stage of the v0.6.8 (H3) checks: a note with an open copy, a
+/// compaction with a snapshot file, and the snapshot's name.
+fn stage_with_snapshot(tag: &str) -> (Kept, ulid::Ulid, String) {
+    let init = shared_init(tag);
+    let (a, wa) = cell_with("a");
+    let (b, wb) = cell_with("b");
+    a.ingest_op(&init).unwrap(/* t */);
+    b.ingest_op(&init).unwrap(/* t */);
+    let note = base_note(41, "prima riga\nseconda riga\nterza riga");
+    let id = note.id;
+    wa.store(K + 1, Ordering::SeqCst);
+    a.put_note(&note, "homun:user").unwrap(/* t */);
+    for op in &union(&a, &b) {
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    // two concurrent human hands, so the family has a copy
+    wb.store(K + 5, Ordering::SeqCst);
+    b.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("felce maudivina sussurrando".into()),
+            ..Default::default()
+        },
+        "homun:bot-x",
+    )
+    .unwrap(/* t */);
+    wa.store(K + 3, Ordering::SeqCst);
+    a.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("prima riga\nscritta a mano\nterza riga".into()),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    let head: i64 = a
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* t */)[0]
+        .parse()
+        .unwrap(/* t */);
+    let snap = a
+        .compact(head, &engramma_core::cell::CompactOptions { keep_snapshot: true })
+        .unwrap(/* t */)
+        .snapshot
+        .expect(/* asked for */ "the snapshot file");
+    let name = snap
+        .file_name()
+        .unwrap(/* our own path */)
+        .to_string_lossy()
+        .to_string();
+    (a, id, name)
+}
+
+/// v0.6.8 (H3): a snapshot the purge CANNOT READ is not one it may call
+/// clean. `snapshot_holds_family` answers `-1` for a file that does not
+/// open, and the caller compared `> 0`: `-1` passed for clean. Every
+/// answer but zero — `-1` included — must make `scrubbed: false`, with
+/// `pending` NAMING the file.
+#[test]
+fn an_unreadable_snapshot_is_not_clean() {
+    let _guard = PURGE_LOCK.lock().unwrap(/* test-only lock */);
+    let (a, id, snap_name) = stage_with_snapshot("illetgibile");
+    // the snapshot exists, but this process cannot open it for reading
+    let snap_path = a
+        .debug_column("SELECT file FROM snapshots ORDER BY seq DESC LIMIT 1")
+        .unwrap(/* t */)
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    let cell_dir = std::path::Path::new(a.file_path()).parent().unwrap(/* t */).to_path_buf();
+    std::fs::set_permissions(cell_dir.join(&snap_path), <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o000))
+        .unwrap(/* t */);
+    let report = a.purge(&id, "diritto all'oblio", "homun:user").unwrap(/* t */);
+    // restore whatever the report said: the file must not stay locked out
+    let _ = std::fs::set_permissions(cell_dir.join(&snap_path), <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644));
+    assert!(
+        !report.scrubbed,
+        "an unreadable snapshot is not clean: {report:?}"
+    );
+    assert!(
+        report.pending.iter().any(|p| p.contains(&snap_name)),
+        "pending names the unreadable snapshot: {report:?} vs {snap_name}"
+    );
+}
+
+/// v0.6.8 (H3): the ORPHAN FTS row — the most likely half-scrub: the
+/// note's row goes, its index row stays. The v0.6.7 check counted the
+/// FTS rows through a JOIN with `notes`, so the orphan was invisible. A
+/// test-only injection skips the purge's FTS delete; the check must find
+/// the row by the rowid it read BEFORE the scrub — the LIVE file's own
+/// check names the cell here (a compaction snapshot holds no FTS rows
+/// by construction: `delete-all` at compact), and the count is ONE
+/// function, `holds_family`, for the two files.
+#[test]
+fn an_orphan_fts_row_is_found_and_named() {
+    let _guard = PURGE_LOCK.lock().unwrap(/* test-only lock */);
+    // SAFETY: the lock above holds every purge of this test binary, so no
+    // other thread reads the environment while the var is set.
+    unsafe { std::env::set_var("ENGRAMMA_TEST_SKIP_PURGE_FTS_DELETE", "1") };
+    let scene = || {
+        let (a, id, _snap_name) = stage_with_snapshot("orft");
+        let live_name = std::path::Path::new(a.file_path())
+            .file_name()
+            .unwrap(/* our own path */)
+            .to_string_lossy()
+            .into_owned();
+        let report = a.purge(&id, "diritto all'oblio", "homun:user").unwrap(/* t */);
+        assert!(
+            !report.scrubbed,
+            "an orphan FTS row keeps the purge honest: {report:?}"
+        );
+        assert!(
+            report.pending.contains(&live_name),
+            "pending names the file that keeps the FTS row: {report:?} vs {live_name}"
+        );
+    };
+    let outcome = std::panic::catch_unwind(scene);
+    // SAFETY: as above — the lock is still held.
+    unsafe { std::env::remove_var("ENGRAMMA_TEST_SKIP_PURGE_FTS_DELETE") };
+    outcome.unwrap(/* the scene's own assert */);
+}
+
 /// v0.6.7 (G3): `scrubbed` is EARNED. The failure is fabricated with the
 /// engine's one test-only injection — the env var makes the snapshot's
 /// scrub skip the copies' transitive closure, a half-done scrub — and the
