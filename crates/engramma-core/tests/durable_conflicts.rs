@@ -455,3 +455,104 @@ fn a_proposal_note_patch_concurrently_derives_the_copy() {
         assert_eq!(live, rebuilt, "the oracle agrees");
     }
 }
+
+// ---------------------------------------------------------------------------
+// v0.6.7 (G1): the hidden index's roots outlive the row — checked on the
+// file's raw bytes, the same needle rule as tests/forgetting.rs (each test
+// binary is its own crate: the helpers are local).
+// ---------------------------------------------------------------------------
+
+/// Every root of a body's terms, as the engine's normalisation produces
+/// them (the same rule `assert_forgotten` applies in forgetting.rs).
+fn roots_here(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in body.split(|c: char| !c.is_alphanumeric()) {
+        let token = token.trim_matches(|c: char| !c.is_alphanumeric());
+        if token.is_empty() {
+            continue;
+        }
+        let lowered = engramma_core::text::strip_diacritics(&token.to_lowercase());
+        let stem = engramma_core::text::normalize(&lowered, Some(engramma_core::format::Lang::It));
+        for needle in [lowered, stem] {
+            if needle.len() >= 5 && !out.contains(&needle) {
+                out.push(needle);
+            }
+        }
+    }
+    out
+}
+
+/// The cell file and its WAL must carry none of the needles.
+fn assert_no_roots(cell: &Cell, needles: &[String]) {
+    let path = cell.file_path().to_path_buf();
+    let wal = path.parent().unwrap(/* our own cell */).join(format!(
+        "{}-wal",
+        path.file_name().unwrap(/* our own cell */).to_string_lossy()
+    ));
+    for f in [path, wal] {
+        let raw = std::fs::read(&f).unwrap_or_default();
+        for n in needles {
+            assert!(
+                !raw.windows(n.len()).any(|w| w == n.as_bytes()),
+                "«{n}» sopravvive in {}: oblio violato",
+                f.display()
+            );
+        }
+    }
+}
+
+/// v0.6.7 (G1): the third way out of the hidden index — a QUARANTINED
+/// conflict copy closed by its resolution. The agent's loser is born in
+/// quarantine, its body's stems live in the hidden index only; the
+/// resolution deletes the copy's note and its hidden FTS row goes with an
+/// FTS `delete` (roots in the old segments). The purge of the original
+/// then finds NO hidden row in the family — and must still forget.
+#[test]
+fn purge_after_a_quarantined_copy_resolution_scrubs_the_hidden_index() {
+    let init = shared_init("chiusa-in-nascosto");
+    let (a, wa) = cell_with("a");
+    let (b, wb) = cell_with("b");
+    a.ingest_op(&init).unwrap(/* t */);
+    b.ingest_op(&init).unwrap(/* t */);
+    let note = base_note(9, "prima riga\nseconda riga\nterza riga");
+    let id = note.id;
+    wa.store(K + 1, Ordering::SeqCst);
+    a.put_note(&note, "user").unwrap(/* t */);
+    for op in &union(&a, &b) {
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    // the agent's body loses to the human's: the copy is born QUARANTINED
+    let loser_body = "prima riga\nquokkaviolaceo zibellinotremante\nterza riga";
+    wb.store(K + 2, Ordering::SeqCst);
+    b.patch_note(
+        &id,
+        &NotePatch { body: Some(loser_body.into()), ..Default::default() },
+        "homun:bot-x",
+    )
+    .unwrap(/* t */);
+    wa.store(K + 3, Ordering::SeqCst);
+    a.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("prima riga\nla mano umana vince\nterza riga".into()),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    let hidden: Vec<String> = a
+        .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes_fts_hidden_docsize")
+        .unwrap(/* t */);
+    assert_eq!(hidden[0], "1", "the quarantined copy sits in the hidden index");
+    let copy = a.conflicts().unwrap(/* t */)[0].copy_id;
+    // the resolution closes it: the hidden FTS row leaves with a `delete`
+    a.resolve_conflict(&copy, ResolveKeep::Original, None, "user")
+        .unwrap(/* t */);
+    // and the original goes too — the whole family's stems must leave
+    a.purge(&id, "diritto all'oblio", "user").unwrap(/* t */);
+    assert_no_roots(&a, &roots_here(loser_body));
+}

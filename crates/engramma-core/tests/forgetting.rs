@@ -167,6 +167,74 @@ fn purge_of_a_quarantined_note_scrubs_the_hidden_index() {
     assert_forgotten(dir.path(), "oblio-nascosto", &needles);
 }
 
+/// v0.6.7 (G1): a note that has BEEN in quarantine and left it. The
+/// release's status transition takes the row OUT of the hidden index with
+/// an FTS `delete` — which leaves the stems in the old segments — and at
+/// the purge the index holds NO row of the family anymore: the v0.6.6
+/// count says «never touched» and skips the `optimize`. The count looks at
+/// today's state; the roots are history. This is the reviewer's proof
+/// (verifica v0.6.6, punto 1), and it is the normal Homun path: the notes
+/// imported from the web are born in quarantine and the user approves
+/// them.
+#[test]
+fn purge_of_a_released_quarantined_note_scrubs_the_hidden_index() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let path = dir.path().join("oblio-rilasciata.sqlite");
+    let cell = Cell::create(&path, "oblio", "tester").unwrap(/* test-only */);
+    let mut secret = note_of(1, "quokkaviolaceo zibellinotremante ovoviviparo");
+    secret.status = Status::Quarantined;
+    cell.put_note(&secret, "tester").unwrap(/* test-only */);
+    let innocent = note_of(2, "passeggiata lungo larghissimo fiume");
+    cell.put_note(&innocent, "tester").unwrap(/* test-only */);
+    // the release: the row leaves the hidden index
+    cell.set_status(&secret.id, Status::Active, "tester").unwrap(/* test-only */);
+    let hidden: Vec<String> = cell
+        .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes_fts_hidden_docsize")
+        .unwrap(/* test-only */);
+    assert_eq!(hidden[0], "0", "after the release the hidden index holds no row");
+
+    let needles = roots_of(&secret.body, Some(Lang::It));
+    cell.purge(&secret.id, "diritto all'oblio", "tester")
+        .unwrap(/* test-only */);
+    drop(cell);
+    assert_forgotten(dir.path(), "oblio-rilasciata", &needles);
+}
+
+/// v0.6.7 (G1): the second way out of the hidden index — a body edit WHILE
+/// in quarantine. The reindex `delete`s the old row from the hidden index
+/// (and inserts the new one), the release later `delete`s that too: two
+/// FTS deletes whose roots sit in the old segments, and a family that at
+/// purge time holds no hidden row at all. Both bodies must go.
+#[test]
+fn purge_after_a_quarantined_body_edit_scrubs_the_hidden_index() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let path = dir.path().join("oblio-modificata.sqlite");
+    let cell = Cell::create(&path, "oblio", "tester").unwrap(/* test-only */);
+    let mut secret = note_of(1, "quokkaviolaceo zibellinotremante");
+    secret.status = Status::Quarantined;
+    cell.put_note(&secret, "tester").unwrap(/* test-only */);
+    let innocent = note_of(2, "passeggiata lungo larghissimo fiume");
+    cell.put_note(&innocent, "tester").unwrap(/* test-only */);
+    let second_body = "verdeviolaceo mugghiarono sottobosco";
+    cell.patch_note(
+        &secret.id,
+        &engramma_core::NotePatch {
+            body: Some(second_body.to_string()),
+            ..Default::default()
+        },
+        "tester",
+    )
+    .unwrap(/* test-only */);
+    cell.set_status(&secret.id, Status::Active, "tester").unwrap(/* test-only */);
+
+    let mut needles = roots_of(&secret.body, Some(Lang::It));
+    needles.extend(roots_of(second_body, Some(Lang::It)));
+    cell.purge(&secret.id, "diritto all'oblio", "tester")
+        .unwrap(/* test-only */);
+    drop(cell);
+    assert_forgotten(dir.path(), "oblio-modificata", &needles);
+}
+
 /// P0.2: with another connection holding an open read transaction (the MCP
 /// server, Homun) the WAL cannot be truncated. Purge must NOT say "done":
 /// `scrubbed = false`, `pending` holds `"wal"`, the roots are still in the
