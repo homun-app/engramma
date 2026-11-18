@@ -9615,3 +9615,38 @@ quelle che hanno bocciato la vista).
    non è un difetto di Engramma — è il confine che ha fatto scartare
    una realizzazione del diff3 di riferimento. Scritto qui perché il
    prossimo che prova una crate di merge sappia dove il banco morde.
+
+## La caccia
+
+`scripts/caccia.sh` senza argomenti, in release, a priorità minima
+(`nice` 19, due job, due fili, `caffeinate`), sul commit finale dei
+sorgenti. **Si è fermata da sola al rosso della quarta proprietà — ed è
+il funzionamento voluto dello script e la risposta del criterio di
+release:**
+
+| proprietà | casi | esito | tempo |
+|---|---|---|---|
+| `the_fleet_converges` | 20 000 | verde | 925 s |
+| `every_copy_equals_its_reconstruction` | 20 000 | verde | 835 s |
+| `no_copy_closes_without_a_witness` | 20 000 | verde | 590 s |
+| `no_body_text_is_lost` | 20 000 | **ROSSO** | 117 s |
+
+Il rosso è il difetto aperto n. 2 (la perdita di testo esposta dal
+cestino): seme `9368190224066329310` (2 dispositivi, 28 giri), la copia
+chiusa dell'utente `…QS6` perde il corpo della scrittura d'agente
+senza `base` — la riga finisce `active` a versione 3 col testo del
+perdente da nessuna parte. Il seme riproduce su `main` in 32 casi; non è
+entrato nel file di regressione (la suite deve correre), come la v0.6.7
+fece per i suoi difetti aperti.
+
+Il verde più importante di questa caccia è il terzo:
+**`no_copy_closes_without_a_witness` a 20 000 casi col giudice del
+RIFERIMENTO** (H4) — il testimone indipendente, il diff3 suo, il
+disaccordo motore-riferimento come fallimento: venti mila flotte senza
+un disaccordo. Le ventidue proprietà restanti e le cinque corse della
+suite non sono state girate: il verdetto della fase è già scritto dal
+rosso (il criterio chiede una fase SENZA difetti nuovi, e questa fase
+ne ha trovati due), e il precedente della v0.6.7 — la caccia lunga non
+si rifà quando i difetti sono già noti da semi riproducibili — è la
+regola seguita. Le suite in debug girano verdi al completo (288/288,
+più le altre crate).
