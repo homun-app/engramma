@@ -9650,3 +9650,40 @@ ne ha trovati due), e il precedente della v0.6.7 — la caccia lunga non
 si rifà quando i difetti sono già noti da semi riproducibili — è la
 regola seguita. Le suite in debug girano verdi al completo (288/288,
 più le altre crate).
+
+## Linux
+
+`scripts/linux.sh` (container `engramma-linux:1.95.0`, rete chiusa,
+sorgente in sola lettura, volume del target ricreato): fmt, clippy a
+`-D warnings` e l'intera suite del workspace — **verde: 74 suite, 568
+test, zero fallimenti**. Una nota onesta: il primo giro è morto sul
+`cargo fmt --check` (le righe lunghe lasciate dalle patch della fase,
+corrette con `cargo fmt` e commesse) — lo stesso tipo di rifiuto che la
+v0.6.7 chiamò «onesto»: il container fa il suo lavoro.
+
+## La chiusura della fase
+
+| punto | stato |
+|---|---|
+| H1 — il cestino, predicato solo | **chiuso**: un frammento unico guidato dal tavolo piccolo, la forma scelta dalla misura (vista e correlato bocciati dal banco); contratto + cancello dei bucket; JS 56/56 |
+| H2 — verify su celle condivise compattate | **primo strato chiuso** (i corpi delle copie traslocano prima del taglio, seme `2864…` guardia); **secondo strato APERTO** (l'ancora che invecchia, semi `1147…` e `1084…`, la regola di fermo della specifica seguita) |
+| H3 — `scrubbed` non si dichiara mai | **chiuso**: `!= 0`, rowid letti prima, orfane contate, una funzione per i due file |
+| H4 — l'oracolo della monotonia | **chiuso**: il riferimento quadratico col diff3 suo; i denti provati (seme `16136…`, 155 successi poi il morso); `diffy` scartato col fatto misurato |
+| H5 — `SyncService` si chiude | **chiuso**: annullamento, attese dichiarate, `Drop`, zero `.tmp*` |
+| H6 — il bordo «conflitto» | **chiuso**: derivato con formula unica, vivo esattamente mentre la copia ha riga viva |
+| H7 — le celle d'oro | **nate**: script ripetibile + cella + test + regola nel DESIGN § 8 |
+| H8 — il fatto mancante | **scritto** nella sezione G3/G4 della v0.6.7 |
+| ALPN | **fermo a `sync/4`**: nessun cambio di derivazione (le ragioni in testa al capitolo) |
+| le misure | inserimento −4,2% (soglia +5%), sonda purga pari (soglia +10%), ricerca pari, `list()` −21% |
+| la caccia | **fermata dal rosso del difetto aperto** dopo tre verdi — il giudice del riferimento a 20 000 casi fra questi |
+| Linux | verde, 74 suite |
+
+**Che cosa può partire e che cosa no.** *Engramma locale senza sync*:
+la fase va dal revisore con le celle d'oro al loro posto — la v0.6.8 è
+la prima che il criterio del DESIGN § 12 ammette a questo passo, se la
+verifica la passa. *La sync agli utenti*: **no** — il criterio vuole
+una fase intera senza difetti nuovi nel motore, e questa ne ha trovati
+due (l'ancora, la perdita esposta dal cestino), tutti e due con semi
+riproducibili e diagnosi nel REPORT. È il criterio che funziona: la
+prossima fase li chiude, e poi la release candidate (v0.6.9) fa il
+resto del percorso.
