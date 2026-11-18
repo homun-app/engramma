@@ -559,3 +559,82 @@ fn purge_after_a_quarantined_copy_resolution_scrubs_the_hidden_index() {
     a.purge(&id, "diritto all'oblio", "user").unwrap(/* t */);
     assert_no_roots(&a, &roots_here(loser_body));
 }
+
+/// v0.6.7 (G3): the purge takes the conflict copies out of the SNAPSHOT
+/// too. The live scrub closes transitively over the copies
+/// (`purge_conflict_copies`); the snapshot's scrub passed only the
+/// ORIGINAL's `purge_state` — and the copy's notes row, body and all,
+/// stayed in the file (the reviewer's proof of the v0.6.6 verification),
+/// while the report said `scrubbed: true`. The whole family's bodies
+/// must leave every file: the cell, the WAL and the snapshot.
+#[test]
+fn purge_takes_the_conflict_copies_out_of_the_snapshot() {
+    let init = shared_init("istantanea-copia");
+    let (a, wa) = cell_with("a");
+    let (b, wb) = cell_with("b");
+    a.ingest_op(&init).unwrap(/* t */);
+    b.ingest_op(&init).unwrap(/* t */);
+    let note = base_note(23, "prima riga\nseconda riga\nterza riga");
+    let id = note.id;
+    wa.store(K + 1, Ordering::SeqCst);
+    a.put_note(&note, "homun:user").unwrap(/* t */);
+    for op in &union(&a, &b) {
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    // the bot loses to the human hand: its copy is born quarantined
+    let loser_body = "zibellinotremante ovoviviparo sussurrando";
+    wb.store(K + 5, Ordering::SeqCst);
+    b.patch_note(
+        &id,
+        &NotePatch { body: Some(loser_body.into()), ..Default::default() },
+        "homun:bot-x",
+    )
+    .unwrap(/* t */);
+    wa.store(K + 3, Ordering::SeqCst);
+    a.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("prima riga\nscritta a mano\nterza riga".into()),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    assert_eq!(a.conflicts().unwrap(/* t */).len(), 1, "the copy is open");
+    // the compaction freezes a snapshot that HOLDS the conflict family
+    let head: i64 = a
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* t */)[0]
+        .parse()
+        .unwrap(/* t */);
+    let snap = a
+        .compact(
+            head,
+            &engramma_core::cell::CompactOptions { keep_snapshot: true },
+        )
+        .unwrap(/* t */)
+        .snapshot
+        .expect(/* asked for */ "the snapshot file");
+    // the purge of the original: the whole family must leave every file
+    let report = a.purge(&id, "diritto all'oblio", "homun:user").unwrap(/* t */);
+    assert!(report.scrubbed, "the purge says done: {report:?}");
+    let needles = roots_here(loser_body);
+    for f in [
+        a.file_path().to_path_buf(),
+        snap.parent().unwrap(/* our own dirs */).join("a.sqlite-wal"),
+        snap.clone(),
+    ] {
+        let raw = std::fs::read(&f).unwrap_or_default();
+        for n in &needles {
+            assert!(
+                !raw.windows(n.len()).any(|w| w == n.as_bytes()),
+                "«{n}» sopravvive in {}: oblio violato",
+                f.display()
+            );
+        }
+    }
+}
