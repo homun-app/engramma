@@ -663,6 +663,27 @@ fn materialize_note(
         .collect();
     states.extend(erased_states);
     super::conflicts::after_replay(tx, id, &applied, &states)?;
+    // v0.6.8 (H6): a note that IS a conflict copy and holds a LIVING
+    // row keeps its `conflitto` edge, whatever branch of the
+    // materialization wrote the row (the restore path always did; the
+    // cut-state path rebuilt the row without it, and the checkpoint
+    // coherence cried wolf — seed `9012498534642822410` reduced)
+    {
+        let original: Option<String> = tx
+            .query_row(
+                "SELECT original_id FROM conflict_copies WHERE copy_id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(original) = original
+            && let Ok(original) = Ulid::from_string(&original)
+            && let Some(row) = ops::read_note_row(tx, id)?
+            && row.note.status != crate::format::Status::Deleted
+        {
+            write_conflict_edge(tx, id, &original)?;
+        }
+    }
     restore_hlc_watermark(tx, watermark, None)?;
     Ok(())
 }
@@ -970,6 +991,41 @@ pub(crate) fn conflict_copy_state(
     Ok(Some((original, note)))
 }
 
+/// The deterministic id of a copy's `conflitto` edge (v0.6.8, H6: one
+/// formula in one place — the derivation that writes it and the verify
+/// that expects it speak the same word).
+pub(crate) fn conflict_edge_id(copy_id: &Ulid) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"engramma/conflict-edge/v1");
+    h.update(copy_id.to_string().as_bytes());
+    format!("d{}", &h.finalize().to_hex()[..31])
+}
+
+/// Write (or rewrite) the `conflitto` edge of a copy toward its
+/// original: derived (id `d%`), so the copy's own rematerialization
+/// cleans and rebuilds it. The RULE (v0.6.8, H6): the edge exists
+/// exactly while its copy holds a LIVING notes row — open and visible,
+/// or the user's own (edited) — and goes with the row (a resolved
+/// copy's tombstone, an invisible window, a closed derivation lose it).
+pub(crate) fn write_conflict_edge(
+    tx: &rusqlite::Transaction<'_>,
+    copy_id: &Ulid,
+    original: &Ulid,
+) -> Result<(), CellError> {
+    tx.execute(
+        "INSERT OR REPLACE INTO edges (id, src, rel, dst, note_id, valid_from, valid_to,
+                                       confidence, status)
+         VALUES (?1, ?2, 'conflitto', ?3, ?4, NULL, NULL, 'stated', 'active')",
+        rusqlite::params![
+            conflict_edge_id(copy_id),
+            format!("note:{copy_id}"),
+            format!("note:{original}"),
+            copy_id.to_string()
+        ],
+    )?;
+    Ok(())
+}
+
 /// Write (or rewrite) the derived ROWS of one conflict copy: the note —
 /// active, tagged `conflitto`, the loser's content — its FTS and tags, and
 /// the edge to the original. Pure derivation: no operation of its own, and
@@ -983,25 +1039,7 @@ pub(crate) fn restore_conflict_copy(
     delete_note_state(tx, copy_id)?;
     ops::restore_note(tx, note, 0)?;
     ops::reindex_note_row(tx, copy_id)?;
-    // the edge to the original: derived (d%), so the copy's own
-    // rematerialization cleans and rebuilds it
-    let edge_id = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"engramma/conflict-edge/v1");
-        h.update(copy_id.to_string().as_bytes());
-        format!("d{}", &h.finalize().to_hex()[..31])
-    };
-    tx.execute(
-        "INSERT OR REPLACE INTO edges (id, src, rel, dst, note_id, valid_from, valid_to,
-                                       confidence, status)
-         VALUES (?1, ?2, 'conflitto', ?3, ?4, NULL, NULL, 'stated', 'active')",
-        rusqlite::params![
-            edge_id,
-            format!("note:{copy_id}"),
-            format!("note:{original}"),
-            copy_id.to_string()
-        ],
-    )?;
+    write_conflict_edge(tx, copy_id, original)?;
     Ok(())
 }
 

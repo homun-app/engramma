@@ -312,7 +312,12 @@ fn verify_checkpoint_coherence(
     snapshot: Option<&SnapshotRecord>,
 ) -> Result<(), String> {
     // 1. derived edges: the expected set re-derived from the notes, the
-    //    actual set from the table
+    //    actual set from the table. v0.6.8 (H6): the `conflitto` edge of
+    //    a copy IS derived — the expected set counts it for every copy
+    //    that holds a LIVING notes row (the same rule the derivation
+    //    writes: seed `9012498534642822410`, reduced, answered
+    //    «expected N, found N+1» on every checkpoint cell with an open
+    //    copy)
     let render = |v: rusqlite::types::Value| -> String {
         match v {
             rusqlite::types::Value::Null => "\u{0}".into(),
@@ -362,6 +367,30 @@ fn verify_checkpoint_coherence(
                     e.status,
                 ));
             }
+        }
+        // the `conflitto` edges: one per copy with a LIVING notes row,
+        // with the derivation's own deterministic id
+        let null = "\u{0}".to_string();
+        let mut stmt = conn
+            .prepare(
+                "SELECT cc.copy_id, cc.original_id FROM conflict_copies cc
+                 JOIN notes n ON n.id = cc.copy_id
+                 WHERE n.status != 'deleted' ORDER BY cc.copy_id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<Result<(String, String), _>> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect();
+        for row in rows {
+            let (copy, original) = row.map_err(|e| e.to_string())?;
+            let edge_id = material::conflict_edge_id(
+                &Ulid::from_string(&copy).map_err(|e| format!("bad copy id {copy}: {e}"))?,
+            );
+            expected.push(format!(
+                "{copy}\u{1}{edge_id}\u{1}note:{copy}\u{1}conflitto\u{1}note:{original}\
+                 \u{1}{null}\u{1}{null}\u{1}stated\u{1}active\u{1}",
+            ));
         }
     }
     let mut actual: Vec<String> = Vec::new();
