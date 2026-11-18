@@ -9166,3 +9166,123 @@ sull'ALPN `engramma/sync/4`.**
 | Caccia | 26 proprietà × 20 000 + 5 × suite a 2 048: 31/31 verdi, 19 389 s |
 | Misure | inserimento −4,5%; sonda purga 141,1 → 127,8 ms (−9,5%) |
 | Aperti | il rigioco da istantanea con taglio sotto la testa (seme `9012498534905088620`); i bordi «mentions» di una copia in quarantena (seme `9012498534642822410`) — entrambi difetti di coerenza del `verify`, nessuno dei due di oblio, entrambi preesistenti |
+
+## Verifica v0.6.7 (revisore, 2026-11-18)
+
+Fatta sul tag `fase-v0.6.7` (`4e7350f`), a priorità minima (`nice -n 19`,
+due job, due fili). Le prove del revisore stanno nello scratchpad, fuori
+dal repo.
+
+### Cosa regge
+
+- **G1 è giusto e semplice.** Il bit lo accende `fts_delete` stessa, quindi
+  ogni causa d'uscita passa da lì per costruzione. I due `delete-all` lo
+  spengono a ragione. Il dente (seme `5022804855041187502`, primo caso) è
+  provato sulla proprietà allargata, che ora genera da sé le transizioni di
+  stato.
+- **La diagnosi di G2 è esemplare.** Le operazioni sono in ordine, il
+  predicato è nominato, e c'è la prova che il giudice e il motore
+  divergevano. La regola «il testimone non dipende dalla lapide» chiude la
+  rinascita, e il dente (a) morde sul seme agganciato e sul test ridotto.
+- **G3 e G4 hanno trovato più di quanto chiesto.** La proprietà a due
+  dispositivi ha trovato al primo giro due buchi veri di oblio:
+  l'istantanea del ricevente nella purga in arrivo, e una `put` concorrente
+  che **ricreava in chiaro** una nota purgata (il guard in `apply_half` e
+  `materialize_note`). Il secondo il REPORT lo dice solo nel commit
+  `1d548e0` e nel DESIGN: va detto anche qui, perché c'è anche nella
+  v0.6.5, e con la sync chiusa non si manifesta.
+- **Le corse del revisore:**
+  - `npm run build` riproduce i tre SHA e i 50 605 576 B dichiarati;
+  - `npm test` e `test:electron` 55/55;
+  - la suite del core in release è verde, compresi `lapide_copies`,
+    `forgetting`, `durable_conflicts` e l'inventario;
+  - la suite di `engramma-sync` è verde.
+
+  La caccia lunga (31 × 20 000 / 2048) non è stata rifatta: i difetti qui
+  sotto vengono da letture e da una sonda deterministica.
+
+### I difetti
+
+1. **Il cestino perde da `list()` e `get()`** (la regola 2 di G2 è a metà).
+   I filtri della lapide sono stati messi in quattro punti: `conflicts()`,
+   `bm25_from`, `read_candidates` e l'elenco delle proposte. Ma la copia ha
+   una riga sua in `notes`, con lo stato `active` e il tag `conflitto`, e
+   `note_ids()`, cioè `list()`, e `get()` non la filtrano.
+   - *Prova del revisore* (`zz_review_v067.rs`): dopo il `delete`
+     dell'originale `conflicts()` è vuoto, ma la copia è in `note_ids()` e
+     `get(copy)` risponde `Active, ["conflitto"]` con tutto il corpo.
+   - In Homun la lista delle note mostra il conflitto di una nota nel
+     cestino. Non è una rinascita (quella G2 l'ha chiusa), ma è proprio la
+     visibilità che la regola doveva togliere.
+   - *La forma giusta* non è un quinto filtro. È **un predicato solo**, il
+     cestino materializzato dalla derivazione, che ogni percorso di lettura
+     usa: `list`, `get`, i vicini del grafo, la ricerca, `conflicts`, le
+     proposte. Accanto, un test di contratto che passa **ogni** API di
+     lettura, così il prossimo percorso dimenticato fallisce da solo.
+2. **Il difetto aperto 1 (il rigioco da istantanea) sta sul percorso
+   normale, non su un terreno raro.**
+   - In una cella condivisa, `compact` taglia alla **frontiera stabile**, e
+     il binding JS taglia a `head - keepLast`: il taglio sotto la testa è
+     la regola, non l'eccezione. La «convenzione di compattare alla testa»
+     dei generatori non è quella dell'API.
+   - Il rigioco da istantanea lo usa solo `verify`, quindi lo stato vivo è
+     giusto. Ma una cella condivisa con `keepSnapshot`, dopo una scrittura
+     arrivata in ritardo, si sente dire da `verify` che diverge. Per
+     l'utente è un falso allarme di corruzione, proprio quando si apre la
+     sync.
+   - Il generatore deve compattare con `keepLast > 0` e con la frontiera,
+     come fa l'API.
+3. **`scrubbed` ha ancora due punti in cui si dichiara invece di
+   guadagnarsi.**
+   - `snapshot_holds_family` risponde `-1` per un file che non si apre, e
+     il commento dice che un file illeggibile non può dirsi pulito. Il
+     chiamante però confronta `> 0`: `-1` passa per pulito. Il confronto
+     giusto è `!= 0`.
+   - Le righe FTS si contano attraverso la `JOIN` con `notes`. Il mezzo
+     scrub più probabile, cioè la riga di `notes` tolta e quella FTS no,
+     lascia una riga orfana che il conto non vede. Vanno contati i `rowid`
+     della famiglia presi **prima** dello scrub, oppure le righe `docsize`
+     senza nota.
+4. **La monotonia non ha un oracolo indipendente nella direzione della
+   chiusura.**
+   - `witness_for_test` chiama `has_witness`, cioè il motore stesso, e dopo
+     G2 i due insiemi di scrittura coincidono. Quindi un testimone sbagliato
+     nel motore è sbagliato anche nel giudice. È questo, e non un fatto
+     strutturale del dominio, il motivo per cui il dente (b) non morde.
+   - Oggi la proprietà morde solo sulle riaperture, che si vedono dal
+     confronto degli stati.
+   - Lo stato dell'arte è il test differenziale: un testimone di
+     riferimento scritto a parte nei test, ingenuo e quadratico, contro cui
+     giudicare la chiusura. Poi il dente (b) va riprovato.
+5. **Preesistente, fuori fase: `SyncService` non aspetta i suoi fili.**
+   - La `.tmp*` che GLM ha trovato sette volte e cancellato, e che la corsa
+     del revisore ha lasciato di nuovo, viene da
+     `confirm_before_the_digits_is_invalid` (`service.rs:326`).
+   - L'invito rimasto aperto ricrea `early-a/device.key` e `devices.db`
+     **dopo** che la `TempDir` è stata tolta. `SyncService` non ha un
+     `Drop` che chiuda e aspetti i fili.
+   - Fuori dai test vuol dire questo: chi azzera la sync, cioè chiude il
+     servizio e cancella la radice, con un invito in volo può ritrovarsi
+     una chiave di dispositivo nuova nella radice cancellata. Va chiuso con
+     un `Drop` che fa join, e con un test che conta le `.tmp*`.
+   - Una nota sul metodo: una `.tmp*` che torna è un sintomo da
+     diagnosticare, non da cancellare.
+
+### Verdetto
+
+**v0.6.7 consegnata per lo sviluppo di Homun**: sostituisce la v0.6.5.
+- I tre blocchi della v0.6.6 sono chiusi davvero: l'oblio dell'indice
+  nascosto, la rinascita sotto lapide e le copie nell'istantanea.
+- Con i due buchi di oblio in più trovati dalla proprietà nuova, è la fase
+  più solida della serie.
+
+**La sync agli utenti: il revisore consiglia di aprirla dopo una v0.6.8
+breve, non ora.** Il difetto 1 e il difetto 2 si vedono proprio sulle celle
+condivise: il conflitto di una nota cestinata nella lista, e il falso
+allarme di `verify`.
+
+Se l'utente vuole aprirla prima, Homun deve fare due cose:
+- nascondere dalla lista le note col tag `conflitto` per cui
+  `conflict(id).originalDeleted` è `true`;
+- non presentare come corruzione un `verify` che diverge su una cella
+  condivisa compattata con istantanea.
