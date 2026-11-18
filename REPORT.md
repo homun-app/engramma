@@ -9048,6 +9048,22 @@ non si vede da fuori.
   `scrub_snapshots_of` condivide il ciclo fra la purga locale e l'arrivo;
   l'arrivo che non può completare il proprio oblio non atterra (errore: la
   prossima sync riprova).
+- **La `put` concorrente ricreava in chiaro una nota purgata** — l'altro
+  buco vero di oblio che la proprietà nuova ha trovato al primo giro, e
+  che questa sezione non diceva (stava solo nel commit `1d548e0` e nel
+  DESIGN § 4.3; la verifica v0.6.7 lo ha chiesto qui, come correzione
+  dichiarata): una `put` della stessa nota arrivata quando la purge era
+  già nell'insieme la ricreava — corpo compreso, in chiaro — nel vivo
+  (`apply_half`) e nel rigioco (`materialize_note`), perché il guard
+  mancava dove la put «crea» invece di modificare. Corretta col guard in
+  entrambi i percorsi: quando l'insieme contiene una purge della nota X,
+  X non materializza, qualunque sia l'ordine totale (la purge domina, e
+  da allora domina anche nel rigioco). **Su quale versione si
+  manifesta:** dalla v0.6.5 in poi — serve una `put` concorrente su una
+  nota purgata, cioè la sync aperta fra dispositivi; con la sync chiusa
+  (una sola mano) non si vede. Nella v0.6.4 e prima la purga non
+  attraversava i dispositivi con la stessa forma, e il percorso d'arrivo
+  era un altro.
 
 ### G4 — la caccia guarda i percorsi veri
 
