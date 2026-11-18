@@ -9302,3 +9302,316 @@ Se l'utente vuole aprirla prima, Homun deve fare due cose:
   `conflict(id).originalDeleted` è `true`;
 - non presentare come corruzione un `verify` che diverge su una cella
   condivisa compattata con istantanea.
+
+---
+
+# v0.6.8 — Il cestino ha una porta sola, e `verify` dice il vero sulle celle condivise
+
+La correzione dei cinque difetti della verifica v0.6.7 più il difetto
+aperto dei bordi «mentions». La fase apre due strade dichiarate nel
+DESIGN § 12: **Engramma locale senza sync** si può distribuire dentro
+Homun da questa versione (con le celle d'oro al loro posto, e la v0.6.8
+le ha); **la sync agli utenti** resta dietro il criterio di release — e
+questa fase ha trovato difetti nuovi (in fondo), quindi il criterio ha
+già la sua risposta per ora.
+
+**L'ALPN resta `engramma/sync/4` e `engramma/mailbox/4`**: nessun punto
+ha cambiato la derivazione. H1 è una regola di LETTURA (lo stato
+derivato è quello di sempre; la prova: il digest e il rigioco non si
+accorgono del predicato, e il test di contratto verifica che `verify`
+resti verde); H2 tocca ciò che la compattazione CONSERVA (una riga di
+derivazione, fuori dal digest replicato), non le regole che due
+dispositivi applicano allo stesso insieme; H3 è un controllo della
+purga; H4, H5, H6 e H7 stanno nei test e nei bordi. Il test
+`protocol_version` continua a parlare v4 contro v4.
+
+## H1 — il cestino ha un predicato solo
+
+**Il difetto chiuso.** La regola «le copie seguono la lapide» stava in
+quattro filtri scritti a mano e `note_ids()`/`list()` e `get()` non la
+parlavano: la prova del revisore è nel repo (`cestino.rs`, il primo test
+rosso del punto).
+
+**Il predicato.** Una nota sta nel cestino quando è cancellata, oppure
+quando è copia di conflitto di una nota cancellata. Una definizione, in
+un posto solo: `cell/bin.rs`. Ogni percorso di lettura la parla:
+`note_ids` (e la `list()` del binding), `note_ids_all` (le lapide
+restano, le copie no), `get` (la copia risponde `NotFound`, l'oracolo
+chiuso del binding — e la lapide continua a leggersi, come `restore` e
+l'elenco delle lapide chiedono), le due ricerche BM25 (i quattro filtri
+della v0.6.7 vanno via), `read_candidates` (il braccio vettoriale),
+`visible_note_count` e l'istogramma delle lingue, `edge_visible`
+(vicini, percorsi, linea del tempo), i tag, il grafo in memoria (il
+nodo della copia cammina come una cancellata, e l'arco che una nota del
+cestino dichiara non è un passo: il filtro sta dentro `steps`, quindi
+ogni cammino lo eredita), `conflicts`, `conflict(copyId)` (onesta per
+id, `originalDeleted: true`, con la stessa parola), la coda delle
+proposte, il consolidamento, l'export markdown e la vista della
+cartella (che eredita tutto da `note_ids` e `get`).
+
+**La forma, scelta dalla misura** — la specifica lo chiedeva, e la
+misura ha bocciato due candidati prima di eleggere il terzo:
+
+| forma | ricerca p50 | `list()` 10k | perché |
+|---|---|---|---|
+| vista `notes_in_bin` letta con `NOT IN` | 4,34 ms | 96,6 ms | il planner materializza la vista per ogni query: scansione di `notes` con sonda `EXISTS` per riga |
+| `NOT EXISTS` correlato per riga | 1,70 ms | 95,4 ms | `visible_note_count` e `note_ids` camminano tutte le righe: una sonda per riga |
+| **frammento unico guidato dal tavolo piccolo** | **0,60 ms** | **41,3 ms** | le copie si chiedono a `conflict_copies` (poche righe, di solito vuoto): `NOT IN` costruisce un piccolo insieme una volta per statement |
+
+Due rifiniture misurate: il conteggio **sottrae** le copie del cestino
+con una `CROSS JOIN` che inchioda `conflict_copies` come guidatore (senza
+pin il planner partiva da `notes`: +0,44 ms per query); e il `get`
+pubblico legge in **una** query (erano due) e domanda la parola del
+cestino solo quando la nota porta il marchio `conflitto` — ogni copia lo
+ha per costruzione, la derivazione riapplica il suo — così le diecimila
+letture della `list()` non pagano nulla. Da qui il −21% della `list()`.
+
+**Il contratto, guardato dalla macchina.** `cestino.rs` passa OGNI
+lettura pubblica che parla note — l'elenco sta in `READS_THE_NOTES`, un
+posto solo, e la passeggiata lo copre per nome: un controllo tolto fa
+cadere il test col nome dell'API dimenticata. Accanto, il cancello
+`every_public_read_is_classified`: ogni `pub fn` di `Cell` deve stare in
+un bucket (letture note / altre letture / interni / scritture, i primi
+tre col motivo) — la prossima porta dimenticata cade da sola, come
+`properties_inventory` insegna. Che cosa il parser non vede: le funzioni
+di altri moduli, le funzioni associate (`Cell::create`) e i blocchi
+`impl` di altri tipi. Lo stesso contratto in JS
+(`sync-pair.test.js`): `list()` in entrambe le forme, `get(copy)` nullo,
+il ritorno intero alla riapertura.
+
+**Confine dichiarato:** la riga FTS di una copia nel cestino resta
+nell'indice (come la riga di una lapide, che pure non risponde a nessuna
+ricerca da sempre): i risultati non la vedono, il denominatore dell'IDF
+sì. L'invariante d'indistinguibilità della v0.5.3 parla della quarantena
+(indice separato); il cestino segue la lapide, e la lapide ha sempre
+lasciato la riga. Scritto qui perché la prossima fase sappia dove
+guardare.
+
+## H2 — `verify` sulle celle condivise compattate: due strati, uno chiuso
+
+**Prima il terreno.** I generatori ora camminano le strade vere: la
+proprietà a due dispositivi scrive gli ACK di sessione
+(`mark_shared` + `record_session_ack`) come il servizio vero, così la
+compattazione taglia alla **frontiera stabile** — sotto la testa — e il
+taglio scende anche di per sé (`head − 0/1/2`, come il `keepLast` del
+binding JS). È il contrario della convenzione «sempre alla testa» di
+ogni test di compattazione: il terreno dove il difetto non si vedeva.
+Una conseguenza onesta: per una cella non condivisa la frontiera È la
+testa (`stable_frontier`), quindi i tagli sotto la testa esistono solo
+nelle celle condivise — dove la sync li produce davvero.
+
+**Il primo strato, chiuso** (seme `2864860944329123852`, caso 79,
+trovato dalla proprietà appena ha camminato la strada vera). Il corpo di
+una copia di conflitto viveva nel payload del perdente — «il payload del
+perdente è la sua casa», dice il DESIGN — ma il taglio dimentica i
+payload: il vivo teneva la riga scritta quando il payload era vivo, il
+rigioco dall'istantanea la ricostruisce senza corpo. La diagnosi è nella
+traccia: la riga della copia …E84N col corpo «qwtonfo» nel vivo e vuota
+nel rigioco. La correzione: `backfill_copy_bodies` muove quel byte nella
+riga di derivazione (`conflict_copies.state_json` — stato derivato,
+fuori da ogni digest) **prima** che i payload muoiano, in tre posti: la
+transazione viva della compattazione, lo spoglio dell'istantanea, e il
+rigioco di `verify` (dove copre anche i file scritti prima della regola
+senza toccarli). Il seme resta nel file di regressione.
+
+**Il secondo strato, APERTO — e la specifica è la regola seguita.**
+Camminando le strade vere, `verify` diverge ancora sulle note i cui
+arrivi fuori ordine attraversano il taglio. La diagnosi completa, coi
+fatti:
+
+- seme `11476711120049502961`: il contatore `version` di una nota che
+  è stata rimaterializzata mentre il taglio saliva (4 → 11 → 26): vivo
+  7, ricostruzione 6. La traccia mostra le rimaterializzazioni del vivo
+  correre contro tagli diversi (`cut=4 … cut=11 …`), e l'ultima contro
+  `cut=26` nell'istantanea: l'ANCORA della rimaterializzazione — la
+  riga di stato-pre da cui un rigioco riparte — porta il numero che
+  l'ancora raggiunse contro il taglio di ALLORA;
+- seme `10840318560449401940`: lo stesso invecchiamento, su un titolo.
+
+Provata e scartata la via del rinfresco: rimaterializzare le note a
+cavallo a ogni compattazione, col taglio nuovo e i payload ancora
+interi. Non basta, e il perché è strutturale: la rimaterializzazione
+LEGGE l'ancora vecchia — l'ancora si alimenta da sé (GIGO). Servirebbe
+riscrivere l'ancora dal sotto-insieme dei payload sotto il taglio
+nuovo — una terza derivazione, con le lapidi, le purghe e i doppi
+importi dentro. È il caso della specifica: «il vivo usa
+un'informazione che l'istantanea non ha». Fermi, dichiarato, semi sopra.
+Il giudizio `verify` della proprietà resta parcheggiato col difetto
+(come nella v0.6.7: la proprietà giudica l'oblio, il suo mandato); il
+test deterministico della forma sana della specifica
+(`shared_verify.rs` — B scrive offline, A compatta con istantanea alla
+frontiera, B arriva, `verify` verde su A) è nel repo. La regola del
+primo strato sta nel DESIGN § 4.4, col difetto dell'ancora nominato.
+
+## H3 — `scrubbed` non si dichiara mai
+
+- Il confronto è `!= 0`: il `-1` del file che non si apre in lettura non
+  è pulito — e un file illeggibile finisce in `pending` per nome, senza
+  che lo scrub gli corra contro mezzo cieco.
+- Le righe FTS si contano **per rowid**, letti PRIMA dello scrub in
+  tutti e due gli indici: il mezzo-scrub più probabile (la riga di
+  `notes` va, quella dell'indice resta) passa dalla JOIN ed era
+  invisibile. In più contano le righe `docsize` orfane — senza la loro
+  nota, di qualunque famiglia.
+- **Una funzione sola** (`holds_family`) per i due file: la purga locale
+  controlla anche il file vivo con le stesse parole, e nomina la cella
+  se tiene qualcosa della famiglia.
+- L'iniezione `ENGRAMMA_TEST_SKIP_PURGE_FTS_DELETE` (stessa disciplina
+  delle altre due del modulo: solo i test, non può far mentire la purga)
+  fabbrica il mezzo-scrub perché il controllo provi di vederlo. Le due
+  prove rosse: l'istantanea illeggibile, la riga orfana trovata e
+  nominata.
+
+## H4 — la monotonia ha un oracolo suo
+
+Il giudice della chiusura (`no_copy_closes_without_a_witness`) non usa
+più il motore: `witness_for_test` chiamava `has_witness`, lo stesso
+insieme, lo stesso errore. Il **testimone di riferimento** sta in
+`tests/common/`: la regola del DESIGN § 4.3 riscritta da capo — (a)
+un'operazione sull'id della copia, (b) una scrittura successiva
+nell'ordine totale che discende dal perdente, (c) una successiva che lo
+contiene, col diff3 rigoroso da F = nca(perdente, testimone), estremi
+compresi. Ingenuo e quadratico: LCS per programmazione dinamica, punti
+stabili, blocchi instabili con la regola «un lato solo cambiato prende
+l'altro, i cambi identici non sono sovrapposizioni». Nessuna funzione
+dei conflitti del motore. **Ogni disaccordo fra motore e riferimento fa
+cadere la proprietà col caso.**
+
+**Il confine dichiarato, misurato:** la prima realizzazione provata era
+il merge di `diffy` (dipendenza di sviluppo, come la specifica
+suggeriva) — sul primo giro il giudice ha morso subito (seme
+`11196124333436581517`) ed era il confine: il perdente e il testimone
+avevano riscritto la stessa riga dello stesso testo, e `diffy` risponde
+«conflitto» ai cambi identici sovrapposti, che il diff3 rigoroso fonde.
+`diffy` non è una realizzazione di questa regola: dipendenza tolta, il
+riferimento porta il diff3 suo. Il confine restante, dichiarato: due
+sottosequenze comuni della stessa lunghezza possono tagliare i punti
+stabili in modi diversi; il DP del riferimento prende una passeggiata
+canonica — un disaccordo nato lì farebbe cadere la proprietà e si
+leggerebbe a mano.
+
+**I denti** (ramo di prova, poi buttato): il sabotaggio (b) della
+v0.6.7 — la forcella del contenimento presa contro il VINCITORE invece
+che contro il testimone — con il giudice nuovo morde: seme
+`16136506979036168247`, 155 successi poi il morso («the engine and the
+reference disagree», motore vero / riferimento falso), a 1024 casi con
+lo shrinking spento. Nella v0.6.7 lo stesso sabotaggio non mordeva: il
+dente che mancava c'è.
+
+## H5 — `SyncService` si chiude davvero
+
+Il difetto riprodotto al volo e perbene (il test rosso è deterministico,
+1,5 secondi): servizio avviato, invito aperto, servizio lasciato cadere
+senza `shutdown`, radice cancellata — e la radice **ricompare** con
+`device.key` e `devices.db` dentro (le `.tmp*` della suite: le TempDir
+di `tempfile` ricreate da un `create_dir_all` in un filo sopravvissuto).
+La chiusura, ora: i fili di abbinamento vivono nel `WorkerCore` (con
+l'inner da annullare e il `JoinHandle` da aspettare); il comando
+`Shutdown` ferma il ciclo, annulla inviti e adesioni e **aspetta** i
+loro fili entro `THREAD_CLOSE` (10 s, dichiarato); chi sfora è un errore
+che si vede; il `Drop` di `ServiceInner` — l'ultimo handle che cade,
+senza `shutdown` esplicito — manda la stessa chiusura (attesa bounded
+`SHUTDOWN_REPLY` 25 s) e poi aspetta il filo del servizio. Dopo la
+chiusura niente scrive nella radice; `device.key` nasce solo da
+un'azione esplicita. La suite intera di `engramma-sync` in una `TMPDIR`
+isolata: **zero `.tmp*`** prima e dopo, senza cancellarle a mano.
+
+## H6 — il bordo «conflitto» è un bordo derivato
+
+Il seme `9012498534642822410` ridotto a mano: una cella qualunque con
+una copia aperta visibile e un punto di controllo (compattazione senza
+file) fa rispondere a `verify` «the derived edges diverge from the notes
+(expected N, found N+1)» — il bordo `conflitto` (id `d%`, scritto dalla
+derivazione) non era mai nell'insieme atteso. La regola, una sola: il
+bordo esiste esattamente mentre la copia tiene una riga viva in `notes`
+(aperta e visibile, o dell'utente che se l'è presa), con la formula
+deterministica in un posto solo (`material::conflict_edge_id`, usata
+dalla scrittura e dall'atteso di `verify`); le vie di chiusura lo
+tolgono come sempre; la materializzazione di una copia con lo stato al
+taglio ora lo riscrive (prima lo ricostruiva senza: da lì il falso
+allarme del `ChainOnly`).
+
+## H7 — le celle d'oro
+
+`crates/engramma-core/tests/golden/` nasce: `v068.sqlite` e la sua
+istantanea di compattazione, scritti dallo **script ripetibile nel
+repo** (`examples/make_golden_cell.rs`: orologi e conii iniettati, dati
+sintetici, mai dati veri). Contiene note di tutti i tipi e di tutti gli
+stati, la quarantena nata `external` e confermata, la lapide, il
+supersede, una copia di conflitto aperta (col corpo del perdente nella
+sua riga: il payload è sotto il taglio) e una chiusa, una purga, la
+compattazione con la sua istantanea, una vista della cartella col suo
+file legato, e i vettori. Il test `golden_cell.rs` copia tutto in una
+cartella temporanea, apre col motore di oggi, `verify` verde che
+dichiara `FromSnapshot`, e controlla i fatti — le tre ricerche
+comprese. **La regola sta nel DESIGN § 8**: ogni fase che cambia lo
+schema aggiunge la sua cella e non tocca le vecchie; il test le apre
+tutte (`GOLDEN_CELLS`, l'elenco cresce a vista).
+
+## H8 — il fatto che mancava nella v0.6.7
+
+La `put` concorrente che ricreava in chiaro una nota purgata ora sta
+nella sezione G3/G4 della fase scorsa, come correzione dichiarata: dal
+commit `1d548e0` e dal DESIGN alla sezione che la racconta, con il
+dove-si-manifesta (dalla v0.6.5, e serve la sync aperta).
+
+## Le misure
+
+Le due coppie alternate (base = worktree sul tag `fase-v0.6.3`, fase =
+`main` a fine fase; e per H1 il tag `fase-v0.6.7`), banco da 10 000
+note, le corse senza `nice`, `uptime` accanto a ogni corsa. Il carico è
+stato quello dell'utente al lavoro: 4,5–5,3 sulle coppie buone (le
+prime corse fatte a carico 12–20 sono state buttate e rifatte, e sono
+quelle che hanno bocciato la vista).
+
+- **Inserimento** (note/s): base 3707/3656 (coppia 1/2) → **media
+  3682**; fase 3530/3527 → **media 3529**. **−4,2%**, dentro il +5%.
+- **La sonda della purga**: base 126,0/129,7 ms (media 127,8); fase
+  128,9/126,6 ms (media 127,7). **Pari**, dentro il +10%.
+- **H1, contro `fase-v0.6.7`**: ricerca p50/p95 0,60/0,69 ms →
+  0,60/0,70 ms (**pari**, dentro il +5%); `list()` 52,3 ms → **41,3 ms
+  (−21%)**: il `get` pubblico legge in una query sola. Il solo testo
+  (grafo spento) misura 0,59/0,69 contro 0,58/0,66.
+
+## Le corse
+
+- **La build** (`npm run build`, dal commit finale dei sorgenti): i tre
+  file, letti dal disco dopo la build —
+  `engramma.darwin-arm64.node` **50 668 744 B**, SHA256
+  `63b5b911ab63ff087173c2dad738430bb00014e1e333c42ca46f5b28bfc6ec7a`;
+  `index.js` 36 188 B, SHA256
+  `6a440672963f2da32989bd306a91863b9ca87df2e50c6d6d15d7049e9fce8053`;
+  `index.d.ts` 24 561 B, SHA256
+  `c2df4a9d1f3ccea71caeeb8c1773815c564c0fd1cb3f0a085714d35acb9d723b`.
+- **Il contratto JS**: `npm test` **56/56** e `test:electron` **56/56**
+  — i 55 della v0.6.7 identici, più il contratto del cestino.
+
+## Difetti nuovi trovati in questa fase
+
+1. **L'ancora della rimaterializzazione invecchia col taglio** (H2,
+   secondo strato — aperto, semi `11476711120049502961` e
+   `10840318560449401940`): il rigioco da istantanea diverge dal vivo su
+   `version` e sui campi d'intestazione delle note i cui arrivi fuori
+   ordine attraversano il taglio. Nessuna istantanea porta la storia dei
+   tagli contro cui le ancore furono scritte. Diagnosi e semi sopra, in
+   H2; il giudizio `verify` della proprietà resta parcheggiato.
+2. **Una perdita di testo esposta dal cestino** (seme
+   `6467221993839934612`, trovato dal giudice `no_body_text_is_lost`
+   durante questa fase): una copia in quarantena perde il corpo della
+   propria riga in un intreccio di scrittura senza `base` (il doppio
+   importo) e patch di sola intestazione — la riga finisce
+   `quarantined` col corpo vuoto e due versioni contate. Sulla v0.6.3 e
+   sulla v0.6.7 il giudice non lo vedeva: la clausola (d) del giudice
+   («una lettura successiva conteneva quel testo») preservava il caso
+   perché la lettura registrata tornava il corpo della copia — e H1,
+   giustamente, ha chiuso quella lettura (una copia nell'cestino non si
+   legge). Il difetto è del motore, preesistente; il cestino ha tolto
+   la scusa. Dichiarato aperto: il seme è riproducibile su `main`
+   (`convergence.rs`, proprietà `no_body_text_is_lost`, 8 casi); non è
+   entrato nel file di regressione per non fermare la suite, e la
+   caccia lunga lo incontrerà se il caso si presenta — se lo incontra,
+   è la risposta del criterio di release, non un incidente.
+3. **Il merge di `diffy` non fonde i cambi identici sovrapposti** (H4):
+   non è un difetto di Engramma — è il confine che ha fatto scartare
+   una realizzazione del diff3 di riferimento. Scritto qui perché il
+   prossimo che prova una crate di merge sappia dove il banco morde.
