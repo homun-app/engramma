@@ -8944,3 +8944,147 @@ della correzione nascono da qui: il testimone non dipende dalla lapide, e le
 copie di una nota nel cestino seguono la lapide (invisibili, non cercabili,
 fuori da `conflicts()`), così che una chiusura o una rinascita sotto lapide
 non si vede da fuori.
+
+### G1 — il bit sporco dell'indice nascosto
+
+- **Il difetto, corretto.** Ogni `delete` dall'indice nascosto accende ora una
+  riga di metadati (`meta['fts_hidden_dirty']`), scritta da `fts_delete`
+  stessa: qualunque causa d'uscita — il rilascio dalla quarantena, la modifica
+  del corpo, la chiusura di una copia, la purga — passa da lì, per
+  costruzione. La purga (locale, in arrivo, e lo scrub dell'istantanea)
+  ottimizza l'indice nascosto se il bit è acceso **o** la famiglia ha righe, e
+  lo spegne solo dentro `hidden_optimize`, insieme alla fusione dei segmenti.
+  Un conto guarda lo stato di oggi; il bit è la memoria della storia, ed è
+  esatto per costruzione.
+- **I percorsi che tolgono righe senza un `delete` FTS** — chiesti dalla
+  specifica — sono due, e li copriamo così: il `delete-all` della strip di
+  compattazione e quello del rebuild del verify svuotano l'indice intero (i
+  segmenti cadono: l'`optimize` successivo della v0.6.6 era già un no-op
+  misurato); in entrambi il bit viene spento nella stessa transazione, o una
+  luce spenta mentirebbe sull'unico caso in cui non c'è niente da fondere. La
+  chiave è bookkeeping locale come `sync_shared` — due copie col medesimo
+  insieme di operazioni possono differire nella storia fisica dei propri
+  indici — e sta fuori dal dump di stato (verde e convergenza).
+- **I test rossi della fase** (commit `78d11ce`): la prova del revisore (nota
+  in quarantena rilasciata poi purgata), la modifica del corpo in quarantena
+  poi il rilascio, e la copia d'agente chiusa da `resolveConflict` con la
+  purga dell'originale. Tutti e tre rossi sul codice della v0.6.6
+  («quokkaviolace» nel file), verdi col bit (`1a47b41`).
+- **Il dente** (ramo di prova, poi buttato): con il bit tolto dal cancello
+  della purga, la proprietà allargata `random_ops_compact_and_purge_leave_no_roots`
+  morde al **primo caso**: seme `5022804855041187502`, «beparol» sopravvive
+  nel file della cella.
+
+### G2 — il testimone non dipende dalla lapide, e le copie la seguono
+
+- **La diagnosi** sta all'inizio della fase, sopra: il predicato che cambia è
+  `has_witness`, e l'ipotesi del revisore è confermata parola per parola.
+- **Le due regole.** (1) `has_witness` scorre ora **tutte** le scritture del
+  corpo che l'insieme conosce, applicate o battute dalla lapide: un insieme
+  può solo crescere verso l'avere un testimone, mai uscirne — la rinascita
+  del seme `3753…` non c'è più (test deterministico ridotto a mano in
+  `lapide_copies.rs`). (2) Finché l'originale tiene una lapide attiva, le sue
+  copie sono il contenuto del cestino: fuori da `conflicts()`, da ogni
+  ricerca (base, nascosta e vettoriale: il filtro sta sia in `bm25_from` sia
+  in `read_candidates`, così il braccio vettoriale non può farle filtrare),
+  e fuori dall'elenco delle proposte — la riga «conflitto» resta nella coda
+  solo nascunta. `conflict(copyId)` continua a rispondere per id, col campo
+  nuovo `originalDeleted: true` (Rust e JS); quando la nota si riapre (base =
+  lapide) le copie aperte tornano con le regole di sempre, quelle chiuse
+  restano chiuse (test).
+- **Il giudice** perde l'eccezione `lapide_active` dalla direzione riapertura
+  e tiene quella di chiusura (la lapide come dominanza, la regola della
+  v0.6.5). L'ALPN sale a `engramma/sync/4` e `engramma/mailbox/4`: la
+  derivazione è cambiata. Il test `protocol_version` parla ora v3 contro v4.
+- **I denti** (ramo di prova `denti-v067`, poi buttato): (a) il testimone
+  tornato a guardare solo le scritture applicate (la regola di ieri) morde
+  due volte: nella proprietà, sul seme di regressione agganciato
+  `11196124333436581516` («copy … reopened — it closed witnessed», 0
+  successi), e sul test deterministico del seme `3753…` ridotto
+  (`lapide_copies.rs:337`: «the witness does not depend on the lapide»).
+  (b) il «dopo» del testimone per chiave di classe (la regola della
+  v0.6.4) **non morde**, e il perché è strutturale, scritto qui invece che
+  nascosto: con la scansione del testimone ora su tutto l'insieme, una
+  chiusura sbagliata per chiave di classe non può più riaprirsi — il
+  contenimento è un fatto della coppia, e senza lapide che batta il
+  testimone (che la scansione completa ormai vede comunque) non c'è flap
+  da catturare; il registro giudica coi predicati stessi del motore, e la
+  regola sbagliata chiude copie diverse, non copie che riaprono. Provato a
+  20 000 casi: verde in 600 s. Il morso della v0.6.6 su questo sabotaggio
+  era anch'esso un flap da lapide, come il suo REPORT dichiara; il dente
+  che oggi morde in quella direzione è il test deterministico del seme
+  `3753…`, rosso sotto il sabotaggio (a).
+- **Il contratto JS**: `conflicts()` non elenca più le copie delle note
+  cancellate — scritto in `docs/node.md`, col test `G2: a deleted note hides
+  its copies; conflict(copyId) says originalDeleted` in `sync-pair.test.js`.
+  I 54 test esistenti restano identici.
+
+### G3 — l'istantanea perde le copie, e `scrubbed` si guadagna
+
+- **La chiusura transitiva nell'istantanea.** `scrub_snapshot` applica la
+  stessa chiusura della purga viva: `purge_state` + `scrub_log_snapshot` +
+  `purge_conflict_copies`, poi l'`optimize` dei due indici (la base sempre,
+  come la purga locale; la nascosta col cancello di G1) e il `VACUUM`. La
+  prova del revisore («zibellinotrem» restava nell'istantanea) è il test
+  rosso `f7e4d8f`, verde ora.
+- **`scrubbed` si guadagna.** Dopo ogni scrub la purga apre l'istantanea in
+  lettura e conta le righe della famiglia rimaste — `notes`,
+  `conflict_copies`, FTS (attraverso le note che indicizzano), `proposte`.
+  Una riga trovata: `scrubbed: false` e `pending` **nomina il file**
+  (`PurgeReport.pending` diventa `Vec<String>`: `"wal"` oppure il nome
+  dell'istantanea). Il controllo sui byte resta ai test.
+- **La fabbricazione del fallimento** — chiesta dalla specifica, scelta
+  dichiarata qui: un punto di iniezione **solo per i test**, la variabile
+  d'ambiente `ENGRAMMA_TEST_SKIP_SNAPSHOT_COPY_SCRUB`, fa saltare la
+  chiusura delle copie nello scrub dell'istantanea (uno scrub a metà). Non
+  può far mentire la purga: può solo farle dire la verità su uno scrub che
+  ha lasciato indietro qualcosa — il controllo lo nomina. Il test
+  `a_half_scrubbed_snapshot_is_named_and_scrubbed_is_false` la usa, dietro
+  un lucchetto che serializza le purghe del binario (la variabile è di
+  processo).
+- **La purga in arrivo scrubba le istantanee del ricevente** — trovato dalla
+  proprietà nuova di G4 al suo primo giro (seme `8450807962548207222`: la
+  `b-snap-24.sqlite` teneva la famiglia mentre il file vivo era pulito).
+  `scrub_snapshots_of` condivide il ciclo fra la purga locale e l'arrivo;
+  l'arrivo che non può completare il proprio oblio non atterra (errore: la
+  prossima sync riprova).
+
+### G4 — la caccia guarda i percorsi veri
+
+- **Il generatore di `random_ops_compact_and_purge_leave_no_roots`** si
+  allarga: un terzo delle note nasce in quarantena (il percorso d'import di
+  Homun), e un braccio nuovo fa `set_status` nei due sensi. Le transizioni
+  di stato che la prova del revisore G1 usava a mano, ora la proprietà le
+  disegna da sé.
+- **La proprietà nuova**, `purge_with_conflict_copies_leaves_no_roots`
+  (inventario: 26 proprietà): due dispositivi, scritture concorrenti del
+  corpo di mano umana e d'agente (così nascono copie attive e copie in
+  quarantena), sync, risoluzioni, compattazioni con istantanea, purghe. Il
+  giudice: nessuna radice di un corpo purgato — copie comprese — in nessun
+  file dei due dispositivi, istantanee comprese; e ogni `scrubbed: true`
+  deve essere la verità (il controllo dei byte è il giudice di quello).
+- **I denti della proprietà nuova**: l'iniezione di G3 accesa morde al
+  primo caso (seme `7350763896401764898`: `pending` nomina `a-snap-18.sqlite`);
+  il bit di G1 tolto morde nella proprietà allargata (seme
+  `5022804855041187502`). Entrambi provati sul ramo di prova, poi buttato.
+- **Due difetti preesistenti trovati dalla proprietà nuova, dichiarati
+  aperti** (fermati e scritti, come chiede la specifica: nessuno dei due è
+  un difetto di oblio, entrambi sono della coerenza del verify su terreno
+  che nessun generatore aveva mai camminato):
+  1. **Il rigioco da istantanea quando il taglio sta sotto la testa.** Con
+     `compact(cut < head, keep_snapshot)` e una scrittura del corpo che
+     arriva fuori ordine **dopo** la compattazione, il corpo vivo segue il
+     vincitore corretto e l'istantanea congelata tiene il vincitore vecchio:
+     `verify` diverge (seme `9012498534905088620`, il corpo della nota
+     `…36` è «rbtonfo» nel vivo e «bktonfo» nella ricostruzione). Il
+     generatore della proprietà nuova compatta alla testa — la convenzione
+     di ogni test di compattazione — e il difetto resta aperto per la
+     prossima fase.
+  2. **I bordi derivati «mentions» di una copia in quarantena divergono**
+     (seme `9012498534642822410`: «the derived edges diverge from the notes
+     (around 01MCR37N0VDBERF9BVYKY1NVVV … expected 5, found 6)»).
+     Riprodotto anche col motore al commit `545bd2d` (prima di G3/G4): è
+     preesistente. Dichiarato aperto.
+  Per questo la proprietà nuova giudica l'oblio e non `verify` (il suo
+  mandato); `verify` resta giudicato dalle proprietà e dai test che lo
+  camminano su terreno sano.
