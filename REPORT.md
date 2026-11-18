@@ -8770,3 +8770,115 @@ bocciarla: in quel caso la proprietà torna rossa e la correzione della
 derivazione diventa una fase dichiarata (ALPN `sync/4`). Il difetto
 dell'istantanea (sopra) resta aperto e non tocca la sync: riguarda
 l'oblio, non la convergenza.
+
+## Verifica v0.6.6 (revisore, 2026-11-18)
+
+Fatta sul tag `fase-v0.6.6` (`a83bf67`). Tutte le corse girano a priorità
+minima (`nice -n 19`, due job di cargo, due fili di test). Le prove del
+revisore stanno in test di scarto, tolti dal repo e copiati nello
+scratchpad del revisore.
+
+### Cosa regge
+
+- **F2, il cancello, è fatto bene.** L'inventario elenca 25 proprietà e il
+  test lo confronta con i sorgenti nei due sensi. Il primo rosso della
+  fase è stato proprio l'inventario. `scripts/caccia.sh` legge
+  l'inventario e rifiuta di partire se il test è rosso. Che cosa il
+  parser non vede è dichiarato.
+- **La proprietà è tornata e ha già trovato un caso reale.** La caccia a
+  20 000 si è fermata da sola sul seme `3753902730771729170`. Lo scenario
+  è ridotto a mano con onestà, e la lettura è scritta perché il revisore
+  possa giudicarla.
+- **Il taglio della camminata degli orfani (`purged_in_set`) è
+  corretto.** Il ragionamento regge: la riga di nascita di una copia
+  purgata resta, e l'id di un originale non può venire dall'hash di un
+  perdente. La sonda passa da 191 a 126 ms.
+- **Il difetto dell'istantanea è dichiarato** con lo scenario e la regola
+  che si rompe, invece di essere taciuto.
+- **Le corse del revisore:**
+  - `npm run build` riproduce i tre SHA dichiarati: `.node` 50 586 616 B,
+    `7eafe1ab36492b2fd8e4afac1fa63355d52d9e4813b866c6da0b3c823c4ef4c5`;
+  - `npm test` 54/54 e `test:electron` 54/54;
+  - suite del core in release verde, `properties_inventory` verde;
+  - alla fine 0 `.tmp*`, nessun processo nostro acceso.
+
+  La caccia lunga di GLM (25 × 20 000 + 5 × 2048) non è stata rifatta: i
+  difetti qui sotto vengono da scenari deterministici.
+
+### I difetti
+
+1. **Il taglio dell'indice nascosto rompe l'oblio (bloccante).** Il
+   cancello `hidden_rows_in_family` conta le righe **di oggi**
+   nell'indice nascosto (`notes_fts_hidden_docsize`). Ma una riga che è
+   uscita dall'indice lascia le sue radici nei segmenti FTS5 fino al
+   prossimo `optimize`. È lo stesso fenomeno per cui la purga fa
+   l'`optimize` (P0.1).
+   - *Prova del revisore:* una nota entra in quarantena, poi
+     `set_status(Active)` la rilascia, poi viene purgata. Al momento della
+     purga il conto è 0, quindi l'`optimize` dell'indice nascosto viene
+     saltato. **«quokkaviolace» sopravvive nel file della cella.** Sul tag
+     `fase-v0.6.5` la stessa prova è verde: la regressione è di questa
+     fase.
+   - Con Homun è il percorso normale: le note importate dal web nascono in
+     quarantena e l'utente le approva. Quelle note, poi purgate, lasciano
+     il testo nel file.
+   - Il test nuovo della fase copre solo la nota **ancora** in quarantena.
+     Non c'è un test per una nota che c'è stata e ne è uscita.
+   - *La correzione giusta* non è un conto più furbo, è un **bit
+     «sporco»** persistente sull'indice nascosto. Ogni `delete` dall'indice
+     nascosto lo accende; la purga fa l'`optimize` se il bit è acceso o se
+     la famiglia ha righe, poi lo spegne. È esatto per costruzione e costa
+     una riga di metadati. Lo stesso ragionamento vale per l'indice base,
+     se un giorno si vorrà tagliare anche lì.
+2. **L'eccezione della lapide nel giudice è troppo larga (bloccante per
+   la sync agli utenti).** Il giudice ora assolve ogni rinascita di una
+   copia chiusa con testimone **se l'originale tiene una lapide**. La
+   lettura di GLM è che il DESIGN lo dichiari («la lapide domina anche
+   sulla durabilità»). Il revisore non è d'accordo, per tre motivi.
+   - *Il DESIGN non lo dice.* La regola della lapide dice che una
+     scrittura battuta dalla lapide non produce copia. Non dice che una
+     copia chiusa da un testimone possa riaprirsi. Il § 4.3 scrive invece
+     «una copia chiusa con un testimone non si riapre mai: il testimone è
+     un'esistenza». Nel seme il testimone è ancora nell'insieme: è
+     proprio la frase che si rompe.
+   - *La rinascita si vede.* Prova del revisore: dopo il `delete`
+     dell'originale la copia resta `active`, compare in `conflicts()` con
+     `visible: true` ed è cercabile. Quindi su una nota nel cestino un
+     conflitto che l'utente aveva chiuso ricompare nella lista e nella
+     ricerca. Per Homun è esattamente il difetto che la monotonia doveva
+     impedire.
+   - *Con l'eccezione la proprietà non ha più denti dimostrati.* Lo scrive
+     il REPORT stesso: anche il morso contro la regola v0.6.4 era una
+     rinascita sotto lapide, quindi ora è assolto. I due sabotaggi provati
+     dopo non hanno prodotto un morso. La spec chiedeva denti provati
+     **sulla forma finale** della proprietà, e oggi non ci sono.
+   - *La forma giusta* (da decidere nella prossima fase, perché tocca la
+     derivazione e alza l'ALPN a `sync/4`): finché l'originale tiene una
+     lapide, **le sue copie seguono la lapide**. Non sono visibili, non
+     sono in `conflicts()` e non sono cercabili, come ci si aspetta da un
+     cestino. Così una chiusura o una rinascita sotto lapide non si vede
+     da fuori, e l'eccezione del giudice diventa stretta e vera: sotto
+     lapide il registro tace; quando la nota si riapre il registro torna
+     a valere, e lì una copia chiusa con testimone non rinasce. Poi i
+     denti vanno riprovati sulla forma finale, con un sabotaggio che
+     fabbrica un flap su una nota senza lapide.
+3. **Il buco dell'istantanea** (dichiarato da GLM): la purga non toglie
+   dal file dell'istantanea le copie di conflitto della nota. È oblio
+   violato, ed è preesistente. Il revisore l'ha riprodotto in modo indipendente. Due dispositivi; il
+   bot perde contro la mano umana e la sua copia va in quarantena;
+   compattazione con istantanea; purga dell'originale. Il file vivo è
+   pulito, ma **«zibellinotrem» e «ovovivipar» restano nell'istantanea**,
+   e la purga risponde comunque `scrubbed: true`. Quindi il rapporto della
+   purga dice il falso, e chi lo legge (Homun, l'utente) crede l'oblio
+   fatto. Con la sync aperta
+   le copie diventano normali, quindi anche questo blocca la sync agli
+   utenti.
+
+### Verdetto
+
+**v0.6.6 non consegnata.** F2 è buono e resta. La caccia ha fatto il suo
+lavoro: ha trovato un caso vero al primo giro. Ma la fase lascia due
+difetti di oblio, uno nuovo (l'indice nascosto) e uno vecchio
+(l'istantanea), e una proprietà di monotonia che oggi assolve proprio le
+rinascite che l'utente vedrebbe. **La sync agli utenti resta chiusa.**
+Per lo sviluppo di Homun resta valida la v0.6.5. Correzione nella v0.6.7.
