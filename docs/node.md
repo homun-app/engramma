@@ -244,6 +244,18 @@ Notevoli:
   sconosciuto è `INVALID_ARGUMENT`, mai un filtro vuoto che risponde
   `[]` senza dire perché. La lista senza `status` resta delle note vive
   e `get` resta l'oracolo chiuso (`null` per quarantena e lapide);
+- **il cestino ha una porta sola** (v0.6.8, H1 — cambio voluto di
+  `list` e `get`): finché l'originale tiene una lapide, le sue copie di
+  conflitto seguono la lapide **anche da `list` e `get`**: non compaiono
+  nella lista delle note vive, non compaiono tra le lapide
+  (`list({ status: ['deleted'] })` mostra l'originale cancellato, mai la
+  copia) e `get(copyId)` risponde `null`, esattamente come per una nota
+  cancellata. La lettura per id onesta resta `conflict(copyId)` con
+  `originalDeleted: true`. Quando la nota si riapre (una modifica che
+  ha visto la lapide), tutto torna visibile insieme: la copia torna in
+  `list`, in `conflicts()` e in `get`, col testo integro. Il test del
+  contratto JS è `H1: list() and get() speak the bin; the reopen brings
+  the copy back` (`__test__/sync-pair.test.js`);
 - **`dropCell(name, reason)`** (v0.4.2): l'oblio di una **cella intera**
   — le note (lapidi comprese), i file della cella (WAL e istantanee di
   compattazione compresi) e i file delle note nelle viste legate, come
