@@ -869,6 +869,39 @@ struct ServiceInner {
     join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+/// v0.6.8 (H5): the service closes ITSELF when the last handle goes.
+/// Whoever resets the sync — close the engine, delete the root — with an
+/// invite in flight must not find the root recreated by a thread that
+/// outlived the service (`device.key` and `devices.db` written into a
+/// deleted folder: the `.tmp*` of the suite). The close cancels the
+/// pairings and the serving loop, closes the endpoint and WAITS for the
+/// threads within the declared budgets ([`SHUTDOWN_REPLY`],
+/// [`THREAD_CLOSE`]); a thread that overruns is an error that SHOWS on
+/// stderr, never a thread that stays alive in silence. Nothing writes
+/// into the root after this returns; `device.key` is born only from an
+/// explicit action (`start`, a pairing), never from a background thread.
+impl Drop for ServiceInner {
+    fn drop(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sent = self.cmd_tx.send(Command::Shutdown { reply: tx }).is_ok();
+        if sent && rx.recv_timeout(SHUTDOWN_REPLY).is_err() {
+            eprintln!(
+                "engramma-sync: il servizio di {} non ha risposto alla chiusura entro {SHUTDOWN_REPLY:?} — i suoi fili restano vivi",
+                self.root.display()
+            );
+        }
+        if let Ok(mut slot) = self.join.lock()
+            && let Some(handle) = slot.take()
+            && !join_bounded(handle, THREAD_CLOSE)
+        {
+            eprintln!(
+                "engramma-sync: il filo del servizio di {} non si è chiuso entro {THREAD_CLOSE:?}",
+                self.root.display()
+            );
+        }
+    }
+}
+
 impl SyncService {
     /// Start the service of a root (its worker thread, its runtime). One
     /// per root in a process; a second one on the same root answers
@@ -1099,6 +1132,7 @@ fn worker_main(
                 let core = Arc::new(std::sync::Mutex::new(WorkerCore {
                     serving: None,
                     pass_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    pairings: Vec::new(),
                 }));
                 while let Some(cmd) = cmd_rx.recv().await {
                     let shutting_down = matches!(cmd, Command::Shutdown { .. });
@@ -1115,6 +1149,70 @@ fn worker_main(
 struct WorkerCore {
     serving: Option<Serving>,
     pass_lock: Arc<tokio::sync::Mutex<()>>,
+    /// v0.6.8 (H5): the LIVE pairing threads of this service, with their
+    /// cancel flags — the shutdown cancels and WAITS for them, and the
+    /// `Drop` sends the shutdown when the last handle goes. A pairing
+    /// thread outlives nobody: its ten-minute ticket wait must never
+    /// write into a root the caller has already deleted (the `.tmp*` of
+    /// the suite, found by the reviewer seven times).
+    pairings: Vec<PairingThread>,
+}
+
+/// One live pairing thread: its handle to join, its flag to cancel.
+struct PairingThread {
+    inner: Arc<PairingInner>,
+    join: std::thread::JoinHandle<()>,
+}
+
+/// v0.6.8 (H5): the DECLARED budgets of the close. The shutdown waits
+/// for the worker's answer at most `SHUTDOWN_REPLY`, then for each
+/// thread at most `THREAD_CLOSE` more; a thread that overruns either is
+/// an error that SHOWS (stderr), never a thread that stays alive in
+/// silence.
+const SHUTDOWN_REPLY: Duration = Duration::from_secs(25);
+const THREAD_CLOSE: Duration = Duration::from_secs(10);
+
+/// Join one thread within `budget`: `true` when it ended, `false` when
+/// the budget ran out (the caller makes the overrun visible — a thread
+/// cannot be killed, only named).
+fn join_bounded(join: std::thread::JoinHandle<()>, budget: Duration) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = join.join();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(budget).is_ok()
+}
+
+/// v0.6.8 (H5): cancel every live pairing and WAIT for its thread. The
+/// cancel flag the rounds already speak (25 ms of latency at most)
+/// closes the endpoint and the ticket wait; the join makes «nothing
+/// writes into the root after the close» a fact, not a hope.
+fn close_pairings(core: &Arc<std::sync::Mutex<WorkerCore>>) -> SResult<()> {
+    let mut live: Vec<PairingThread> = Vec::new();
+    if let Ok(mut guard) = core.lock() {
+        guard.pairings.retain(|p| !p.join.is_finished());
+        live = std::mem::take(&mut guard.pairings);
+    }
+    for p in &live {
+        p.inner
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    let deadline = std::time::Instant::now() + THREAD_CLOSE;
+    let mut stuck = 0_usize;
+    for p in live {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if !join_bounded(p.join, left) {
+            stuck += 1;
+        }
+    }
+    if stuck > 0 {
+        return Err(ServiceError::Io(format!(
+            "{stuck} fili di abbinamento non si sono chiusi entro {THREAD_CLOSE:?}"
+        )));
+    }
+    Ok(())
 }
 
 async fn handle_command(
@@ -1141,12 +1239,12 @@ async fn handle_command(
             // caller chose (the driver thread would race it)
             let first = ensure_first_device(root, &name);
             let _ = reply
-                .send(first.and_then(|()| spawn_pairing(root, PairingKind::Invite, flag, events)));
+                .send(first.and_then(|()| spawn_pairing(root, PairingKind::Invite, flag, events, core)));
         }
         Command::Code { name, flag, reply } => {
             let first = ensure_first_device(root, &name);
             let _ = reply
-                .send(first.and_then(|()| spawn_pairing(root, PairingKind::Code, flag, events)));
+                .send(first.and_then(|()| spawn_pairing(root, PairingKind::Code, flag, events, core)));
         }
         Command::Join {
             text,
@@ -1158,7 +1256,7 @@ async fn handle_command(
             // (the pairing's own add lands on top of it later)
             let first = ensure_first_device(root, &name);
             let _ = reply.send(first.and_then(|()| {
-                spawn_pairing(root, PairingKind::Join { text, name }, flag, events)
+                spawn_pairing(root, PairingKind::Join { text, name }, flag, events, core)
             }));
         }
         Command::Remove { name, reply } => {
@@ -1185,7 +1283,10 @@ async fn handle_command(
         }
         Command::Shutdown { reply } => {
             let _ = serve_stop(core).await;
-            let _ = reply.send(Ok(()));
+            // v0.6.8 (H5): the pairings close with the service — cancel,
+            // then WAIT for the threads (bounded, declared)
+            let out = close_pairings(core);
+            let _ = reply.send(out);
         }
     }
 }
@@ -2098,6 +2199,7 @@ fn spawn_pairing(
     kind: PairingKind,
     flag: Option<RelayChoice>,
     events: &EventTx,
+    core: &Arc<std::sync::Mutex<WorkerCore>>,
 ) -> SResult<PairingHandle> {
     // a first refusal that needs no thread at all
     if kind == PairingKind::Code
@@ -2110,6 +2212,7 @@ fn spawn_pairing(
     let (answer_tx, answer_rx) = tokio::sync::mpsc::unbounded_channel::<Answer>();
     let handle = PairingHandle::from_parts(answer_tx, answer_rx);
     let inner = Arc::clone(&handle.inner);
+    let tracked = Arc::clone(&handle.inner);
     let root = root.to_path_buf();
     let events = events.clone();
     let spawn_result = std::thread::Builder::new()
@@ -2138,7 +2241,19 @@ fn spawn_pairing(
             });
         });
     match spawn_result {
-        Ok(_) => Ok(handle),
+        Ok(join) => {
+            // v0.6.8 (H5): the thread is LIVE until the service closes it
+            // — the shutdown cancels and waits for it, so a dropped
+            // service leaves nothing that writes into the root
+            if let Ok(mut guard) = core.lock() {
+                guard.pairings.retain(|p| !p.join.is_finished());
+                guard.pairings.push(PairingThread {
+                    inner: tracked,
+                    join,
+                });
+            }
+            Ok(handle)
+        }
         Err(e) => Err(ServiceError::io(e)),
     }
 }
