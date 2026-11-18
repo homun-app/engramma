@@ -2022,10 +2022,26 @@ proptest! {
                     // lapide (their own rules), and a set that no longer
                     // DESERVES the copy (a graph an out-of-order arrival
                     // completed made the loser the winner, or an ancestor
-                    // of it — the text lives in the note itself)
-                    let witnessed = runner.fleet.cells[dev]
+                    // of it — the text lives in the note itself).
+                    // v0.6.8 (H4): the witness is the REFERENCE's word —
+                    // the rule of DESIGN § 4.3 written from scratch in
+                    // `common`, its diff3 is diffy's — and the engine must
+                    // AGREE with it: a disagreement fails here, with the
+                    // case, before any monotonicity is judged
+                    let witnessed = common::reference_witness(
+                        &runner.fleet.cells[dev],
+                        original,
+                        &loser.to_string(),
+                    )
+                    .unwrap_or(false);
+                    let engine = runner.fleet.cells[dev]
                         .conflict_witness_for_test(original, loser)
                         .unwrap_or(false);
+                    prop_assert!(
+                        witnessed == engine,
+                        "seed {seed}: copy {copy} — the engine and the reference \
+                         disagree on the witness (engine {engine}, reference {witnessed})"
+                    );
                     let deserved = runner.fleet.cells[dev]
                         .conflict_deserved_for_test(original, loser)
                         .unwrap_or(true);
@@ -2077,10 +2093,24 @@ proptest! {
                 if held.contains(copy) {
                     continue;
                 }
+                // v0.6.8 (H4): the reference judges the tail too, and the
+                // engine must agree with it
+                let witnessed = common::reference_witness(
+                    &runner.fleet.cells[dev],
+                    original,
+                    &loser.to_string(),
+                )
+                .unwrap_or(false);
+                let engine = runner.fleet.cells[dev]
+                    .conflict_witness_for_test(original, loser)
+                    .unwrap_or(false);
                 prop_assert!(
-                    runner.fleet.cells[dev]
-                        .conflict_witness_for_test(original, loser)
-                        .unwrap_or(false)
+                    witnessed == engine,
+                    "seed {seed}: copy {copy} — the engine and the reference \
+                     disagree on the witness in the tail (engine {engine}, reference {witnessed})"
+                );
+                prop_assert!(
+                    witnessed
                         || original_purged(&runner.fleet.cells[dev], original)
                         || original_row_gone(&runner.fleet.cells[dev], original)
                         || lapide_active(&runner.fleet.cells[dev], original)

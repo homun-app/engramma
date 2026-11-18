@@ -656,3 +656,282 @@ pub fn judge_no_text_lost(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// v0.6.8 (H4): the REFERENCE WITNESS — the monotonicity judge's own
+// oracle, written from DESIGN § 4.3 from scratch. It calls NO conflict
+// function of the engine: not `has_witness`, not `Ancestry`, not
+// `winner_and_candidates`. It reads the LOG (a public surface) and the
+// copy id's deterministic formula (a hash, not a judgement), it is
+// naive and quadratic, and its diff3 is `diffy`'s — a different
+// realization than the engine's own.
+// ---------------------------------------------------------------------------
+
+/// One body write of the note, as the reference sees it.
+pub struct RefWrite {
+    pub hash: String,
+    pub key: (String, String),
+    pub text: String,
+    pub base: Option<String>,
+}
+
+/// The reference witness of one (original, loser op): does the SET
+/// contain a closure witness for the copy the loser would open?
+///
+/// The rule (DESIGN § 4.3, written anew):
+/// - (a) an operation on the copy's id — an edit, the resolving delete,
+///   a decision on its proposal;
+/// - (b) a body write SUBSEQUENT to the loser in the total order that
+///   DESCENDS from it (its base chain passes through the loser);
+/// - (c) a subsequent body write that CONTAINS it: the rigorous diff3
+///   from F = nca(perdente, testimone), both ends included — when the
+///   loser is the witness's ancestor, F is the loser itself, and (b)
+///   has already answered.
+///
+/// Every body write the set carries counts — applied, lapide-beaten or
+/// rolled back alike (the v0.6.7 rule: the witness is an existence, and
+/// it does not depend on the lapide); a payload the compaction cut no
+/// longer carries is beyond anyone's judgement, exactly as the engine's
+/// own scan says.
+///
+/// Boundary with the engine's realization, declared: both merge
+/// line-wise from the same fork; when the loser's and the witness's
+/// changes touch the SAME lines, the engine's diff3 answers «conflict,
+/// no containment» and diffy's merge answers Err — the same word. Where
+/// two correct line merges could part ways (adjacent-context hunks),
+/// the differential judge FAILS and the case is looked at by hand: that
+/// is the point of a reference.
+pub fn reference_witness(cell: &Cell, original: &Ulid, loser_op: &str) -> Result<bool, String> {
+    let ops = cell.ops().map_err(|e| e.to_string())?;
+    // the note's body writes and the parent map, over the WHOLE log
+    let mut writes: Vec<RefWrite> = Vec::new();
+    let mut parent: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut loser: Option<RefWrite> = None;
+    for op in &ops {
+        if op.note_id.is_some_and(|n| n == *original) {
+            parent.insert(op.content_hash.clone(), op.base.clone());
+        }
+        let text = op
+            .body
+            .as_ref()
+            .and_then(|b| b.get("set"))
+            .and_then(|s| s.get("body"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                let mine = op
+                    .body
+                    .as_ref()
+                    .and_then(|b| b.get("note"))
+                    .and_then(|n| n.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| id == original.to_string().as_str());
+                mine.then(|| {
+                    op.body
+                        .as_ref()
+                        .and_then(|b| b.get("note"))
+                        .and_then(|n| n.get("body"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .flatten()
+            });
+        if let Some(text) = text {
+            let w = RefWrite {
+                hash: op.content_hash.clone(),
+                key: (op.hlc.to_string(), op.op_id.to_string()),
+                text,
+                base: op.base.clone(),
+            };
+            if op.op_id.to_string() == loser_op {
+                loser = Some(RefWrite {
+                    hash: w.hash.clone(),
+                    key: w.key.clone(),
+                    text: w.text.clone(),
+                    base: w.base.clone(),
+                });
+            }
+            writes.push(w);
+        }
+    }
+    let Some(loser) = loser else {
+        return Ok(false);
+    };
+    // (a) an operation on the copy's id — the log's own object index
+    let copy = conflict_copy_id_for_test(&loser.hash, &loser.key.0);
+    let on_copy: i64 = cell
+        .debug_column(&format!(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM op_objects WHERE object = 'note:{copy}'"
+        ))
+        .unwrap_or_default()
+        .first()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    if on_copy > 0 {
+        return Ok(true);
+    }
+    // (b) and (c): the subsequent body writes, in the total order
+    let past = |from: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = Some(from.to_string());
+        while let Some(h) = cur {
+            out.push(h.clone());
+            cur = parent.get(&h).cloned().flatten();
+        }
+        out
+    };
+    let loser_past = past(&loser.hash);
+    for w in &writes {
+        if w.key <= loser.key {
+            continue;
+        }
+        // (b) descent: the witness's chain passes through the loser
+        if past(&w.hash).contains(&loser.hash) {
+            return Ok(true);
+        }
+        // (c) containment from the pair's own fork, both ends included
+        let fork = {
+            let w_chain = past(&w.hash);
+            let mut meet = None;
+            for h in &w_chain {
+                if h == &loser.hash || loser_past.contains(h) {
+                    meet = Some(h.clone());
+                    break;
+                }
+            }
+            meet
+        };
+        let Some(fork) = fork else { continue };
+        // the fork's body: the first body write at or above it
+        let mut cur = Some(fork);
+        let mut fork_text: Option<&String> = None;
+        while let Some(h) = cur {
+            if let Some(fw) = writes.iter().find(|x| x.hash == h) {
+                fork_text = Some(&fw.text);
+                break;
+            }
+            cur = parent.get(&h).cloned().flatten();
+        }
+        let Some(f) = fork_text else { continue };
+        if ref_diff3_contains(f, &w.text, &loser.text) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The reference's own rigorous diff3 (v0.6.8, H4), quadratic and
+/// naive by design: the LCS against the fork by dynamic programming,
+/// the stable points both sides still match, and the unstable chunks in
+/// between merge by the RULE of DESIGN § 4.3 — one side unchanged takes
+/// the other, identical changes never count as an overlap, everything
+/// else is one. `true` when the witness's text CONTAINS the loser's
+/// change cleanly (the merge is the witness itself).
+///
+/// Why not `diffy`'s merge, measured and declared: on the hunt's own
+/// first disagreement (seed 11196124333436581517) the loser and the
+/// witness rewrote the fork's middle line to the SAME text, and diffy
+/// answered «conflict» — identical overlapping changes, which the
+/// rigorous diff3 merges. diffy's merge is not a realization of this
+/// rule, so the reference carries its own (a different one than the
+/// engine's all the same: DP matches against the fork, not the
+/// engine's walk). The declared boundary: two longest common
+/// subsequences of the same length can cut the stable points
+/// differently on ties; the reference's DP takes one canonical walk —
+/// a disagreement born there fails the property and is read by hand.
+pub fn ref_diff3_contains(fork: &str, witness: &str, loser: &str) -> bool {
+    let fb: Vec<&str> = fork.split('\n').collect();
+    let fw: Vec<&str> = witness.split('\n').collect();
+    let fl: Vec<&str> = loser.split('\n').collect();
+    let mw = ref_lcs_matches(&fb, &fw);
+    let ml = ref_lcs_matches(&fb, &fl);
+    let mut out: Vec<&str> = Vec::new();
+    let mut bi = 0_usize;
+    let mut wi = 0_usize;
+    let mut li = 0_usize;
+    let mut iw = 0_usize;
+    let mut il = 0_usize;
+    loop {
+        while iw < mw.len() && mw[iw].0 < bi {
+            iw += 1;
+        }
+        while il < ml.len() && ml[il].0 < bi {
+            il += 1;
+        }
+        // the next fork line BOTH sides still match: the next stable point
+        let mut jw = iw;
+        let mut jl = il;
+        let common = loop {
+            match (mw.get(jw), ml.get(jl)) {
+                (Some(x), Some(y)) if x.0 == y.0 => break Some((x.0, x.1, y.1)),
+                (Some(x), Some(y)) if x.0 < y.0 => jw += 1,
+                (Some(_), Some(_)) => jl += 1,
+                _ => break None,
+            }
+        };
+        let Some((k, sw, sl)) = common else {
+            return ref_merge_chunk(&fb[bi..], &fw[wi..], &fl[li..], &mut out)
+                .then_some(out.join("\n"))
+                .is_some_and(|m| m == witness);
+        };
+        if !ref_merge_chunk(&fb[bi..k], &fw[wi..sw], &fl[li..sl], &mut out) {
+            return false;
+        }
+        // the stable line itself — both sides kept it
+        out.push(fb[k]);
+        bi = k + 1;
+        wi = sw + 1;
+        li = sl + 1;
+    }
+}
+
+/// One unstable chunk by the rule: one side unchanged takes the other,
+/// identical changes never count as an overlap.
+pub fn ref_merge_chunk<'a>(base: &[&'a str], a: &[&'a str], b: &[&'a str], out: &mut Vec<&'a str>) -> bool {
+    if a == b {
+        out.extend_from_slice(a);
+        true
+    } else if a == base {
+        out.extend_from_slice(b);
+        true
+    } else if b == base {
+        out.extend_from_slice(a);
+        true
+    } else {
+        false
+    }
+}
+
+/// The LCS matches of two line lists, by the quadratic DP: `(i, j)`
+/// pairs, both strictly increasing. One canonical walk on ties — the
+/// declared boundary of the reference.
+pub fn ref_lcs_matches(base: &[&str], side: &[&str]) -> Vec<(usize, usize)> {
+    let n = base.len();
+    let m = side.len();
+    // dp[i][j]: the LCS length of base[i..] and side[j..]
+    let mut dp = vec![vec![0_usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if base[i] == side[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0_usize, 0_usize);
+    while i < n && j < m {
+        if base[i] == side[j] {
+            out.push((i, j));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
