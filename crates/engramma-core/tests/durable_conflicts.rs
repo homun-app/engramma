@@ -851,3 +851,97 @@ fn a_half_scrubbed_snapshot_is_named_and_scrubbed_is_false() {
     unsafe { std::env::remove_var("ENGRAMMA_TEST_SKIP_SNAPSHOT_COPY_SCRUB") };
     outcome.unwrap(/* the scene's own assert */);
 }
+
+/// v0.6.8 (H6): the derived edges are a function of the notes — and the
+/// `conflitto` edge of an open copy IS one of them. The ChainOnly
+/// coherence of `verify` re-derived the expected set from the notes'
+/// bodies and never counted it, so a checkpoint cell holding an open
+/// visible copy answered «the derived edges diverge from the notes
+/// (expected N, found N+1)» — the seed `9012498534642822410` of the
+/// v0.6.7 hunt, reduced by hand: any cell with an open copy and a
+/// checkpoint (no snapshot file) diverges. The rule: the `conflitto`
+/// edge exists exactly while its copy holds a LIVING notes row.
+#[test]
+fn the_conflitto_edge_counts_as_derived_in_the_checkpoint_check() {
+    let init = shared_init("h6-bordo");
+    let (a, wa) = cell_with("a");
+    let (b, wb) = cell_with("b");
+    a.ingest_op(&init).unwrap(/* t */);
+    b.ingest_op(&init).unwrap(/* t */);
+    let note = base_note(51, "prima riga\nseconda riga\nterza riga");
+    let id = note.id;
+    wa.store(K + 1, Ordering::SeqCst);
+    a.put_note(&note, "homun:user").unwrap(/* t */);
+    for op in &union(&a, &b) {
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    wa.store(K + 3, Ordering::SeqCst);
+    a.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("prima\nocchiello turchino\nterza".into()),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    wb.store(K + 5, Ordering::SeqCst);
+    b.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("prima\nmanopola smeraldo\nterza".into()),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    assert_eq!(
+        a.conflicts().unwrap(/* t */).len(),
+        1,
+        "the copy is open and visible"
+    );
+    let head: i64 = a
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* t */)[0]
+        .parse()
+        .unwrap(/* t */);
+    let report = a
+        .compact(
+            head,
+            &engramma_core::cell::CompactOptions { keep_snapshot: false },
+        )
+        .unwrap(/* t */);
+    assert!(report.snapshot.is_none(), "a checkpoint, no file");
+    let vr = a.verify().unwrap(/* t */);
+    assert!(vr.ok(), "verify counts the conflitto edge: {:?}", vr.mismatch);
+
+    // and the rule holds at the other end: the copy the user resolved
+    // (a tombstone now) loses its notes row's life, and the edge with it
+    let copy = b
+        .conflicts()
+        .unwrap(/* t */)
+        .first()
+        .map(|c| c.copy_id)
+        .expect(/* open */ "the copy on b");
+    b.resolve_conflict(&copy, ResolveKeep::Original, None, "homun:user")
+        .unwrap(/* t */);
+    let head: i64 = b
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* t */)[0]
+        .parse()
+        .unwrap(/* t */);
+    let _ = b.compact(
+        head,
+        &engramma_core::cell::CompactOptions { keep_snapshot: false },
+    );
+    let vr = b.verify().unwrap(/* t */);
+    assert!(
+        vr.ok(),
+        "the resolved copy leaves no living row, no edge: {:?}",
+        vr.mismatch
+    );
+}
