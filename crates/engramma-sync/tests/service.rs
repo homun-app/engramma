@@ -600,3 +600,31 @@ fn the_second_lock_taker_leaves_the_holders_pid_alone() {
     );
     drop(winner);
 }
+
+/// v0.6.8 (H5): the service closes ITSELF when the last handle goes.
+/// A dropped `SyncService` — no explicit `shutdown`, the case of whoever
+/// resets the sync by closing the engine and deleting the root — must
+/// cancel the open invite, close the endpoint and WAIT for its threads:
+/// nothing may write into the root afterwards. The reviewer's proof:
+/// `confirm_before_the_digits_is_invalid` left the invite's thread
+/// alive, and it recreated `device.key` and `devices.db` in the deleted
+/// root (the `.tmp*` of the suite, seven times).
+#[test]
+fn a_dropped_service_closes_its_threads_and_the_root_stays_gone() {
+    bounded("chiusa-drop", 120, || {
+        let a = Root::new("early-drop");
+        let root = a.root.clone();
+        let svc = SyncService::start(&root).unwrap(/* t */);
+        let invite = svc.invite("portatile", NO_RELAY).unwrap(/* t */);
+        drop(invite);
+        // the service goes FIRST, the root after: whoever drops both must
+        // not leave a thread that recreates what the removal took away
+        drop(svc);
+        drop(a);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !root.exists(),
+            "la radice cancellata è ricomparsa: un filo del servizio scrive dopo la chiusura"
+        );
+    });
+}
