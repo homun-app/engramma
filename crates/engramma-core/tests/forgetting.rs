@@ -266,7 +266,7 @@ fn purge_with_an_open_reader_completes_the_scrub_on_the_next_write() {
         .unwrap(/* test-only */);
     assert!(report.forgotten_payloads >= 1, "{report:?}");
     assert!(!report.scrubbed, "purge cannot say done: {report:?}");
-    assert_eq!(report.pending, vec!["wal"], "{report:?}");
+    assert_eq!(report.pending, vec!["wal".to_string()], "{report:?}");
     // and it is true: the roots are still in the WAL frames
     let wal = dir.path().join("lettore.sqlite-wal");
     assert!(

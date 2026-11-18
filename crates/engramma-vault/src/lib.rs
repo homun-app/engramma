@@ -1097,8 +1097,8 @@ pub fn purge_everywhere(
             });
         }
     }
-    if !problems.is_empty() && !report.pending.contains(&"vault") {
-        report.pending.push("vault");
+    if !problems.is_empty() && !report.pending.contains(&"vault".to_string()) {
+        report.pending.push("vault".to_string());
     }
     report.scrubbed = report.pending.is_empty();
     Ok((report, problems))

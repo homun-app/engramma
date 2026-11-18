@@ -509,6 +509,7 @@ fn assert_no_roots(cell: &Cell, needles: &[String]) {
 /// then finds NO hidden row in the family — and must still forget.
 #[test]
 fn purge_after_a_quarantined_copy_resolution_scrubs_the_hidden_index() {
+    let _guard = PURGE_LOCK.lock().unwrap(/* see the lock's own note */);
     let init = shared_init("chiusa-in-nascosto");
     let (a, wa) = cell_with("a");
     let (b, wb) = cell_with("b");
@@ -569,6 +570,7 @@ fn purge_after_a_quarantined_copy_resolution_scrubs_the_hidden_index() {
 /// must leave every file: the cell, the WAL and the snapshot.
 #[test]
 fn purge_takes_the_conflict_copies_out_of_the_snapshot() {
+    let _guard = PURGE_LOCK.lock().unwrap(/* see the lock's own note */);
     let init = shared_init("istantanea-copia");
     let (a, wa) = cell_with("a");
     let (b, wb) = cell_with("b");
@@ -637,4 +639,88 @@ fn purge_takes_the_conflict_copies_out_of_the_snapshot() {
             );
         }
     }
+}
+
+/// The purge tests of this file serialize on one lock: the G3 test below
+/// flips a PROCESS-WIDE env var (the module's only test-only injection),
+/// and a purge running concurrently in the same binary would see it.
+static PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// v0.6.7 (G3): `scrubbed` is EARNED. The failure is fabricated with the
+/// engine's one test-only injection — the env var makes the snapshot's
+/// scrub skip the copies' transitive closure, a half-done scrub — and the
+/// purge then LOOKS into the file: a row of the family still there means
+/// `scrubbed: false`, with `pending` NAMING the snapshot. The injection
+/// can never make a purge lie; it can only make it tell the truth about
+/// a scrub that left something behind.
+#[test]
+fn a_half_scrubbed_snapshot_is_named_and_scrubbed_is_false() {
+    let _guard = PURGE_LOCK.lock().unwrap(/* test-only lock */);
+    // SAFETY: the lock above holds every purge of this test binary, so no
+    // other thread reads the environment while the var is set.
+    unsafe { std::env::set_var("ENGRAMMA_TEST_SKIP_SNAPSHOT_COPY_SCRUB", "1") };
+    let scene = || {
+        let init = shared_init("mezzo-scrub");
+        let (a, wa) = cell_with("a");
+        let (b, wb) = cell_with("b");
+        a.ingest_op(&init).unwrap(/* t */);
+        b.ingest_op(&init).unwrap(/* t */);
+        let note = base_note(31, "prima riga\nseconda riga\nterza riga");
+        let id = note.id;
+        wa.store(K + 1, Ordering::SeqCst);
+        a.put_note(&note, "homun:user").unwrap(/* t */);
+        for op in &union(&a, &b) {
+            b.ingest_op(op).unwrap(/* t */);
+        }
+        let loser_body = "felce maudivina sussurrando";
+        wb.store(K + 5, Ordering::SeqCst);
+        b.patch_note(
+            &id,
+            &NotePatch { body: Some(loser_body.into()), ..Default::default() },
+            "homun:bot-x",
+        )
+        .unwrap(/* t */);
+        wa.store(K + 3, Ordering::SeqCst);
+        a.patch_note(
+            &id,
+            &NotePatch {
+                body: Some("prima riga\nscritta a mano\nterza riga".into()),
+                ..Default::default()
+            },
+            "homun:user",
+        )
+        .unwrap(/* t */);
+        for op in &union(&a, &b) {
+            a.ingest_op(op).unwrap(/* t */);
+            b.ingest_op(op).unwrap(/* t */);
+        }
+        let head: i64 = a
+            .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+            .unwrap(/* t */)[0]
+            .parse()
+            .unwrap(/* t */);
+        let snap = a
+            .compact(head, &engramma_core::cell::CompactOptions { keep_snapshot: true })
+            .unwrap(/* t */)
+            .snapshot
+            .expect(/* asked for */ "the snapshot file");
+        let snap_name = snap
+            .file_name()
+            .unwrap(/* our own path */)
+            .to_string_lossy()
+            .to_string();
+        let report = a.purge(&id, "diritto all'oblio", "homun:user").unwrap(/* t */);
+        assert!(
+            !report.scrubbed,
+            "a half-scrubbed snapshot is not done: {report:?}"
+        );
+        assert!(
+            report.pending.contains(&snap_name),
+            "pending names the snapshot: {report:?} vs {snap_name}"
+        );
+    };
+    let outcome = std::panic::catch_unwind(scene);
+    // SAFETY: as above — the lock is still held.
+    unsafe { std::env::remove_var("ENGRAMMA_TEST_SKIP_SNAPSHOT_COPY_SCRUB") };
+    outcome.unwrap(/* the scene's own assert */);
 }

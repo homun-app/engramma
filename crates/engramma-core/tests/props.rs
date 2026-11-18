@@ -15,6 +15,10 @@ use proptest::prelude::*;
 use time::OffsetDateTime;
 use ulid::Ulid;
 
+// v0.6.7 (G4): the two-device forgetting property leans on the shared
+// conflict stage — fixed clocks, deterministic mints, the union of logs
+mod common;
+
 fn ts(secs: i64) -> At {
     At(OffsetDateTime::from_unix_timestamp(1_700_000_000 + secs)
         .unwrap(/* test-only invariant: range checked by strategy */)
@@ -246,6 +250,10 @@ proptest! {
     /// verify holds at the end, and no root of any body a purged note ever
     /// had survives in the cell file, in the WAL or in any snapshot. Each
     /// note carries distinctive invented words: a hit is always a leak.
+    /// v0.6.7 (G4): the mix now crosses the state transitions too — notes
+    /// born in quarantine (the Homun import path) and `set_status` in both
+    /// directions — the paths the v0.6.6 generator never drew, and where
+    /// the hidden-index leak of the verification lived.
     #[test]
     fn random_ops_compact_and_purge_leave_no_roots(seed in any::<u64>()) {
         let dir = tempfile::tempdir().unwrap(/* test-only */);
@@ -304,10 +312,16 @@ proptest! {
             }
         };
         for i in 0..40_u16 {
-            match next() % 6 {
+            match next() % 7 {
                 0 | 1 => {
                     let w = word_of(i);
-                    let note = note_of(i, &w);
+                    let mut note = note_of(i, &w);
+                    // v0.6.7 (G4): one note in three is BORN in quarantine
+                    // — the Homun import path — so the generator crosses
+                    // the state transitions the old mix never touched
+                    if next() % 3 == 0 {
+                        note.status = Status::Quarantined;
+                    }
                     if cell.put_note(&note, "prop").is_ok() {
                         living.push((note.id, vec![w]));
                     }
@@ -349,6 +363,28 @@ proptest! {
                             living.retain(|(n, _)| n != &id);
                             living.push((new.id, vec![w]));
                         }
+                    }
+                }
+                5 => {
+                    // v0.6.7 (G4): the state transitions, in BOTH
+                    // directions — quarantine → active is the release the
+                    // reviewer's G1 proof used, active → quarantine walks
+                    // the hidden index the other way. Both take the row
+                    // out of an FTS index with a `delete`, and the purge
+                    // that follows must still forget the stems
+                    if let Some(id) = draw(&living, next()) {
+                        let status = cell
+                            .debug_column(&format!(
+                                "SELECT status FROM notes WHERE id = '{id}'"
+                            ))
+                            .unwrap_or_default()
+                            .first()
+                            .cloned();
+                        let to = match status.as_deref() {
+                            Some("quarantined") => Status::Active,
+                            _ => Status::Quarantined,
+                        };
+                        let _ = cell.set_status(&id, to, "prop");
                     }
                 }
                 _ => {
@@ -497,6 +533,315 @@ proptest! {
                 prop_assert!(h > p, "hlc went backwards: {p:?} -> {h:?}");
             }
             prev = Some(h);
+        }
+    }
+
+    /// v0.6.7 (G4): the forgetting property at TWO devices, with conflict
+    /// copies in play. Concurrent body writes — human and agent hands, so
+    /// ACTIVE copies and QUARANTINED copies are both born — syncs,
+    /// resolutions, compactions with a snapshot file, purges. The judge:
+    /// no root of any body a purged note ever had — its copies' bodies
+    /// included, which are those very bodies — survives in ANY file of
+    /// either device, snapshots included; and every purge report's
+    /// `scrubbed: true` must be the truth (the byte check is the judge of
+    /// that: a report that lied would leave roots behind).
+    #[test]
+    fn purge_with_conflict_copies_leaves_no_roots(seed in any::<u64>()) {
+        use common::{cell_with, shared_init, union};
+        use std::sync::atomic::Ordering;
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let init = shared_init(&format!("oblio-copie/{seed}"));
+        let (a, wa) = cell_with("a");
+        let (b, wb) = cell_with("b");
+        for cell in [&a, &b] {
+            cell.ingest_op(&init).unwrap(/* t */);
+        }
+        let bword_of = |i: u16| {
+            format!(
+                "{}{}tonfo",
+                char::from(b'a' + (i / 26) as u8),
+                char::from(b'a' + (i % 26) as u8)
+            )
+        };
+        // every body word a note ever carried, and the words of the purged
+        let mut living: Vec<(ulid::Ulid, Vec<String>)> = Vec::new();
+        let mut purged_words: Vec<String> = Vec::new();
+        let mut reports: Vec<engramma_core::PurgeReport> = Vec::new();
+        let mut purged_with_copies = false;
+        let mut tick: u64 = 0;
+        let mut i: u16 = 0;
+        for _round in 0..48 {
+            i += 1;
+            let dev = next() % 2;
+            let (cell, wall) = if dev == 0 { (&a, &wa) } else { (&b, &wb) };
+            let pick = |pool: &[(ulid::Ulid, Vec<String>)], rnd: u64| {
+                pool.get((rnd % pool.len().max(1) as u64) as usize)
+                    .map(|(id, _)| *id)
+            };
+            match next() % 8 {
+                0 | 1 | 2 => {
+                    // a body write: on a note this device holds, half the
+                    // time without any sync first — the concurrent branch
+                    let fresh = living.is_empty() || next() % 3 == 0;
+                    let (id, w) = if fresh {
+                        let w = bword_of(i);
+                        let note = {
+                            let mut n = common::base_note(u32::from(i), &format!("{w} [[Roma]]"));
+                            if next() % 4 == 0 {
+                                n.status = Status::Quarantined;
+                            }
+                            n
+                        };
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        if cell.put_note(&note, "prop:user").is_ok() {
+                            living.push((note.id, vec![w.clone()]));
+                        }
+                        (note.id, w)
+                    } else {
+                        let Some(id) = pick(&living, next()) else { continue };
+                        let w = bword_of(400 + i);
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let actor = if next() % 2 == 0 { "prop:user" } else { "prop:bot" };
+                        let patch = NotePatch {
+                            body: Some(format!("{w} [[Roma]]")),
+                            ..Default::default()
+                        };
+                        if cell.patch_note(&id, &patch, actor).is_ok()
+                            && let Some(entry) = living.iter_mut().find(|(n, _)| n == &id)
+                        {
+                            entry.1.push(w.clone());
+                        }
+                        (id, w)
+                    };
+                    let _ = id;
+                    let _ = w;
+                }
+                3 => {
+                    // a header-only patch: no conflict may come of it
+                    if let Some(id) = pick(&living, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let _ = cell.patch_note(
+                            &id,
+                            &NotePatch {
+                                title: Some(Some(format!("il titolo {i}"))),
+                                ..Default::default()
+                            },
+                            "prop:user",
+                        );
+                    }
+                }
+                4 => {
+                    // the sync: everything flows both ways
+                    for op in &union(&a, &b) {
+                        let _ = a.ingest_op(op);
+                        let _ = b.ingest_op(op);
+                    }
+                }
+                5 => {
+                    // a resolution of one conflict copy this device sees
+                    if let Ok(list) = cell.conflicts()
+                        && let Some(first) = list.first()
+                    {
+                        let keep = if next() % 2 == 0 {
+                            engramma_core::ResolveKeep::Original
+                        } else {
+                            engramma_core::ResolveKeep::Copy
+                        };
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let _ = cell.resolve_conflict(&first.copy_id, keep, None, "prop:user");
+                    }
+                }
+                6 => {
+                    // a compaction, with or without the snapshot file
+                    let head: i64 = cell
+                        .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
+                        .unwrap_or_default()
+                        .first()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if head >= 1 {
+                        // the cut is the head — the convention every
+                        // compaction test uses. A cut BELOW the head with a
+                        // snapshot file breaks verify's snapshot replay
+                        // today (an out-of-order body write that arrives
+                        // after the compaction corrects the live body, the
+                        // frozen snapshot keeps the old winner): found by
+                        // this very property, seed 9012498534905088620,
+                        // declared open in the REPORT — the oblivion this
+                        // property guards is another matter, and its
+                        // compactions stay where the engine is sound.
+                        let _ = cell.compact(
+                            head,
+                            &engramma_core::cell::CompactOptions {
+                                keep_snapshot: next() % 2 == 0,
+                            },
+                        );
+                    }
+                }
+                _ => {
+                    // a purge — the note, its history and its copies go
+                    if let Some(id) = pick(&living, next()) {
+                        let copies: i64 = cell
+                            .debug_column(&format!(
+                                "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies
+                                 WHERE original_id = '{id}'"
+                            ))
+                            .unwrap_or_default()
+                            .first()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        if let Ok(report) = cell.purge(&id, "prop", "prop:user") {
+                            if copies > 0 {
+                                purged_with_copies = true;
+                            }
+                            reports.push(report);
+                            if let Some((_, words)) = living.iter().find(|(n, _)| n == &id) {
+                                purged_words.extend(words.iter().cloned());
+                            }
+                            living.retain(|(n, _)| n != &id);
+                            // the purge travels: the other device takes it
+                            for op in &union(&a, &b) {
+                                let _ = a.ingest_op(op);
+                                let _ = b.ingest_op(op);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // a seed can go whole rounds without purging a note that HAD
+        // copies: force one, so every case really crosses the hole G3
+        // closed (the copy rows in the snapshot)
+        if !purged_with_copies {
+            // a real device purges what IT holds: the candidate must live
+            // on a (with its copies), or the minted purge would lean on a
+            // birds-eye knowledge no device has
+            let with_copies: Vec<ulid::Ulid> = living
+                .iter()
+                .filter(|(id, _)| {
+                    a.get(id).is_ok()
+                        && a.debug_column(&format!(
+                            "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies
+                             WHERE original_id = '{id}'"
+                        ))
+                        .unwrap_or_default()
+                        .first()
+                        .is_some_and(|n| n != "0")
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            if let Some(id) = with_copies.first() {
+                if let Ok(report) = a.purge(id, "prop", "prop:user") {
+                    reports.push(report);
+                    if let Some((_, words)) = living.iter().find(|(n, _)| n == id) {
+                        purged_words.extend(words.iter().cloned());
+                    }
+                    living.retain(|(n, _)| n != id);
+                    for op in &union(&a, &b) {
+                        let _ = a.ingest_op(op);
+                        let _ = b.ingest_op(op);
+                    }
+                }
+            } else if let Some((id, words)) = living.iter().find(|(n, _)| a.get(n).is_ok()).cloned() {
+                tick += 1;
+                wa.store(common::K + tick, Ordering::SeqCst);
+                if let Ok(report) = a.purge(&id, "prop", "prop:user") {
+                    reports.push(report);
+                    purged_words.extend(words);
+                }
+                living.retain(|(n, _)| n != &id);
+                for op in &union(&a, &b) {
+                    let _ = a.ingest_op(op);
+                    let _ = b.ingest_op(op);
+                }
+            }
+        }
+        prop_assert!(
+            !purged_words.is_empty(),
+            "the mix must purge something (seed {seed})"
+        );
+        // `scrubbed: true` must be the truth — and here, with no reader
+        // open, every report must have said true
+        for r in &reports {
+            prop_assert!(r.scrubbed, "a purge with no readers said pending: {r:?}");
+        }
+        // the final settle: everything everywhere
+        for _ in 0..2 {
+            for op in &union(&a, &b) {
+                let _ = a.ingest_op(op);
+                let _ = b.ingest_op(op);
+            }
+        }
+        // NOTE: this property judges the OBLIVION (the bytes below), not
+        // verify — the two-device mix walks ground whose verify coherence
+        // carries two pre-existing defects of its own (the snapshot
+        // replay when the cut sits below the head, seed
+        // 9012498534905088620; the derived `mentions` edges of a
+        // quarantined copy, seed 9012498534642822410), both found by this
+        // property on its first runs, both declared open in the REPORT,
+        // neither an oblivion matter.
+        // The judge: no root of any purged body in ANY file of either
+        // device — the cells, the WALs, the snapshots
+        let needles: Vec<String> = purged_words
+            .iter()
+            .flat_map(|w| {
+                let folded = engramma_core::text::strip_diacritics(&w.to_lowercase());
+                let stem = engramma_core::text::normalize(&folded, Some(Lang::It));
+                [folded, stem]
+            })
+            .collect();
+        for cell in [&a, &b] {
+            let dir = cell
+                .file_path()
+                .parent()
+                .unwrap(/* our own cell */)
+                .to_path_buf();
+            let stem = cell
+                .file_path()
+                .file_stem()
+                .unwrap(/* our own cell */)
+                .to_string_lossy()
+                .to_string();
+            cell.retire().unwrap(/* t */);
+            let mut files: Vec<std::path::PathBuf> = vec![
+                dir.join(format!("{stem}.sqlite")),
+                dir.join(format!("{stem}.sqlite-wal")),
+            ];
+            let mut snaps: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(&format!("{stem}-snap-")))
+                })
+                .collect();
+            snaps.sort();
+            files.extend(snaps);
+            for f in files {
+                let raw = std::fs::read(&f).unwrap_or_default();
+                for n in &needles {
+                    prop_assert!(
+                        !raw.windows(n.len()).any(|w| w == n.as_bytes()),
+                        "«{n}» sopravvive in {} (seed {seed})",
+                        f.display()
+                    );
+                }
+            }
         }
     }
 }

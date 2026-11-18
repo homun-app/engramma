@@ -317,6 +317,15 @@ fn apply_half(tx: &rusqlite::Transaction<'_>, op: &Op, object: &str) -> Result<(
     };
     let id = Ulid::from_string(id)
         .map_err(|_| CellError::Invalid(format!("bad object key `{object}`")))?;
+    // v0.6.7 (G4's property found it): the purge dominates the WHOLE
+    // set, whatever the total order says. A PATCH on a purged note
+    // already parked (the note is not there to patch); a PUT recreated
+    // it — body and all, in the clear. DESIGN § 4.3: «X non
+    // materializza»; the purge op itself keeps applying (its scrub IS
+    // the state it carries).
+    if op.kind != OpKind::Purge && note_purged_in_set(tx, &id)? {
+        return Ok(());
+    }
     ops::apply_scoped(tx, op, Scope::Note(id))
 }
 
@@ -510,6 +519,23 @@ fn materialize_note(
         std::collections::HashMap::new();
     let purged = note_purged_in_set(tx, id)?;
     for op in &all {
+        // v0.6.7 (G4's property found it): the purge dominates the
+        // replay too. The ops' payloads are loaded ABOVE, before this
+        // loop runs — a purge sorting EARLIER than a body write in the
+        // total order redacts the log's copy (`scrub_log`, inside
+        // `apply_purge`) but not the in-memory one, and the write would
+        // resurrect the note the purge had already taken (a patch parks
+        // on the missing note in the fast path; a PUT recreates it
+        // outright). DESIGN § 4.3: «X non materializza» — only the
+        // purge ops themselves apply (their scrub IS the state they
+        // carry).
+        if purged && op.kind != OpKind::Purge {
+            events.push(ReplayEvent {
+                hash: op.content_hash.clone(),
+                body: None,
+            });
+            continue;
+        }
         // v0.6.1 (P0): an operation whose base is nowhere in the log has
         // not been ordered yet — the author leaned on a past this copy does
         // not hold. It waits (the object turns pending) and applies when

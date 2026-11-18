@@ -2005,6 +2005,26 @@ pub(crate) fn hidden_rows_in_family(conn: &Connection, id: &Ulid) -> Result<i64,
     .map_err(CellError::from)
 }
 
+/// (v0.6.7, G3) The ids of the note's FAMILY — itself and its conflict
+/// copies, transitively, the same closure `purge_conflict_copies` walks
+/// and the purge takes with it. Read BEFORE the purge op: afterwards the
+/// rows are gone, and the earned `scrubbed` check needs the names.
+///
+/// # Errors
+/// [`CellError::Db`] on SQL failure.
+pub(crate) fn family_of(conn: &Connection, id: &Ulid) -> Result<Vec<String>, CellError> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE fam(id) AS (
+             SELECT ?1
+             UNION
+             SELECT cc.copy_id FROM conflict_copies cc JOIN fam ON cc.original_id = fam.id
+         )
+         SELECT f.id FROM fam f",
+    )?;
+    let rows = stmt.query_map([id.to_string()], |r| r.get::<_, String>(0))?;
+    Ok(rows.flatten().collect())
+}
+
 /// (v0.6.7, G1) Is the HIDDEN index's dirty bit lit? The bit is a meta
 /// row every `delete` from that index lights (see [`fts_delete`]); a
 /// purge merges the segments when it is lit OR the family holds rows —

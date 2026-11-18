@@ -1000,7 +1000,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 let why = report
                     .pending
                     .iter()
-                    .map(|p| match *p {
+                    .map(|p| match p.as_str() {
                         "wal" => "il WAL non è stato troncato (un lettore teneva \
                                   la cella aperta; verrà ritentato alla prossima \
                                   scrittura)"
@@ -1009,7 +1009,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                                     (la `vault sync` finisce il lavoro, o \
                                     `vault unbind` la sgancia)"
                             .to_string(),
-                        other => other.to_string(),
+                        // v0.6.7 (G3): a snapshot the scrub left something
+                        // in — the file is named, the words say the rest
+                        other => format!("{other}: l'istantanea tiene ancora                                           righe della famiglia purgata"),
                     })
                     .collect::<Vec<_>>()
                     .join("; ");

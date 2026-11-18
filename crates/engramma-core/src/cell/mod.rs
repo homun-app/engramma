@@ -202,11 +202,18 @@ pub struct PurgeReport {
     pub forgotten_payloads: usize,
     /// Whether the file, the WAL and the snapshots already carry none of the
     /// bytes. False means something still holds them — see [`Self::pending`].
+    /// v0.6.7 (G3): `scrubbed` is EARNED, not declared — after every
+    /// snapshot scrub the purge looks into the file and checks that no
+    /// row of the note's family survived (notes, conflict copies, FTS,
+    /// proposals); a row found means `false`, and `pending` names the
+    /// snapshot. The byte-level proof stays the tests' own.
     pub scrubbed: bool,
     /// What could not be scrubbed yet. `"wal"`: a reader kept the WAL from
     /// being truncated (`PRAGMA wal_checkpoint(TRUNCATE)` answered busy);
-    /// the next write and the cell close retry the checkpoint.
-    pub pending: Vec<&'static str>,
+    /// the next write and the cell close retry the checkpoint. A file
+    /// name (v0.6.7, G3): that snapshot still holds rows of the family —
+    /// the scrub left something behind, and the report says which file.
+    pub pending: Vec<String>,
 }
 
 /// How a compaction keeps its restart point (v0.3.2, P0.1).
@@ -1288,6 +1295,12 @@ impl Cell {
         } else {
             false
         };
+        // v0.6.7 (G3): the arriving purge scrubs THIS copy's snapshots
+        // too — the family names, read before the op applies
+        let mut arrival_family: Vec<String> = Vec::new();
+        if purge_arrival && let Some(purged) = arrival.note_id {
+            arrival_family = ops::family_of(&tx, &purged)?;
+        }
         material::arrive(&tx, &arrival)?;
         for purged in &scrubbed_notes {
             ops::scrub_log(&tx, purged)?;
@@ -1320,6 +1333,29 @@ impl Cell {
                 ops::hidden_optimize(&inner.conn)?;
             }
             inner.conn.execute_batch("VACUUM;")?;
+            // v0.6.7 (G3): every snapshot THIS copy registered is a full
+            // copy made before the purge arrived — the same scrub the
+            // local purge runs on its own files, closure and digest
+            // included (found by the two-device forgetting property on
+            // its first run: the receiving device's snapshot kept the
+            // family while the live file was clean)
+            let left = Self::scrub_snapshots_of(
+                &mut inner,
+                &self.path,
+                arrival.note_id,
+                &arrival_family,
+                &arrival.op_id,
+            )?;
+            if !left.is_empty() {
+                // an arrival that cannot complete its oblivion does not
+                // land: the op stays un-ingested and the next sync
+                // retries it
+                return Err(CellError::Db(format!(
+                    "the arriving purge left rows in {} snapshot(s): {:?}",
+                    left.len(),
+                    left
+                )));
+            }
             if !wal_checkpoint(&inner.conn).unwrap_or(false) {
                 inner.pending_scrub = vec!["wal"];
             }
@@ -1352,21 +1388,20 @@ impl Cell {
         // a stray -wal next to a snapshot would survive the file's VACUUM:
         // fold it in and stay in rollback-journal mode
         conn.pragma_update(None, "journal_mode", "DELETE")?;
-        // v0.6.6 (F3; v0.6.7, G1): which indexes does this snapshot
-        // actually carry? The current compact writes them EMPTY by
-        // construction (`delete-all` at compact, rebuilt only in the
-        // restore's copy), so their `optimize` was a no-op; a v0.3.1
-        // snapshot with rows keeps the dance. Counted before the scrub,
-        // like the live purge's own count — and the hidden one joins its
-        // own DIRTY BIT: a row that left this snapshot's hidden index in
-        // an earlier scrub left its stems in the old segments, and the
-        // count of today cannot see it (the same gate as the live purge).
-        let rows: (i64, i64) = conn.query_row(
-            "SELECT (SELECT COUNT(*) FROM notes_fts_docsize),
-                    (SELECT COUNT(*) FROM notes_fts_hidden_docsize)",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
+        // v0.6.6 (F3; v0.6.7, G1): does this snapshot's HIDDEN index
+        // need its merge? The current compact writes both indexes EMPTY
+        // by construction (`delete-all` at compact, rebuilt only in the
+        // restore's copy); a v0.3.1 snapshot with rows keeps the dance.
+        // Counted before the scrub, like the live purge's own count —
+        // and joined by the DIRTY BIT: a row that left this snapshot's
+        // hidden index in an earlier scrub left its stems in the old
+        // segments, and the count of today cannot see it (the same gate
+        // as the live purge). The base index merges unconditionally,
+        // exactly as the live purge runs it.
+        let hidden_rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM notes_fts_hidden_docsize", [], |r| {
+                r.get(0)
+            })?;
         let hidden_dirty = ops::hidden_dirty(&conn)?;
         let secure_before: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
         conn.pragma_update(None, "secure_delete", "ON")?;
@@ -1374,17 +1409,159 @@ impl Cell {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             ops::purge_state(&tx, id)?;
             ops::scrub_log_snapshot(&tx, id, censorable)?;
+            // v0.6.7 (G3): the SAME transitive closure the live purge
+            // walks — the copies are the note's own derivation, and the
+            // right to be forgotten reaches everything its text
+            // produced, in the frozen file no less than in the live
+            // one. (The one test-only injection of the module: the env
+            // var below fabricates a HALF-DONE scrub, the case the
+            // earned `scrubbed` exists to catch — it can never make a
+            // purge lie, only make it say the truth.)
+            if std::env::var("ENGRAMMA_TEST_SKIP_SNAPSHOT_COPY_SCRUB").is_err() {
+                material::purge_conflict_copies(&tx, id)?;
+            }
             tx.commit()?;
         }
-        if rows.0 > 0 {
-            conn.execute_batch("INSERT INTO notes_fts(notes_fts) VALUES('optimize');")?;
-        }
-        if rows.1 > 0 || hidden_dirty {
+        // the two indexes join the dance exactly as the live purge runs
+        // it: the base one always (its rows carried the stems), the
+        // hidden one when it holds rows or its dirty bit is lit
+        conn.execute_batch("INSERT INTO notes_fts(notes_fts) VALUES('optimize');")?;
+        if hidden_rows > 0 || hidden_dirty {
             ops::hidden_optimize(&conn)?;
         }
         conn.pragma_update(None, "secure_delete", secure_before)?;
         conn.execute_batch("VACUUM;")?;
         state_digest(&conn)
+    }
+
+    /// (v0.6.7, G3) Scrub every snapshot THIS cell has registered, for one
+    /// purged note: the shared body of the local purge and of a purge that
+    /// ARRIVES (a copy's snapshots are full copies made before the purge
+    /// reached it — the right to be forgotten crosses devices). Returns
+    /// the files that still hold rows of the family after their scrub:
+    /// the callers turn them into their own honest answer (`pending` for
+    /// the local report, an error for the arrival — an op that cannot
+    /// complete its oblivion does not land half-done).
+    fn scrub_snapshots_of(
+        inner: &mut Inner,
+        cell_path: &Path,
+        id: Option<Ulid>,
+        family: &[String],
+        purge_op_id: &Ulid,
+    ) -> Result<Vec<String>, CellError> {
+        // `censorable`: the supersede payloads the LIVE log still carries
+        // after its own scrub — only those are censored inside the
+        // snapshot; the ones the compaction cut already forgot are merely
+        // deleted there, or the snapshot's ops rows would fork from the
+        // live prefix.
+        let censorable: std::collections::HashSet<String> = {
+            let mut stmt = inner.conn.prepare(
+                "SELECT o.op_id FROM ops o JOIN op_payloads p ON p.op_id = o.op_id
+                 WHERE o.kind IN ('supersede', 'decide', 'revert_decision')",
+            )?;
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .flatten()
+                .collect()
+        };
+        let rows: Vec<(i64, Option<String>)> = {
+            let mut stmt = inner
+                .conn
+                .prepare("SELECT seq, file FROM snapshots ORDER BY seq DESC")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .flatten()
+                .collect()
+        };
+        let mut left_behind: Vec<String> = Vec::new();
+        for (i, (seq, file)) in rows.into_iter().enumerate() {
+            // v0.3.2 (P0.3): a checkpoint row has no file to scrub, but its
+            // digest described a state that contained the purged note. It is
+            // an hash of the whole state — not readable data — yet from here
+            // on it is unverifiable and there is no reason to keep it: NULL,
+            // with this purge's op_id in `redacted_by`.
+            let Some(file) = file else {
+                let redacted = Self::redacted_by(&inner.conn, seq, purge_op_id)?;
+                inner.conn.execute(
+                    "UPDATE snapshots SET state_digest = NULL, redacted_by = ?2
+                     WHERE seq = ?1",
+                    rusqlite::params![seq, redacted],
+                )?;
+                continue;
+            };
+            let snap_path = cell_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(&file);
+            if !snap_path.exists() {
+                if i > 0 {
+                    // a ghost row (crash between the row's removal and the
+                    // file's in a past compaction — the newest always exists):
+                    // drop it, nothing references it
+                    inner
+                        .conn
+                        .execute("DELETE FROM snapshots WHERE seq = ?1", [seq])?;
+                    continue;
+                }
+                return Err(CellError::Db(format!(
+                    "the newest snapshot {} is missing: the purge refuses to forget half of the cell",
+                    snap_path.display()
+                )));
+            }
+            let Some(id) = id else {
+                continue;
+            };
+            let digest = Self::scrub_snapshot(&snap_path, &id, &censorable)?;
+            let redacted = Self::redacted_by(&inner.conn, seq, purge_op_id)?;
+            inner.conn.execute(
+                "UPDATE snapshots SET state_digest = ?2, redacted_by = ?3 WHERE seq = ?1",
+                rusqlite::params![seq, digest, redacted],
+            )?;
+            // v0.6.7 (G3): `scrubbed` is earned, not declared. The scrub
+            // above SAYS it took the family out of this file; the purge
+            // looks into the file and counts what is left — a note row,
+            // a derivation row, an FTS row, a queue row of the family
+            // means the scrub left something behind. A row-level check:
+            // the bytes stay the tests' business.
+            if Self::snapshot_holds_family(&snap_path, family)? > 0 && !left_behind.contains(&file)
+            {
+                left_behind.push(file);
+            }
+        }
+        Ok(left_behind)
+    }
+
+    /// (v0.6.7, G3) How many rows of the family a snapshot file still
+    /// holds: notes, conflict copies, FTS rows (through the notes they
+    /// index) and queue rows. Read-only — the check never disturbs the
+    /// file it judges. An unopenable file answers `-1`: a snapshot the
+    /// purge cannot READ is not one it may call clean.
+    fn snapshot_holds_family(path: &Path, family: &[String]) -> Result<i64, CellError> {
+        let Ok(conn) =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        else {
+            return Ok(-1);
+        };
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        let placeholders = vec!["?"; family.len()].join(",");
+        let sql = format!(
+            "SELECT (SELECT COUNT(*) FROM notes WHERE id IN ({placeholders}))
+                  + (SELECT COUNT(*) FROM conflict_copies WHERE copy_id IN ({placeholders})
+                                                OR original_id IN ({placeholders}))
+                  + (SELECT COUNT(*) FROM notes_fts_docsize d JOIN notes n ON n.rowid = d.id
+                     WHERE n.id IN ({placeholders}))
+                  + (SELECT COUNT(*) FROM notes_fts_hidden_docsize d JOIN notes n ON n.rowid = d.id
+                     WHERE n.id IN ({placeholders}))
+                  + (SELECT COUNT(*) FROM proposals WHERE note_id IN ({placeholders}))"
+        );
+        // six lists of the same names, one per IN above
+        let mut all: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(6 * family.len());
+        for _ in 0..6 {
+            for s in family {
+                all.push(s);
+            }
+        }
+        conn.query_row(&sql, all.as_slice(), |r| r.get(0))
+            .map_err(CellError::from)
     }
 
     /// The `redacted_by` JSON of a snapshot row after one more purge op.
@@ -1448,6 +1625,10 @@ impl Cell {
         // row every hidden `delete` lights, `fts_delete` itself.
         let hidden_touched: bool =
             ops::hidden_dirty(&inner.conn)? || ops::hidden_rows_in_family(&inner.conn, id)? > 0;
+        // v0.6.7 (G3): the family's ids, read BEFORE the op — the purge
+        // takes them all, and the earned `scrubbed` check below needs
+        // the names once the rows are gone
+        let family: Vec<String> = ops::family_of(&inner.conn, id)?;
         let purge_op_id = execute_op(
             &mut inner,
             OpKind::Purge,
@@ -1488,80 +1669,25 @@ impl Cell {
         // secure_delete does not cover the WAL: only a checkpoint copies the
         // frames over and truncates. `TRUNCATE` answers busy when a reader
         // holds an older snapshot: that is `pending`, not done.
-        let pending = if wal_checkpoint(&inner.conn)? {
+        let mut pending: Vec<String> = if wal_checkpoint(&inner.conn)? {
             Vec::new()
         } else {
             inner.pending_scrub = vec!["wal"];
-            vec!["wal"]
+            vec!["wal".to_string()]
         };
-        // v0.3.1 (P0.3): every registered snapshot is a full copy made before
-        // the purge — it holds the note, its payloads and its FTS entries.
-        // The same purge (state + log scrub + optimize + VACUUM) runs on the
-        // file; the row keeps its head hash and records the new digest with
-        // `redacted_by` naming this purge op. `censorable`: the supersede
-        // payloads the LIVE log still carries after its own scrub — only
-        // those are censored inside the snapshot; the ones the compaction
-        // cut already forgot are merely deleted there, or the snapshot's ops
-        // rows would fork from the live prefix.
-        let censorable: std::collections::HashSet<String> = {
-            let mut stmt = inner.conn.prepare(
-                "SELECT o.op_id FROM ops o JOIN op_payloads p ON p.op_id = o.op_id
-                 WHERE o.kind IN ('supersede', 'decide', 'revert_decision')",
-            )?;
-            stmt.query_map([], |r| r.get::<_, String>(0))?
-                .flatten()
-                .collect()
-        };
-        let rows: Vec<(i64, Option<String>)> = {
-            let mut stmt = inner
-                .conn
-                .prepare("SELECT seq, file FROM snapshots ORDER BY seq DESC")?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .flatten()
-                .collect()
-        };
-        for (i, (seq, file)) in rows.into_iter().enumerate() {
-            // v0.3.2 (P0.3): a checkpoint row has no file to scrub, but its
-            // digest described a state that contained the purged note. It is
-            // an hash of the whole state — not readable data — yet from here
-            // on it is unverifiable and there is no reason to keep it: NULL,
-            // with this purge's op_id in `redacted_by`.
-            let Some(file) = file else {
-                let redacted = Self::redacted_by(&inner.conn, seq, &purge_op_id)?;
-                inner.conn.execute(
-                    "UPDATE snapshots SET state_digest = NULL, redacted_by = ?2
-                     WHERE seq = ?1",
-                    rusqlite::params![seq, redacted],
-                )?;
-                continue;
-            };
-            let snap_path = self
-                .path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(&file);
-            if !snap_path.exists() {
-                if i > 0 {
-                    // a ghost row (crash between the row's removal and the
-                    // file's in a past compaction — the newest always exists):
-                    // drop it, nothing references it
-                    inner
-                        .conn
-                        .execute("DELETE FROM snapshots WHERE seq = ?1", [seq])?;
-                    continue;
-                }
-                return Err(CellError::Db(format!(
-                    "the newest snapshot {} is missing: the purge refuses to                      forget half of the cell",
-                    snap_path.display()
-                )));
+        // v0.3.1 (P0.3; v0.6.7, G3): every registered snapshot is a full
+        // copy made before the purge — it holds the note, its payloads
+        // and its FTS entries. The same purge (state + log scrub +
+        // closure over the copies + optimize + VACUUM) runs on the file;
+        // the row keeps its head hash and records the new digest with
+        // `redacted_by` naming this purge op — and what the scrub left
+        // behind is NAMED, so `scrubbed` is earned, never declared.
+        for file in
+            Self::scrub_snapshots_of(&mut inner, &self.path, Some(*id), &family, &purge_op_id)?
+        {
+            if !pending.contains(&file) {
+                pending.push(file);
             }
-            let digest = Self::scrub_snapshot(&snap_path, id, &censorable)?;
-            let redacted = Self::redacted_by(&inner.conn, seq, &purge_op_id)?;
-            inner.conn.execute(
-                "UPDATE snapshots SET state_digest = ?2, redacted_by = ?3 WHERE seq = ?1",
-                rusqlite::params![seq, digest, redacted],
-            )?;
         }
         // the purge itself wrote one payload: the forgotten rows are the drop
         // net of it

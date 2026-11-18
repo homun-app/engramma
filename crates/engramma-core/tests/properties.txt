@@ -22,6 +22,7 @@ crates/engramma-core/tests/props.rs format_round_trip
 crates/engramma-core/tests/props.rs replay_equals_state
 crates/engramma-core/tests/props.rs compaction_keeps_verify_and_state
 crates/engramma-core/tests/props.rs random_ops_compact_and_purge_leave_no_roots
+crates/engramma-core/tests/props.rs purge_with_conflict_copies_leaves_no_roots
 crates/engramma-core/tests/props.rs export_import_equality
 crates/engramma-core/tests/props.rs hlc_monotonic
 crates/engramma-mcp/tests/oauth_props.rs rfc1918_is_never_public
