@@ -794,10 +794,17 @@ fn bm25_from(
     limit: i64,
     statuses: &str,
 ) -> Result<Vec<(String, f64)>, SearchError> {
+    // v0.6.7 (G2): a conflict copy whose ORIGINAL holds an active
+    // lapide follows the lapide — the bin's contents answer no search,
+    // whatever the copy's own state (the `include_quarantined` owner's
+    // view included: it widens quarantine, not the bin)
     let sql = format!(
         "SELECT n.id, bm25({table}, 10.0, 3.0, 2.0) FROM {table}
          JOIN notes n ON n.rowid = {table}.rowid
          WHERE {table} MATCH ?1 AND n.status IN {statuses}
+           AND NOT EXISTS (SELECT 1 FROM conflict_copies cc
+                           JOIN notes o ON o.id = cc.original_id
+                           WHERE cc.copy_id = n.id AND o.status = 'deleted')
          ORDER BY bm25({table}, 10.0, 3.0, 2.0) LIMIT ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -918,10 +925,16 @@ fn read_candidates(
     // lookups on notes. A plain JOIN let the planner drive from the status
     // filter — every active note in the cell probed against `cand`, 100k
     // probes per query (found profiling the probe at 100k, v0.2.1).
+    // v0.6.7 (G2): the bin's contents never become candidates — the same
+    // lapide filter the BM25 lists apply, so the vector arm (whose ids
+    // come from the index, not from FTS) cannot leak a hidden copy either.
     let sql = format!(
         "SELECT n.id, n.frontmatter_json, n.body, n.body_norm, n.tags_text
          FROM cand c CROSS JOIN notes n ON n.id = c.id
-         WHERE n.status IN {statuses}{type_clause}"
+         WHERE n.status IN {statuses}{type_clause}
+           AND NOT EXISTS (SELECT 1 FROM conflict_copies cc
+                           JOIN notes o ON o.id = cc.original_id
+                           WHERE cc.copy_id = n.id AND o.status = 'deleted')"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {

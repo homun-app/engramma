@@ -86,6 +86,15 @@ async function run(op, args) {
       const note = await state[args.cell].patch(args.id, set);
       return { id: note.id, body: note.body };
     }
+    case 'delete':
+      await state[args.cell].delete(args.id);
+      return { deleted: true };
+    case 'search':
+      return await state[args.cell].search({
+        text: args.text,
+        k: args.k ?? 10,
+        includeQuarantined: args.wide ?? false,
+      });
     case 'conflicts':
       return await state[args.cell].conflicts();
     case 'conflict':

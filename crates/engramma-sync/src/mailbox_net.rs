@@ -30,7 +30,7 @@ use crate::{Error, Result};
 
 /// The mailbox protocol's ALPN — the rules version rides with the sync
 /// one (D4: a v0.6.5 device must refuse a v0.6.4 mailbox too).
-pub const MAILBOX_NET_ALPN: &[u8] = b"engramma/mailbox/3";
+pub const MAILBOX_NET_ALPN: &[u8] = b"engramma/mailbox/4";
 /// The mailbox protocol's version.
 pub const MAILBOX_VERSION: u64 = 1;
 /// A frame is at most 1 MiB.

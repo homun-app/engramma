@@ -36,7 +36,7 @@ nello stesso — riceve un rifiuto dedicato: riga a parte e uscita 7 nella
 CLI, `SYNC_BUSY` in JS.
 
 - **`engramma sync run`**: una passata con ogni dispositivo vivo raggiungibile (e col nodo cieco configurato). Il riepilogo JSON dice, per cella, operazioni inviate e ricevute, rifiuti al cancello, conflitti, **non speditibili** e frontiera; per dispositivo, se la sessione è avvenuta, per quale strada (diretta o via relay) e perché no. **Un irraggiungibile non è un errore**: è una riga.
-- **`engramma sync serve`**: ascolta (ALPN `engramma/sync/1`), applica il cancello a ogni accettazione, e sincronizza a ogni scrittura locale (`PRAGMA data_version`, rimbalzo 2 s) e ogni 5 minuti. Si ferma pulito su SIGINT/SIGTERM. Il demone gira **accanto** a Homun sulla stessa radice: due processi, un registro, la sessione che li attraversa è provata.
+- **`engramma sync serve`**: ascolta (ALPN `engramma/sync/4`, la versione delle regole), applica il cancello a ogni accettazione, e sincronizza a ogni scrittura locale (`PRAGMA data_version`, rimbalzo 2 s) e ogni 5 minuti. Si ferma pulito su SIGINT/SIGTERM. Il demone gira **accanto** a Homun sulla stessa radice: due processi, un registro, la sessione che li attraversa è provata.
 - **Gli indirizzi**: ogni radice ricorda l'ultimo indirizzo noto di ogni dispositivo (il libro degli indirizzi, aggiornato a ogni sessione e all'abbinamento; il biglietto dell'abbinamento gli consegna anche il relay, quando c'è). `--relay <url>` e `--no-relay` come nel biglietto; pkarr spento. La scelta si **salva nella radice** (un flag esplicito vince e la sostituisce): `sync serve` non la chiede a ogni avvio. Una radice che vuole essere raggiunta senza inviti tiene `sync serve` acceso.
 
 ## Come si condivide una cella
@@ -98,20 +98,23 @@ Un estraneo che si finge un dispositivo: la connessione si chiude **prima di qua
 
 **Quello che il dispositivo aveva già lo tiene**: la revoca non cancella i dischi altrui. Le sei cifre e il biglietto monouso sono le difese dell'**abbinamento**; la rotazione è la difesa del **dopo**.
 
-## La versione delle regole (v0.6.5)
+## La versione delle regole (v0.6.5; la 4 in v0.6.7)
 
 L'ALPN **è** la versione delle regole di materializzazione:
-`engramma/sync/3` (e `engramma/mailbox/3` per la casella postale). Un
+`engramma/sync/4` (e `engramma/mailbox/4` per la casella postale). Un
 dispositivo con regole diverse, davanti allo stesso insieme di
 operazioni, deriva stati diversi — quindi non devono scambiare
 nemmeno un'operazione. Il rifiuto avviene all'handshake: chi chiama
 riceve `PEER_OUTDATED` (in JS, con il nome del dispositivo da
 aggiornare), chi risponde non vede nemmeno la connessione. Ogni cambio
-della derivazione alza la versione: la v0.6.5 porta la `3` perché
-cambiano la `base` di una scrittura locale (la testa visibile), il
-testimone di contenimento (la biforcazione è fra perdente e testimone)
-e la riapertura della lapide (la linea chiusa); la v0.7 delle
-organizzazioni alzerà ancora.
+della derivazione alza la versione: la v0.6.5 portava la `3` (la
+`base` di una scrittura locale diventa la testa visibile, il testimone
+di contenimento forcella per coppia, la riapertura della lapide
+giudica la linea chiusa); la v0.6.7 porta la `4` perché il testimone
+non dipende più dalla lapide (una scrittura che la lapide ha battuto
+attesta lo stesso ciò che il suo autore aveva davanti) e le copie di
+una nota cancellata seguono la lapide (invisibili, non cercabili,
+fuori da `conflicts()`); la v0.7 delle organizzazioni alzerà ancora.
 
 ## I conflitti
 

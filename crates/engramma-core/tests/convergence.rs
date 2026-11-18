@@ -2040,32 +2040,23 @@ proptest! {
                 }
                 // absent → present (v0.6.5, E2): a closed copy that is
                 // open again — only a winner-following rebirth may come
-                // back; a witnessed close never does. v0.6.6 (F1): ONE
-                // more declared exception, symmetric to the close
-                // direction's own lapide clause — the original holds a
-                // LAPIDE. Wherever it does, «la regola della lapide…
-                // domina anche sulla durabilità» (DESIGN § 4.3) and the
-                // conflict set follows the lapide line, not the
-                // witnesses: a rebirth there follows rules of the
-                // lapide's own, whether it was already there at the
-                // close or arrived after it. Found by the restored
-                // property itself, twice: at 20 000 cases (seed
-                // 3753902730771729170 — the copy closes when the second
-                // delete lands, reopens while the note stays deleted,
-                // the witness still in the set, every device agreeing)
-                // and in the first teeth run against the v0.6.4 class
-                // key (seed 11196124333436581516, 6 018 successes — that
-                // flap was lapide-driven too: the E2 ledger had simply
-                // never met a lapide-note rebirth in 512–3 000 cases).
-                // On a note the lapide never touched, a witnessed close
-                // still never reopens.
-                for (copy, original, _) in is {
+                // back; a witnessed close never does. v0.6.7 (G2): the
+                // v0.6.6 lapide exception is GONE from this direction.
+                // The witness no longer depends on the lapide — a write
+                // the lapide beat still attests what its author saw — so
+                // a set can only grow into having a witness, never out
+                // of one: the rebirth the exception used to absolve (the
+                // hunt of v0.6.6, seed 3753902730771729170) is a defect
+                // now, and the copies of a deleted note are the bin's
+                // hidden contents anyway. The close direction keeps its
+                // own lapide clause (the lapide as dominance, the
+                // v0.6.5 rule).
+                for (copy, _original, _) in is {
                     if let Some((witnessed_close, deserved_close)) =
                         closed_at[dev].remove(copy)
                     {
                         prop_assert!(
-                            (!witnessed_close && !deserved_close)
-                                || lapide_active(&runner.fleet.cells[dev], original),
+                            !witnessed_close && !deserved_close,
                             "seed {seed}: copy {copy} reopened — it closed \
                              witnessed ({witnessed_close}) or deserved ({deserved_close})"
                         );

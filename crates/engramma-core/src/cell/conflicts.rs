@@ -758,24 +758,37 @@ fn write_note_head(
 }
 
 /// Does the SET hold a closure witness for this loser? (D1.6, E2) An
-/// operation on the copy's id; an APPLIED body write after the loser
-/// in the total order that DESCENDS from it (its author had seen the
-/// loser — the containment's special case with the fork taken at the
-/// loser itself, kept its own arm because it needs no payload); or an
-/// applied later body write that CONTAINS it — the rigorous diff3 from
-/// the fork between the LOSER and THAT WRITER returns the writer
-/// without overlaps. The fork never names the winner: a late arrival
-/// can move it, and a witness is a fact about the pair and their past
-/// (v0.6.5, E2 — the reopened copies of the reviewer's R2). A later
-/// write with the very same text contains it (two identical changes
-/// are one change), which is how equal-bodied losers collapse into a
-/// single copy.
+/// operation on the copy's id; a body write after the loser in the
+/// total order that DESCENDS from it (its author had seen the loser —
+/// the containment's special case with the fork taken at the loser
+/// itself, kept its own arm because it needs no payload); or a later
+/// body write that CONTAINS it — the rigorous diff3 from the fork
+/// between the LOSER and THAT WRITER returns the writer without
+/// overlaps. The fork never names the winner: a late arrival can move
+/// it, and a witness is a fact about the pair and their past (v0.6.5,
+/// E2 — the reopened copies of the reviewer's R2). A later write with
+/// the very same text contains it (two identical changes are one
+/// change), which is how equal-bodied losers collapse into a single
+/// copy.
+///
+/// v0.6.7 (G2): the witness does not depend on the lapide. The scan
+/// covers every body write the SET holds, APPLIED OR NOT: a write the
+/// lapide beat (the tombstone rule, the rollback) attests the same
+/// existence — its author had the loser in front of them, merged it in
+/// or built upon it — and the lapide that beats the write cancels the
+/// note whole, the loser's text included, which is the user's choice;
+/// what the WITNESS attests stays true. Scanning the applied writes
+/// only let a late-arriving lapide retract a witness that had closed a
+/// copy (the hunt of v0.6.6, seed `3753902730771729170`: the copy of L
+/// reopened while the note stayed deleted and the witness never left
+/// the set). A set can only GROW into having a witness, never out of
+/// one.
 fn has_witness(
     tx: &Transaction<'_>,
     rows: &[NoteOpRow],
     ancestry: &Ancestry,
     loser: usize,
-    applied: &[usize],
+    _applied: &[usize],
     copy_id: &Ulid,
 ) -> Result<bool, CellError> {
     // (a) an operation on the copy's id
@@ -787,9 +800,18 @@ fn has_witness(
     if on_copy > 0 {
         return Ok(true);
     }
-    // every APPLIED body write that descends from the loser: its author
-    // had seen it (the base chain walks through it)
-    if applied.iter().any(|&i| ancestry.contains(i, loser)) {
+    // every body write the set knows — applied, lapide-beaten, or
+    // rolled back alike: a payload the compaction cut no longer carries
+    // (body `None`) is beyond anyone's judgement, as it always was
+    let scan: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.body.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    // every body write that descends from the loser: its author had
+    // seen it (the base chain walks through it)
+    if scan.iter().any(|&i| ancestry.contains(i, loser)) {
         return Ok(true);
     }
     // the witness is a LATER write, in the TOTAL ORDER — not in the
@@ -803,7 +825,7 @@ fn has_witness(
     let Some(loser_text) = loser_text else {
         return Ok(false);
     };
-    for &i in applied {
+    for &i in &scan {
         let key = (rows[i].hlc.as_str(), rows[i].op_id.to_string());
         if key <= loser_key {
             continue;
@@ -1558,9 +1580,17 @@ pub struct ConflictInfo {
 /// # Errors
 /// [`CellError::Db`] on SQL failure.
 pub fn conflicts(tx: &Transaction<'_>) -> Result<Vec<ConflictInfo>, CellError> {
+    // v0.6.7 (G2): the copies follow the lapide. While the original
+    // holds an active tombstone its open copies are a bin's contents —
+    // not listed here, whatever their own state. A read BY ID
+    // (`conflict`) still answers: it is honest, and it says
+    // `original_deleted`.
     let mut stmt = tx.prepare(
         "SELECT copy_id, original_id, loser_actor, loser_hlc, open, visible FROM conflict_copies
-         WHERE open = 1 ORDER BY original_id, loser_hlc, loser_op",
+         WHERE open = 1
+           AND NOT EXISTS (SELECT 1 FROM notes o
+                           WHERE o.id = conflict_copies.original_id AND o.status = 'deleted')
+         ORDER BY original_id, loser_hlc, loser_op",
     )?;
     let out: Vec<ConflictInfo> = stmt
         .query_map([], |r| {
@@ -1646,6 +1676,10 @@ pub struct ConflictDetail {
     pub quarantined: bool,
     /// Inside the cap's window of three: a notes row of its own.
     pub visible: bool,
+    /// v0.6.7 (G2): the original holds an active lapide — the copy is a
+    /// bin's contents (not listed, not searchable), and this read by id
+    /// says so.
+    pub original_deleted: bool,
     /// The ORIGINAL's body as it stands.
     pub original_body: Option<String>,
     /// The LOSER's body (the loser's payload is its home).
@@ -1697,6 +1731,11 @@ pub fn conflict(tx: &Transaction<'_>, copy_id: &Ulid) -> Result<ConflictDetail, 
     )?;
     // the original's body as it stands
     let original_body = ops::read_note_row(tx, &original)?.map(|row| row.note.body);
+    // v0.6.7 (G2): does the original hold an active lapide? The copy
+    // then follows it (not listed, not searchable); this read by id
+    // stays honest and says so
+    let original_deleted = ops::read_note_row(tx, &original)?
+        .is_some_and(|row| row.note.status == crate::format::Status::Deleted);
     // the loser's body: its payload is the home (a patch's set.body, a
     // put's note.body); the copy's own notes row is the fallback
     let copy_body: Option<String> = {
@@ -1767,6 +1806,7 @@ pub fn conflict(tx: &Transaction<'_>, copy_id: &Ulid) -> Result<ConflictDetail, 
         loser_at: at,
         quarantined: status.as_deref() == Some("quarantined"),
         visible: visible != 0,
+        original_deleted,
         original_body,
         copy_body,
         fork_body,

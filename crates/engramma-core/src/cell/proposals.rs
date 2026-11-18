@@ -901,6 +901,22 @@ impl Cell {
             if !row_in_range(&Some(proposed_at.clone()), &since, &until) {
                 continue;
             }
+            // v0.6.7 (G2): a derived conflict-copy row stays in the queue
+            // while its original holds an active lapide — the bin keeps
+            // its contents — but the LISTING hides it: the row is state
+            // (a function of the set), the hiding is the bin's own rule
+            if reason.as_deref() == Some("conflitto") && state == ProposalState::Pending {
+                let hidden: i64 = inner.conn.query_row(
+                    "SELECT COUNT(*) FROM conflict_copies cc
+                     JOIN notes o ON o.id = cc.original_id
+                     WHERE cc.copy_id = ?1 AND o.status = 'deleted'",
+                    [&note_id],
+                    |r| r.get(0),
+                )?;
+                if hidden > 0 {
+                    continue;
+                }
+            }
             let note = {
                 let tx = inner.conn.unchecked_transaction()?;
                 super::get_note_tx(

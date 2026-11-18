@@ -1848,6 +1848,10 @@ pub struct ConflictDetailEntry {
     pub quarantined: bool,
     /// Inside the cap's window of three.
     pub visible: bool,
+    /// v0.6.7 (G2): the original holds an active lapide — the copy is the
+    /// bin's content (not in `conflicts()`, not searchable); this read by
+    /// id says so.
+    pub original_deleted: bool,
     /// The ORIGINAL's body as it stands (the left column).
     pub original_body: Option<String>,
     /// The LOSER's body — the copy's own text (the right column).
@@ -2438,6 +2442,7 @@ impl Task for ConflictTask {
             loser_at: d.loser_at.clone(),
             quarantined: d.quarantined,
             visible: d.visible,
+            original_deleted: d.original_deleted,
             original_body: d.original_body,
             copy_body: d.copy_body,
             fork_body: d.fork_body,

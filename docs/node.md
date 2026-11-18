@@ -308,17 +308,25 @@ Notevoli:
   base diversa può solo consegnare gli **stessi** byte o fallire, mai
   cambiare il contenuto.
 
-### I conflitti da risolvere (v0.6.4; la lettura in v0.6.5)
+### I conflitti da risolvere (v0.6.4; la lettura in v0.6.5; il cestino in v0.6.7)
 
 - `cell.conflicts(): Promise<ConflictEntry[]>` — ogni copia di conflitto
   **aperta**: `{ copyId, originalId, loserActor, loserClass: 'human' | 'agent',
   loserAt, quarantined, visible }`. Nessun testo nell'elenco: il testo si
   legge con `conflict` (sotto). `visible: false` è una copia
   oltre il tetto di tre: resta aperta, appare quando una visibile si
-  chiude.
+  chiude. **v0.6.7:** le copie di una nota **cancellata** seguono la
+  lapide — finché l'originale tiene una lapide attiva non stanno
+  nell'elenco e non rispondono a nessuna ricerca (è il comportamento di
+  un cestino, anche nella vista ampia `includeQuarantined`); quando la
+  nota si riapre (una modifica con `base` uguale alla lapide) le copie
+  aperte tornano con le regole di sempre, quelle chiuse restano chiuse.
 - `cell.conflict(copyId): Promise<ConflictDetail>` (v0.6.5, E5) — una
   copia per intero, i tre testi della scelta:
-  `{ ...ConflictEntry, originalBody, copyBody, forkBody }`.
+  `{ ...ConflictEntry, originalDeleted, originalBody, copyBody, forkBody }`.
+  `originalDeleted: true` (v0.6.7) dice che l'originale tiene una
+  lapide attiva e la copia è nascosta: una lettura per id resta onesta
+  e nomina il perché.
   `originalBody` è il corpo dell'originale com'è; `copyBody` è il corpo
   del perdente (il suo payload ne è la casa); `forkBody` è il corpo alla
   biforcazione fra il perdente e il vincitore (`null` sotto il taglio di

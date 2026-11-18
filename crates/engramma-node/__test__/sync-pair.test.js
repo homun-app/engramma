@@ -690,3 +690,84 @@ test('D3: a title patch neither closes nor creates copies', async () => {
     await b.quit();
   }
 });
+
+// v0.6.7 (G2): the copies follow the lapide. A conflict is open on both
+// devices; the ORIGINAL is then deleted — and while the note stays in the
+// bin its copy is not in `conflicts()`, not searchable (the owner's wide
+// view included), and `conflict(copyId)` — a read by id, honest — answers
+// with `originalDeleted: true`. The reviewer's proof of the v0.6.6
+// verification, as the JS contract speaks it.
+test('G2: a deleted note hides its copies; conflict(copyId) says originalDeleted', async () => {
+  const a = new Peer();
+  const b = new Peer();
+  try {
+    await a.cmd('open', { root: rootName(), name: 'laptop', actor: 'user' });
+    await b.cmd('open', { root: rootName(), name: 'mac' });
+    await a.cmd('cell', { cell: 'memoria' });
+    const put = await a.cmd('put', { cell: 'memoria', body: 'alpha\nbeta\ngamma' });
+    const invite = await a.cmd('invite', { key: 'p' });
+    await a.cmd('share', { cell: 'memoria' });
+    await b.cmd('join', { ticketOrCode: invite.ticket, key: 'p' });
+    const sasA = (await a.cmd('sas', { key: 'p' })).sas;
+    const sasB = (await b.cmd('sas', { key: 'p' })).sas;
+    assert.equal(sasA, sasB);
+    await a.cmd('confirm', { same: true, key: 'p' });
+    await b.cmd('confirm', { same: true, key: 'p' });
+    await a.cmd('done', { key: 'p' });
+    await b.cmd('done', { key: 'p' });
+    const infoA = await a.cmd('start');
+    const infoB = await b.cmd('start');
+    await b.cmd('remember', { device: 'laptop', serve: infoA });
+    await a.cmd('remember', { device: 'mac', serve: infoB });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await b.cmd('cell', { cell: 'memoria' });
+
+    // the conflict: A's human hand wins, B's loses — the copy is open
+    await a.cmd('patch', { cell: 'memoria', id: put.id, body: 'la mano umana al lavoro' });
+    await b.cmd('patch', { cell: 'memoria', id: put.id, body: 'occhiello turchino' });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    const list = await a.cmd('conflicts', { cell: 'memoria' });
+    assert.equal(list.length, 1, `one open copy: ${JSON.stringify(list)}`);
+    const copyId = list[0].copyId;
+    // the loser is the agent's (the peer's own actor): quarantined, so
+    // the OWNER's wide view is the one that sees it before the delete
+    const found = await a.cmd('search', {
+      cell: 'memoria',
+      text: 'occhiello turchino',
+      wide: true,
+    });
+    assert.ok(found.some((h) => h.id === copyId), 'before the delete the copy is searchable');
+
+    // the bin: the original goes, and its copy follows the lapide
+    await a.cmd('delete', { cell: 'memoria', id: put.id });
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    await a.cmd('runOnce');
+    await b.cmd('runOnce');
+    for (const peer of [a, b]) {
+      const hidden = await peer.cmd('conflicts', { cell: 'memoria' });
+      assert.equal(hidden.length, 0, `the bin hides the copy: ${JSON.stringify(hidden)}`);
+      const hits = await peer.cmd('search', { cell: 'memoria', text: 'occhiello turchino' });
+      assert.ok(hits.every((h) => h.id !== copyId), 'the bin answers no search');
+      const wide = await peer.cmd('search', {
+        cell: 'memoria',
+        text: 'occhiello turchino',
+        wide: true,
+      });
+      assert.ok(wide.every((h) => h.id !== copyId), 'not even the owner wide view searches the bin');
+      // a read by id is honest: the detail answers and says why it is hidden
+      const detail = await peer.cmd('conflict', { cell: 'memoria', id: copyId });
+      assert.equal(detail.copyId, copyId);
+      assert.equal(detail.originalId, put.id);
+      assert.equal(detail.originalDeleted, true, 'the lapide is named');
+      assert.equal(detail.copyBody, 'occhiello turchino', 'the text is still a choice');
+    }
+  } finally {
+    await a.quit();
+    await b.quit();
+  }
+});
