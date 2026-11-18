@@ -218,8 +218,13 @@ proptest! {
             .unwrap(/* test-only */)[0]
             .parse()
             .unwrap(/* test-only */);
+        // v0.6.8 (H2): the cut walks BELOW the head too (the JS binding
+        // cuts at `head - keepLast`; a shared cell at its frontier) —
+        // the head-only convention was the one ground the snapshot
+        // replay defect lived on
+        let cut = head - (seed % 3) as i64;
         let snap = cell
-            .compact(head, &engramma_core::cell::CompactOptions { keep_snapshot: true })
+            .compact(cut, &engramma_core::cell::CompactOptions { keep_snapshot: true })
             .unwrap(/* test-only */)
             .snapshot
             .unwrap(/* keep_snapshot always writes one */);
@@ -229,7 +234,7 @@ proptest! {
         // head (the live cell forgot the very same payloads).
         let recorded = cell
             .debug_column(&format!(
-                "SELECT state_digest FROM snapshots WHERE seq = {head}"
+                "SELECT state_digest FROM snapshots WHERE seq = {cut}"
             ))
             .unwrap(/* test-only */);
         let digest_after = cell.state_digest().unwrap(/* test-only */);
@@ -640,11 +645,19 @@ proptest! {
                     }
                 }
                 4 => {
-                    // the sync: everything flows both ways
+                    // the sync: everything flows both ways — and the
+                    // session ACKS land like the real service writes
+                    // them (v0.6.8, H2: the frontier is what the
+                    // devices CONFIRMED, so a compaction between two
+                    // syncs cuts below the head, the road the API walks)
                     for op in &union(&a, &b) {
                         let _ = a.ingest_op(op);
                         let _ = b.ingest_op(op);
                     }
+                    let _ = a.mark_shared();
+                    let _ = b.mark_shared();
+                    let _ = a.record_session_ack("b000000000x");
+                    let _ = b.record_session_ack("a000000000x");
                 }
                 5 => {
                     // a resolution of one conflict copy this device sees
@@ -662,26 +675,25 @@ proptest! {
                     }
                 }
                 6 => {
-                    // a compaction, with or without the snapshot file
+                    // a compaction, with or without the snapshot file —
+                    // and the cut walks the TRUE roads (v0.6.8, H2): at
+                    // the head sometimes, below it most of the time (the
+                    // JS binding cuts at `head - keepLast`; a shared cell
+                    // compacts at the stable frontier the acks built).
+                    // The v0.6.7 convention — always the head — was the
+                    // one ground the verify defect lived on (seed
+                    // 9012498534905088620, declared open then, closed in
+                    // this phase).
                     let head: i64 = cell
                         .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
                         .unwrap_or_default()
                         .first()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
-                    if head >= 1 {
-                        // the cut is the head — the convention every
-                        // compaction test uses. A cut BELOW the head with a
-                        // snapshot file breaks verify's snapshot replay
-                        // today (an out-of-order body write that arrives
-                        // after the compaction corrects the live body, the
-                        // frozen snapshot keeps the old winner): found by
-                        // this very property, seed 9012498534905088620,
-                        // declared open in the REPORT — the oblivion this
-                        // property guards is another matter, and its
-                        // compactions stay where the engine is sound.
+                    let cut = head - (next() % 3) as i64;
+                    if cut >= 1 {
                         let _ = cell.compact(
-                            head,
+                            cut,
                             &engramma_core::cell::CompactOptions {
                                 keep_snapshot: next() % 2 == 0,
                             },
@@ -784,14 +796,20 @@ proptest! {
                 let _ = b.ingest_op(op);
             }
         }
-        // NOTE: this property judges the OBLIVION (the bytes below), not
-        // verify — the two-device mix walks ground whose verify coherence
-        // carries two pre-existing defects of its own (the snapshot
-        // replay when the cut sits below the head, seed
-        // 9012498534905088620; the derived `mentions` edges of a
-        // quarantined copy, seed 9012498534642822410), both found by this
-        // property on its first runs, both declared open in the REPORT,
-        // neither an oblivion matter.
+        // v0.6.8 (H2 + H6): with the snapshot replay and the derived
+        // `conflitto` edges both sound again, the property judges VERIFY
+        // as well, at every case's end, on both devices — the state must
+        // be the same function of the set everywhere, below the head's
+        // cuts no less than at the head
+        for (who, cell) in ["a", "b"].iter().zip([&a, &b]) {
+            let vr = cell.verify().unwrap(/* t */);
+            prop_assert!(
+                vr.ok(),
+                "seed {seed}: verify diverges on {who} (replay {:?}): {:?}",
+                vr.replay,
+                vr.mismatch
+            );
+        }
         // The judge: no root of any purged body in ANY file of either
         // device — the cells, the WALs, the snapshots
         let needles: Vec<String> = purged_words
