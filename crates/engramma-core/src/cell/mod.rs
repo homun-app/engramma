@@ -1273,13 +1273,16 @@ impl Cell {
         } else {
             None
         };
-        // v0.6.6 (F3): the arriving purge optimizes the hidden index only
-        // when THIS copy holds quarantined rows of the family — the same
-        // before-the-op count of the local purge (the arrival applies the
-        // same tombstones a local purge would)
+        // v0.6.6 (F3; v0.6.7, G1): the arriving purge optimizes the hidden
+        // index only when THIS copy holds quarantined rows of the family
+        // — the same before-the-op count of the local purge (the arrival
+        // applies the same tombstones a local purge would) — or when the
+        // dirty bit says rows have LEFT the index before now
         let hidden_touched = if purge_arrival {
             match arrival.note_id {
-                Some(purged) => ops::hidden_rows_in_family(&tx, &purged)? > 0,
+                Some(purged) => {
+                    ops::hidden_dirty(&tx)? || ops::hidden_rows_in_family(&tx, &purged)? > 0
+                }
                 None => false,
             }
         } else {
@@ -1314,9 +1317,7 @@ impl Cell {
                 .conn
                 .execute_batch("INSERT INTO notes_fts(notes_fts) VALUES('optimize');")?;
             if hidden_touched {
-                inner.conn.execute_batch(
-                    "INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
-                )?;
+                ops::hidden_optimize(&inner.conn)?;
             }
             inner.conn.execute_batch("VACUUM;")?;
             if !wal_checkpoint(&inner.conn).unwrap_or(false) {
@@ -1351,17 +1352,22 @@ impl Cell {
         // a stray -wal next to a snapshot would survive the file's VACUUM:
         // fold it in and stay in rollback-journal mode
         conn.pragma_update(None, "journal_mode", "DELETE")?;
-        // v0.6.6 (F3): which indexes does this snapshot actually carry? The
-        // current compact writes them EMPTY by construction (`delete-all`
-        // at compact, rebuilt only in the restore's copy), so their
-        // `optimize` was a no-op; a v0.3.1 snapshot with rows keeps the
-        // dance. Counted before the scrub, like the live purge's own count
+        // v0.6.6 (F3; v0.6.7, G1): which indexes does this snapshot
+        // actually carry? The current compact writes them EMPTY by
+        // construction (`delete-all` at compact, rebuilt only in the
+        // restore's copy), so their `optimize` was a no-op; a v0.3.1
+        // snapshot with rows keeps the dance. Counted before the scrub,
+        // like the live purge's own count — and the hidden one joins its
+        // own DIRTY BIT: a row that left this snapshot's hidden index in
+        // an earlier scrub left its stems in the old segments, and the
+        // count of today cannot see it (the same gate as the live purge).
         let rows: (i64, i64) = conn.query_row(
             "SELECT (SELECT COUNT(*) FROM notes_fts_docsize),
                     (SELECT COUNT(*) FROM notes_fts_hidden_docsize)",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
+        let hidden_dirty = ops::hidden_dirty(&conn)?;
         let secure_before: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
         conn.pragma_update(None, "secure_delete", "ON")?;
         {
@@ -1373,10 +1379,8 @@ impl Cell {
         if rows.0 > 0 {
             conn.execute_batch("INSERT INTO notes_fts(notes_fts) VALUES('optimize');")?;
         }
-        if rows.1 > 0 {
-            conn.execute_batch(
-                "INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
-            )?;
+        if rows.1 > 0 || hidden_dirty {
+            ops::hidden_optimize(&conn)?;
         }
         conn.pragma_update(None, "secure_delete", secure_before)?;
         conn.execute_batch("VACUUM;")?;
@@ -1433,13 +1437,17 @@ impl Cell {
             .conn
             .query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
         inner.conn.pragma_update(None, "secure_delete", "ON")?;
-        // v0.6.6 (F3): does this purge touch the HIDDEN index at all? An
-        // index the purge never wrote to holds none of the purged stems,
-        // and its `optimize` — an O(index) merge — is pure cost. Counted
-        // BEFORE the op: the FTS delete leaves a tombstone the count could
-        // no longer see, and checking after would turn the saving into a
-        // leak (the forgetting.rs case of the quarantined note).
-        let hidden_touched: bool = ops::hidden_rows_in_family(&inner.conn, id)? > 0;
+        // v0.6.6 (F3; v0.6.7, G1): does this purge touch the HIDDEN index
+        // at all? An index the cell never wrote to holds none of the
+        // purged stems, and its `optimize` — an O(index) merge — is pure
+        // cost. Counted BEFORE the op: the FTS delete leaves a tombstone
+        // the count could no longer see. But the count sees only TODAY:
+        // a row that already left the index leaves its stems in the old
+        // segments (the released quarantine, the resolved copy — the
+        // reviewer's proof), so the DIRTY BIT joins the gate — one meta
+        // row every hidden `delete` lights, `fts_delete` itself.
+        let hidden_touched: bool =
+            ops::hidden_dirty(&inner.conn)? || ops::hidden_rows_in_family(&inner.conn, id)? > 0;
         let purge_op_id = execute_op(
             &mut inner,
             OpKind::Purge,
@@ -1455,13 +1463,13 @@ impl Cell {
         // the pages the merge frees are zeroed. The hidden twin joins only
         // when the purge touched it (v0.6.6, F3): a quarantined body's stems
         // live nowhere else, but an untouched index holds nothing to forget.
+        // The bit goes out WITH the merge (v0.6.7, G1): optimize fuses all
+        // segments, so no root of a deleted row survives it.
         inner
             .conn
             .execute_batch("INSERT INTO notes_fts(notes_fts) VALUES('optimize');")?;
         if hidden_touched {
-            inner.conn.execute_batch(
-                "INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');",
-            )?;
+            ops::hidden_optimize(&inner.conn)?;
         }
         // the in-memory vector index drops the note with its vectors
         if let Some(st) = &mut inner.index {
@@ -2980,10 +2988,13 @@ impl Cell {
                     // external-content FTS5: `delete-all` empties both
                     // indices (their segments carry the stems); verify
                     // rebuilds them from the content table before the tail
-                    // replay
+                    // replay. v0.6.7 (G1): the hidden index's dirty bit
+                    // goes out with them — the segments that carried the
+                    // roots are gone, a lit bit would be a lie
                     tx.execute_batch(
                         "INSERT INTO notes_fts(notes_fts) VALUES('delete-all');
-                         INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('delete-all');",
+                         INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('delete-all');
+                         DELETE FROM meta WHERE key = 'fts_hidden_dirty';",
                     )?;
                     tx.commit()?;
                 }
@@ -3455,7 +3466,8 @@ impl Cell {
                                      INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('delete-all');
                                      INSERT INTO notes_fts_hidden(rowid, title, body_norm, tags_text)
                                      SELECT rowid, COALESCE(title, ''), body_norm, tags_text
-                                     FROM notes WHERE status = 'quarantined';",
+                                     FROM notes WHERE status = 'quarantined';
+                                     DELETE FROM meta WHERE key = 'fts_hidden_dirty';",
                                 )?;
                                 tx.commit()?;
                             }
@@ -3842,15 +3854,18 @@ fn state_dump_tables(replicated: bool) -> Vec<(&'static str, &'static str)> {
     // `sync_shared` is LOCAL bookkeeping written without an operation (a
     // device decides which cells IT syncs): it never rides with the state,
     // or a copy that joined would fail verify against its own replay
-    // (v0.6.1, found by the two-device loopback session).
+    // (v0.6.1, found by the two-device loopback session). So is
+    // `fts_hidden_dirty` (v0.6.7, G1): it remembers THIS file's physical
+    // index history — which deletes reached which segments — and two
+    // copies holding the same op set may differ in it without diverging.
     let meta_sql = if replicated {
         "SELECT key, value FROM meta
          WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13', 'hlc',
-                           'sync_shared') ORDER BY key"
+                           'sync_shared', 'fts_hidden_dirty') ORDER BY key"
     } else {
         "SELECT key, value FROM meta
          WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13',
-                           'sync_shared') ORDER BY key"
+                           'sync_shared', 'fts_hidden_dirty') ORDER BY key"
     };
     vec![
         (

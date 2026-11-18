@@ -1085,6 +1085,20 @@ fn fts_delete(
          VALUES ('delete', ?1, ?2, ?3, ?4)"
     ))?
     .execute(rusqlite::params![rowid, title, body_norm, tags_text])?;
+    // v0.6.7 (G1): every delete from the HIDDEN index lights the dirty
+    // bit — a persistent meta row, never memory. The row is gone from
+    // today's state, but its stems stay in the old segments until a merge
+    // (the very phenomenon P0.1 built the purge's `optimize` for), and a
+    // COUNT of today's rows cannot see history. Whatever the cause of the
+    // exit — a release from quarantine, an edit, a deletion, a purge —
+    // this one place sees it.
+    if idx == FtsIndex::Hidden {
+        tx.prepare_cached(
+            "INSERT INTO meta (key, value) VALUES ('fts_hidden_dirty', '1')
+             ON CONFLICT(key) DO NOTHING",
+        )?
+        .execute([])?;
+    }
     Ok(())
 }
 
@@ -1961,14 +1975,17 @@ fn apply_unlink(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     Ok(())
 }
 
-/// (v0.6.6, F3) How many rows of the note's family — itself and its
-/// conflict copies, the same transitive closure `purge_conflict_copies`
-/// walks — sit in the HIDDEN index right now. The purge's disk hygiene
-/// optimizes that index only when this is non-zero: an index the purge
-/// never wrote to holds none of the purged stems, and merging its
-/// segments is pure cost (the 10 000-note probe measured it, REPORT
-/// §v0.6.6). Counted BEFORE the purge op: the FTS `delete` leaves a
-/// tombstone the count could no longer see.
+/// (v0.6.6, F3; v0.6.7, G1) How many rows of the note's family — itself
+/// and its conflict copies, the same transitive closure
+/// `purge_conflict_copies` walks — sit in the HIDDEN index right now.
+/// The purge's disk hygiene optimizes that index only when this is
+/// non-zero OR the dirty bit is lit: an index the cell never wrote to
+/// holds none of the purged stems and merging its segments is pure cost
+/// (the 10 000-note probe measured it, REPORT §v0.6.6), but a row that
+/// LEFT the index leaves its stems behind until a merge — the count
+/// looks at today's state, the roots are history, and the bit is the
+/// history's one-row memory. Counted BEFORE the purge op: the FTS
+/// `delete` leaves a tombstone the count could no longer see.
 ///
 /// # Errors
 /// [`CellError::Db`] on SQL failure.
@@ -1986,6 +2003,39 @@ pub(crate) fn hidden_rows_in_family(conn: &Connection, id: &Ulid) -> Result<i64,
         |r| r.get(0),
     )
     .map_err(CellError::from)
+}
+
+/// (v0.6.7, G1) Is the HIDDEN index's dirty bit lit? The bit is a meta
+/// row every `delete` from that index lights (see [`fts_delete`]); a
+/// purge merges the segments when it is lit OR the family holds rows —
+/// the exact gate `hidden_rows_in_family` alone could not be.
+///
+/// # Errors
+/// [`CellError::Db`] on SQL failure.
+pub(crate) fn hidden_dirty(conn: &Connection) -> Result<bool, CellError> {
+    let on: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'fts_hidden_dirty'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(on.is_some())
+}
+
+/// (v0.6.7, G1) Merge ALL the segments of the hidden index and put the
+/// dirty bit out: after an `optimize` no old segment survives, so no
+/// root of a deleted row can either. The pair is one operation — the bit
+/// must never go out while the roots are still in.
+///
+/// # Errors
+/// [`CellError::Db`] on SQL failure.
+pub(crate) fn hidden_optimize(conn: &Connection) -> Result<(), CellError> {
+    conn.execute_batch(
+        "INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('optimize');
+         DELETE FROM meta WHERE key = 'fts_hidden_dirty';",
+    )?;
+    Ok(())
 }
 
 /// The right to be forgotten (DESIGN §4.4). Removes the note, its versions,

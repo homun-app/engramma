@@ -191,7 +191,10 @@ fn purge_of_a_released_quarantined_note_scrubs_the_hidden_index() {
     let hidden: Vec<String> = cell
         .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes_fts_hidden_docsize")
         .unwrap(/* test-only */);
-    assert_eq!(hidden[0], "0", "after the release the hidden index holds no row");
+    assert_eq!(
+        hidden[0], "0",
+        "after the release the hidden index holds no row"
+    );
 
     let needles = roots_of(&secret.body, Some(Lang::It));
     cell.purge(&secret.id, "diritto all'oblio", "tester")

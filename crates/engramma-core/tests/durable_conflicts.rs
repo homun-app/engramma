@@ -547,7 +547,10 @@ fn purge_after_a_quarantined_copy_resolution_scrubs_the_hidden_index() {
     let hidden: Vec<String> = a
         .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM notes_fts_hidden_docsize")
         .unwrap(/* t */);
-    assert_eq!(hidden[0], "1", "the quarantined copy sits in the hidden index");
+    assert_eq!(
+        hidden[0], "1",
+        "the quarantined copy sits in the hidden index"
+    );
     let copy = a.conflicts().unwrap(/* t */)[0].copy_id;
     // the resolution closes it: the hidden FTS row leaves with a `delete`
     a.resolve_conflict(&copy, ResolveKeep::Original, None, "user")
