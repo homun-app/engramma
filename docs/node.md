@@ -214,7 +214,8 @@ Notevoli:
   salta);
 - gli **errori** sono `Error` con `code` stabile: `NOT_FOUND`,
   `QUARANTINED`, `INVALID_NOTE`, **`INVALID_ARGUMENT`** (v0.4.2),
-  `CONFLICT`, `CLOSED`, `IO`, `MODEL_MISSING`, `COMPACTED`. I messaggi
+  `CONFLICT`, `CLOSED`, `IO`, `MODEL_MISSING`, `COMPACTED`,
+  **`NOTE_PURGED`** (v0.6.9). I messaggi
   non rivelano contenuti di note. `INVALID_ARGUMENT` è per gli
   **argomenti della chiamata** (uno `status` sconosciuto in `list`, un
   `limit` di zero, `graphHops` oltre 2, `depth` oltre 4, una `mode` che
@@ -332,7 +333,13 @@ Notevoli:
   nell'elenco e non rispondono a nessuna ricerca (è il comportamento di
   un cestino, anche nella vista ampia `includeQuarantined`); quando la
   nota si riapre (una modifica con `base` uguale alla lapide) le copie
-  aperte tornano con le regole di sempre, quelle chiuse restano chiuse.
+  aperte tornano con le regole di sempre, quelle chiuse restano chiuse. **v0.6.9 (I2): il
+  cestino contiene le copie che nessuno ha preso.** Una copia che
+  l'utente ha preso — modificata con la propria mano, il testimone che
+  la chiude — è una nota sua: resta visibile (`list`, `get`, ricerche,
+  linea del tempo) anche quando l'originale va nel cestino, e
+  `conflict(copyId)` risponde `NOT_FOUND` (non c'è più conflitto da
+  descrivere). Solo le copie ancora APERTE seguono la lapide.
 - `cell.conflict(copyId): Promise<ConflictDetail>` (v0.6.5, E5) — una
   copia per intero, i tre testi della scelta:
   `{ ...ConflictEntry, originalDeleted, originalBody, copyBody, forkBody }`.
@@ -371,6 +378,39 @@ Notevoli:
   quarantena, nella coda. L'actor è dichiarato e non firmato: nella
   sync personale basta (tutti gli scrittori sono sui dispositivi del
   proprietario); nelle organizzazioni la classe sarà legata a una firma.
+
+## Quello che è dimenticato non torna (v0.6.9, I1)
+
+- **`NOTE_PURGED`.** «Dimentica per sempre» vuol dire che **quell'id non
+  torna**: ogni scrittura che ha l'id purgato come oggetto — `put`,
+  `patch`, `delete`, `restore`, `setStatus`, `confirm`, i `link` e gli
+  `unlink` da o verso la nota, `supersede`, le proposte e le decisioni
+  che la nominano — è rifiutata con `e.code === 'NOTE_PURGED'` e l'id
+  nel messaggio. Per riscrivere un contenuto simile serve una **nota
+  nuova, con un id nuovo**: passa un `id` diverso (o nessuno) alla
+  `put`. `purge` sull'id continua a funzionare (l'oblio non chiude
+  l'oblio), come sulla lapide.
+- **Il percorso vero è l'import.** Reimportare un'esportazione vecchia
+  o un backup che contiene la nota purgata fa proprio quella `put`. I
+  percorsi d'import dell'engine non si fermano e non sbagliano: **salta
+  la nota e la nominano**. Homun legge il rapporto così:
+  - se importa da solo con `put` (la libreria non ha un metodo
+    d'import cartella): cattura `NOTE_PURGED`, raccoglie l'id, continua
+    con i file restanti — alla fine dice all'utente quali file
+    riportano un id dimenticato e vanno buttati o riscritti;
+  - se chiama la CLI (`engramma import --json`, per esempio dentro un
+    flusso di migrazione): il rapporto JSON porta **`skippedPurged`**,
+    la lista degli id saltati (accanto a `imported`, `skipped`,
+    `errors`); la vista della cartella (il demone che guarda la
+    cartella markdown) nomina gli id nello stesso campo del suo
+    rapporto e lascia i file al loro posto.
+- **`verify` ripara le celle vecchie.** Le celle scritte dalla
+  v0.6.7/v0.6.8 possono contenere una `put` dopo la purga (il difetto
+  del seme `1207…`): al primo `verify` la nota sparisce dal vivo
+  secondo la regola e il rapporto la nomina in
+  **`phantomPurged: [id…]`** — vuoto su una cella sana, e la riparazione
+  è una volta sola. Homun può mostrare l'elenco dopo un `verify`
+  post-aggiornamento.
 
 ## Un assistente che ricorda
 

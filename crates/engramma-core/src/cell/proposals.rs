@@ -562,9 +562,12 @@ impl Cell {
                 }
             }
             // The supersede target must exist (and its text rides with the
-            // reviewer's request).
+            // reviewer's request). v0.6.9 (I1): a target the set PURGED is
+            // the rule's word first — the existence check below would
+            // answer `NoteNotFound` for a row the purge already took.
             match input.mode {
                 ProposalMode::Supersede(target) => {
+                    super::refuse_purged_ids(&inner.conn, &[target])?;
                     if !super::ops::note_exists(&inner.conn, &target)? {
                         return Err(CellError::NoteNotFound(target.to_string()));
                     }
@@ -1014,13 +1017,17 @@ impl Cell {
                 DecisionAction::Reject => None,
             };
             // the supersede target: it must exist now, and the decision
-            // records what it was (the revert restores exactly that)
+            // records what it was (the revert restores exactly that).
+            // v0.6.9 (I1): a target the set PURGED is the rule's word
+            // first — the status read below would answer `NoteNotFound`
+            // for a row the purge already took
             let mut target_before = None;
             let mut target_closing = None;
             if mode == "supersede" {
                 let Some(target) = target else {
                     return Err(CellError::Db("supersede proposal without target".into()));
                 };
+                super::refuse_purged_ids(&inner.conn, &[target])?;
                 let row = super::ops::read_note_status(&inner.conn, &target)?
                     .ok_or_else(|| CellError::NoteNotFound(target.to_string()))?;
                 target_before = Some(serde_json::json!({

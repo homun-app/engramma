@@ -106,7 +106,11 @@ Engramma folder (with `engramma.json`) or, with `--obsidian`, any Markdown
 vault: hidden entries (`.obsidian/`, `.trash/`) and non-Markdown files are
 skipped, symlinks never followed, notes without an Engramma header get one
 (`source: import:obsidian/<relative path>`). JSON:
-`{imported, skipped: [..], errors: [..], warnings: [..]}`.
+`{imported, skipped: [..], skippedPurged: [id..], errors: [..], warnings: [..]}`.
+`skippedPurged` (v0.6.9) nomina gli id che la cella ha purgato: il file
+torna, l'id no — l'import non si ferma, e tocca all'utente buttare o
+riscrivere quei file con un id nuovo (`docs/node.md` dice come li legge
+Homun).
 
 ### `export DIR`
 Writes `<dir>/<type>/<slug>-<id8>.md` plus `engramma.json`. Tombstones are

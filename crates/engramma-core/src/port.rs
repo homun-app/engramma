@@ -40,6 +40,13 @@ pub struct ImportSummary {
     pub errors: Vec<String>,
     /// Format warnings (unknown keys, …).
     pub warnings: Vec<String>,
+    /// v0.6.9 (I1): note ids the import SKIPPED because the cell holds a
+    /// purge of them (an old export, a backup: the file comes back, the
+    /// id does not). The import does not stop — the other files enter —
+    /// and these are NAMED, not errored: the caller tells the user which
+    /// files to drop or rewrite with a new id (`skippedPurged` in the
+    /// CLI's JSON report).
+    pub skipped_purged: Vec<String>,
 }
 
 /// Kebab-case, diacritics-folded slug for export file names.
@@ -252,6 +259,7 @@ pub fn import_cell(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSummary
         skipped: Vec::new(),
         errors: Vec::new(),
         warnings: Vec::new(),
+        skipped_purged: Vec::new(),
     };
     let files = walk_markdown(dir, &mut summary.skipped)?;
     // Phase 1: parse everything (the note that closes a superseded one may
@@ -294,6 +302,15 @@ pub fn import_cell(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSummary
                 }
                 summary.imported += 1;
             }
+            // v0.6.9 (I1): the id this cell forgot does not come back —
+            // not even from an old export. The import says so, names the
+            // id, and moves on: the OTHER files enter
+            Err(crate::CellError::NotePurged(id)) => {
+                summary.skipped_purged.push(id.clone());
+                summary
+                    .skipped
+                    .push(format!("{relative}: purged id {id} (forgotten forever)"));
+            }
             Err(e) => summary.errors.push(format!("{relative}: {e}")),
         }
     }
@@ -313,6 +330,7 @@ pub fn import_obsidian(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSum
         skipped: Vec::new(),
         errors: Vec::new(),
         warnings: Vec::new(),
+        skipped_purged: Vec::new(),
     };
     let files = walk_markdown(dir, &mut summary.skipped)?;
     // Phase 1: parse everything (an Engramma-headed note may supersede one
@@ -377,6 +395,14 @@ pub fn import_obsidian(cell: &Cell, dir: &Path, actor: &str) -> Result<ImportSum
     for (note, relative) in notes {
         match cell.put_note(&note, actor) {
             Ok(()) => summary.imported += 1,
+            // v0.6.9 (I1): same word as the folder import — the purged id
+            // is named and skipped, the other files enter
+            Err(crate::CellError::NotePurged(id)) => {
+                summary.skipped_purged.push(id.clone());
+                summary
+                    .skipped
+                    .push(format!("{relative}: purged id {id} (forgotten forever)"));
+            }
             Err(e) => summary.errors.push(format!("{relative}: {e}")),
         }
     }

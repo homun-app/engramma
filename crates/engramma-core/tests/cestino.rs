@@ -604,7 +604,7 @@ fn the_bin_copy_appears_in_no_public_read() {
     // resolve_visible_note_id: the copy does not exist for surfaces that
     // must not reveal hidden notes
     walked.push("resolve_visible_note_id");
-    let suffix: String = copy_s.chars().rev().take(8).collect();
+    let suffix: String = copy_s.chars().skip(copy_s.len() - 8).collect();
     if let Ok(resolved) = b.resolve_visible_note_id(&suffix) {
         panic!("resolve_visible_note_id answers the bin's copy ({resolved})");
     }
@@ -764,7 +764,9 @@ fn the_taken_copy_answers_every_read_like_a_living_note() {
     walked.push("path");
     if let Some(steps) = b.path("Namorio", "Salerno", false).unwrap(/* t */) {
         assert!(
-            steps.iter().any(|s| s.from == format!("note:{copy}") || s.to == format!("note:{copy}")),
+            steps
+                .iter()
+                .any(|s| s.from == format!("note:{copy}") || s.to == format!("note:{copy}")),
             "a path out of Namorio does not pass through the taken copy"
         );
     }
@@ -777,7 +779,10 @@ fn the_taken_copy_answers_every_read_like_a_living_note() {
             .iter()
             .map(|t| usize::try_from(t.note_count).unwrap_or(0))
             .sum();
-        assert_eq!(total, 1, "tags counts the taken copy (quarantine={include})");
+        assert_eq!(
+            total, 1,
+            "tags counts the taken copy (quarantine={include})"
+        );
     }
 
     // entities: the mention binds no title — nothing to assert beyond
@@ -804,10 +809,15 @@ fn the_taken_copy_answers_every_read_like_a_living_note() {
         .iter()
         .all(|c| c.copy_id != copy));
 
-    // conflict: the read BY ID stays honest — originalDeleted: true
+    // conflict: the read BY ID — the TAKEN copy is closed, there is no
+    // conflict left to describe: `NotFound` is the honest word (the
+    // open-in-bin copy keeps answering with `originalDeleted: true`,
+    // the walk above covers that side)
     walked.push("conflict");
-    let detail = b.conflict(&copy).unwrap(/* t */);
-    assert!(detail.original_deleted, "the by-id read names the lapide");
+    match b.conflict(&copy) {
+        Err(engramma_core::CellError::NoteNotFound(_)) => {}
+        other => panic!("conflict(copy) on a taken copy: {other:?}"),
+    }
 
     // the queue: no pending row (the copy is not a proposal)
     walked.push("proposals");
@@ -828,7 +838,7 @@ fn the_taken_copy_answers_every_read_like_a_living_note() {
 
     // resolve_visible_note_id: the copy exists for the surfaces
     walked.push("resolve_visible_note_id");
-    let suffix: String = copy_s.chars().rev().take(8).collect();
+    let suffix: String = copy_s.chars().skip(copy_s.len() - 8).collect();
     let resolved = b
         .resolve_visible_note_id(&suffix)
         .expect("resolve_visible_note_id hides the taken copy");

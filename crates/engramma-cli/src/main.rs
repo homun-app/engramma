@@ -1345,6 +1345,10 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 let mut v = serde_json::json!({
                     "imported": summary.imported,
                     "skipped": summary.skipped,
+                    // v0.6.9 (I1): the ids the cell forgot — the file came
+                    // back, the id did not. Homun reads this list to tell
+                    // the user which files to drop or rewrite (docs/node.md)
+                    "skippedPurged": summary.skipped_purged,
                     "errors": summary.errors,
                     "warnings": summary.warnings,
                 });
@@ -1361,6 +1365,12 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 println!("saltate: {}", summary.skipped.len());
                 for s in &summary.skipped {
                     println!("  - {s}");
+                }
+                if !summary.skipped_purged.is_empty() {
+                    println!("purgate (id dimenticato per sempre):");
+                    for id in &summary.skipped_purged {
+                        println!("  ⌫ {id}");
+                    }
                 }
                 println!("errori: {}", summary.errors.len());
                 for e in &summary.errors {

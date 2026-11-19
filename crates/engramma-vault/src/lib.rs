@@ -89,6 +89,11 @@ pub struct SyncReport {
     pub errors: Vec<String>,
     /// Non-fatal warnings.
     pub warnings: Vec<String>,
+    /// v0.6.9 (I1): note ids the reconciliation SKIPPED because the cell
+    /// holds a purge of them — a file that came back from a backup under
+    /// a forgotten id. The file is left alone on disk (named here); the
+    /// id does not come back.
+    pub skipped_purged: Vec<String>,
 }
 
 impl SyncReport {
@@ -103,6 +108,7 @@ impl SyncReport {
             && self.moved.is_empty()
             && self.errors.is_empty()
             && self.warnings.is_empty()
+            && self.skipped_purged.is_empty()
     }
 }
 
@@ -797,8 +803,19 @@ impl Vault {
                 report.updated_files.push(file.path.clone());
             }
             (true, false) => {
-                // the file moved: apply it to the cell
+                // the file moved: apply it to the cell. v0.6.9 (I1): a
+                // file come back under an id the cell forgot is named and
+                // left alone — the id does not return, the next
+                // reconciliations will name it again until the user drops
+                // the file or rewrites it with a new id
                 if let Err(e) = self.cell.put_note(&file_note, "vault") {
+                    if let engramma_core::CellError::NotePurged(id) = &e {
+                        report.skipped_purged.push(id.clone());
+                        report
+                            .warnings
+                            .push(format!("{}: purged id {id} (forgotten forever)", file.path));
+                        return Ok(());
+                    }
                     report.errors.push(format!("{}: {e}", file.path));
                     return Ok(());
                 }
@@ -904,6 +921,14 @@ impl Vault {
         note.confidence = Confidence::Stated;
         note.status = Status::Active;
         if let Err(e) = self.cell.put_note(&note, "vault") {
+            // v0.6.9 (I1): the header carried an id the cell forgot
+            if let engramma_core::CellError::NotePurged(id) = &e {
+                report.skipped_purged.push(id.clone());
+                report
+                    .warnings
+                    .push(format!("{}: purged id {id} (forgotten forever)", file.path));
+                return Ok(());
+            }
             report.errors.push(format!("{}: {e}", file.path));
             return Ok(());
         }

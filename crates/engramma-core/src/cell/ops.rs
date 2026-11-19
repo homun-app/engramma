@@ -2691,6 +2691,24 @@ pub(crate) fn note_exists(conn: &Connection, id: &Ulid) -> Result<bool, CellErro
     Ok(n > 0)
 }
 
+/// v0.6.9 (I1): does the set hold a PURGE of this note? The local write
+/// path's guard — one EXISTS probe that stops at the first purge: the
+/// object leads through `idx_op_objects_object`, the op row through the
+/// `ops.op_id` unique index. No scan (the plan is in the phase's
+/// REPORT). [`material::note_purged_in_set`] answers the same question
+/// for the derivation, inside its transaction.
+pub(crate) fn note_purged(conn: &Connection, id: &Ulid) -> Result<bool, CellError> {
+    let found: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM op_objects oo
+             JOIN ops o ON o.op_id = oo.op_id
+             WHERE oo.object = ?1 AND o.kind = 'purge')",
+        [format!("note:{id}")],
+        |r| r.get(0),
+    )?;
+    Ok(found > 0)
+}
+
 /// `(status, valid_to)` of a note row, when it exists — what a decision
 /// records about its supersede target and what a revert restores.
 pub(crate) fn read_note_status(

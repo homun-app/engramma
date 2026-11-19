@@ -150,12 +150,12 @@ fn parse_open_defects(text: &str) -> Vec<(String, String, Vec<String>, String)> 
         .map(|l| {
             let (head, reference) = l.split_once('#').unwrap_or((l, ""));
             let mut parts = head.split_whitespace();
-            let path = parts.next().unwrap_or_else(|| {
-                panic!("riga dei difetti aperti malformata: «{l}»")
-            });
-            let name = parts.next().unwrap_or_else(|| {
-                panic!("riga dei difetti aperti senza proprietà: «{l}»")
-            });
+            let path = parts
+                .next()
+                .unwrap_or_else(|| panic!("riga dei difetti aperti malformata: «{l}»"));
+            let name = parts
+                .next()
+                .unwrap_or_else(|| panic!("riga dei difetti aperti senza proprietà: «{l}»"));
             let seeds = parts
                 .next()
                 .map(|s| s.split(',').map(str::trim).map(str::to_string).collect())
@@ -180,12 +180,12 @@ fn parse_open_defects(text: &str) -> Vec<(String, String, Vec<String>, String)> 
 fn open_defects_reference_real_properties() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let defects_path = manifest.join("tests/open-defects.txt");
-    let defects_text = std::fs::read_to_string(&defects_path)
-        .expect(/* test-only */ "open-defects.txt");
-    let inventory = parse_inventory(&std::fs::read_to_string(
-        manifest.join("tests/properties.txt"),
-    )
-    .expect(/* test-only */ "properties.txt"));
+    let defects_text =
+        std::fs::read_to_string(&defects_path).expect(/* test-only */ "open-defects.txt");
+    let inventory = parse_inventory(
+        &std::fs::read_to_string(manifest.join("tests/properties.txt"))
+            .expect(/* test-only */ "properties.txt"),
+    );
     let defects = parse_open_defects(&defects_text);
     assert!(
         !defects.is_empty(),
@@ -225,10 +225,10 @@ fn open_defect_seeds_stay_out_of_the_regression_files() {
         .ancestors()
         .nth(2)
         .expect(/* test-only */ "the workspace root");
-    let defects = parse_open_defects(&std::fs::read_to_string(
-        manifest.join("tests/open-defects.txt"),
-    )
-    .expect(/* test-only */ "open-defects.txt"));
+    let defects = parse_open_defects(
+        &std::fs::read_to_string(manifest.join("tests/open-defects.txt"))
+            .expect(/* test-only */ "open-defects.txt"),
+    );
     let mut offenders: Vec<String> = Vec::new();
     for file in test_sources(root) {
         let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");

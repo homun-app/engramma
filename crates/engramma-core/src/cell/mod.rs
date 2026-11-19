@@ -284,6 +284,15 @@ pub struct VerifyReport {
     /// Vector coverage per model, reported separately: embeddings are
     /// derived data and their absence is never a verification failure.
     pub coverage: Vec<ModelCoverage>,
+    /// v0.6.9 (I1): note ids this verify REMATERIALIZED ACCORDING TO THE
+    /// RULE — cells written by v0.6.7/v0.6.8 may hold a local `put` after
+    /// a purge (the guard covered arrival and replay, not the local
+    /// write): the live state kept a row the replay never materializes.
+    /// The phantom rows go here, the state says so, and the list is empty
+    /// on a healthy cell. The disk hygiene of the bytes the old write
+    /// left (optimize, VACUUM) stays what the old phase left it: a
+    /// `purge` of the same id completes it, and still works.
+    pub phantom_purged: Vec<String>,
 }
 
 impl VerifyReport {
@@ -1890,11 +1899,23 @@ impl Cell {
         self.execute(OpKind::SetStatus, Some(*id), actor, payload)
     }
 
+    /// The purged-id rule for callers that check BEFORE their own
+    /// validations would answer a lesser error (v0.6.9, I1): a
+    /// `supersede` on a purged old id would say `NoteNotFound` — the row
+    /// is gone — a `propose` on a purged target the same, before the
+    /// write path's guard could say the truth. Callers that already hold
+    /// the cell's lock speak [`refuse_purged_ids`] on their connection.
+    fn refuse_if_purged(&self, ids: &[Ulid]) -> Result<(), CellError> {
+        let inner = self.lock()?;
+        refuse_purged_ids(&inner.conn, ids)
+    }
+
     /// Replace `old` with `new`: the old note gets `valid_to` (from the new
     /// note's `valid_from`, or from `override_valid_to`) and `superseded`.
     ///
     /// # Errors
-    /// [`CellError::NoteNotFound`] when the old note is missing.
+    /// [`CellError::NoteNotFound`] when the old note is missing;
+    /// [`CellError::NotePurged`] when either id is one the set forgot.
     pub fn supersede(
         &self,
         old_id: &Ulid,
@@ -1902,6 +1923,10 @@ impl Cell {
         override_valid_to: Option<Validity>,
         actor: &str,
     ) -> Result<(), CellError> {
+        // v0.6.9 (I1): closing a purged id OR creating over one — both are
+        // the rule's word, and it comes before the existence checks below
+        // would answer `NoteNotFound` for a row the purge already took
+        self.refuse_if_purged(&[*old_id, new.id])?;
         // a LOCAL writer closes a note it has in front of them: the old note
         // must exist here (the apply tolerates its absence for the REPLAY of
         // a redacted log, but an operation BORN here without its target
@@ -3455,6 +3480,14 @@ impl Cell {
     /// (v0.6.8, H1: the binding maps it to `null`, as it already does
     /// for a tombstone). A tombstone itself still reads here: restore
     /// and the tombstone listings want it, and the JS `get` hides it.
+    /// v0.6.9 (I2): the bin's copy arm is the OPEN copy only — a copy
+    /// the user took is their note and answers. The old fast guard
+    /// (`conflitto` tag first, predicate only then) died with it: the
+    /// tag is the USER's to change, and the reviewer's re-tagged copy
+    /// walked past the guard into a wrong `Active`. The probe now rides
+    /// in the SAME single read, as the copy arm of [`bin::not_in_bin`]
+    /// verbatim — the same predicate by construction (the SQL texts are
+    /// the same words), and the contract test walks the agreement.
     ///
     /// # Errors
     /// [`CellError::NoteNotFound`] when missing or in the bin.
@@ -3463,13 +3496,18 @@ impl Cell {
         let tx = inner.conn.unchecked_transaction()?;
         let id_str = id.to_string();
         // ONE plain read — the same columns the old two-query read
-        // fetched — then the bin's word only when the note wears the
-        // copy's mark
-        let row: (String, String) = tx
+        // fetched, plus the bin's copy arm as a computed column: no
+        // second round trip, no tag to trust
+        let row: (String, String, bool) = tx
             .query_row(
-                "SELECT frontmatter_json, body FROM notes WHERE id = ?1",
+                "SELECT n.frontmatter_json, n.body,
+                        EXISTS(SELECT 1 FROM conflict_copies cc
+                               JOIN notes o ON o.id = cc.original_id
+                               WHERE cc.copy_id = n.id
+                                 AND o.status = 'deleted' AND cc.open = 1)
+                 FROM notes n WHERE n.id = ?1",
                 [&id_str],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .map_err(|_| CellError::NoteNotFound(id_str.clone()))?;
         let mut note = Note::from_json(
@@ -3478,18 +3516,9 @@ impl Cell {
         )
         .map_err(|e| CellError::Db(format!("corrupt frontmatter_json: {e}")))?;
         note.body = row.1;
-        // the fast guard: only a CONFLICT COPY can follow a lapide, and
-        // every copy carries the `conflitto` tag by construction (the
-        // derivation re-tags its own) — a note without the mark answers
-        // without touching `conflict_copies` at all, and `list()`'s
-        // 10 000 reads pay nothing (measured: a per-get probe cost
-        // +34 ms on the list; the guard took it home). A tombstone
-        // reads here (restore and the tombstone listings want it); a
-        // marked copy whose original holds a lapide does not
-        if note.tags.iter().any(|t| t == "conflitto")
-            && note.status != crate::format::Status::Deleted
-            && bin::note_in_bin(&tx, &id_str)?
-        {
+        // a tombstone reads here (restore and the tombstone listings
+        // want it); an OPEN copy whose original holds a lapide does not
+        if row.2 {
             return Err(CellError::NoteNotFound(id_str));
         }
         Ok(note)
@@ -3614,7 +3643,77 @@ impl Cell {
     /// # Errors
     /// [`CellError::Db`] only on infrastructure failures.
     pub fn verify(&self) -> Result<VerifyReport, CellError> {
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
+        // v0.6.9 (I1): the phantom repair, BEFORE the log is read — the
+        // scrub redacts the phantom's payload in the live file, and the
+        // replay must be built from the REDACTED log or the comparison
+        // would hold the old engine's bytes against the rule (the first
+        // run of this repair taught it: the replay stored the whole
+        // payload it had read a moment earlier). A cell written by
+        // v0.6.7/v0.6.8 may hold a LOCAL put after a purge (the guard
+        // covered arrival and replay, not the local write — the
+        // reviewer's seed 1207…): the live state keeps a row the rule
+        // says does not materialize, and the comparison below would go
+        // red on it forever. verify is where the repair lives (and not
+        // at open) because the audit already reads the whole log, while
+        // `open` must stay at half a millisecond. The repair is the same
+        // dance the arriving purge runs: the state rows, the closure
+        // over the copies, the log scrub, the in-memory indexes. The
+        // DISK hygiene of the bytes the old write left (FTS optimize,
+        // VACUUM) stays what the old phase left it: a `purge` of the
+        // same id completes it, and the purge still works on a purged
+        // id.
+        let mut phantom_purged: Vec<String> = Vec::new();
+        {
+            let mut purged_ids: Vec<Option<String>> = {
+                let mut stmt = inner
+                    .conn
+                    .prepare("SELECT DISTINCT note_id FROM ops WHERE kind = 'purge'")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                rows.flatten().collect()
+            };
+            purged_ids.sort();
+            purged_ids.dedup();
+            let mut phantoms: Vec<Ulid> = Vec::new();
+            for id in purged_ids.into_iter().flatten() {
+                if let Ok(id) = Ulid::from_string(&id) {
+                    let row: i64 = inner.conn.query_row(
+                        "SELECT COUNT(*) FROM notes WHERE id = ?1",
+                        [id.to_string()],
+                        |r| r.get(0),
+                    )?;
+                    if row > 0 {
+                        phantoms.push(id);
+                    }
+                }
+            }
+            if !phantoms.is_empty() {
+                let secure_before: i64 = inner
+                    .conn
+                    .query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+                inner.conn.pragma_update(None, "secure_delete", "ON")?;
+                let tx = inner
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                for id in &phantoms {
+                    ops::purge_state(&tx, id)?;
+                    ops::scrub_log(&tx, id)?;
+                    material::purge_conflict_copies(&tx, id)?;
+                }
+                tx.commit()?;
+                inner
+                    .conn
+                    .pragma_update(None, "secure_delete", secure_before)?;
+                if let Some(st) = &mut inner.index {
+                    for id in &phantoms {
+                        st.idx.remove(&id.to_string());
+                    }
+                }
+                inner.graph_dirt.global = true;
+                inner.lang_hist_dirty = true;
+                phantom_purged = phantoms.iter().map(|i| i.to_string()).collect();
+            }
+        }
         let source_ops = match ops::read_ops(&inner.conn) {
             Ok(ops) => ops,
             Err(e) => {
@@ -3627,6 +3726,7 @@ impl Cell {
                     snapshot_ok: false,
                     mismatch: Some(format!("unreadable log: {e}")),
                     coverage: Vec::new(),
+                    phantom_purged,
                 });
             }
         };
@@ -3876,6 +3976,7 @@ impl Cell {
                 snapshot_ok,
                 mismatch: Some(mismatch.unwrap_or_else(|| format!("replay failed: {e}"))),
                 coverage: Vec::new(),
+                phantom_purged,
             });
         }
         if chain_only {
@@ -3917,6 +4018,7 @@ impl Cell {
             snapshot_ok,
             mismatch,
             coverage,
+            phantom_purged,
         })
     }
 
@@ -3934,6 +4036,144 @@ impl Cell {
 
 /// Build, seal and apply one operation inside one immediate transaction.
 /// The caller holds the write lock and passes the locked `Inner`.
+/// v0.6.9 (I1): every note id a LOCAL write holds as its OBJECT — the
+/// set the purged-id rule refuses. It mirrors [`ops::objects_of`]'s
+/// payload extractions (the supersede's NEW note, the decide's target,
+/// the revert's restored note) and adds what `objects_of` does not
+/// carry: an edge's `note:` endpoints and the note it cites — the
+/// rule's «link e unlink da X o verso X». An unlink names its edge by
+/// id only, so its endpoints are read from the row.
+fn local_write_objects(
+    tx: &rusqlite::Transaction<'_>,
+    kind: OpKind,
+    note_id: Option<Ulid>,
+    payload: &Value,
+) -> Result<Vec<Ulid>, CellError> {
+    let mut ids: Vec<Ulid> = Vec::new();
+    let push = |id: Ulid, ids: &mut Vec<Ulid>| {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    };
+    if let Some(id) = note_id {
+        push(id, &mut ids);
+    }
+    let id_of = |v: Option<&Value>| -> Option<Ulid> {
+        v.and_then(Value::as_str)
+            .and_then(|s| Ulid::from_string(s).ok())
+    };
+    match kind {
+        // the supersede CREATES the new note as much as it closes the
+        // old one: both are its objects
+        OpKind::Supersede => {
+            let new = payload.get("note").and_then(|n| n.get("id"));
+            if let Some(id) = id_of(new) {
+                push(id, &mut ids);
+            }
+        }
+        OpKind::Decide => {
+            if let Some(id) = id_of(payload.get("target")) {
+                push(id, &mut ids);
+            }
+        }
+        OpKind::RevertDecision => {
+            let restored = payload.get("restore_target").and_then(|t| t.get("id"));
+            if let Some(id) = id_of(restored) {
+                push(id, &mut ids);
+            }
+        }
+        OpKind::Link => {
+            let edge = payload.get("edge");
+            for endpoint in [
+                edge.and_then(|e| e.get("src")),
+                edge.and_then(|e| e.get("dst")),
+            ] {
+                if let Some(id) = endpoint
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.strip_prefix("note:"))
+                    .and_then(|s| Ulid::from_string(s).ok())
+                {
+                    push(id, &mut ids);
+                }
+            }
+            if let Some(id) = id_of(edge.and_then(|e| e.get("note_id"))) {
+                push(id, &mut ids);
+            }
+        }
+        OpKind::Unlink => {
+            // the edge is named by id: its endpoints decide the refusal
+            if let Some(edge_id) = payload.get("edge_id").and_then(Value::as_str) {
+                let row: Option<(Option<String>, Option<String>, Option<String>)> = tx
+                    .query_row(
+                        "SELECT src, dst, note_id FROM edges WHERE id = ?1",
+                        [edge_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                if let Some((src, dst, cited)) = row {
+                    for endpoint in [src, dst] {
+                        if let Some(id) = endpoint
+                            .as_deref()
+                            .and_then(|s| s.strip_prefix("note:"))
+                            .and_then(|s| Ulid::from_string(s).ok())
+                        {
+                            push(id, &mut ids);
+                        }
+                    }
+                    if let Some(id) = cited.as_deref().and_then(|s| Ulid::from_string(s).ok()) {
+                        push(id, &mut ids);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(ids)
+}
+
+/// v0.6.9 (I1): the purged-id rule on a connection the caller already
+/// holds (propose and decide sit inside the cell's lock when they ask).
+fn refuse_purged_ids(conn: &Connection, ids: &[Ulid]) -> Result<(), CellError> {
+    for id in ids {
+        if ops::note_purged(conn, id)? {
+            return Err(CellError::NotePurged(id.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// v0.6.9 (I1): the purged-id rule on the LOCAL write path. The guard
+/// of v0.6.7 covers the ARRIVAL and the REPLAY (the purge dominates the
+/// set: the note does not materialize) — not the local write, and the
+/// reviewer's seed `1207186286826530307` showed the hole: a `put` with
+/// a purged id recreated the note in the live state while the replay
+/// refused it, and the state stopped being a function of the
+/// operations. One rule for write, arrival and replay now: the id
+/// never comes back, and the writer is told so, by name (to rewrite
+/// similar content takes a NEW note). The purge itself is exempt —
+/// forgetting an already-forgotten id stays possible, as it is for a
+/// tombstone — and so is the `revert_decision` audit op:
+/// `classify_revert` has ALREADY refused every revert that could
+/// return purged content (its answer is `RevertOutcome::Purged`), and
+/// the op that remains writes bookkeeping (the decisions registry),
+/// never a note — v0.5 had this rule before v0.6.9 did.
+fn refuse_purged_objects(
+    tx: &rusqlite::Transaction<'_>,
+    kind: OpKind,
+    note_id: Option<Ulid>,
+    payload: &Value,
+) -> Result<(), CellError> {
+    if matches!(kind, OpKind::Purge | OpKind::RevertDecision) {
+        return Ok(());
+    }
+    for id in local_write_objects(tx, kind, note_id, payload)? {
+        if ops::note_purged(tx, &id)? {
+            return Err(CellError::NotePurged(id.to_string()));
+        }
+    }
+    Ok(())
+}
+
 fn execute_op(
     inner: &mut Inner,
     kind: OpKind,
@@ -3945,6 +4185,10 @@ fn execute_op(
     let tx = inner
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // v0.6.9 (I1): before anything is minted or leaned on, the purged-id
+    // rule has its word — every note this write holds as its object must
+    // be one the set did not forget
+    refuse_purged_objects(&tx, kind, note_id, &payload)?;
     // Inside the write transaction: align with the newest HLC in the log
     // before ticking. Another process may have written since we opened
     // (the daemon and the CLI share a cell); without this, an operation

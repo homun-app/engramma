@@ -1247,3 +1247,49 @@ test('conflicts(): empty on a quiet cell; resolveConflict refuses cleanly', asyn
     await e.close();
   }
 });
+
+// v0.6.9 (I1): «forgotten forever» means the id does not come back. A
+// purged id answers NOTE_PURGED on every write that touches it — the
+// path is real with Homun: re-importing an old export or a backup that
+// still holds the purged note does exactly this put. To write similar
+// content again takes a NEW note; the import report names the skipped
+// ids as `skippedPurged` (the CLI's JSON — docs/node.md tells how
+// Homun reads it).
+test('NOTE_PURGED: a purged id never comes back (I1)', async () => {
+  const e = await engine();
+  try {
+    const cell = await e.cell('oblio-js');
+    const n = await cell.put({
+      body: 'segreto quokkaviolaceo zibellinotremante',
+      title: 'Segreto',
+      source: 's',
+      confidence: 'stated',
+    });
+    const purged = await cell.purge(n.id, 'diritto all’oblio');
+    assert.equal(purged.scrubbed, true, `${JSON.stringify(purged)}`);
+
+    // the same id again (an old export, a backup): refused, by code,
+    // with the id in the message
+    await assert.rejects(
+      cell.put({ id: n.id, body: 'il ritorno', source: 's', confidence: 'stated' }),
+      // (the engine speaks ULIDs upper-case, the binding lower-case:
+      // the compare is case-blind)
+      (err) =>
+        err.code === 'NOTE_PURGED' &&
+        err.message.toUpperCase().includes(n.id.toUpperCase()),
+    );
+    await assert.rejects(
+      cell.patch(n.id, { body: 'il ritorno in patch' }),
+      (err) => err.code === 'NOTE_PURGED',
+    );
+    // a NEW id writes normally: the refusal is about the id, not the pen
+    const fresh = await cell.put({ body: 'appunto nuovo', source: 's', confidence: 'stated' });
+    assert.equal((await cell.get(fresh.id)).body, 'appunto nuovo');
+    // verify stays green, and the report says nothing was repaired
+    const v = await cell.verify();
+    assert.equal(v.ok, true, `${JSON.stringify(v)}`);
+    assert.deepEqual(v.phantomPurged, [], `${JSON.stringify(v)}`);
+  } finally {
+    await e.close();
+  }
+});

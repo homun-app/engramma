@@ -90,6 +90,14 @@ pub enum CellError {
     /// later operation. The message names the operations in the way.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// v0.6.9 (I1): the write touches an id the set holds a PURGE of.
+    /// «Forgotten forever» means the id does not come back: every local
+    /// write that has it as its object is refused (the arrival and the
+    /// replay keep the v0.6.7 rule — the purge dominates the set, the
+    /// operation rests redacted); to write similar content again takes a
+    /// NEW note, with a new id. The message carries the id.
+    #[error("note {0} is purged: that id never comes back — write a new note")]
+    NotePurged(String),
 }
 
 /// Errors returned by import/export.

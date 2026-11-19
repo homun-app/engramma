@@ -9398,7 +9398,21 @@ binding JS). È il contrario della convenzione «sempre alla testa» di
 ogni test di compattazione: il terreno dove il difetto non si vedeva.
 Una conseguenza onesta: per una cella non condivisa la frontiera È la
 testa (`stable_frontier`), quindi i tagli sotto la testa esistono solo
-nelle celle condivise — dove la sync li produce davvero.
+nelle celle condivise — dove la sync li produce davvero. **(v0.6.9, I5
+— correzione dichiarata, la frase era falsa):** la conseguenza non
+regge. In una cella non condivisa la frontiera è la testa, ma il taglio
+si può chiedere comunque sotto: `compact(head - keepLast)` taglia
+sotto, come il binding JS fa di suo (`keepLast`) e come la stessa
+proprietà di questa fase disegna (`head − 0/1/2`, senza ACK e senza
+condivisione). I tagli sotto la testa esistono in ogni cella; la
+frontiera stabile non è l'unica strada per arrivarci. Quello che resta
+vero della frase è l'ultima parte: è la **sync** a rendere il secondo
+strato di H2 un difetto vivo, perché serve quello che solo la sync
+produce — arrivi fuori ordine che attraversano il taglio. Su un
+dispositivo solo la storia è una linea, gli arrivi non si incrociano
+con il taglio, e l'ancora non invecchia: il difetto dichiarato resta
+legato alla sync non perché i tagli sotto la testa non esistano senza,
+ma perché senza di lei nessuna scrittura li attraversa fuori ordine.
 
 **Il primo strato, chiuso** (seme `2864860944329123852`, caso 79,
 trovato dalla proprietà appena ha camminato la strada vera). Il corpo di
