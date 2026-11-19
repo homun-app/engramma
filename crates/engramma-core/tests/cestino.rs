@@ -6,6 +6,14 @@
 //! lived in four hand-written filters and `note_ids()`/`list()` and
 //! `get()` forgot the copy: the reviewer's proof (below) is that hole.
 //!
+//! v0.6.9 (I2) narrows the rule to the copies NOBODY took: a copy is
+//! bin when the original holds a lapide AND the copy is still OPEN. A
+//! copy the user TOOK (modified — the witness (a) of DESIGN § 4.3) is
+//! the user's own note and lives its own life, lapide or no lapide. The
+//! reviewer's second proof (below) is the hole the tag shortcut left:
+//! `get()` asked the predicate only behind the user-writable
+//! `conflitto` tag.
+//!
 //! The contract test walks EVERY public read of a Cell that speaks
 //! notes — the list sits in [`READS_THE_NOTES`], one place — and the
 //! gate (`every_public_read_is_classified`) fails when a new `pub fn`
@@ -87,6 +95,103 @@ fn zz_the_copy_of_a_deleted_note_is_in_note_ids_and_get() {
     match b.get(&copy) {
         Err(engramma_core::CellError::NoteNotFound(_)) => {}
         other => panic!("get(copy) must answer like a deleted note (NotFound); got {other:?}"),
+    }
+}
+
+/// v0.6.9 (I2): the reviewer's second proof, verbatim in shape
+/// (`zz_review_v068.rs` of the verification). The user TAKES the open
+/// copy — a patch on its id, the witness (a) that closes it — and
+/// re-tags it (the tag is the user's, `conflitto` is gone). After the
+/// `delete` of the original the copy is THE USER'S NOTE: it stays
+/// visible, in `note_ids()` AND in `get()`. The v0.6.8 read hid it in
+/// `note_ids()` (the copy arm looked at open AND closed copies) while
+/// `get()` showed it `Active` behind the tag shortcut — two doors, two
+/// answers.
+#[test]
+fn zz_the_taken_copy_of_a_deleted_note_is_visible_everywhere() {
+    let init = shared_init("zz-lapide8");
+    let (a, wa) = cell_with("a");
+    let (b, wb) = cell_with("b");
+    a.ingest_op(&init).unwrap(/* t */);
+    b.ingest_op(&init).unwrap(/* t */);
+    let note = base_note(9, "uno\ndue\ntre");
+    let id = note.id;
+    wa.store(K + 1, Ordering::SeqCst);
+    a.put_note(&note, "homun:user").unwrap(/* t */);
+    for op in &union(&a, &b) {
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    wa.store(K + 2, Ordering::SeqCst);
+    a.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("uno\nzibellinoxb\ntre".into()),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    wb.store(K + 5, Ordering::SeqCst);
+    b.patch_note(
+        &id,
+        &NotePatch {
+            body: Some("uno\nDUE-di-B\ntre".into()),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    let copies = open_copies(&b, &id);
+    assert_eq!(copies.len(), 1);
+    let copy = Ulid::from_string(&copies[0].0).unwrap(/* t */);
+    // the user takes the copy: a patch on its id (the witness (a)) that
+    // also re-tags it — the tag is the user's now
+    wb.store(K + 7, Ordering::SeqCst);
+    b.patch_note(
+        &copy,
+        &NotePatch {
+            tags: Some(vec!["mio".into()]),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    // the take closed the copy: the derivation says 0/1 (open/visible)
+    let closed = b.debug_column(&format!(
+        "SELECT open || '/' || visible FROM conflict_copies WHERE copy_id = '{copy}'"
+    ))
+    .unwrap(/* t */);
+    assert_eq!(
+        closed.first().map(String::as_str),
+        Some("0/0"),
+        "the user's patch is the witness (a): the copy is closed \
+(open=0; the derivation's window bit goes with it)"
+    );
+    wb.store(K + 9, Ordering::SeqCst);
+    b.delete_note(&id, "homun:user").unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    let ids = b.note_ids().unwrap(/* t */);
+    assert!(
+        ids.contains(&copy),
+        "a taken copy is the user's note: note_ids (list()) keeps it"
+    );
+    match b.get(&copy) {
+        Ok(n) => assert!(
+            n.tags.iter().any(|t| t == "mio"),
+            "get answers the taken copy with the user's tags"
+        ),
+        other => panic!("get(copy) must answer the user's note; got {other:?}"),
     }
 }
 
@@ -203,6 +308,92 @@ fn stage_with_bin_copy(tag: &str) -> (Kept, Ulid, Ulid, Ulid) {
     // leak before the fix
     b.embed_pending(&FakeEmbedder, 64).unwrap(/* t */);
     // the bin: the original goes, the copy follows the lapide
+    wb.store(K + 9, Ordering::SeqCst);
+    b.delete_note(&original, "homun:user").unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    (b, original, copy, alive)
+}
+
+/// v0.6.9 (I2): the same stage, with the user TAKING the copy before the
+/// delete — a header patch on its id (the witness (a)) that re-tags it
+/// `mio`. The copy closes; when the original goes to the bin, the copy
+/// is the user's note and STAYS. Returns `(b, original, copy, alive)`.
+fn stage_with_taken_copy(tag: &str) -> (Kept, Ulid, Ulid, Ulid) {
+    let init = shared_init(tag);
+    let (a, wa) = cell_with("a");
+    let (b, wb) = cell_with("b");
+    a.ingest_op(&init).unwrap(/* t */);
+    b.ingest_op(&init).unwrap(/* t */);
+    let note = base_note(9, "prima\nseconda\nterza");
+    let original = note.id;
+    let alive_note = base_note(11, ALIVE_BODY);
+    let alive = alive_note.id;
+    wa.store(K + 1, Ordering::SeqCst);
+    a.put_note(&note, "homun:user").unwrap(/* t */);
+    wa.store(K + 2, Ordering::SeqCst);
+    a.put_note(&alive_note, "homun:user").unwrap(/* t */);
+    for op in &union(&a, &b) {
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    wa.store(K + 3, Ordering::SeqCst);
+    a.patch_note(
+        &original,
+        &NotePatch {
+            body: Some(LOSER_BODY.into()),
+            tags: Some(vec!["spicchio".into()]),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    wb.store(K + 5, Ordering::SeqCst);
+    b.patch_note(
+        &original,
+        &NotePatch {
+            body: Some(WINNER_BODY.into()),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    let list = b.conflicts().unwrap(/* t */);
+    assert_eq!(list.len(), 1, "the conflict is open before the take");
+    let copy = list[0].copy_id;
+    // the take: the user's patch on the copy's id, with their own tag
+    wb.store(K + 7, Ordering::SeqCst);
+    b.patch_note(
+        &copy,
+        &NotePatch {
+            tags: Some(vec!["mio".into()]),
+            ..Default::default()
+        },
+        "homun:user",
+    )
+    .unwrap(/* t */);
+    for op in &union(&a, &b) {
+        a.ingest_op(op).unwrap(/* t */);
+        b.ingest_op(op).unwrap(/* t */);
+    }
+    let closed = b.debug_column(&format!(
+        "SELECT open || '/' || visible FROM conflict_copies WHERE copy_id = '{copy}'"
+    ))
+    .unwrap(/* t */);
+    assert_eq!(
+        closed.first().map(String::as_str),
+        Some("0/0"),
+        "the take closed the copy (witness (a); the derivation's \
+window bit goes with it)"
+    );
+    // the vectors of the taken note: the semantic arm has something to say
+    b.embed_pending(&FakeEmbedder, 64).unwrap(/* t */);
+    // the original goes to the bin all the same
     wb.store(K + 9, Ordering::SeqCst);
     b.delete_note(&original, "homun:user").unwrap(/* t */);
     for op in &union(&a, &b) {
@@ -488,6 +679,186 @@ fn the_reopen_brings_the_copy_back_whole() {
     assert!(
         hits.iter().any(|h| h.note.id == copy),
         "the copy is searchable again"
+    );
+}
+
+/// v0.6.9 (I2): the same walk as the bin's, on the copy the user TOOK
+/// before the delete — every read answers it like the living note it
+/// now is. One predicate means one flip, in the other direction.
+#[test]
+fn the_taken_copy_answers_every_read_like_a_living_note() {
+    let (b, original, copy, alive) = stage_with_taken_copy("contratto-v069");
+    let mut walked: Vec<&'static str> = Vec::new();
+    let copy_s = copy.to_string();
+
+    // note_ids: the taken copy IS a living note
+    walked.push("note_ids");
+    let ids = b.note_ids().unwrap(/* t */);
+    assert!(ids.contains(&alive), "control: the alive note is listed");
+    assert!(
+        ids.contains(&copy),
+        "note_ids hides the taken copy (the user's note)"
+    );
+
+    // note_ids_all: living notes are there, tombstones included
+    walked.push("note_ids_all");
+    let all = b.note_ids_all().unwrap(/* t */);
+    assert!(all.contains(&original), "control: the tombstone stays");
+    assert!(all.contains(&copy), "note_ids_all hides the taken copy");
+
+    // get: the copy reads, with the user's tag
+    walked.push("get");
+    let got = b.get(&copy).unwrap(/* t */);
+    assert!(
+        got.tags.iter().any(|t| t == "mio"),
+        "get answers the taken copy with the user's tags"
+    );
+
+    // history / note_version: as ever
+    walked.push("history");
+    b.history(&copy).unwrap(/* t */);
+    walked.push("note_version");
+    b.note_version(&copy).unwrap(/* t */);
+
+    // search, both views: the copy's token answers
+    walked.push("search");
+    let mut wide = Query::text("occhiello turchino").k(10);
+    wide.filters.include_quarantined = true;
+    for q in [Query::text("occhiello turchino").k(10), wide] {
+        let hits = b.search(&q).unwrap(/* t */);
+        assert!(
+            hits.iter().any(|h| h.note.id == copy),
+            "search does not answer the taken copy (quarantine={:?})",
+            q.filters.include_quarantined
+        );
+    }
+    walked.push("search_with_now");
+    let now = OffsetDateTime::from_unix_timestamp(1_810_000_000).unwrap(/* fixed */);
+    let hits = b
+        .search_with_now(&Query::text("occhiello turchino").k(10), now)
+        .unwrap(/* t */);
+    assert!(hits.iter().any(|h| h.note.id == copy));
+
+    // the semantic arm: the vectors say the taken note
+    walked.push("search_semantic");
+    walked.push("search_semantic_with_now");
+    let sem = Semantic::new(Arc::new(FakeEmbedder));
+    let outcome = b
+        .search_semantic_with_now(&Query::text("occhiello turchino").k(10), now, &sem)
+        .unwrap(/* t */);
+    assert!(
+        outcome.hits.iter().any(|h| h.note.id == copy),
+        "the semantic arm does not answer the taken copy"
+    );
+
+    // neighbors: the copy is a node again
+    walked.push("neighbors");
+    let near = b.neighbors("Namorio", 1, &[], false).unwrap(/* t */);
+    assert!(
+        near.iter()
+            .any(|n| n.note_id.as_deref() == Some(copy_s.as_str())),
+        "neighbors does not name the taken copy from Namorio"
+    );
+
+    // path: a walk may pass through the copy (it is the only Namorio)
+    walked.push("path");
+    if let Some(steps) = b.path("Namorio", "Salerno", false).unwrap(/* t */) {
+        assert!(
+            steps.iter().any(|s| s.from == format!("note:{copy}") || s.to == format!("note:{copy}")),
+            "a path out of Namorio does not pass through the taken copy"
+        );
+    }
+
+    // tags: the user's tag counts one (the copy carries it)
+    walked.push("tags");
+    for include in [false, true] {
+        let counted = b.tags("mio", include).unwrap(/* t */);
+        let total: usize = counted
+            .iter()
+            .map(|t| usize::try_from(t.note_count).unwrap_or(0))
+            .sum();
+        assert_eq!(total, 1, "tags counts the taken copy (quarantine={include})");
+    }
+
+    // entities: the mention binds no title — nothing to assert beyond
+    // the call itself (the original's title is not Namorio)
+    walked.push("entities");
+    b.entities("Namorio").unwrap(/* t */);
+
+    // timeline: the entity's story has the copy's chapter again
+    walked.push("timeline");
+    for include in [false, true] {
+        let hits = b.timeline("Namorio", include).unwrap(/* t */);
+        assert!(
+            hits.iter().any(|h| h.note.id == copy),
+            "timeline hides the taken copy (quarantine={include})"
+        );
+    }
+
+    // conflicts: the listing of OPEN copies does not name it (the take
+    // closed it — that is what a take IS)
+    walked.push("conflicts");
+    assert!(b
+        .conflicts()
+        .unwrap(/* t */)
+        .iter()
+        .all(|c| c.copy_id != copy));
+
+    // conflict: the read BY ID stays honest — originalDeleted: true
+    walked.push("conflict");
+    let detail = b.conflict(&copy).unwrap(/* t */);
+    assert!(detail.original_deleted, "the by-id read names the lapide");
+
+    // the queue: no pending row (the copy is not a proposal)
+    walked.push("proposals");
+    let queue = b
+        .proposals(&engramma_core::ProposalsFilter::default())
+        .unwrap(/* t */);
+    assert!(queue.iter().all(|p| p.id != copy));
+
+    // consolidation: the copy's own contradiction (two lives_in) is a
+    // candidate again — it was hidden with the copy
+    walked.push("consolidation_candidates");
+    let cfg = engramma_core::Consolidation::default();
+    let candidates = b.consolidation_candidates(50, &cfg).unwrap(/* t */);
+    assert!(
+        candidates.iter().any(|c| c.a == copy || c.b == copy),
+        "consolidation does not propose the taken copy's contradiction"
+    );
+
+    // resolve_visible_note_id: the copy exists for the surfaces
+    walked.push("resolve_visible_note_id");
+    let suffix: String = copy_s.chars().rev().take(8).collect();
+    let resolved = b
+        .resolve_visible_note_id(&suffix)
+        .expect("resolve_visible_note_id hides the taken copy");
+    assert_eq!(resolved, copy);
+
+    // the export: the copy's file is written
+    let dir = tempfile::tempdir().unwrap(/* t */);
+    let summary = engramma_core::port::export(&b, dir.path()).unwrap(/* t */);
+    assert_eq!(
+        summary.written, 2,
+        "the alive note AND the taken copy are written ({summary:?})"
+    );
+    assert!(
+        summary.tombstones >= 1,
+        "the deleted original counts as a tombstone ({summary:?})"
+    );
+
+    // verify stays green: hiding is a read rule, not a state change
+    assert!(b.verify().unwrap(/* t */).ok(), "verify after the delete");
+
+    // the walk covered the whole list
+    let missing: Vec<&str> = READS_THE_NOTES
+        .iter()
+        .filter(|n| !walked.contains(n))
+        .copied()
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the contract forgot to walk: {missing:?} — walk them or take \
+         them out of READS_THE_NOTES (and say why in the REPORT)"
     );
 }
 
