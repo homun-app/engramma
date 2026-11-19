@@ -8,3 +8,4 @@
 # una suite che parte già rossa non misura niente.
 crates/engramma-core/tests/props.rs compaction_keeps_verify_and_state 11476711120049502961,10840318560449401940 # REPORT.md, v0.6.8 H2 secondo strato: l'ancora della rimaterializzazione invecchia col taglio (sync: servono arrivi fuori ordine)
 crates/engramma-core/tests/convergence.rs no_body_text_is_lost 6467221993839934612,9368190224066329310 # REPORT.md, v0.6.8 «Difetti nuovi» 2: la perdita di testo esposta dal cestino
+crates/engramma-core/tests/props.rs replay_equals_state 14903861504949011020 # REPORT.md, v0.6.9 «Difetti nuovi» 1: la metà bersaglio di una decide rigioca sopra la purga della proposta (preesistente fra v0.6.3 e v0.6.8; la correzione è un cambio di derivazione)
