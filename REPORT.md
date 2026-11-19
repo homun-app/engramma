@@ -9837,3 +9837,374 @@ La fusione a righe, il proprietario delle righe e i difetti della sync
 vengono dopo.
 
 **La sync resta chiusa**, come scrive il REPORT stesso.
+
+# REPORT — Engramma v0.6.9 (quello che è dimenticato non torna, e la caccia non si ferma più a metà)
+
+Fase breve, l'ultima prima della release locale: Engramma dentro
+Homun, un dispositivo solo, senza sync. Base `main` @ `6a005be`
+(verifica v0.6.8 del revisore). Cinque punti: I1 l'id purgato che non
+torna, I2 il cestino delle copie che nessuno ha preso, I3 la caccia
+intera, I4 lo SHA letto dal tag, I5 la frase falsa del REPORT.
+L'ALPN resta `engramma/sync/4`: I1 rende la scrittura locale coerente
+con una regola di derivazione che c'è già (la purga domina l'insieme),
+I2 è una regola di lettura. Nessun cambio alla derivazione.
+
+## I1 — un id purgato non torna (bloccante per la release locale)
+
+**Il difetto** (regressione della v0.6.7, trovato dalla caccia del
+revisore): la proprietà `compaction_keeps_verify_and_state`, seme
+`1207186286826530307`, cade su una cella sola, anche senza
+compattazione. La nota nasce, viene purgata, e una `put` locale con lo
+stesso id la ricrea nel vivo; il rigioco applica la regola della
+v0.6.7 («la purga domina l'insieme», la guardia in `apply_half` e
+`materialize_note`) e non la ricrea. Lo stato vivo smette di essere
+funzione delle operazioni, e `verify` è rosso. La guardia della
+v0.6.7 copre l'arrivo e il rigioco, non la scrittura locale: con Homun
+il percorso è reale — reimportare un'esportazione vecchia o un backup
+che contiene la purgata fa proprio quella `put`.
+
+**La regola, una sola per scrittura, arrivo e rigioco:** quando
+l'insieme contiene una purga della nota X, ogni scrittura locale che
+ha X come oggetto è rifiutata con `CellError::NotePurged` (Rust) e il
+codice `NOTE_PURGED` (JS), l'id nel messaggio. Per riscrivere un
+contenuto simile serve una nota nuova, con un id nuovo. La strada
+della lapide (riaprire con `base` = la purga) è scartata: riporterebbe
+in vita l'id che l'utente ha chiesto di dimenticare.
+
+- **La guardia** sta in `execute_op`, l'imbuto di ogni scrittura
+  locale, prima che qualunque id venga coniato o appoggiato: la sonda
+  `note_purged` è un `EXISTS` che passa da `idx_op_objects_object` e
+  dall'indice unico di `ops.op_id` — due sonde indicizzate, niente
+  scansioni. Il piano, letto dal motore stesso (`EXPLAIN QUERY PLAN`
+  sulla cella d'oro): `SEARCH oo USING INDEX idx_op_objects_object
+  (object=?)` + `SEARCH o USING INDEX sqlite_autoindex_ops_1 (op_id=?)`.
+- **L'elenco delle operazioni** della specifica era: `put`, `patch`,
+  `restore`, `setStatus`, `confirm`, `link` e `unlink` da X o verso X,
+  `supersede` che crea o chiude X, `propose` su X. **Aggiunte trovate:
+  `delete`** (ha X come oggetto come le altre) **e `decide` il cui
+  bersaglio è X** (la decisione chiuderebbe una nota dimenticata; il
+  rifiuto anticipato evita che il controllo d'esistenza risponda
+  `NoteNotFound` per una riga che la purga ha già portato via — lo
+  stesso anticipo sta in `supersede` e `propose`). **Esenti accanto
+  alla `purge`: `revert_decision`**, che ha la sua risposta tipizzata
+  fin dalla v0.5 (`RevertOutcome::Purged`: «niente torna», col suo op
+  di audit) e `classify_revert` ha già rifiutato ogni percorso che
+  potrebbe resuscitare il contenuto: l'op che resta scrive solo il
+  registro delle decisioni. Un test chiude il contratto.
+- **L'import non si ferma.** La cartella markdown, l'import Obsidian e
+  la vista della cartella saltano la nota purgata e la nominano:
+  `ImportSummary.skipped_purged` (`skippedPurged` nel JSON della CLI,
+  con la riga di salto che porta l'id), `SyncReport.skipped_purged`
+  nel vault (il file resta al suo posto, nominato a ogni
+  riconciliazione finché l'utente non lo butta o lo riscrive). Come
+  Homun lo legge è in `docs/node.md`.
+- **Le celle già scritte** dalla v0.6.7/v0.6.8 con una put dopo la
+  purga si riparano **al primo `verify`**, che le nomina in
+  `phantom_purged`: la nota sparisce dal vivo secondo la regola, e lo
+  stato torna funzione delle operazioni. Perché `verify` e non
+  `open`: l'audit già legge tutto il registro (le purge sono già in
+  mano lì), mentre `open` deve restare al mezzo millisecondo. La
+  riparazione è la stessa danza della purga in arrivo (le righe di
+  stato, la chiusura sulle copie, lo scrub del registro con
+  `secure_delete` attorno) — e sta **prima** della lettura del
+  registro, o il rigioco conterebbe i byte interi del fantasma contro
+  la regola appena scritta: la prima corsa della riparazione l'ha
+  imparato (`state differs around: proposals`, il payload della put
+  ricostruito intero). L'igiene del disco dei byte lasciati
+  dall'engine vecchio (optimize, VACUUM) resta quella della fase
+  vecchia: una `purge` dello stesso id la completa, e la purga
+  funziona ancora su un id purgato come su una lapide.
+- **Il costo** sta nelle misure, sotto: l'inserimento è a −4,7% dalla
+  v0.6.3 (soglia +5%), e il piano della sonda è indicizzato.
+
+**Il test del fantasma usa una cella vera della v0.6.8.**
+`tests/golden/v068-put-after-purge.sqlite` è scritto dal motore
+v0.6.8 (worktree sul tag `fase-v0.6.8`, orologio e conio fissi, il
+programma nello scratchpad e non nel repo): una nota (…895), una
+purga, e la put locale che quel motore accettava. La sua `verify`
+sulla v0.6.8 dice `ok=false` — il difetto, catturato in un file.
+L'engine di oggi la apre, la ripara al primo `verify`, la nomina, e
+la seconda `verify` è verde e non ripara più niente.
+
+## I2 — una copia presa dall'utente è sua
+
+**Il difetto** (sonda `zz_review_v068.rs` del revisore): `get()`
+chiedeva il predicato del cestino solo se la nota portava il tag
+`conflitto` — e il tag è dell'utente. L'utente prende la copia (la
+modifica: il testimone (a), la copia si chiude), le cambia i tag; dopo
+il `delete` dell'originale, `note_ids()` la nascondeva (il braccio
+della copia guardava `conflict_copies` aperte E chiuse) mentre `get()`
+la mostrava `Active` dietro la scorciatoia. Due porte, due risposte.
+
+**La regola:** il cestino contiene le copie che nessuno ha preso. Una
+copia sta nel cestino quando l'originale tiene una lapide **e la copia
+è ancora aperta**; una copia che l'utente ha preso è una nota sua e
+segue la propria vita. Nel predicato (`bin.rs`, un posto solo) il
+braccio della copia porta `open = 1` — `not_in_bin`, `note_in_bin`,
+`bin_note_ids` e la risoluzione visibile parlano tutti da lì.
+
+- **Niente più scorciatoia sul tag**: la sonda di `get()` è il braccio
+  stesso della copia, le stesse parole SQL nella stessa lettura —
+  stessa risposta **per costruzione**, e il contratto di `cestino.rs`
+  cammina l'accordo. Il prezzo iniziale era vero: la passeggiata della
+  lista (diecimila `get()`) pagava il piano della sonda per ogni
+  chiamata, e `list()` andava da 42,7 a 73,7 ms — oltre tre volte la
+  soglia. `prepare_cached` (la stessa SQL, il piano pagato una volta)
+  l'ha riportata a **34,6 ms: −19% contro la v0.6.8** — la sonda costa
+  ora meno della scorciatoia che ha sostituito.
+- **Il contratto** prende il caso della copia presa in tutta la
+  passeggiata (`READS_THE_NOTES`): `list`, `get`, le due ricerche, il
+  braccio vettoriale, i vicini, i percorsi, i tag, la linea del tempo,
+  il consolidamento (la contraddizione due `lives_in` torna candidata),
+  la risoluzione visibile, l'esportazione — la copia presa risponde
+  come la nota viva che ormai è. `conflicts()` non la elenca (è chiusa:
+  è questo che «presa» significa) e `conflict(copyId)` risponde
+  `NotFound` — non c'è più conflitto da descrivere. La copia aperta
+  non presa segue la lapide come nella v0.6.8, e la riapertura torna
+  tutto: quei due test restano verdi, identici.
+- **Confine dichiarato**: le righe «conflitto» della coda delle
+  proposte (la copia d'agente in quarantena) restano nascoste finché
+  l'originale tiene la lapide, come nella v0.6.7: sono righe di
+  derivazione, non note — la visibilità della NOTA presa è cambiata,
+  il quadro della coda no. E una copia chiusa dal testimone (b)
+  (contenuta in una scrittura successiva, nessuno l'ha presa) torna
+  visibile come le prese: la regola della specifica è «aperta =
+  cestino», e il testo di una (b) vive comunque nella riga del
+  vincitore. Scritto qui perché la prossima fase sappia dove guardare.
+
+## I3 — la caccia non si ferma più a metà
+
+Il difetto: `caccia.sh` si fermava al primo rosso, e nella v0.6.8 un
+difetto noto lasciò 22 proprietà su 26 senza giudizio — con il difetto
+I1 fra quelle. Ora:
+
+- la caccia gira **sempre tutte** le proprietà dell'inventario e tutte
+  le corse della suite: un rosso si scrive, il registro intero sta in
+  `target/caccia/<inizio>/`, e si va avanti. Alla fine stampa il
+  riepilogo ed esce con codice non zero se c'è almeno un rosso;
+- **i difetti aperti** stanno in `crates/engramma-core/tests/
+  open-defects.txt` (una riga per difetto: proprietà, semi, riferimento
+  al REPORT — oggi i due della sync: l'ancora che invecchia e la
+  perdita di testo esposta dal cestino). Un test dell'inventario
+  controlla che ogni proprietà nominata esista, che ci sia un seme e un
+  riferimento; un altro che i semi stiano **fuori** dai file delle
+  regressioni (il seme `1207…` entrato nella v0.6.8 faceva cadere le
+  cinque corse della suite su un difetto dichiarato — il revisore lo
+  tolse a mano, ora lo impedisce la macchina). Limite dichiarato nel
+  test: il seme dev'essere in forma decimale (il commento «shrinks to
+  seed = N» che proptest scrive accanto al digest `cc`); una riga
+  `cc` senza seme nel commento resta invisibile;
+- una proprietà con un difetto aperto **si gira comunque**: non si
+  salta, perché guarda anche altro. Il giudizio («è il difetto
+  dichiarato o uno nuovo?», con la riproduzione) sta nel REPORT,
+  scritto a mano — la tabella della caccia è qui sotto;
+- per ogni corsa: proprietà, casi, esito, tempo, e per i rossi il
+  **seme minimo** che proptest stampa dopo lo shrinking.
+
+**Il sabotaggio di prova**: sul ramo `sabota-caccia` (buttato) una
+proprietà finta che cade sempre, messa a metà dell'inventario, con
+`caccia.sh 32 0`: le proprietà dopo il rosso sono girate fino
+all'ultima (`rfc1918_is_never_public`), il rosso porta il suo
+«minimal failing input: seed = 0» e il registro, il riepilogo dice
+«1 rossi», e l'uscita è **1**.
+
+## I4 — lo SHA si legge dal tag, non da prima
+
+Due volte in quattro fasi (v0.6.5 e v0.6.8) il REPORT dichiarò lo SHA
+di una build fatta prima di un commit che toccava i sorgenti. La
+regola adesso sta nella macchina: `scripts/build-sha.sh` rifiuta un
+albero sporco (l'elenco dei file sporchi in chiaro), costruisce con
+`npm run build` sotto `nice -n 19`, e stampa il commit su cui ha
+costruito (con il tag esatto, quando c'è) e, per i tre file
+dell'aggancio, dimensione e SHA256 letti dal disco dopo la build.
+L'ultimo passo della fase è lanciarlo sul tag e riportare qui quello
+che stampa — i numeri sono in coda, nella sezione della chiusura.
+
+## I5 — la frase falsa del REPORT
+
+La v0.6.8 scriveva «i tagli sotto la testa esistono solo nelle celle
+condivise». Non è così: in una cella non condivisa la frontiera è la
+testa, ma `compact(head - keepLast)` taglia comunque sotto — come il
+binding JS fa di suo e come la stessa proprietà della v0.6.8 disegnava
+(`head − 0/1/2`, senza ACK). Corretto **per dichiarazione**, senza
+cancellare niente, al suo posto nel REPORT della v0.6.8. Quello che
+resta vero dell'idea: il secondo strato di H2 resta un difetto **della
+sync** non perché i tagli sotto la testa non esistano senza, ma perché
+serve quello che solo la sync produce — arrivi fuori ordine che
+attraversano il taglio. Su un dispositivo solo la storia è una linea,
+l'ancora non invecchia.
+
+## Le misure, contro `fase-v0.6.3` (e la v0.6.8 per la lista)
+
+Le coppie alternate (base = worktree sul tag, fase = `main` al commit
+finale dei sorgenti), banco da 10 000 note, le corse senza `nice`,
+`uptime` accanto a ogni corsa. Il carico è stato quello dell'utente al
+lavoro: **4,2–5,8** per tutta la durata — i numeri vanno letti così.
+
+- **Inserimento** (note/s, media dei due corpus per coppia):
+
+  | coppia | base (v0.6.3) | fase | delta |
+  |---|---|---|---|
+  | 1 | 2710 / 2709 → 2709,5 | 2612 / 2610 → 2611 | −3,6% |
+  | 2 | 2707 / 2697 → 2702 | 2501 / 2507 → 2504 | −7,3% |
+  | 3 (ordine ruotato) | 2691 / 2711 → 2701 | 2589 / 2588 → 2588,5 | −4,2% |
+  | 4 | 2705 / 2705 → 2705 | 2597 / 2606 → 2601,5 | −3,8% |
+
+  **Media: base 2704, fase 2576 → −4,7%**, dentro il +5%. La coppia 2
+  è l'anomala (−7,3% a carico 4,8): riportata com'è. Il costo atteso
+  della guardia è una sonda EXISTS indicizzata per scrittura (~µs
+  contro i ~385 µs per nota del banco: l'1%), e il piano è quello
+  dichiarato sopra. Le ricerche p50/p95 della tabella del banco sono
+  pari (0,60–0,62 / 0,72–0,75 ms).
+- **La sonda della purga** (10 000 note, compattazione con istantanea,
+  una purga; la sonda copiata nel worktree della base come le fasi
+  precedenti fecero — il motore è quello della base):
+  coppia 1: base 129,2 → fase 133,1 ms; coppia 2: base 129,4 → fase
+  133,8 ms. **Media 129,3 → 133,5 ms: +3,3%**, dentro il +10%.
+- **`list()` contro `fase-v0.6.8`** (la sonda: gli id viventi + una
+  lettura per id, tre passate, mediana): base 43,5 / 42,3 ms →
+  **fase 34,7 / 34,4 ms: −19,5%**, dentro il +5% — dalla parte del
+  risparmio. È il `prepare_cached` del `get()` (I2): la sonda del
+  cestino costa meno della scorciatoia del tag che ha sostituito. Le
+  ricerche della stessa sonda sono pari (p50 0,60 contro 0,60–0,62 ms).
+
+## Le corse
+
+- **Il contratto JS**: `npm test` **57/57** — i 56 della v0.6.8
+  identici e verdi, più il nuovo del `NOTE_PURGED` (il codice stabile,
+  l'id nel messaggio, una nota nuova che scrive normale, `verify`
+  verde). `test:electron`: **57/57**.
+- **La build** (`scripts/build-sha.sh`, {{BUILD_COMMIT}}): {{BUILD_SHA}}.
+
+## La caccia, sul commit finale
+
+`scripts/caccia.sh` nuovo (I3), in release, a priorità minima (`nice` 19,
+due job, due fili, `caffeinate`), sul commit finale dei sorgenti
+(`39f7621`). **Girata intera: 26 proprietà a 20 000 casi + 5 corse
+della suite a 2 048, 15 475 s in tutto, uscita 1** — il rosso non ha
+fermato niente (era il punto).
+
+| proprietà | casi | esito | tempo |
+|---|---|---|---|
+| `the_fleet_converges` | 20 000 | verde | 961 s |
+| `every_copy_equals_its_reconstruction` | 20 000 | verde | 861 s |
+| `no_copy_closes_without_a_witness` | 20 000 | verde | 640 s |
+| `no_body_text_is_lost` | 20 000 | verde | 646 s |
+| `the_new_diff3_decides_as_the_v064_one` | 20 000 | verde | 3 s |
+| `the_long_alignment_is_still_a_lcs` | 20 000 | verde | 133 s |
+| `the_identity_never_moves_on_generated_histories` | 20 000 | verde | 281 s |
+| `hidden_notes_leave_no_fingerprint` | 20 000 | verde | 429 s |
+| `proposal_sequences_keep_the_invariants` | 20 000 | verde | 651 s |
+| `format_round_trip` | 20 000 | verde | 5 s |
+| `replay_equals_state` | 20 000 | verde | 775 s |
+| `compaction_keeps_verify_and_state` | 20 000 | verde | 1 064 s |
+| `random_ops_compact_and_purge_leave_no_roots` | 20 000 | verde | 1 789 s |
+| `purge_with_conflict_copies_leaves_no_roots` | 20 000 | verde | 2 973 s |
+| `export_import_equality` | 20 000 | verde | 1 s |
+| `hlc_monotonic` | 20 000 | verde | 0 s |
+| `rfc1918_is_never_public` | 20 000 | verde | 37 s |
+| `loopback_linklocal_and_cgnat_are_never_public` | 20 000 | verde | 1 s |
+| `multicast_and_reserved_v4_are_never_public` | 20 000 | verde | 0 s |
+| `mapped_reserved_v4_is_never_public` | 20 000 | verde | 1 s |
+| `reserved_v6_blocks_are_never_public` | 20 000 | verde | 0 s |
+| `ordinary_public_v4_is_public` | 20 000 | verde | 0 s |
+| `sixto_four_is_the_ipv4_it_carries` | 20 000 | verde | 0 s |
+| `nat64_teredo_and_ipv4_compatible_are_never_public` | 20 000 | verde | 0 s |
+| `ports_matter_except_on_loopback_http` | 20 000 | verde | 1 s |
+| `the_path_must_match_even_on_loopback_http` | 20 000 | verde | 0 s |
+| suite-1 (core, 2 048) | 2 048 | verde | 888 s |
+| suite-2 (core, 2 048) | 2 048 | verde | 869 s |
+| suite-3 (core, 2 048) | 2 048 | **ROSSO** | 860 s |
+| suite-4 (core, 2 048) | 2 048 | **ROSSO** | 778 s |
+| suite-5 (core, 2 048) | 2 048 | **ROSSO** | 826 s |
+
+**Il giudizio dei rossi: un difetto solo, nuovo per la caccia,
+preesistente nel codice.** La suite-3 è caduta su `replay_equals_state`
+con il seme minimo `14903861504949011020` (1 760 successi prima); le
+suite-4 e 5 sono cadute sullo STESSO seme, ripescato dal file delle
+regressioni dove proptest l'aveva salvato al volo — non è un secondo
+difetto, è la stessa risposta, e il seme è stato tolto dal file e
+dichiarato in `open-defects.txt` (la regola nuova l'ha poi controllato
+la macchina). La riduzione, la diagnosi e la discendenza stanno nella
+sezione «Difetti nuovi». Le due proprietà con difetti aperti dichiarati
+(`compaction_keeps_verify_and_state`, `no_body_text_is_lost`) sono
+verdi a 20 000 casi: i loro semi vivono fuori dalle regressioni e il
+caso non li ha pescati — il seme `1207…` della I1, che quella
+proprietà faceva cadere, oggi non la tocca più: la put su un id
+purgato è rifiutata e il generatore la tollera.
+
+## Linux
+
+
+## La pulizia
+
+- `du -sh target`: **17 G all'inizio**, {{DU_FINE}} alla fine (il
+  lavoro è stato debug + release; i worktree della misura hanno target
+  loro, dentro `/tmp`, buttati via alla fine).
+- `.tmp*` in `$TMPDIR`: {{TMP}}.
+- Nessun processo lasciato acceso; i worktree (`/tmp/eng-v068wt`,
+  `/tmp/eng-v063wt`) e i loro target rimossi.
+
+## Difetti nuovi trovati in questa fase
+
+1. **La metà bersaglio di una `decide` rigioca sopra la purga della
+   proposta** (seme `14903861504949011020`, trovato dalla suite-3 della
+   caccia): la riga `supersedes` (proposta ← bersaglio) che la purga
+   della proposta aveva portato via RINASCE nel rigioco. Ridotto a mano
+   (la traccia nel registro della caccia): una proposta in modalità
+   supersede viene accettata (la `decide`, op 30, censure alla purga
+   successiva), la proposta viene purgata (op 33: la chiusura
+   transitiva porta via la riga `supersedes`), poi una patch del corpo
+   sul BERSAGLIO (op 40) rimaterializza l'insieme del bersaglio — e la
+   `decide` è un'operazione del bersaglio pure: la sua metà rigioca e
+   riscrive la riga. La guardia della v0.6.7 è **chiave-per-oggetto**
+   (`apply_half` chiede «è purgato QUESTO oggetto?»): il bersaglio non
+   è purgato, la sua metà rigioca. Il vivo non la riscrive (il percorso
+   locale non rimaterializza), il rigioco sì: `verify` rosso.
+   **Preesistente**: il seme cade identico sul tag `fase-v0.6.8` ed è
+   verde su `fase-v0.6.3` — nato fra le due (l'era delle copie
+   durevoli e della dominanza della purga), mai visto perché la caccia
+   della v0.6.8 si fermò alla quarta proprietà e quella della v0.6.7
+   non pescò il caso. **La correzione è un cambio di derivazione** (la
+   dominanza della purga per OPERAZIONE, non per oggetto: una
+   `decide` la cui proposta è purgata non rigioca nessuna delle due
+   metà) — cioè un ALPN nuovo, e la specifica di questa fase lo vieta:
+   fermi e dichiarati. Sta alla prossima fase, insieme alla fusione a
+   righe. Il seme è in `open-defects.txt`, fuori dalle regressioni.
+
+## La chiusura della fase
+
+I cinque punti sono chiusi: l'id purgato non torna (rifiuto tipizzato
+su ogni scrittura, import che nomina, celle vecchie riparate al primo
+`verify` — con la cella vera della v0.6.8 a provarlo), il cestino
+contiene le copie che nessuno ha preso (una definizione, nessuna
+scorciatoia sul tag, `list()` più svelta di prima), la caccia gira
+intera (provata dal sabotaggio e da un rosso vero), lo SHA si legge
+dal tag (lo script ha rifiutato l'albero sporco prima di questa stessa
+riga), la frase falsa è corretta per dichiarazione. Le misure sono
+dentro le soglie, i 56 test del contratto JS identici e verdi col
+nuovo.
+
+Ma il criterio di questa fase chiedeva anche una caccia intera, e la
+caccia ha risposto: un difetto di coerenza del `verify` che nessuna
+fase aveva mai visto, preesistente, la cui correzione cambia la
+derivazione. È esattamente il lavoro della caccia — e il motivo per
+cui non si ferma a metà.
+
+| | |
+|---|---|
+| Tag | `fase-v0.6.9` (annotato, solo locale) |
+| Base | `main` @ `6a005be` (verifica v0.6.8 del revisore) |
+| Test | workspace verde in debug (75 suite); `npm test` 57/57; sabotaggio della caccia: rosso a metà inventario, il resto gira, uscita 1 |
+| Caccia | 26/26 proprietà verdi a 20 000; suite 2 verdi + 3 rosse (un difetto solo, seme `14903861504949011020`, preesistente); 15 475 s |
+| Misure | inserimento −4,7% (soglia +5%); sonda purga +3,3% (soglia +10%); `list()` −19,5% (soglia +5%) |
+| Aperti | i due della sync dichiarati in `open-defects.txt`: l'ancora che invecchia col taglio (`compaction_keeps_verify_and_state`, semi `11476711120049502961` e `10840318560449401940`) e la perdita di testo esposta dal cestino (`no_body_text_is_lost`, semi `6467221993839934612` e `9368190224066329310`) |
+
+**La release locale**: **non pronta**. Il difetto nuovo (la `decide` che rigioca sopra la
+purga) rompe `verify` su una cella sola, senza sync — lo stesso tipo
+di difetto che il revisore della v0.6.8 usò per fermare la release
+locale, e lì la correzione era piccola; qui è un cambio di derivazione
+(ALPN `sync/5`), il lavoro della prossima fase insieme alla fusione a
+righe. Tutto il resto è pronto: il difetto I1 è chiuso, le misure
+dentro le soglie, il contratto esteso senza rotture, la caccia e lo
+SHA ormai incapaci di fermarsi a metà o di mentire.

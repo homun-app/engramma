@@ -24,7 +24,10 @@ docker volume create engramma-linux-target
 # il volume nasce di root: una volta sola, lo si dà all'utente che compila
 docker run --rm -v engramma-linux-target:/target engramma-linux:1.95.0 \
   chown -R "$(id -u):$(id -g)" /target
-docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp \
+# v0.6.9: la CPU del container è limitata a due -- il Mac serve
+# all'utente mentre la verifica gira (prima era disciplina di chi
+# lanciava, ora è della macchina, come la caccia e lo SHA)
+docker run --rm --cpus=2 --network none --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -v "$PWD":/src:ro -v "$HOME/.cargo/registry":/usr/local/cargo/registry:ro \
   -v "$HOME/.cache/engramma":/tmp/.cache/engramma:ro \
   -v engramma-linux-target:/target -e CARGO_TARGET_DIR=/target -e CARGO_NET_OFFLINE=true \
