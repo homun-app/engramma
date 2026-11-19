@@ -88,6 +88,9 @@ fn split_transport(err: &Error) -> (&'static str, String) {
                 "NOT_SHARED",
                 "LAST_DEVICE",
                 "CANCELLED",
+                // v0.6.9 (I1): «forgotten forever» — the id does not
+                // come back, not even from an old export
+                "NOTE_PURGED",
             ];
             let c: &str = code;
             match known.iter().find(|k| **k == c) {
@@ -177,6 +180,17 @@ fn cell_error(e: CellError) -> Error {
         ),
         // v0.6.4 (D3): resolving a conflict that is already closed
         CellError::Conflict(m) => transport_err("CONFLICT", m),
+        // v0.6.9 (I1): «forgotten forever» means the id does not come
+        // back — not even from an old export. Homun catches the code and
+        // tells the user which file to drop or rewrite with a new id (the
+        // import report names them as `skippedPurged`: docs/node.md)
+        CellError::NotePurged(id) => transport_err(
+            "NOTE_PURGED",
+            format!(
+                "la nota {id} è purgata: quell'id non torna, \
+                 serve una nota nuova"
+            ),
+        ),
         CellError::Invalid(m) if m.contains("empty patch") => invalid("patch vuota"),
         CellError::Invalid(m) => invalid(m),
         CellError::Io(e) => transport_err("IO", e),
@@ -413,6 +427,10 @@ pub struct VerifyView {
     pub ok: bool,
     pub mismatch: Option<String>,
     pub coverage: Vec<CoverageView>,
+    /// v0.6.9 (I1): note ids this verify rematerialized according to the
+    /// purge rule — cells written by v0.6.7/v0.6.8 may hold a local `put`
+    /// after a purge. Empty on a healthy cell (the repair is once).
+    pub phantom_purged: Vec<String>,
 }
 
 #[napi(object)]
@@ -2687,6 +2705,7 @@ impl Task for VerifyTask {
             snapshot_ok: r.snapshot_ok,
             ok: r.ok(),
             mismatch: r.mismatch,
+            phantom_purged: r.phantom_purged,
             coverage: r
                 .coverage
                 .into_iter()
