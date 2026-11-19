@@ -139,3 +139,119 @@ fn properties_inventory() {
         "l'inventario delle proprietà non torna:\n  nei sorgenti ma NON nell'inventario (aggiungi la riga, o è una proprietà che il parser non vede — dichiara il limite): {missing_from_inventory:?}\n  nell'inventario ma NON nei sorgenti (la proprietà è stata tolta? v0.6.6, F2): {missing_from_sources:?}"
     );
 }
+
+/// One open-defect line: `path-from-the-workspace-root property_name
+/// seed[, seed…] # the REPORT reference` (the `#` part is free text,
+/// the seed field may hold more than one seed, comma-separated).
+fn parse_open_defects(text: &str) -> Vec<(String, String, Vec<String>, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (head, reference) = l.split_once('#').unwrap_or((l, ""));
+            let mut parts = head.split_whitespace();
+            let path = parts.next().unwrap_or_else(|| {
+                panic!("riga dei difetti aperti malformata: «{l}»")
+            });
+            let name = parts.next().unwrap_or_else(|| {
+                panic!("riga dei difetti aperti senza proprietà: «{l}»")
+            });
+            let seeds = parts
+                .next()
+                .map(|s| s.split(',').map(str::trim).map(str::to_string).collect())
+                .unwrap_or_default();
+            (
+                path.to_string(),
+                name.to_string(),
+                seeds,
+                reference.trim().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// v0.6.9 (I3): the OPEN DEFECTS file is the hunt's other gate. A defect
+/// named there must name a property that EXISTS in the inventory (a
+/// typo would silently stop the hunt from judging that property), and
+/// the line must carry at least one seed and a REPORT reference (the
+/// judgement «declared defect or new one» lives in the REPORT, written
+/// by hand — the file only points at it).
+#[test]
+fn open_defects_reference_real_properties() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let defects_path = manifest.join("tests/open-defects.txt");
+    let defects_text = std::fs::read_to_string(&defects_path)
+        .expect(/* test-only */ "open-defects.txt");
+    let inventory = parse_inventory(&std::fs::read_to_string(
+        manifest.join("tests/properties.txt"),
+    )
+    .expect(/* test-only */ "properties.txt"));
+    let defects = parse_open_defects(&defects_text);
+    assert!(
+        !defects.is_empty(),
+        "an empty open-defects file means NO defects are open: if that is \
+         the truth, delete the file and this test with it"
+    );
+    for (path, name, seeds, reference) in &defects {
+        assert!(
+            inventory.contains(&(path.clone(), name.clone())),
+            "the open defect names «{path} {name}», which is NOT in the \
+             inventory: a typo would make the hunt judge nothing"
+        );
+        assert!(
+            !seeds.is_empty(),
+            "the open defect «{path} {name}» carries no seed: the \
+             reproduction is the defect's proof"
+        );
+        assert!(
+            !reference.is_empty(),
+            "the open defect «{path} {name}» carries no REPORT reference"
+        );
+    }
+}
+
+/// v0.6.9 (I3): the open defects' seeds stay OUT of the regression
+/// files. A seed in `.proptest-regressions` makes every suite run fall
+/// on a declared defect — the v0.6.8 lesson (the reviewer took the
+/// `1207…` seed out by hand). The hunt says it checked; this test keeps
+/// it checked between hunts. Declared limit: the seed must appear in
+/// its decimal form (proptest writes «shrinks to seed = N» beside the
+/// `cc` digest it replays); a hand-added `cc` line with the digest only
+/// and no seed comment is invisible here.
+#[test]
+fn open_defect_seeds_stay_out_of_the_regression_files() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest
+        .ancestors()
+        .nth(2)
+        .expect(/* test-only */ "the workspace root");
+    let defects = parse_open_defects(&std::fs::read_to_string(
+        manifest.join("tests/open-defects.txt"),
+    )
+    .expect(/* test-only */ "open-defects.txt"));
+    let mut offenders: Vec<String> = Vec::new();
+    for file in test_sources(root) {
+        let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.ends_with(".proptest-regressions") {
+            continue;
+        }
+        let rel = file
+            .strip_prefix(root)
+            .expect(/* test-only */ "under the root")
+            .display()
+            .to_string();
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        for (_, property, seeds, _) in &defects {
+            for seed in seeds {
+                if text.contains(seed.as_str()) {
+                    offenders.push(format!("{rel}: the seed of «{property}»"));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "open-defect seeds inside the regression files (every suite run \
+         would fall on a declared defect): {offenders:?}"
+    );
+}
