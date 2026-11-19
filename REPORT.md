@@ -9702,3 +9702,124 @@ due (l'ancora, la perdita esposta dal cestino), tutti e due con semi
 riproducibili e diagnosi nel REPORT. È il criterio che funziona: la
 prossima fase li chiude, e poi la release candidate (v0.6.9) fa il
 resto del percorso.
+
+## Verifica v0.6.8 (revisore, 2026-11-19)
+
+Fatta sul tag `fase-v0.6.8` (`6136577`), a priorità minima (`nice -n 19`,
+due job, due fili). Le sonde stanno nello scratchpad del revisore, fuori
+dal repo.
+
+### Cosa regge
+
+- **H4 è il pezzo migliore della fase.** Il testimone di riferimento è
+  davvero indipendente: dal motore prende solo la formula dell'id della
+  copia. La scelta di scartare `diffy` è motivata con un fatto misurato.
+  Il dente che nella v0.6.7 mancava ora morde, e la monotonia regge 20 000
+  casi contro l'oracolo.
+- **H5 è chiuso.** La suite di `engramma-sync`, rifatta dal revisore, lascia
+  zero `.tmp*`. Le due rimaste da GLM erano davvero sue riproduzioni prima
+  della correzione (`early-a`, `early-drop`): il revisore le ha controllate
+  e tolte.
+- **H1** ha scelto la forma con la misura, e due candidati sono stati
+  bocciati coi numeri. Il cancello dei bucket di `Cell` è il meccanismo
+  giusto.
+- **H3**, **H6**, **H7**, **H8**: fatti come chiesto.
+- **La lettura dei due difetti aperti è corretta: riguardano solo la
+  sync.** Su un dispositivo solo ogni scrittura su una nota esistente porta
+  come `base` la testa visibile (`execute`), quindi la storia è una linea e
+  non nascono copie di conflitto. Senza copie non c'è la perdita di testo;
+  senza arrivi fuori ordine non c'è l'ancora che invecchia.
+- **Le corse del revisore:**
+  - `npm test` e `test:electron` 56/56;
+  - la suite di `engramma-sync` verde;
+  - `index.js` e `index.d.ts` riproducono gli SHA dichiarati;
+  - il `.node` no (vedi il difetto 2).
+
+### La caccia che mancava
+
+GLM si è fermato dopo 4 proprietà su 26, e ha citato come precedente la
+verifica v0.6.7. Ma lì era il **revisore** a non rifare la caccia di una
+fase che l'aveva già fatta tutta: non è una regola per la fase stessa. Con
+un rosso noto, la cosa giusta è saltare quella proprietà e cacciare le
+altre.
+
+Il revisore ha girato le 22 mancanti a 20 000 casi e le cinque suite a 2048,
+saltando solo `no_body_text_is_lost`. Risultato: **21 verdi e un rosso**,
+proprio fra quelle che non erano state girate.
+
+### I difetti
+
+1. **Una `put` locale ricrea una nota purgata, e il rigioco no
+   (bloccante, anche per la release locale).**
+   - La proprietà `compaction_keeps_verify_and_state`, seme
+     `1207186286826530307`, cade su **una cella sola, anche senza
+     compattazione**. La nota `…895` nasce (op 7), viene purgata (op 13),
+     poi una `put` locale con lo stesso id (op 46) la ricrea.
+   - Il **vivo** la tiene. Il **rigioco** applica la regola della v0.6.7,
+     «la purga domina l'insieme: la nota non si materializza più» (la
+     guardia in `apply_half` e `materialize_note`), e non la ricrea. Lo
+     stato vivo non è più funzione delle operazioni, e `verify` è rosso.
+   - La guardia della v0.6.7 copre l'arrivo e il rigioco, **non la
+     scrittura locale**. È una regressione della v0.6.7: riprodotta sul tag
+     `fase-v0.6.7`. Le cinque suite sono cadute tutte su questo seme,
+     perché era entrato nel file delle regressioni.
+   - *Dove si presenta con Homun:* la vista della cartella cancella il file
+     della nota purgata, quindi non da lì. Ma reimportare una vecchia
+     esportazione o un backup che contiene la nota fa proprio questa `put`.
+   - *La forma giusta:* una regola sola per scrittura, arrivo e rigioco. Il
+     revisore consiglia che **la scrittura locale su un id purgato sia
+     rifiutata**, con un errore tipizzato (per esempio `NOTE_PURGED`), e che
+     l'import la riporti per nome. «Dimentica per sempre» vuol dire che quell'id
+     non torna: per riscrivere il contenuto serve una nota nuova. L'altra
+     strada è riaprire solo con `base` = la purga, come la lapide. Si può
+     difendere, ma riporta in vita un id che l'utente ha chiesto di
+     dimenticare.
+2. **Lo SHA del `.node` nel REPORT non è quello del tag.**
+   - Il REPORT dichiara `63b5b911…`. La build del revisore dal tag dà
+     `091a73f63f79f9db030a6069e2ae6fceb5b444b54e9f521ca405cf5d221747dd`,
+     con la stessa dimensione (50 668 744 B).
+   - Il commit `fdd88ac` (cargo fmt) ha toccato quattro sorgenti del motore
+     **dopo** la build: le righe spostate cambiano il binario.
+   - È lo stesso errore della v0.6.5, e la spec chiedeva esplicitamente di
+     rifare la build dopo fmt e clippy. **Per agganciare il tag vale lo SHA
+     del revisore.**
+3. **Il cestino non è ancora un predicato solo** (solo con la sync).
+   - `get()` chiede il predicato solo se la nota porta il tag `conflitto`,
+     e il tag è dell'utente.
+   - Sonda del revisore (`zz_review_v068.rs`): l'utente prende una copia,
+     cioè la modifica (così la copia si chiude, `0/0`), e le cambia i tag.
+     Dopo il `delete` dell'originale, `note_ids()` la nasconde, perché
+     guarda `conflict_copies` aperte o chiuse, mentre `get()` la mostra
+     `Active`.
+   - Va decisa la regola, cioè se una copia presa dall'utente è ormai una
+     nota sua, e poi una sola funzione per tutti e due i percorsi. Il
+     revisore consiglia «sua»: il cestino contiene le copie che nessuno ha
+     preso.
+4. **Una frase del REPORT è falsa:** «i tagli sotto la testa esistono solo
+   nelle celle condivise». In una cella non condivisa la frontiera è la
+   testa, ma `compact(head - keepLast)` taglia comunque sotto. Il secondo
+   strato di H2 resta legato alla sync solo perché servono arrivi fuori
+   ordine.
+5. **`caccia.sh` si ferma al primo rosso e non ha modo di saltare le
+   proprietà già dichiarate aperte.** Così una fase con un difetto noto
+   finisce per non cacciare il resto. Serve un'opzione per saltare per
+   nome le proprietà aperte (scritte nel REPORT), senza fermare le altre.
+
+### Verdetto
+
+**v0.6.8 agganciabile per lo sviluppo di Homun**, al posto della v0.6.7,
+con lo SHA del revisore. Rispetto alla v0.6.7 è più sicura (H1, H3, H5), e
+il difetto 1 c'è anche nella v0.6.7.
+
+**Non ancora per la release locale**: il difetto 1 è su una cella sola. La
+correzione è piccola. Il revisore propone una fase breve prima della
+release locale, con quattro cose:
+- il difetto 1;
+- la regola delle copie prese dall'utente;
+- l'opzione di `caccia.sh`;
+- la caccia **intera**.
+
+La fusione a righe, il proprietario delle righe e i difetti della sync
+vengono dopo.
+
+**La sync resta chiusa**, come scrive il REPORT stesso.
