@@ -3498,17 +3498,20 @@ impl Cell {
         // ONE plain read — the same columns the old two-query read
         // fetched, plus the bin's copy arm as a computed column: no
         // second round trip, no tag to trust
-        let row: (String, String, bool) = tx
-            .query_row(
-                "SELECT n.frontmatter_json, n.body,
-                        EXISTS(SELECT 1 FROM conflict_copies cc
-                               JOIN notes o ON o.id = cc.original_id
-                               WHERE cc.copy_id = n.id
-                                 AND o.status = 'deleted' AND cc.open = 1)
-                 FROM notes n WHERE n.id = ?1",
-                [&id_str],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+        // v0.6.9 (I2): the statement is CACHED — a bulk reader walks ten
+        // thousand ids through this read, and paying the planner per call
+        // cost the list its whole budget (measured: 42,7 → 73,7 ms; the
+        // cache took it home)
+        let mut read_note = tx.prepare_cached(
+            "SELECT n.frontmatter_json, n.body,
+                    EXISTS(SELECT 1 FROM conflict_copies cc
+                           JOIN notes o ON o.id = cc.original_id
+                           WHERE cc.copy_id = n.id
+                             AND o.status = 'deleted' AND cc.open = 1)
+             FROM notes n WHERE n.id = ?1",
+        )?;
+        let row: (String, String, bool) = read_note
+            .query_row([&id_str], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .map_err(|_| CellError::NoteNotFound(id_str.clone()))?;
         let mut note = Note::from_json(
             &serde_json::from_str::<Value>(&row.0)
