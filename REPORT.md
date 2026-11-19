@@ -10074,7 +10074,18 @@ lavoro: **4,2–5,8** per tutta la durata — i numeri vanno letti così.
   identici e verdi, più il nuovo del `NOTE_PURGED` (il codice stabile,
   l'id nel messaggio, una nota nuova che scrive normale, `verify`
   verde). `test:electron`: **57/57**.
-- **La build** (`scripts/build-sha.sh`, {{BUILD_COMMIT}}): {{BUILD_SHA}}.
+- **La build sul tag** (`scripts/build-sha.sh`, albero pulito, sul
+  commit `d0a7220cc1510f439387be218318e7404284641b` = tag
+  `fase-v0.6.9` esatto, build sotto `nice`): i tre file dell'aggancio,
+  letti dal disco dopo la build —
+  `engramma.darwin-arm64.node` **50 687 528 B**, SHA256
+  `99956ac64a94045356b05e4417f99fff2a7333be720193092e2aa1acd58b0366`;
+  `index.js` 36 188 B, SHA256
+  `6a440672963f2da32989bd306a91863b9ca87df2e50c6d6d15d7049e9fce8053`;
+  `index.d.ts` 24 815 B, SHA256
+  `d58d4d5b8dc9349c60bc3e1820d939ae72ea7cc84c981a9ca8f775d96336175e`.
+  Il comando che li ha prodotti è lo stesso che il revisore rifà
+  («costruzione sul commit… (tag: fase-v0.6.9)»): I4.
 
 ## La caccia, sul commit finale
 
@@ -10138,10 +10149,15 @@ purgato è rifiutata e il generatore la tollera.
 
 ## La pulizia
 
-- `du -sh target`: **17 G all'inizio**, {{DU_FINE}} alla fine (il
-  lavoro è stato debug + release; i worktree della misura hanno target
-  loro, dentro `/tmp`, buttati via alla fine).
-- `.tmp*` in `$TMPDIR`: {{TMP}}.
+- `du -sh target`: **17 G all'inizio, 22 G alla fine** — le build di
+  release della caccia (26 proprietà + 5 suite come binari di test) e
+  dei banchi di misura. I registri della caccia stanno in
+  `target/caccia/20261119-195046/` e restano finché il target vive. I
+  worktree della misura (`/tmp/eng-v063wt`, `/tmp/eng-v068wt`, con i
+  target loro) sono stati rimossi.
+- `.tmp*` in `$TMPDIR`: **zero, senza che nessuna sia stata cancellata
+  a mano** — il motore non ne lascia (confermato dalla v0.6.8), e
+  questa fase non ne ha aggiunte.
 - Nessun processo lasciato acceso; i worktree (`/tmp/eng-v068wt`,
   `/tmp/eng-v063wt`) e i loro target rimossi.
 
