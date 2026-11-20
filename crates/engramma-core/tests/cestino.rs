@@ -942,6 +942,9 @@ const INTERNAL: &[(&str, &str)] = &[
 /// itself.
 const WRITES: &[&str] = &[
     "retire",
+    // v0.6.10 (J2): the explicit repair — a write, the diagnosis stays
+    // read-only (verify)
+    "repair",
     "checkpoint",
     "set_query_cache_capacity",
     "build_graph",

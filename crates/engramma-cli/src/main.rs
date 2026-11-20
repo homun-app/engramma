@@ -315,6 +315,9 @@ enum Command {
     },
     /// Verify the log (hash chain + replay)
     Verify,
+    /// Repair what verify found: the phantom notes' content moves to
+    /// NEW ids, the old (purged) ids are forgotten by the rule
+    Repair,
     /// Compact the log: register a checkpoint (no second copy of the cell)
     /// and forget the old payloads
     Compact {
@@ -1539,9 +1542,24 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "replay_ok": report.replay_ok,
                     "fts_ok": report.fts_ok,
                     "mismatch": report.mismatch,
+                    "phantom_purged": report.phantom_purged,
                     "coverage": coverage,
                     "ok": report.ok(),
                 }));
+            } else if !report.phantom_purged.is_empty() {
+                // v0.6.10 (J2): the phantoms are FOUND, not repaired —
+                // the repair is an explicit step, and the user is told
+                // which command takes it
+                println!(
+                    "la cella contiene {} note fantasma (una riga viva su un id purgato,",
+                    report.phantom_purged.len()
+                );
+                println!("scritta dai motori v0.6.7/v0.6.8):");
+                for id in &report.phantom_purged {
+                    println!("  {}", engramma_core::id::id8(&Ulid::from_string(id).unwrap_or_default()));
+                }
+                println!("verify non tocca niente: «engramma repair» sposta il contenuto su id nuovi");
+                return Err(CliError::internal("la cella ha bisogno di repair".to_string()));
             } else if report.ok() {
                 match &report.replay {
                     engramma_core::cell::Replay::Full => println!(
@@ -1582,6 +1600,37 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     report.replay_ok,
                     report.mismatch.unwrap_or_default()
                 )));
+            }
+            Ok(())
+        }
+        Command::Repair => {
+            let cell = open_cell(cli)?;
+            let report = cell.repair()?;
+            if cli.json {
+                let moved: Vec<serde_json::Value> = report
+                    .moved
+                    .iter()
+                    .map(|(old, new)| serde_json::json!({ "old": old, "new": new }))
+                    .collect();
+                print_json(&serde_json::json!({
+                    "moved": moved,
+                    // the map is for the CALLER (Homun's references): it
+                    // is saved nowhere
+                    "verify_ok": cell.verify().map(|r| r.ok()).unwrap_or(false),
+                }));
+            } else if report.moved.is_empty() {
+                println!("niente da riparare: nessun fantasma");
+            } else {
+                println!("riparate {} note fantasma (il contenuto vive sotto id nuovi):",
+                    report.moved.len());
+                for (old, new) in &report.moved {
+                    println!(
+                        "  {} → {}",
+                        engramma_core::id::id8(&Ulid::from_string(old).unwrap_or_default()),
+                        engramma_core::id::id8(&Ulid::from_string(new).unwrap_or_default())
+                    );
+                }
+                println!("la mappa vecchio → nuovo non si salva da nessuna parte: tienila ora");
             }
             Ok(())
         }

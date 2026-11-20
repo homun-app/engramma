@@ -2085,18 +2085,15 @@ pub(crate) fn hidden_optimize(conn: &Connection) -> Result<(), CellError> {
 /// are already forgotten) it is what keeps the replay equal to the live
 /// state. The `[[Mentions]]` of the purged note in OTHER notes stay: they are
 /// other notes (documented in the CLI help).
-fn apply_purge(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
-    let Some(id) = op.note_id else {
-        return Err(CellError::Invalid(format!(
-            "op {}: purge needs `note_id`",
-            op.op_id
-        )));
-    };
-    purge_state(tx, &id)?;
-    scrub_log(tx, &id)?;
-    // v0.6 (P1): the purge dominates the note's whole derivation — its
-    // conflict copies go with it
-    super::material::purge_conflict_copies(tx, &id)?;
+/// v0.6.10 (J1): the closure the purge's application walks — the
+/// co-objects of every operation this purge (of `id`) dominates
+/// rematerialize, transitively. Called by `apply_purge` and by
+/// [`Cell::repair`](super::Cell::repair)'s reconciliation of cells the
+/// older engines wrote; idempotent (the same set derives the same state).
+pub(crate) fn dominated_comaterialize(
+    tx: &Transaction<'_>,
+    id: &Ulid,
+) -> Result<(), CellError> {
     // v0.6.10 (J1): the purge dominates per OPERATION, and the halves it
     // dominates may have LANDED already — a copy that applied the decide
     // before the proposal's purge arrived holds the target's closing,
@@ -2222,6 +2219,22 @@ fn apply_purge(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
             }
         }
     }
+    Ok(())
+}
+
+fn apply_purge(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
+    let Some(id) = op.note_id else {
+        return Err(CellError::Invalid(format!(
+            "op {}: purge needs `note_id`",
+            op.op_id
+        )));
+    };
+    purge_state(tx, &id)?;
+    scrub_log(tx, &id)?;
+    // v0.6 (P1): the purge dominates the note's whole derivation — its
+    // conflict copies go with it
+    super::material::purge_conflict_copies(tx, &id)?;
+    dominated_comaterialize(tx, &id)?;
     Ok(())
 }
 

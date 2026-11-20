@@ -1293,3 +1293,61 @@ test('NOTE_PURGED: a purged id never comes back (I1)', async () => {
     await e.close();
   }
 });
+
+// v0.6.10 (J2): verify() è una diagnosi in sola lettura e la riparazione
+// è un passo esplicito. La cella del fixture v0.6.8 (una riga viva su un
+// id purgato, scritta dal motore vecchio) viene copiata nella radice:
+// verify() non cambia un byte, nomina il fantasma e dice che serve
+// repair; repair() sposta il contenuto sotto un id nuovo, dimentica il
+// vecchio, restituisce la mappa a chi l'ha chiamata — e non la salva
+// da nessuna parte.
+test('verify signals the phantom, repair moves it under a new id (J2)', async () => {
+  const rootDir = root();
+  const cellsDir = path.join(rootDir, 'cells');
+  fs.mkdirSync(cellsDir, { recursive: true });
+  const golden = path.join(
+    __dirname, '..', '..', 'engramma-core', 'tests', 'golden', 'v068-put-after-purge.sqlite',
+  );
+  fs.copyFileSync(golden, path.join(cellsDir, 'fantasma-j2.sqlite'));
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  const cell = await e.cell('fantasma-j2');
+  try {
+    // the phantom is the live state the v0.6.8 engine left
+    const phantom = '01' + '0'.repeat(16) + '00000895';
+    assert.notEqual(await cell.get(phantom), null, 'the fixture holds the phantom row');
+
+    // the diagnosis: it names the phantom, it says repair is needed,
+    // and it changes nothing (judged with the cell open: closing it may
+    // checkpoint a pre-existing WAL, and the close is not verify's act)
+    const before = fs.readFileSync(path.join(cellsDir, 'fantasma-j2.sqlite'));
+    const v = await cell.verify();
+    assert.equal(v.ok, false, JSON.stringify(v));
+    assert.deepEqual(v.phantomPurged, [phantom], JSON.stringify(v));
+    const after = fs.readFileSync(path.join(cellsDir, 'fantasma-j2.sqlite'));
+    assert.deepEqual(after, before, 'verify is read-only: not one byte moves');
+
+    // the repair: the content lives under a NEW id, the map says which
+    const r = await cell.repair();
+    assert.equal(r.moved.length, 1, JSON.stringify(r));
+    const [m] = r.moved;
+    assert.equal(m.old, phantom);
+    assert.match(m.new, /^[0-9A-HJKMNP-TV-Z]{26}$/);
+    assert.notEqual(m.new, phantom);
+    const moved = await cell.get(m.new);
+    assert.equal(moved.body, 'quokkaviolaceo zibellinotremante ritorno');
+    assert.equal(moved.title, 'la nota che non torna');
+    assert.equal(await cell.get(phantom), null, 'the old id is gone');
+    const s = await cell.search({ text: 'quokkaviolaceo', k: 10 });
+    assert.ok(s.every((h) => h.id !== phantom), 'the search answers the new id only');
+    assert.ok(s.some((h) => h.id === m.new), 'the moved content is findable');
+
+    // verify is green after, and repairing again does nothing
+    const v2 = await cell.verify();
+    assert.equal(v2.ok, true, JSON.stringify(v2));
+    assert.deepEqual(v2.phantomPurged, []);
+    const r2 = await cell.repair();
+    assert.deepEqual(r2.moved, [], 'the repair is once');
+  } finally {
+    await e.close();
+  }
+});

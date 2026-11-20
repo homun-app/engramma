@@ -284,23 +284,65 @@ pub struct VerifyReport {
     /// Vector coverage per model, reported separately: embeddings are
     /// derived data and their absence is never a verification failure.
     pub coverage: Vec<ModelCoverage>,
-    /// v0.6.9 (I1): note ids this verify REMATERIALIZED ACCORDING TO THE
-    /// RULE — cells written by v0.6.7/v0.6.8 may hold a local `put` after
-    /// a purge (the guard covered arrival and replay, not the local
-    /// write): the live state kept a row the replay never materializes.
-    /// The phantom rows go here, the state says so, and the list is empty
-    /// on a healthy cell. The disk hygiene of the bytes the old write
-    /// left (optimize, VACUUM) stays what the old phase left it: a
-    /// `purge` of the same id completes it, and still works.
+    /// v0.6.10 (J2): note ids of the «phantoms» this verify FOUND — a
+    /// living row on a purged id, written by the v0.6.7/v0.6.8 engines
+    /// (their local write path had no purged-id guard). verify changes
+    /// nothing (v0.6.9's verify repaired in place, an irreversible
+    /// `secure_delete` the report only announced): the ids go here, the
+    /// outcome says the cell needs repair, and [`Cell::repair`] is the
+    /// step that moves each phantom's content to a new id and applies
+    /// the forgetting rule to the old one. The list is empty on a
+    /// healthy cell.
     pub phantom_purged: Vec<String>,
 }
 
 impl VerifyReport {
     /// Everything passed. `ChainOnly` can pass: it checked the chain, the
-    /// surviving payloads and the derived indexes.
+    /// surviving payloads and the derived indexes. A phantom is never a
+    /// pass: the cell needs repair, and the repair is explicit (J2).
     pub fn ok(&self) -> bool {
-        self.hash_chain_ok && self.replay_ok && self.fts_ok && self.snapshot_ok
+        self.hash_chain_ok
+            && self.replay_ok
+            && self.fts_ok
+            && self.snapshot_ok
+            && self.phantom_purged.is_empty()
     }
+}
+
+/// v0.6.10 (J2): the «phantom» ids — a living notes row on an id the set
+/// purged. verify names them; repair moves them. One query, shared.
+fn phantom_ids(conn: &Connection) -> Result<Vec<Ulid>, CellError> {
+    let mut purged_ids: Vec<Option<String>> = {
+        let mut stmt = conn.prepare("SELECT DISTINCT note_id FROM ops WHERE kind = 'purge'")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.flatten().collect()
+    };
+    purged_ids.sort();
+    purged_ids.dedup();
+    let mut phantoms: Vec<Ulid> = Vec::new();
+    for id in purged_ids.into_iter().flatten() {
+        if let Ok(id) = Ulid::from_string(&id) {
+            let row: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM notes WHERE id = ?1",
+                [id.to_string()],
+                |r| r.get(0),
+            )?;
+            if row > 0 {
+                phantoms.push(id);
+            }
+        }
+    }
+    Ok(phantoms)
+}
+
+/// What [`Cell::repair`] did (v0.6.10, J2).
+#[derive(Debug, Clone, Default)]
+pub struct RepairReport {
+    /// old id → new id, one pair per phantom whose content moved. The
+    /// map goes back to the CALLER (Homun updates its references) and is
+    /// saved nowhere: the forgotten id must not stay written anywhere
+    /// new.
+    pub moved: Vec<(String, String)>,
 }
 
 /// One `snapshots` row as verify reads it: (seq, head_hash, state_digest,
@@ -3647,77 +3689,26 @@ impl Cell {
     /// [`CellError::Db`] only on infrastructure failures.
     pub fn verify(&self) -> Result<VerifyReport, CellError> {
         let mut inner = self.lock()?;
-        // v0.6.9 (I1): the phantom repair, BEFORE the log is read — the
-        // scrub redacts the phantom's payload in the live file, and the
-        // replay must be built from the REDACTED log or the comparison
-        // would hold the old engine's bytes against the rule (the first
-        // run of this repair taught it: the replay stored the whole
-        // payload it had read a moment earlier). A cell written by
-        // v0.6.7/v0.6.8 may hold a LOCAL put after a purge (the guard
-        // covered arrival and replay, not the local write — the
-        // reviewer's seed 1207…): the live state keeps a row the rule
-        // says does not materialize, and the comparison below would go
-        // red on it forever. verify is where the repair lives (and not
-        // at open) because the audit already reads the whole log, while
-        // `open` must stay at half a millisecond. The repair is the same
-        // dance the arriving purge runs: the state rows, the closure
-        // over the copies, the log scrub, the in-memory indexes. The
-        // DISK hygiene of the bytes the old write left (FTS optimize,
-        // VACUUM) stays what the old phase left it: a `purge` of the
-        // same id completes it, and the purge still works on a purged
-        // id.
-        let mut phantom_purged: Vec<String> = Vec::new();
-        {
-            let mut purged_ids: Vec<Option<String>> = {
-                let mut stmt = inner
-                    .conn
-                    .prepare("SELECT DISTINCT note_id FROM ops WHERE kind = 'purge'")?;
-                let rows = stmt.query_map([], |r| r.get(0))?;
-                rows.flatten().collect()
-            };
-            purged_ids.sort();
-            purged_ids.dedup();
-            let mut phantoms: Vec<Ulid> = Vec::new();
-            for id in purged_ids.into_iter().flatten() {
-                if let Ok(id) = Ulid::from_string(&id) {
-                    let row: i64 = inner.conn.query_row(
-                        "SELECT COUNT(*) FROM notes WHERE id = ?1",
-                        [id.to_string()],
-                        |r| r.get(0),
-                    )?;
-                    if row > 0 {
-                        phantoms.push(id);
-                    }
-                }
-            }
-            if !phantoms.is_empty() {
-                let secure_before: i64 = inner
-                    .conn
-                    .query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
-                inner.conn.pragma_update(None, "secure_delete", "ON")?;
-                let tx = inner
-                    .conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
-                for id in &phantoms {
-                    ops::purge_state(&tx, id)?;
-                    ops::scrub_log(&tx, id)?;
-                    material::purge_conflict_copies(&tx, id)?;
-                }
-                tx.commit()?;
-                inner
-                    .conn
-                    .pragma_update(None, "secure_delete", secure_before)?;
-                if let Some(st) = &mut inner.index {
-                    for id in &phantoms {
-                        st.idx.remove(&id.to_string());
-                    }
-                }
-                inner.graph_dirt.global = true;
-                inner.lang_hist_dirty = true;
-                phantom_purged = phantoms.iter().map(|i| i.to_string()).collect();
-            }
-        }
-        let source_ops = match ops::read_ops(&inner.conn) {
+        // v0.6.10 (J2): verify is READ-ONLY, by construction — the whole
+        // audit runs inside ONE deferred transaction that ALWAYS rolls
+        // back (it rolls back on drop, on every return path). The
+        // `PRAGMA query_only` route cannot host it: the FTS5
+        // `integrity-check` is a write command by construction (it opens
+        // a write transaction even when it finds nothing), and the
+        // choice leaves a bonus — every read of the audit sees one
+        // stable snapshot, and the audit cannot tear under a concurrent
+        // writer. The phantoms (a living row on a purged id, the
+        // v0.6.7/v0.6.8 engines' local-write hole) are NAMED, not
+        // repaired: the phantom is content the USER wrote after the
+        // purge (a reimport, a backup), the rule forgot the ID, not the
+        // TEXT — and a diagnosis must never destroy. `Cell::repair` is
+        // the explicit step that moves the content and applies the rule.
+        let audit = inner
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let phantom_purged: Vec<String> =
+            phantom_ids(&audit)?.iter().map(|i| i.to_string()).collect();
+        let source_ops = match ops::read_ops(&audit) {
             Ok(ops) => ops,
             Err(e) => {
                 return Ok(VerifyReport {
@@ -3785,8 +3776,7 @@ impl Cell {
         let mut tail: &[Op] = &source_ops;
         let mut chain_only = false;
         // (read inline: the cell lock is already held)
-        let snapshot: Option<SnapshotRecord> = inner
-            .conn
+        let snapshot: Option<SnapshotRecord> = audit
             .query_row(
                 "SELECT seq, head_hash, state_digest, file, redacted_by FROM snapshots
                  ORDER BY seq DESC LIMIT 1",
@@ -3805,6 +3795,10 @@ impl Cell {
                     .join(file);
                 // what the file says: its logical digest and its own last op
                 let checks = Connection::open(&snap_path).and_then(|snap| {
+                    // read-only by construction here too (J2): the
+                    // snapshot is a full copy of the cell, and a write
+                    // through this handle would mutate it silently
+                    snap.pragma_update(None, "query_only", "ON")?;
                     let d = state_digest(&snap)
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                     let last: Option<(String, String)> = snap
@@ -3986,19 +3980,19 @@ impl Cell {
             // ChainOnly (P0.2): everything that can still be checked without
             // a replay — the derived edges re-derived from the notes, the
             // vectors' liveness, the digest at the head.
-            if let Err(e) = verify_checkpoint_coherence(&inner.conn, snapshot.as_ref()) {
+            if let Err(e) = verify_checkpoint_coherence(&audit, snapshot.as_ref()) {
                 mismatch = mismatch.or(Some(e));
             }
         } else if mismatch.is_none() {
-            mismatch = compare_states(&inner.conn, &rebuild_conn)?;
+            mismatch = compare_states(&audit, &rebuild_conn)?;
         }
         // The FTS index is not part of the logical replay: check it against
         // its content table, on the live cell and on the rebuild alike (a
         // checkpoint has no rebuild: the live check is all there is).
         let fts_check = if chain_only {
-            fts_integrity_check(&inner.conn)
+            fts_integrity_check(&audit)
         } else {
-            fts_integrity_check(&inner.conn).and_then(|()| fts_integrity_check(&rebuild_conn))
+            fts_integrity_check(&audit).and_then(|()| fts_integrity_check(&rebuild_conn))
         };
         let fts_ok = match fts_check {
             Ok(()) => true,
@@ -4009,7 +4003,7 @@ impl Cell {
         };
         // Vector coverage is reported, not verified: embeddings are derived
         // data, recomputable from the notes at any time.
-        let coverage = vectors::VectorTx { conn: &inner.conn }
+        let coverage = vectors::VectorTx { conn: &audit }
             .coverage()
             .unwrap_or_default();
         Ok(VerifyReport {
@@ -4023,6 +4017,188 @@ impl Cell {
             coverage,
             phantom_purged,
         })
+    }
+
+    /// v0.6.10 (J2): the EXPLICIT repair of what verify found. A phantom
+    /// — a living row on a purged id, written by the v0.6.7/v0.6.8
+    /// engines — is content the user wrote after the purge (a
+    /// reimportation, a backup): the rule forgot the ID, not the TEXT.
+    /// For each phantom, in its own transaction (an interruption leaves
+    /// every note either as it was or repaired, never halfway):
+    /// - the content of the living row (body, title, tags, type, fields,
+    ///   source) is written to a note with a NEW id, with a normal `put`
+    ///   — the actor declares the repair, `engramma:repair`, the AGENT
+    ///   class: the engine's hand, like every `mcp:` write — the human
+    ///   authority is the command that ran the repair, not this write;
+    /// - then the forgetting rule applies to the old id: the state rows,
+    ///   the closure over the conflict copies, the log scrub, under
+    ///   `secure_delete` — the same steps the purge itself takes, minus
+    ///   the op (the purge is already in the log).
+    ///
+    /// The J1 leftover of a v0.6.9 cell — a row born from a half that
+    /// no longer replays (the resurrected `supersedes` of a decide over
+    /// a purged proposal) — is settled by the same call: the
+    /// reconciliation re-derives the co-objects of the dominated
+    /// operations, and the state is a function of the operations again.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure; [`CellError::Invalid`] on a
+    /// phantom row that cannot be read back as a note.
+    pub fn repair(&self) -> Result<RepairReport, CellError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| CellError::Db("write lock poisoned".into()))?;
+        let mut inner = self.lock()?;
+        // v0.6.8 (H3)'s discipline: the test-only injection stops the
+        // walk after N phantoms — the interruption is part of the
+        // contract, and the test proves the relaunch ends clean. It can
+        // never change what a full repair does.
+        let stop_after: Option<usize> = std::env::var("ENGRAMMA_TEST_REPAIR_STOP_AFTER")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let mut inner_guard = inner;
+        let mut moved: Vec<(String, String)> = Vec::new();
+        let mut repaired = 0_usize;
+        loop {
+            let inner = &mut *inner_guard;
+            let Some(id) = phantom_ids(&inner.conn)?.into_iter().next() else {
+                break;
+            };
+            // the ids are minted BEFORE the transaction opens (the same
+            // order `execute_op` walks: the minter never leans on the
+            // transaction, and the borrow stays split by field)
+            let (op_id, salt) = mint_ids(inner)?;
+            let new_id = mint_ids(inner)?.0;
+            let secure_before: i64 =
+                inner.conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+            inner.conn.pragma_update(None, "secure_delete", "ON")?;
+            let tx = inner
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let Some(row) = ops::read_note_row(&tx, &id)? else {
+                // nothing to move (a concurrent writer took it): the
+                // rule still applies, for idempotence's sake
+                ops::purge_state(&tx, &id)?;
+                tx.commit()?;
+                inner
+                    .conn
+                    .pragma_update(None, "secure_delete", secure_before)?;
+                continue;
+            };
+            // the content as the state shows it — the COLUMN names the
+            // phantom, whatever the row's own header claims
+            let mut note = row.note;
+            note.id = new_id;
+            {
+                let mut stmt = tx.prepare("SELECT tag FROM note_tags WHERE note_id = ?1")?;
+                note.tags = stmt
+                    .query_map([id.to_string()], |r| r.get(0))?
+                    .flatten()
+                    .collect();
+            }
+            let logged: Option<String> = tx
+                .prepare_cached("SELECT value FROM meta WHERE key = 'hlc'")?
+                .query_row([], |r| r.get(0))
+                .optional()?;
+            if let Some(slogged) = logged
+                && let Ok(h) = Hlc::parse(&slogged)
+            {
+                inner.clock.observe(&h);
+            }
+            let mut hlc = inner.clock.tick();
+            if let Some(signer) = &inner.signer {
+                hlc.node = signer.device_id();
+            }
+            let (prev_seq, prev_hash): (i64, String) = tx
+                .prepare_cached("SELECT seq, hash FROM ops ORDER BY seq DESC LIMIT 1")?
+                .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap_or((0, ops::GENESIS_HASH.to_string()));
+            let mut op = ops::make_op(ops::OpParts {
+                op_id,
+                hlc,
+                actor: "engramma:repair".to_string(),
+                kind: OpKind::PutNote,
+                note_id: Some(new_id),
+                base: None,
+                body: serde_json::json!({ "note": note.to_json() }),
+                salt: salt.to_vec(),
+                device: inner.signer.as_ref().map(|s| s.device_id()),
+                sig: None,
+            })?;
+            if let Some(signer) = &inner.signer {
+                op.sig = Some(signer.sign(op.content_hash.as_bytes()));
+            }
+            op.seq = prev_seq + 1;
+            op.seal(&prev_hash);
+            ops::apply(&tx, &op)?;
+            // the forgetting rule to the old id, as the purge applies it
+            ops::purge_state(&tx, &id)?;
+            ops::scrub_log(&tx, &id)?;
+            material::purge_conflict_copies(&tx, &id)?;
+            tx.commit()?;
+            inner
+                .conn
+                .pragma_update(None, "secure_delete", secure_before)?;
+            if let Some(st) = &mut inner.index {
+                st.idx.remove(&id.to_string());
+            }
+            moved.push((id.to_string(), new_id.to_string()));
+            repaired += 1;
+            if stop_after == Some(repaired) {
+                // interrupted: the reconciliation stays for the relaunch
+                // — it re-applies the rule to the purged ids, and a
+                // phantom still waiting must not lose its content to a
+                // walk that stopped (every note either as it was or
+                // repaired, never halfway — the interruption's own law)
+                let inner = &mut *inner_guard;
+                inner.graph_dirt.global = true;
+                inner.lang_hist_dirty = true;
+                return Ok(RepairReport { moved });
+            }
+        }
+        // the J1 reconciliation: the cells the v0.6.9 engine wrote may
+        // hold rows born from halves that no longer replay — the
+        // co-objects of the dominated operations re-derive, and the
+        // stale rows go (idempotent: repairing a healthy cell walks
+        // empty worklists)
+        {
+            let inner = &mut *inner_guard;
+            let secure_before: i64 =
+                inner.conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+            inner.conn.pragma_update(None, "secure_delete", "ON")?;
+            let tx = inner
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let purged: Vec<Option<String>> = {
+                let mut stmt = tx.prepare("SELECT DISTINCT note_id FROM ops WHERE kind = 'purge'")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                rows.flatten().collect()
+            };
+            for id in purged.into_iter().flatten() {
+                if let Ok(id) = Ulid::from_string(&id) {
+                    // the rule, again, on every purged id: the state
+                    // rows (a leftover `supersedes` row belongs to the
+                    // purged id by `new_id`, and no co-object's
+                    // materialization would take it), then the
+                    // co-objects' re-derivation — both idempotent
+                    ops::purge_state(&tx, &id)?;
+                    ops::scrub_log(&tx, &id)?;
+                    material::purge_conflict_copies(&tx, &id)?;
+                    ops::dominated_comaterialize(&tx, &id)?;
+                }
+            }
+            tx.commit()?;
+            inner
+                .conn
+                .pragma_update(None, "secure_delete", secure_before)?;
+        }
+        {
+            let inner = &mut *inner_guard;
+            inner.graph_dirt.global = true;
+            inner.lang_hist_dirty = true;
+        }
+        Ok(RepairReport { moved })
     }
 
     fn now_at(&self) -> Result<At, CellError> {

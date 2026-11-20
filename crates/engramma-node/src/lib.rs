@@ -427,9 +427,11 @@ pub struct VerifyView {
     pub ok: bool,
     pub mismatch: Option<String>,
     pub coverage: Vec<CoverageView>,
-    /// v0.6.9 (I1): note ids this verify rematerialized according to the
-    /// purge rule — cells written by v0.6.7/v0.6.8 may hold a local `put`
-    /// after a purge. Empty on a healthy cell (the repair is once).
+    /// v0.6.10 (J2): note ids of the «phantoms» this verify FOUND — a
+    /// living row on a purged id, written by the v0.6.7/v0.6.8 engines.
+    /// verify changes nothing: `ok` is false, and `repair()` is the
+    /// explicit step that moves each phantom's content to a new id.
+    /// Empty on a healthy cell.
     pub phantom_purged: Vec<String>,
 }
 
@@ -2722,6 +2724,48 @@ impl Task for VerifyTask {
     reject_recode!();
 }
 
+/// What `repair()` did (v0.6.10, J2): the map old id → new id, back to
+/// the caller, saved nowhere — Homun updates its references with it.
+#[napi(object)]
+pub struct RepairView {
+    /// `[{ old, new }]`, one pair per phantom whose content moved.
+    pub moved: Vec<RepairMove>,
+}
+
+#[napi(object)]
+pub struct RepairMove {
+    /// the purged id the phantom lived on.
+    pub old: String,
+    /// the fresh id the content lives under now.
+    pub new: String,
+}
+
+pub struct RepairTask {
+    cell: CoreCell,
+    _open: CellPermits,
+}
+
+impl Task for RepairTask {
+    type Output = engramma_core::cell::RepairReport;
+    type JsValue = RepairView;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.cell.repair().map_err(cell_error)
+    }
+
+    fn resolve(&mut self, _env: Env, r: engramma_core::cell::RepairReport) -> Result<RepairView> {
+        Ok(RepairView {
+            moved: r
+                .moved
+                .into_iter()
+                .map(|(old, new)| RepairMove { old, new })
+                .collect(),
+        })
+    }
+
+    reject_recode!();
+}
+
 pub struct CompactTask {
     cell: CoreCell,
     keep_last: i64,
@@ -2997,6 +3041,18 @@ impl Cell {
     #[napi(ts_return_type = "Promise<VerifyView>")]
     pub fn verify(&self, env: Env) -> Result<AsyncTask<VerifyTask>> {
         Ok(AsyncTask::new(VerifyTask {
+            cell: self.cell.clone(),
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// Repair what verify found: each phantom's content moves to a NEW
+    /// id (a normal put, actor `engramma:repair`), the old purged ids
+    /// are forgotten by the rule. The map old → new goes back to the
+    /// caller and is saved nowhere.
+    #[napi(ts_return_type = "Promise<RepairView>")]
+    pub fn repair(&self, env: Env) -> Result<AsyncTask<RepairTask>> {
+        Ok(AsyncTask::new(RepairTask {
             cell: self.cell.clone(),
             _open: self.enter(env)?,
         }))
