@@ -317,19 +317,18 @@ fn the_revert_of_purged_content_keeps_its_own_answer() {
     assert!(report.ok(), "{:?}", report.mismatch);
 }
 
-/// v0.6.9 (I1): a cell the v0.6.8 ENGINE wrote — `tests/golden/
-/// v068-put-after-purge.sqlite`, built by a scratch example in a
-/// worktree on the tag (`fase-v0.6.8`), with a fixed clock and mint:
-/// one note (…895), one purge, then the local `put` of the same id the
-/// v0.6.8 engine accepted (its own `verify` on it answers `ok=false` —
-/// the defect, captured). Today's engine opens it, and the FIRST
-/// `verify` rematerializes the note ACCORDING TO THE RULE — it
-/// disappears from the live state, the report names the id, and the
-/// state is a function of the operations again. Why `verify` and not
-/// `open`: the audit already reads the whole log (the purges are in
-/// hand there), while `open` must stay at half a millisecond.
+/// v0.6.9 (I1) found them, v0.6.10 (J2) made the step explicit: a cell
+/// the v0.6.8 ENGINE wrote — `tests/golden/v068-put-after-purge.sqlite`,
+/// built by a scratch example in a worktree on the tag (`fase-v0.6.8`),
+/// with a fixed clock and mint: one note (…895), one purge, then the
+/// local `put` of the same id the v0.6.8 engine accepted (its own
+/// `verify` on it answers `ok=false` — the defect, captured). Today's
+/// engine opens it, `verify` FINDS the phantom and says the cell needs
+/// repair without touching a byte, and `repair()` moves the content
+/// under a new id (the full contract is `tests/repair.rs`; this test
+/// keeps the historical fixture at the point that declared it).
 #[test]
-fn a_v068_cell_with_a_put_after_a_purge_is_repaired_at_verify() {
+fn a_v068_cell_with_a_put_after_a_purge_signals_and_repairs_explicitly() {
     let dir = tempfile::tempdir().unwrap(/* test-only */);
     let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/v068-put-after-purge.sqlite");
@@ -340,44 +339,39 @@ fn a_v068_cell_with_a_put_after_a_purge_is_repaired_at_verify() {
     let alive = Ulid::from_string(&format!("01{}{:08}", "0".repeat(16), 2)).unwrap(/* fixture */);
 
     let cell = Cell::open(&path).unwrap(/* test-only */);
-    // the phantom is there before the repair: the live state the v0.6.8
-    // engine left
     assert!(
         cell.note_ids_all().unwrap(/* t */).contains(&phantom),
         "the fixture holds the phantom row"
     );
+    // verify is a diagnosis: it names the phantom, it says the cell
+    // needs repair, and it changes nothing
     let report = cell.verify().unwrap(/* test-only */);
     assert!(
-        report.ok(),
-        "verify repairs the phantom: {:?}",
-        report.mismatch
+        !report.ok(),
+        "the outcome says the cell needs repair"
     );
     assert_eq!(
         report.phantom_purged,
         vec![phantom.to_string()],
-        "the report names the rematerialized id"
+        "the report names the phantom it found"
     );
-    // gone from the live state, on every read
-    assert!(!cell.note_ids_all().unwrap(/* t */).contains(&phantom));
-    assert!(cell.get(&phantom).is_err());
     assert!(
-        cell.search(&engramma_core::search::Query::text("quokkaviolaceo").k(10))
-        .unwrap(/* t */)
-        .iter()
-        .all(|h| h.note.id != phantom)
+        cell.note_ids_all().unwrap(/* t */).contains(&phantom),
+        "the diagnosis left the state alone"
     );
-    // the living control note is untouched
+    // the repair moves the content under a new id, and verify goes green
+    let repaired = cell.repair().unwrap(/* test-only */);
+    assert_eq!(
+        repaired.moved,
+        vec![(phantom.to_string(), repaired.moved[0].1.clone())],
+        "one phantom, moved"
+    );
+    let check = cell.verify().unwrap(/* test-only */);
+    assert!(check.ok(), "{:?}", check.mismatch);
+    // the living control note is untouched through it all
     assert_eq!(
         cell.get(&alive).unwrap(/* t */).body,
         "passeggiata lungo larghissimo fiume"
-    );
-    // the SECOND verify is green and repairs nothing more
-    let again = cell.verify().unwrap(/* t */);
-    assert!(again.ok(), "{:?}", again.mismatch);
-    assert!(
-        again.phantom_purged.is_empty(),
-        "the repair is once: {:?}",
-        again.phantom_purged
     );
 }
 
