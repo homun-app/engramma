@@ -707,6 +707,19 @@ fn materialize_note(
             write_conflict_edge(tx, id, &original)?;
         }
     }
+    // v0.6.10 (J1, the hunt's seeds 4815… and 3695…): a note whose
+    // replay left NO ROW (its creation was dominated — or it never had
+    // one) cannot leave anything that NAMES it: a `supersedes` row would
+    // point at a note that will never materialize (whether it lingered
+    // depended on which half materialized last), and its CONFLICT COPIES
+    // — derived while it lived — are the derivation of a dead line (the
+    // same closure the purge applies to the ids it forgets). The
+    // `new_id` rows the pre-clean already took; these are the `old_id`
+    // ones and the copies.
+    if ops::read_note_row(tx, id)?.is_none() {
+        tx.execute("DELETE FROM supersedes WHERE old_id = ?1", [id.to_string()])?;
+        purge_conflict_copies(tx, id)?;
+    }
     restore_hlc_watermark(tx, watermark, None)?;
     Ok(())
 }

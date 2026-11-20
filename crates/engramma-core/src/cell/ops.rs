@@ -1862,6 +1862,7 @@ fn apply_supersede(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), Ce
             "INSERT OR IGNORE INTO supersedes (new_id, old_id) VALUES (?1, ?2)",
             rusqlite::params![new.id.to_string(), old_id.to_string()],
         )?;
+
     }
     Ok(())
 }
@@ -2942,10 +2943,15 @@ fn apply_decide(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), CellE
             t.updated_at = decided_at;
             write_note(tx, &t, true, false)?;
             reindex_note(tx, &target, Some(&trow))?;
-            tx.execute(
-                "INSERT OR IGNORE INTO supersedes (new_id, old_id) VALUES (?1, ?2)",
-                rusqlite::params![id.to_string(), target.to_string()],
-            )?;
+            // v0.6.10 (J1): same rule as the whole body — the row only
+            // when the target lives (the censored body keeps the target
+            // id; the note may be long gone)
+            if read_note(tx, &target)?.is_some() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO supersedes (new_id, old_id) VALUES (?1, ?2)",
+                    rusqlite::params![id.to_string(), target.to_string()],
+                )?;
+            }
         }
         return Ok(());
     }
@@ -3067,7 +3073,13 @@ fn apply_decide(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), CellE
                     write_note(tx, &t, true, false)?;
                     reindex_note(tx, &target, Some(trow))?;
                 }
-                if scope.wants(&id) || scope.wants(&target) {
+                // v0.6.10 (J1): the row is written only when the target
+                // LIVES — a decide whose target's creation was dominated
+                // (the note will never materialize) must not leave a
+                // phantom pointer behind, whatever half materializes
+                if (scope.wants(&id) || scope.wants(&target))
+                    && read_note(tx, &target)?.is_some()
+                {
                     tx.execute(
                         "INSERT OR IGNORE INTO supersedes (new_id, old_id) VALUES (?1, ?2)",
                         rusqlite::params![id.to_string(), target.to_string()],
