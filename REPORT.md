@@ -10224,3 +10224,102 @@ locale, e lì la correzione era piccola; qui è un cambio di derivazione
 righe. Tutto il resto è pronto: il difetto I1 è chiuso, le misure
 dentro le soglie, il contratto esteso senza rotture, la caccia e lo
 SHA ormai incapaci di fermarsi a metà o di mentire.
+
+## Verifica v0.6.9 (revisore, 2026-11-20)
+
+Fatta sul tag `fase-v0.6.9` (`d0a7220`), a priorità minima. Le sonde stanno
+nello scratchpad del revisore, fuori dal repo.
+
+### Cosa regge
+
+- **I4 funziona.** `scripts/build-sha.sh` sul tag, rifatto dal revisore,
+  riproduce i tre SHA del REPORT (`.node` `99956ac6…`, 50 687 528 B). Per la
+  prima volta in tre fasi lo SHA dichiarato è quello del tag.
+- **I3 ha già pagato.** La caccia intera ha trovato un difetto che la caccia
+  a metà della v0.6.8 non avrebbe visto. Il giudizio dei rossi sta nel
+  REPORT, ed è fatto bene: il seme è ridotto, diagnosticato e datato con i
+  due worktree.
+- **I1 e I2.**
+  - La guardia sta nell'imbuto unico della scrittura, `execute_op`, e GLM
+    ha trovato da sé `delete` e `decide`, che mancavano dall'elenco.
+  - La sonda del revisore della v0.6.8, girata sul tag con l'asserzione
+    rovesciata, è verde: la copia presa resta visibile sia in `note_ids()`
+    sia in `get()`.
+  - `list()` scende del 19%.
+- **Le corse del revisore:**
+  - `test:electron` 57/57;
+  - `npm test` 57/57, con la CLI ricostruita (vedi il difetto 3).
+- **Le sonde sulle altre operazioni a due oggetti sono verdi.** Il revisore
+  ha provato su una cella sola: `link` verso una nota poi purgata, `supersede`
+  con la nota nuova purgata, `supersede` con la vecchia purgata, seguiti da
+  una scrittura e da `verify`. Il buco sembra proprio della `decide`.
+  Serve comunque una prova generale (vedi sotto).
+
+### I difetti
+
+1. **La `decide` che rigioca sopra la purga** (dichiarato da GLM, seme
+   `14903861504949011020`). Il revisore è d'accordo con la diagnosi e col
+   fermo. **Non** è d'accordo con la proposta di metterlo nella fase della
+   fusione a righe.
+   - La correzione è piccola: la dominanza della purga va applicata per
+     operazione, non per oggetto.
+   - Alzare l'ALPN a `sync/5` oggi non costa niente, perché nessuno usa la
+     sync.
+   - Legarla alla fusione a righe, che è il cambio più rischioso del motore,
+     terrebbe ferma la release locale dietro un lavoro che alla release
+     locale non serve.
+2. **`verify` cancella dati (bloccante per la release locale).**
+   - La riparazione delle note «fantasma» sta dentro `verify` e fa
+     `purge_state` + `scrub_log` + `purge_conflict_copies` con
+     `secure_delete`: è irreversibile, e lo dice solo il campo
+     `phantom_purged` del rapporto.
+   - Una diagnosi non deve cambiare lo stato, tanto meno cancellare in modo
+     irreversibile, per due motivi:
+     - *il fantasma è contenuto scritto dall'utente **dopo** la purga* (una
+       reimportazione, un backup): la regola dice che quell'**id** non torna,
+       non che quel **testo** va distrutto;
+     - *qualunque difetto futuro* che lasci una riga viva su un id purgato
+       diventerebbe una perdita silenziosa al primo `verify`, invece di un
+       allarme.
+   - *La forma giusta:*
+     - `verify` torna a sola lettura e **segnala** i fantasmi;
+     - la riparazione è un passo esplicito (`repairPhantoms()`, o una
+       migrazione all'apertura che scrive il suo rapporto) che **sposta il
+       contenuto su un id nuovo** con una `put` normale, poi applica la
+       regola all'id vecchio;
+     - così lo stato resta funzione delle operazioni, l'id dimenticato non
+       torna, e l'utente non perde quello che ha scritto dopo.
+3. **I test JS usano in silenzio un binario vecchio** (preesistente, del
+   banco di prova).
+   - `engine.test.js` cerca la CLI prima in `target/release` e poi in
+     `target/debug`, senza controllare che corrisponda ai sorgenti.
+   - Sulla macchina del revisore `target/release/engramma` era del 18
+     novembre (schema 20): tre test della vista sono caduti con «the cell
+     schema is newer than this binary». Con `ENGRAMMA_BIN` puntato alla
+     build fresca, 57/57.
+   - Un test che passa o cade secondo quale binario trova in giro non misura
+     il codice. Serve un controllo prima dei test: la CLI ricostruita dal
+     `pretest`, oppure `engramma --version` con il commit e lo schema,
+     confrontati con l'addon. Se non coincidono, il test si rifiuta di
+     partire.
+4. **`target/` cresce:** 13 G → 17 G → 22 G in tre fasi. Va detto
+   all'utente; il revisore non pulisce niente da sé.
+
+### Verdetto
+
+**v0.6.9 agganciabile per lo sviluppo di Homun**, con lo SHA del REPORT,
+riprodotto. Sostituisce la v0.6.8.
+
+**Release locale: non pronta**, d'accordo con GLM, ma per due ragioni e non
+per una: la `decide` sopra la purga, e il `verify` che cancella.
+
+Il revisore propone una **v0.6.10 breve**, solo questo:
+- la dominanza della purga per operazione, con `sync/5` e una proprietà che
+  copra tutte le operazioni a due oggetti;
+- `verify` di nuovo in sola lettura, e la riparazione esplicita che sposta
+  il contenuto;
+- il controllo del binario nei test JS;
+- la caccia intera.
+
+Poi la release locale. La fusione a righe e il proprietario delle righe
+vengono dopo, nella loro fase.
