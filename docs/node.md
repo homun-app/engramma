@@ -101,6 +101,7 @@ export class Cell {
   embedPending(limit?: number): Promise<number>
   changesSince(seq: number): Promise<{ head: number; ops: OpView[] } | { compacted: true; head: number }>
   verify(): Promise<VerifyView>
+  repair(): Promise<RepairView>          // v0.6.10, J2: { moved: [{old, new}] }
   compact(keepLast: number, opts?: { keepSnapshot?: boolean }): Promise<CompactView>
   vaultViews(): Promise<VaultView[]>
   vaultUnbind(dirOrViewId: string): Promise<void>
@@ -404,13 +405,33 @@ Notevoli:
     `errors`); la vista della cartella (il demone che guarda la
     cartella markdown) nomina gli id nello stesso campo del suo
     rapporto e lascia i file al loro posto.
-- **`verify` ripara le celle vecchie.** Le celle scritte dalla
-  v0.6.7/v0.6.8 possono contenere una `put` dopo la purga (il difetto
-  del seme `1207…`): al primo `verify` la nota sparisce dal vivo
-  secondo la regola e il rapporto la nomina in
-  **`phantomPurged: [id…]`** — vuoto su una cella sana, e la riparazione
-  è una volta sola. Homun può mostrare l'elenco dopo un `verify`
-  post-aggiornamento.
+- **(v0.6.10, J2) `verify` è una diagnosi: trova, non tocca.** Le celle
+  scritte dalla v0.6.7/v0.6.8 possono contenere una `put` dopo la purga
+  (il difetto del seme `1207…`): `verify` nomina quelle note in
+  **`phantomPurged: [id…]`** — vuoto su una cella sana — e `ok` è
+  **false**: la cella ha bisogno di repair. Non un byte si muove (il
+  fantasma è contenuto che l'utente ha scritto dopo la purga: la regola
+  dimentica l'id, non il testo).
+- **`cell.repair()` è il passo esplicito.** Per ogni fantasma, in una
+  transazione per ciascuno (un'interruzione lascia ogni nota o com'era o
+  riparata; riparare due volte non fa niente la seconda): il contenuto
+  va in una **nota nuova con un id nuovo** con una `put` normale
+  (attore `engramma:repair`), poi la regola all'id vecchio. Risponde
+  **`{ moved: [{ old, new }] }`** — la mappa vecchio → nuovo, che
+  **Homun deve usare subito** per aggiornare i suoi riferimenti
+  (i link nei messaggi, i promemoria, i riferimenti in conversazione):
+  la mappa non si salva da nessuna parte nella cella, l'id dimenticato
+  non deve restare scritto in nessun posto nuovo. Dopo `repair()`,
+  `verify()` è verde (la stessa chiamata sistema anche le righe che i
+  motori fino alla v0.6.9 scrissero con metà che la nuova regola di
+  dominanza non rigioca più).
+- **(v0.6.10, J3) il banco misura il binario giusto.** `engramma
+  --version` e **`buildInfo()`** dicono entrambi il commit (con
+  `-dirty`) e lo schema; il banco dei test confronta i due e **si
+  rifiuta di partire** se non coincidono («la CLI in … è del commit X,
+  l'addon del commit Y: ricostruisci o imposta ENGRAMMA_BIN»). Il
+  `pretest` di `npm test` e `test:electron` costruisce la CLI: il caso
+  normale è sempre fresco.
 
 ## Un assistente che ricorda
 

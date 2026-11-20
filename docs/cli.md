@@ -126,11 +126,39 @@ compaction), `from_snapshot` (the tail replays on the snapshot file) or
 chain, every surviving payload's digest, the derived indexes (the `d…`
 edges re-derived from the notes, no vector for a note that no longer lives)
 and the state digest while the head has not moved past the checkpoint.
-JSON: `{ops, replay, hash_chain_ok, replay_ok, fts_ok, mismatch, coverage,
-ok}` — `coverage` lists the vector coverage per model (`{model, state,
-covered, living}`; embeddings are derived data, their absence is never a
-verification failure). The human output prints one `copertura vettori` line
-per model.
+JSON: `{ops, replay, hash_chain_ok, replay_ok, fts_ok, mismatch,
+phantom_purged, coverage, ok}` — `coverage` lists the vector coverage per
+model (`{model, state, covered, living}`; embeddings are derived data,
+their absence is never a verification failure). The human output prints one
+`copertura vettori` line per model. **(v0.6.10, J2) verify is read-only**:
+it runs inside a deferred transaction that always rolls back, and when the
+cell holds «phantom» notes — a living row on a purged id, written by the
+v0.6.7/v0.6.8 engines — it NAMES them (`phantom_purged`), the outcome says
+the cell needs repair, and not one byte moves. The phantom is content the
+user wrote after the purge (a reimport, a backup): the rule forgot the id,
+not the text.
+
+### `repair` (v0.6.10)
+The explicit step verify asks for. For each phantom, in its own
+transaction (an interruption leaves every note either as it was or
+repaired, never halfway): the content of the living row goes to a note
+with a NEW id, with a normal `put` (actor `engramma:repair`); then the
+forgetting rule applies to the old id — state rows, closure over the
+conflict copies, log scrub, `secure_delete`. The same call settles the
+rows the v0.6.9-or-older engines wrote with halves that no longer replay
+(the resurrected `supersedes` of a decide over a purged proposal): the
+co-objects re-derive, and verify is green after. JSON:
+`{moved: [{old, new}], verify_ok}` — the map goes to the CALLER (Homun's
+references) and is saved nowhere: the forgotten id must not stay written
+anywhere new. The human output prints `id8 → id8` per note.
+
+### `--version` (v0.6.10)
+Prints the version, the **commit** the binary was built from (with the
+`-dirty` mark when the tree was not clean) and the cell **schema** it
+supports: `engramma 0.1.0-dev (commit 97669d2, schema 22)`. The JS bench
+compares this line with the addon's own build and refuses to run when
+they disagree — a test that passes or falls according to which binary
+lies around in `target/` measures nothing.
 
 ### `search TEXT` (v0.2)
 Options: `--mode text|vector|hybrid` (default: `hybrid` when the cell has a

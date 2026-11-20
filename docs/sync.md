@@ -99,10 +99,10 @@ Un estraneo che si finge un dispositivo: la connessione si chiude **prima di qua
 
 **Quello che il dispositivo aveva già lo tiene**: la revoca non cancella i dischi altrui. Le sei cifre e il biglietto monouso sono le difese dell'**abbinamento**; la rotazione è la difesa del **dopo**.
 
-## La versione delle regole (v0.6.5; la 4 in v0.6.7)
+## La versione delle regole (v0.6.5; la 4 in v0.6.7; la 5 in v0.6.10)
 
 L'ALPN **è** la versione delle regole di materializzazione:
-`engramma/sync/4` (e `engramma/mailbox/4` per la casella postale). Un
+`engramma/sync/5` (e `engramma/mailbox/5` per la casella postale). Un
 dispositivo con regole diverse, davanti allo stesso insieme di
 operazioni, deriva stati diversi — quindi non devono scambiare
 nemmeno un'operazione. Il rifiuto avviene all'handshake: chi chiama
@@ -115,7 +115,11 @@ giudica la linea chiusa); la v0.6.7 porta la `4` perché il testimone
 non dipende più dalla lapide (una scrittura che la lapide ha battuto
 attesta lo stesso ciò che il suo autore aveva davanti) e le copie di
 una nota cancellata seguono la lapide (invisibili, non cercabili,
-fuori da `conflicts()`); la v0.7 delle organizzazioni alzerà ancora.
+fuori da `conflicts()`); la v0.7 delle organizzazioni alzerà ancora. La v0.6.10 porta la `5` perché la purga
+domina per OPERAZIONE: un'operazione a due oggetti (una `decide`, una
+`supersede`, un `link`) con un lato purgato non rigioca nessuna metà —
+regole 4 e 5 derivano stati diversi dallo stesso insieme, e devono
+rifiutarsi a vicenda.
 
 ## I conflitti
 
