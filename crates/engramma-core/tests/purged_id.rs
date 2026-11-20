@@ -346,10 +346,7 @@ fn a_v068_cell_with_a_put_after_a_purge_signals_and_repairs_explicitly() {
     // verify is a diagnosis: it names the phantom, it says the cell
     // needs repair, and it changes nothing
     let report = cell.verify().unwrap(/* test-only */);
-    assert!(
-        !report.ok(),
-        "the outcome says the cell needs repair"
-    );
+    assert!(!report.ok(), "the outcome says the cell needs repair");
     assert_eq!(
         report.phantom_purged,
         vec![phantom.to_string()],

@@ -1570,10 +1570,17 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 );
                 println!("scritta dai motori v0.6.7/v0.6.8):");
                 for id in &report.phantom_purged {
-                    println!("  {}", engramma_core::id::id8(&Ulid::from_string(id).unwrap_or_default()));
+                    println!(
+                        "  {}",
+                        engramma_core::id::id8(&Ulid::from_string(id).unwrap_or_default())
+                    );
                 }
-                println!("verify non tocca niente: «engramma repair» sposta il contenuto su id nuovi");
-                return Err(CliError::internal("la cella ha bisogno di repair".to_string()));
+                println!(
+                    "verify non tocca niente: «engramma repair» sposta il contenuto su id nuovi"
+                );
+                return Err(CliError::internal(
+                    "la cella ha bisogno di repair".to_string(),
+                ));
             } else if report.ok() {
                 match &report.replay {
                     engramma_core::cell::Replay::Full => println!(
@@ -1635,8 +1642,10 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             } else if report.moved.is_empty() {
                 println!("niente da riparare: nessun fantasma");
             } else {
-                println!("riparate {} note fantasma (il contenuto vive sotto id nuovi):",
-                    report.moved.len());
+                println!(
+                    "riparate {} note fantasma (il contenuto vive sotto id nuovi):",
+                    report.moved.len()
+                );
                 for (old, new) in &report.moved {
                     println!(
                         "  {} → {}",

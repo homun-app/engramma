@@ -1189,7 +1189,10 @@ fn purge_relevant_note_ids(
                 .and_then(|n| n.get("id"))
                 .and_then(serde_json::Value::as_str)
                 // the censor keeps the id by itself (v0.6.10, J1)
-                .or_else(|| body.and_then(|b| b.get("new_id")).and_then(serde_json::Value::as_str));
+                .or_else(|| {
+                    body.and_then(|b| b.get("new_id"))
+                        .and_then(serde_json::Value::as_str)
+                });
             if let Some(id) = new.and_then(|s| Ulid::from_string(s).ok()) {
                 push(id, &mut ids);
             }
@@ -1203,7 +1206,10 @@ fn purge_relevant_note_ids(
             // a correction of a note the set forgot is dead weight: no
             // decide can ever accept it (the decide would be dominated
             // too)
-            if body.and_then(|b| b.get("mode")).and_then(serde_json::Value::as_str) == Some("supersede")
+            if body
+                .and_then(|b| b.get("mode"))
+                .and_then(serde_json::Value::as_str)
+                == Some("supersede")
                 && let Some(id) = id_of(body.and_then(|b| b.get("target")))
             {
                 push(id, &mut ids);
@@ -1211,7 +1217,10 @@ fn purge_relevant_note_ids(
         }
         OpKind::Link => {
             let edge = body.and_then(|b| b.get("edge"));
-            for endpoint in [edge.and_then(|e| e.get("src")), edge.and_then(|e| e.get("dst"))] {
+            for endpoint in [
+                edge.and_then(|e| e.get("src")),
+                edge.and_then(|e| e.get("dst")),
+            ] {
                 if let Some(id) = endpoint
                     .and_then(serde_json::Value::as_str)
                     .and_then(|s| s.strip_prefix("note:"))
@@ -1225,15 +1234,21 @@ fn purge_relevant_note_ids(
             }
         }
         OpKind::Unlink => {
-            let endpoints = |edge: Option<&serde_json::Value>| -> Option<(String, String, Option<String>)> {
-                let e = edge?;
-                Some((
-                    e.get("src")?.as_str()?.to_string(),
-                    e.get("dst")?.as_str()?.to_string(),
-                    e.get("note_id").and_then(serde_json::Value::as_str).map(String::from),
-                ))
-            };
-            let row = match body.and_then(|b| b.get("edge_id")).and_then(serde_json::Value::as_str) {
+            let endpoints =
+                |edge: Option<&serde_json::Value>| -> Option<(String, String, Option<String>)> {
+                    let e = edge?;
+                    Some((
+                        e.get("src")?.as_str()?.to_string(),
+                        e.get("dst")?.as_str()?.to_string(),
+                        e.get("note_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(String::from),
+                    ))
+                };
+            let row = match body
+                .and_then(|b| b.get("edge_id"))
+                .and_then(serde_json::Value::as_str)
+            {
                 Some(edge_id) => tx
                     .query_row(
                         "SELECT src, dst, note_id FROM edges WHERE id = ?1",
@@ -1320,7 +1335,6 @@ pub(crate) fn op_dominated_by_purge(
     }
     Ok(false)
 }
-
 
 /// The purge of a note takes its CONFLICT COPIES with it: they are the
 /// note's own derivation, and the right to be forgotten reaches everything

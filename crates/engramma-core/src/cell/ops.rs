@@ -2090,10 +2090,7 @@ pub(crate) fn hidden_optimize(conn: &Connection) -> Result<(), CellError> {
 /// rematerialize, transitively. Called by `apply_purge` and by
 /// [`Cell::repair`](super::Cell::repair)'s reconciliation of cells the
 /// older engines wrote; idempotent (the same set derives the same state).
-pub(crate) fn dominated_comaterialize(
-    tx: &Transaction<'_>,
-    id: &Ulid,
-) -> Result<(), CellError> {
+pub(crate) fn dominated_comaterialize(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
     // v0.6.10 (J1): the purge dominates per OPERATION, and the halves it
     // dominates may have LANDED already — a copy that applied the decide
     // before the proposal's purge arrived holds the target's closing,
@@ -2162,7 +2159,9 @@ pub(crate) fn dominated_comaterialize(
             }
             continue;
         };
-        let Ok(nid) = Ulid::from_string(nid) else { continue };
+        let Ok(nid) = Ulid::from_string(nid) else {
+            continue;
+        };
         // the purge already answered for its own id: a co-object that is
         // itself purged has nothing to rematerialize
         if super::material::note_purged_in_set(tx, &nid)? {
@@ -2208,10 +2207,7 @@ pub(crate) fn dominated_comaterialize(
                    AND oo2.object != ?1
                    AND oo2.object LIKE 'note:%'",
             )?;
-            let rows: Vec<String> = stmt
-                .query_map([&object], |r| r.get(0))?
-                .flatten()
-                .collect();
+            let rows: Vec<String> = stmt.query_map([&object], |r| r.get(0))?.flatten().collect();
             for next in rows {
                 if seen.insert(next.clone()) {
                     frontier.push(next);

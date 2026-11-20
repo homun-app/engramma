@@ -15,9 +15,11 @@
 //! - `link` e `unlink` (i due estremi e la nota che dichiara);
 //! - `propose` con un bersaglio.
 
-use engramma_core::cell::ops::OpKind;
-use engramma_core::cell::proposals::{DecisionAction, DecisionInput, ProposalInput, ProposalMode, ProposeContext};
 use engramma_core::cell::EdgeInput;
+use engramma_core::cell::ops::OpKind;
+use engramma_core::cell::proposals::{
+    DecisionAction, DecisionInput, ProposalInput, ProposalMode, ProposeContext,
+};
 use engramma_core::format::{At, Lang, Note, NoteType};
 use engramma_core::{Cell, Confidence, NotePatch, Status};
 use time::OffsetDateTime;
@@ -462,7 +464,11 @@ fn a_propose_for_a_purged_target_does_not_materialize() {
     let queue: Vec<String> = cell
         .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM proposals WHERE note_id != 'x' AND target IS NOT NULL")
         .unwrap(/* t */);
-    assert_eq!(queue.first().map(String::as_str), Some("0"), "the queue holds no proposal for a purged target");
+    assert_eq!(
+        queue.first().map(String::as_str),
+        Some("0"),
+        "the queue holds no proposal for a purged target"
+    );
 
     let report = cell.verify().unwrap(/* t */);
     assert!(report.ok(), "{:?}", report.mismatch);

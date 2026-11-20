@@ -4070,8 +4070,9 @@ impl Cell {
             // transaction, and the borrow stays split by field)
             let (op_id, salt) = mint_ids(inner)?;
             let new_id = mint_ids(inner)?.0;
-            let secure_before: i64 =
-                inner.conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+            let secure_before: i64 = inner
+                .conn
+                .query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
             inner.conn.pragma_update(None, "secure_delete", "ON")?;
             let tx = inner
                 .conn
@@ -4164,14 +4165,16 @@ impl Cell {
         // empty worklists)
         {
             let inner = &mut *inner_guard;
-            let secure_before: i64 =
-                inner.conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+            let secure_before: i64 = inner
+                .conn
+                .query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
             inner.conn.pragma_update(None, "secure_delete", "ON")?;
             let tx = inner
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let purged: Vec<Option<String>> = {
-                let mut stmt = tx.prepare("SELECT DISTINCT note_id FROM ops WHERE kind = 'purge'")?;
+                let mut stmt =
+                    tx.prepare("SELECT DISTINCT note_id FROM ops WHERE kind = 'purge'")?;
                 let rows = stmt.query_map([], |r| r.get(0))?;
                 rows.flatten().collect()
             };

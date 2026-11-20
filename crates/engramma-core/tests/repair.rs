@@ -11,8 +11,8 @@
 //! caller and is saved nowhere: the forgotten id must not stay written
 //! anywhere new.
 
-use engramma_core::search::Query;
 use engramma_core::Cell;
+use engramma_core::search::Query;
 use ulid::Ulid;
 
 /// The v0.6.8 fixture (`tests/golden/v068-put-after-purge.sqlite`): one
@@ -35,8 +35,8 @@ fn phantom_stage(name: &str) -> (tempfile::TempDir, Cell, Ulid, Ulid) {
 /// The bytes of the cell file (and the WAL, when one exists) — what
 /// «verify touches nothing» is judged on.
 fn file_bytes(dir: &std::path::Path, name: &str) -> Vec<Vec<u8>> {
-    let mut out = vec![std::fs::read(dir.path().join(name)).unwrap(/* ours */)];
-    let wal = dir.path().join(format!("{name}-wal"));
+    let mut out = vec![std::fs::read(dir.join(name)).unwrap(/* ours */)];
+    let wal = dir.join(format!("{name}-wal"));
     if wal.is_file() {
         out.push(std::fs::read(&wal).unwrap(/* ours */));
     }
@@ -81,13 +81,15 @@ fn verify_touches_nothing_and_names_the_phantom() {
         cell.note_ids_all().unwrap(/* t */).contains(&phantom),
         "verify left the phantom where it was"
     );
-    // …and the file is byte for byte the same, pages and digest included
-    drop(cell);
+    // …and the file is byte for byte the same, pages and digest
+    // included (judged with the cell still open: closing it may
+    // checkpoint a pre-existing WAL, and the close is not verify's act)
     let after = file_bytes(dir.path(), "verify-lettura.sqlite");
     assert_eq!(
         before, after,
         "verify is read-only: the cell file must not change"
     );
+    drop(cell);
 }
 
 /// v0.6.10 (J2): the explicit repair of a v0.6.8-written cell. The
@@ -110,7 +112,7 @@ fn repair_moves_the_phantom_content_under_a_new_id() {
     // the content survives, whole, under the new id…
     let moved = cell.get(&new).unwrap(/* t */);
     assert_eq!(moved.body, "quokkaviolaceo zibellinotremante ritorno");
-    assert_eq!(moved.title.as_deref(), Some("titolo 895"));
+    assert_eq!(moved.title.as_deref(), Some("la nota che non torna"));
     // …the old id is gone from every read…
     assert!(!cell.note_ids_all().unwrap(/* t */).contains(&phantom));
     assert!(cell.get(&phantom).is_err());
@@ -136,7 +138,7 @@ fn repair_moves_the_phantom_content_under_a_new_id() {
     // …and the repair declared itself in the log
     let actors = cell
         .debug_column(&format!(
-            "SELECT actor FROM ops WHERE kind = 'put' AND note_id = '{new}'"
+            "SELECT actor FROM ops WHERE kind = 'put_note' AND note_id = '{new}'"
         ))
         .unwrap(/* t */);
     assert_eq!(actors, vec!["engramma:repair".to_string()]);
@@ -150,8 +152,10 @@ fn repair_moves_the_phantom_content_under_a_new_id() {
         format!("SELECT 1 FROM note_tags WHERE note_id = '{phantom}'"),
         format!("SELECT 1 FROM edges WHERE note_id = '{phantom}'"),
         format!("SELECT 1 FROM supersedes WHERE new_id = '{phantom}' OR old_id = '{phantom}'"),
-        format!("SELECT 1 FROM op_payloads p JOIN ops o ON o.op_id = p.op_id
-                  WHERE o.note_id = '{phantom}' AND p.body IS NOT NULL"),
+        format!(
+            "SELECT 1 FROM op_payloads p JOIN ops o ON o.op_id = p.op_id
+                  WHERE o.note_id = '{phantom}' AND p.body IS NOT NULL"
+        ),
     ] {
         assert!(
             cell.debug_column(&sql).unwrap(/* t */).is_empty(),
@@ -190,7 +194,7 @@ fn an_interrupted_resumable_repair_ends_clean() {
     let second = Ulid::from_string(&format!("01{}{:08}", "0".repeat(16), 999))
         .unwrap(/* fixture id space */);
     {
-        use engramma_core::format::{Lang, Note, NoteType};
+        use engramma_core::format::{Lang, NoteType};
         let mut fresh = note(999, "secondo fantasma zibellinotremante");
         fresh.note_type = NoteType::Fact;
         fresh.lang = Some(Lang::It);
@@ -214,22 +218,36 @@ fn an_interrupted_resumable_repair_ends_clean() {
     drop(cell);
     let cell = Cell::open(&dir.path().join("interrotta.sqlite")).unwrap(/* t */);
     let ids = cell.note_ids_all().unwrap(/* t */);
-    assert!(ids.contains(&phantom) && ids.contains(&second), "two phantoms");
+    assert!(
+        ids.contains(&phantom) && ids.contains(&second),
+        "two phantoms"
+    );
 
     // the interruption: stop after the first phantom (the test-only
     // injection, same discipline as the purge's FTS one)
     let stopped = {
-        std::env::set_var("ENGRAMMA_TEST_REPAIR_STOP_AFTER", "1");
+        // SAFETY: the test runner is single-threaded here (the injection
+        // is read once, at repair's start)
+        unsafe {
+            std::env::set_var("ENGRAMMA_TEST_REPAIR_STOP_AFTER", "1");
+        }
         let r = cell.repair();
-        std::env::remove_var("ENGRAMMA_TEST_REPAIR_STOP_AFTER");
+        unsafe {
+            std::env::remove_var("ENGRAMMA_TEST_REPAIR_STOP_AFTER");
+        }
         r.unwrap(/* t */)
     };
-    assert_eq!(stopped.moved.len(), 1, "one phantom repaired, then the stop");
+    assert_eq!(
+        stopped.moved.len(),
+        1,
+        "one phantom repaired, then the stop"
+    );
     let (old, new) = stopped.moved[0].clone();
     assert_eq!(old, phantom.to_string(), "the phantoms go in order");
     // the FIRST is whole under its new id, the SECOND is exactly as it was
     assert!(
-        cell.get(&Ulid::from_string(&new).unwrap(/* ours */)).is_ok(),
+        cell.get(&Ulid::from_string(&new).unwrap(/* ours */))
+            .is_ok(),
         "the first phantom's content lives"
     );
     assert!(
