@@ -4403,3 +4403,27 @@ impl Pairing {
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
+
+/// v0.6.10 (J3): what the ADDON was built from — the commit (with the
+/// `-dirty` mark, baked by the build script) and the cell schema it
+/// supports. The JS bench compares this with the CLI's own `--version`
+/// line and refuses to run when they disagree: a test that passes or
+/// falls according to which binary lies around measures nothing.
+#[napi(object)]
+pub struct BuildInfo {
+    /// the crate version.
+    pub version: String,
+    /// the commit the addon was built from (`…-dirty` on a dirty tree).
+    pub commit: String,
+    /// the cell schema this build supports.
+    pub schema: i64,
+}
+
+#[napi]
+pub fn build_info() -> BuildInfo {
+    BuildInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        commit: env!("ENGRAMMA_BUILD_COMMIT").to_string(),
+        schema: engramma_core::cell::schema::SCHEMA_VERSION,
+    }
+}

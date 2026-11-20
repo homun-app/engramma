@@ -4049,7 +4049,7 @@ impl Cell {
             .write_lock
             .lock()
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
-        let mut inner = self.lock()?;
+        let inner = self.lock()?;
         // v0.6.8 (H3)'s discipline: the test-only injection stops the
         // walk after N phantoms — the interruption is part of the
         // contract, and the test proves the relaunch ends clean. It can

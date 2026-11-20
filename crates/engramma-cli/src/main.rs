@@ -30,10 +30,24 @@ use engramma_core::{Cell, CellError, Confidence, NotePatch, Status, Validity};
 use output::{CliError, hit_human, hit_json, note_json};
 use ulid::Ulid;
 
+/// v0.6.10 (J3): `--version` says WHICH sources built this binary — the
+/// commit (with the `-dirty` mark when the tree was not clean) and the
+/// schema it supports. A bench (the JS one compares this line with the
+/// addon's own) or a human can refuse a stale binary instead of
+/// measuring it.
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (commit ",
+    env!("ENGRAMMA_BUILD_COMMIT"),
+    ", schema ",
+    env!("ENGRAMMA_SCHEMA"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(
     name = "engramma",
-    version,
+    version = LONG_VERSION,
     about = "Motore di memoria personale: note, grafo, tempo, ricerca",
     disable_help_subcommand = true
 )]

@@ -10,7 +10,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { Engine, version } = require('..');
+const { Engine, version, buildInfo } = require('..');
+const { assertCliMatchesAddon } = require('./bincheck.js');
 
 // v0.4.2: the CLI binary the view tests spawn. ENGRAMMA_BIN wins; then
 // $CARGO_TARGET_DIR (a v0.4.1 leftover: with it set, the old lookup only
@@ -22,6 +23,17 @@ const engrammaBin = () =>
     .flatMap((t) => [`${t}/release/engramma`, `${t}/debug/engramma`])
     .map((p) => path.resolve(__dirname, p))
     .find((p) => fs.existsSync(p));
+
+// v0.6.10 (J3): the bench REFUSES a CLI that is not the one these
+// sources built — the commit and the schema the binary prints must be
+// the addon's own. A test that passes or falls according to which
+// binary lies around in target/ measures nothing (the v0.6.9
+// verification met one three days old). When no binary is around, the
+// per-test assertion below keeps saying so as it always did.
+{
+  const cli = engrammaBin();
+  if (cli) assertCliMatchesAddon(cli, buildInfo());
+}
 
 const TMP = process.env.ENGRAMMA_TEST_TMP
   ? process.env.ENGRAMMA_TEST_TMP
@@ -1350,4 +1362,45 @@ test('verify signals the phantom, repair moves it under a new id (J2)', async ()
   } finally {
     await e.close();
   }
+});
+
+// v0.6.10 (J3): the refusal itself. A fake binary — or an old one —
+// pointed at by ENGRAMMA_BIN makes the bench refuse to start with a
+// message that names both sides, instead of dropping three random view
+// tests with a schema error nobody asked for.
+test('the bench refuses a CLI that is not the addon\'s own build (J3)', async () => {
+  const info = buildInfo();
+  assert.match(info.commit, /^[0-9a-f]+(-dirty)?$/);
+  assert.equal(typeof info.schema, 'number');
+
+  // a fake binary that speaks the OLD shape: the refusal names it
+  const stub = path.join(TMP, 'engramma-vecchio.sh');
+  fs.writeFileSync(stub, '#!/bin/sh\necho "engramma 0.1.0-dev (commit deadbee, schema 20)"\n');
+  fs.chmodSync(stub, 0o755);
+  assert.throws(
+    () => assertCliMatchesAddon(stub, info),
+    (err) =>
+      err.message.includes('deadbee') &&
+      err.message.includes('schema 20') &&
+      err.message.includes(info.commit) &&
+      err.message.includes('ricostruisci o imposta ENGRAMMA_BIN'),
+    'the message names both sides and the way out',
+  );
+
+  // a binary that says nothing about its commit: refused all the same
+  const mute = path.join(TMP, 'engramma-muto.sh');
+  fs.writeFileSync(mute, '#!/bin/sh\necho "engramma 0.1.0-dev"\n');
+  fs.chmodSync(mute, 0o755);
+  assert.throws(() => assertCliMatchesAddon(mute, info), /non dice il suo commit/);
+
+  // one that agrees: nothing happens (the suite runs)
+  const good = path.join(TMP, 'engramma-uguale.sh');
+  fs.writeFileSync(
+    good,
+    `#!/bin/sh\necho "engramma 0.1.0-dev (commit ${info.commit}, schema ${info.schema})"\n`,
+  );
+  fs.chmodSync(good, 0o755);
+  const parsed = assertCliMatchesAddon(good, info);
+  assert.equal(parsed.commit, info.commit);
+  assert.equal(parsed.schema, info.schema);
 });
