@@ -664,12 +664,14 @@ fn a_purge_forgets_the_proposal_its_decisions_and_stays_verifiable() {
     assert!(report.ok(), "mismatch: {:?}", report.mismatch);
 }
 
-/// The trickiest replay equality of the phase: purging an ACCEPTED
-/// supersede proposal must not un-close its target. The decide op is
-/// CENSORED, not forgotten — the closing survives in the redacted body —
-/// and the from-zero replay of the redacted log keeps the target superseded.
+/// v0.6.10 (J1) rewrote this replay equality: purging an ACCEPTED
+/// supersede proposal dominates the whole DECIDE — the target's closing
+/// goes with the proposal, and the from-zero replay of the redacted log
+/// must agree with the live state. (v0.5–v0.6.9 kept the target closed:
+/// the censored decide still replayed the closing. That was the hole the
+/// reviewer's seed `14903861504949011020` walked through.)
 #[test]
-fn purging_an_accepted_supersede_keeps_the_target_closed_and_verifiable() {
+fn purging_an_accepted_supersede_reopens_the_target_and_stays_verifiable() {
     let (_d, cell) = cell();
     let old = note("Fabio lavora a Milano.");
     cell.put_note(&old, "cli").unwrap(/* t */);
@@ -693,13 +695,13 @@ fn purging_an_accepted_supersede_keeps_the_target_closed_and_verifiable() {
     assert!(cell.get(&id).is_err());
     assert!(cell.proposals(&ProposalsFilter::default()).unwrap(/* t */).is_empty());
     assert!(cell.decisions(&DecisionsFilter::default()).unwrap(/* t */).is_empty());
-    // …but the TARGET keeps the closing the decision applied
-    let closed = cell.get(&old.id).unwrap(/* t */);
-    assert_eq!(closed.status, Status::Superseded);
-    assert!(closed.valid_to.is_some());
+    // …and the TARGET is open again: the dominated decide closed nothing
+    let reopened = cell.get(&old.id).unwrap(/* t */);
+    assert_eq!(reopened.status, Status::Active);
+    assert!(reopened.valid_to.is_none());
     assert!(
-        ids(&cell, "Milano").is_empty(),
-        "a superseded note is not the current truth"
+        !ids(&cell, "Milano").is_empty(),
+        "the reopened note is the current truth again"
     );
     // and the redacted replay (from zero: no compaction) reproduces it
     let report = cell.verify().unwrap(/* t */);

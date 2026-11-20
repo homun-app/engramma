@@ -196,10 +196,25 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
             to_materialize.push(object.clone());
         }
     }
+    // v0.6.10 (J1): the purge dominates the whole operation — once, here,
+    // for every half below. A dominated operation is recorded, it does
+    // not wait: nothing it leans on will ever materialize.
+    let dominated = op_dominated_by_purge(tx, op)?;
+    if dominated {
+        // a dominated operation is recorded, it does not wait: the link it
+        // names will never materialize, and a pending row that no arrival
+        // can wake is a lie (the pathological order — the unlink parks
+        // before its link arrives, both after the purge — is closed here:
+        // the link's own arrival is dominated too and clears the wait)
+        for object in objects.iter().filter(|o| o.starts_with("edge:")) {
+            clear_pending(tx, object)?;
+        }
+    }
     // an unlink whose link has not arrived waits like a patch before its
     // put: the edge object goes pending, and the link's arrival replays
     let mut unlink_waits = false;
     if op.kind == OpKind::Unlink
+        && !dominated
         && let Some(edge) = objects.iter().find(|o| o.starts_with("edge:"))
     {
         let edge_id = edge.strip_prefix("edge:").unwrap_or_default();
@@ -225,6 +240,7 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
             for object in &objects {
                 if let Some(nid) = object.strip_prefix("note:")
                     && let Ok(nid) = Ulid::from_string(nid)
+                    && !dominated
                     && is_body_write(op, &nid)
                 {
                     match tombstone_rule(tx, op, &nid)? {
@@ -310,6 +326,16 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
 
 /// The half of one operation that concerns one object.
 fn apply_half(tx: &rusqlite::Transaction<'_>, op: &Op, object: &str) -> Result<(), CellError> {
+    // v0.6.10 (J1): the purge dominates the WHOLE OPERATION, not the
+    // single object — a decide whose proposal is purged closes no target
+    // either, a supersede whose new note is purged closes no old one.
+    // The v0.6.7 guard asked «is THIS object purged?» and let the other
+    // half land. The purge op itself keeps applying (its scrub IS the
+    // state it carries), and so does a revert (its own Purged answer
+    // came first).
+    if op_dominated_by_purge(tx, op)? {
+        return Ok(());
+    }
     let Some(id) = object.strip_prefix("note:") else {
         // an edge or the policy: the operation's whole state step is that
         // object's half
@@ -317,15 +343,6 @@ fn apply_half(tx: &rusqlite::Transaction<'_>, op: &Op, object: &str) -> Result<(
     };
     let id = Ulid::from_string(id)
         .map_err(|_| CellError::Invalid(format!("bad object key `{object}`")))?;
-    // v0.6.7 (G4's property found it): the purge dominates the WHOLE
-    // set, whatever the total order says. A PATCH on a purged note
-    // already parked (the note is not there to patch); a PUT recreated
-    // it — body and all, in the clear. DESIGN § 4.3: «X non
-    // materializza»; the purge op itself keeps applying (its scrub IS
-    // the state it carries).
-    if op.kind != OpKind::Purge && note_purged_in_set(tx, &id)? {
-        return Ok(());
-    }
     ops::apply_scoped(tx, op, Scope::Note(id))
 }
 
@@ -519,17 +536,23 @@ fn materialize_note(
         std::collections::HashMap::new();
     let purged = note_purged_in_set(tx, id)?;
     for op in &all {
-        // v0.6.7 (G4's property found it): the purge dominates the
-        // replay too. The ops' payloads are loaded ABOVE, before this
-        // loop runs — a purge sorting EARLIER than a body write in the
-        // total order redacts the log's copy (`scrub_log`, inside
-        // `apply_purge`) but not the in-memory one, and the write would
-        // resurrect the note the purge had already taken (a patch parks
-        // on the missing note in the fast path; a PUT recreates it
-        // outright). DESIGN § 4.3: «X non materializza» — only the
-        // purge ops themselves apply (their scrub IS the state they
-        // carry).
-        if purged && op.kind != OpKind::Purge {
+        // v0.6.10 (J1): the purge dominates the replay PER OPERATION —
+        // when the set holds a purge of ANY object of this operation,
+        // the operation replays NO half, not only the half that touches
+        // the purged one. The v0.6.7 guard (G4) asked «is THIS object
+        // purged?»: a decide whose proposal was purged still closed its
+        // target here, and the closing came back at every
+        // rematerialization of the target while the purge — not an
+        // operation of the target — never undid it (the reviewer's seed
+        // `14903861504949011020`). The ops' payloads are loaded ABOVE,
+        // before this loop runs — a purge sorting EARLIER than a body
+        // write in the total order redacts the log's copy (`scrub_log`,
+        // inside `apply_purge`) but not the in-memory one, and the
+        // write would resurrect the note the purge had already taken.
+        // DESIGN § 4.3: «X non materializza» — the purge ops themselves
+        // keep applying (their scrub IS the state they carry), and so
+        // does the revert (its own Purged answer came first).
+        if op_dominated_by_purge(tx, op)? {
             events.push(ReplayEvent {
                 hash: op.content_hash.clone(),
                 body: None,
@@ -1111,6 +1134,194 @@ pub(crate) fn note_purged_in_set(
     Ok(n > 0)
 }
 
+/// The note ids a purge of would dominate THIS operation by (v0.6.10, J1):
+/// the operation's own objects — `note_id`, a supersede's new note, a
+/// decide's target, a revert's restored note — plus the objects the
+/// `op_objects` index does not carry: a propose's target and a link's
+/// endpoints and declared note. The index rows are read for STORED
+/// operations and merged over [`ops::objects_of`]: the purge's censor
+/// takes the new note's id OUT of a supersede's body (`note: null`), and
+/// the index — ids only, alive after any redaction — is what still
+/// names it. The `edges` row an unlink names may be gone (the purge
+/// took it): its endpoints are then read from the link op of the same
+/// edge, whose body the censor never touches (a link is not an
+/// operation of the note it cites).
+fn purge_relevant_note_ids(
+    tx: &rusqlite::Transaction<'_>,
+    op: &Op,
+) -> Result<Vec<Ulid>, CellError> {
+    let mut ids: Vec<Ulid> = Vec::new();
+    let push = |id: Ulid, ids: &mut Vec<Ulid>| {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    };
+    if let Some(id) = op.note_id {
+        push(id, &mut ids);
+    }
+    // the stored index: written at apply time from the body the operation
+    // CARRIED then, censored bodies included
+    {
+        let mut stmt = tx.prepare("SELECT object FROM op_objects WHERE op_id = ?1")?;
+        let rows: Vec<String> = stmt
+            .query_map([op.op_id.to_string()], |r| r.get(0))?
+            .flatten()
+            .collect();
+        for object in rows
+            .iter()
+            .filter_map(|o| o.strip_prefix("note:"))
+            .filter_map(|n| Ulid::from_string(n).ok())
+        {
+            push(object, &mut ids);
+        }
+    }
+    // the body's own extraction — a fresh (not yet stored) operation has
+    // no index rows, and the link/propose objects were never indexed
+    let body = op.body.as_ref();
+    let id_of = |v: Option<&serde_json::Value>| -> Option<Ulid> {
+        v.and_then(serde_json::Value::as_str)
+            .and_then(|s| Ulid::from_string(s).ok())
+    };
+    match op.kind {
+        OpKind::Supersede => {
+            let new = body
+                .and_then(|b| b.get("note"))
+                .and_then(|n| n.get("id"))
+                .and_then(serde_json::Value::as_str)
+                // the censor keeps the id by itself (v0.6.10, J1)
+                .or_else(|| body.and_then(|b| b.get("new_id")).and_then(serde_json::Value::as_str));
+            if let Some(id) = new.and_then(|s| Ulid::from_string(s).ok()) {
+                push(id, &mut ids);
+            }
+        }
+        OpKind::Decide => {
+            if let Some(id) = id_of(body.and_then(|b| b.get("target"))) {
+                push(id, &mut ids);
+            }
+        }
+        OpKind::Propose => {
+            // a correction of a note the set forgot is dead weight: no
+            // decide can ever accept it (the decide would be dominated
+            // too)
+            if body.and_then(|b| b.get("mode")).and_then(serde_json::Value::as_str) == Some("supersede")
+                && let Some(id) = id_of(body.and_then(|b| b.get("target")))
+            {
+                push(id, &mut ids);
+            }
+        }
+        OpKind::Link => {
+            let edge = body.and_then(|b| b.get("edge"));
+            for endpoint in [edge.and_then(|e| e.get("src")), edge.and_then(|e| e.get("dst"))] {
+                if let Some(id) = endpoint
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|s| s.strip_prefix("note:"))
+                    .and_then(|s| Ulid::from_string(s).ok())
+                {
+                    push(id, &mut ids);
+                }
+            }
+            if let Some(id) = id_of(edge.and_then(|e| e.get("note_id"))) {
+                push(id, &mut ids);
+            }
+        }
+        OpKind::Unlink => {
+            let endpoints = |edge: Option<&serde_json::Value>| -> Option<(String, String, Option<String>)> {
+                let e = edge?;
+                Some((
+                    e.get("src")?.as_str()?.to_string(),
+                    e.get("dst")?.as_str()?.to_string(),
+                    e.get("note_id").and_then(serde_json::Value::as_str).map(String::from),
+                ))
+            };
+            let row = match body.and_then(|b| b.get("edge_id")).and_then(serde_json::Value::as_str) {
+                Some(edge_id) => tx
+                    .query_row(
+                        "SELECT src, dst, note_id FROM edges WHERE id = ?1",
+                        [edge_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                    // the row is gone (a purge took it): the link op of
+                    // the same edge still names its endpoints
+                    .or_else(|| {
+                        let mut stmt = match tx.prepare(
+                            "SELECT p.body FROM ops o
+                             JOIN op_objects oo ON oo.op_id = o.op_id
+                             JOIN op_payloads p ON p.op_id = o.op_id
+                             WHERE oo.object = ?1 AND o.kind = 'link'
+                             ORDER BY o.seq DESC LIMIT 1",
+                        ) {
+                            Ok(stmt) => stmt,
+                            Err(_) => return None,
+                        };
+                        let body: Option<String> = stmt
+                            .query_row([format!("edge:{edge_id}")], |r| r.get(0))
+                            .optional()
+                            .ok()
+                            .flatten();
+                        body.as_deref()
+                            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                            .as_ref()
+                            .and_then(|b| endpoints(b.get("edge")))
+                    }),
+                None => None,
+            };
+            if let Some((src, dst, cited)) = row {
+                for endpoint in [src, dst] {
+                    if let Some(id) = endpoint
+                        .strip_prefix("note:")
+                        .and_then(|s| Ulid::from_string(s).ok())
+                    {
+                        push(id, &mut ids);
+                    }
+                }
+                if let Some(id) = cited.as_deref().and_then(|s| Ulid::from_string(s).ok()) {
+                    push(id, &mut ids);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(ids)
+}
+
+/// v0.6.10 (J1): does the purge dominate THIS operation? When the set
+/// holds a purge of ANY object of an operation, the operation replays
+/// NONE of its halves — the v0.6.7 guard asked «is THIS object purged?»,
+/// and a decide whose proposal was purged still closed its target, a
+/// supersede whose new note was purged still closed its old one: halves
+/// the purge had already taken came back at the next rematerialization,
+/// and the state stopped being a function of the operations (the
+/// reviewer's seed `14903861504949011020`, reduced to
+/// `purge_wins_per_op.rs`). The exceptions are the [`OpKind::Purge`]
+/// itself — its scrub IS the state it carries — and
+/// [`OpKind::RevertDecision`], whose `classify_revert` has already
+/// refused every revert that could return purged content (its answer is
+/// `RevertOutcome::Purged`). One function for the arrival, the replay
+/// and the rematerialization: the local write path refuses what this
+/// one would skip, by the same object list.
+pub(crate) fn op_dominated_by_purge(
+    tx: &rusqlite::Transaction<'_>,
+    op: &Op,
+) -> Result<bool, CellError> {
+    if matches!(op.kind, OpKind::Purge | OpKind::RevertDecision) {
+        return Ok(false);
+    }
+    for id in purge_relevant_note_ids(tx, op)? {
+        if note_purged_in_set(tx, &id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+
 /// The purge of a note takes its CONFLICT COPIES with it: they are the
 /// note's own derivation, and the right to be forgotten reaches everything
 /// the note's content produced.
@@ -1220,6 +1431,13 @@ fn materialize_edge(
     tx.execute("DELETE FROM edges WHERE id = ?1", [edge_id])?;
     let mut pending_since: Option<String> = None;
     for op in &all {
+        // v0.6.10 (J1): the purge dominates per operation here too — a
+        // link whose endpoint (or cited note) is purged does not
+        // recreate the edge row the purge's state step deleted, and a
+        // dominated unlink does not wait
+        if op_dominated_by_purge(tx, op)? {
+            continue;
+        }
         match op.kind {
             OpKind::Link => {
                 match ops::apply_scoped(tx, op, Scope::Full) {

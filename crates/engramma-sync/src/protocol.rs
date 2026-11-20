@@ -35,10 +35,10 @@ use crate::{Error, Result};
 /// the lapide beat still attests what its author saw), and the copies
 /// of a deleted note follow the lapide — hidden from `conflicts()`,
 /// from search and from the proposals listing.
-pub const ALPN: &[u8] = b"engramma/sync/4";
+pub const ALPN: &[u8] = b"engramma/sync/5";
 /// The protocol version this build speaks (kept in the hello as a
 /// belt-and-braces check: the ALPN already gates the rules).
-pub const PROTOCOL_VERSION: u64 = 4;
+pub const PROTOCOL_VERSION: u64 = 5;
 /// A message is at most 1 MiB.
 pub const MAX_MESSAGE: usize = 1024 * 1024;
 

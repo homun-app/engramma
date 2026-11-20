@@ -652,6 +652,14 @@ pub fn objects_of(op: &Op) -> Vec<String> {
             .and_then(|b| b.get("note"))
             .and_then(|n| n.get("id"))
             .and_then(Value::as_str)
+            // v0.6.10 (J1): the censor keeps the new note's id by itself —
+            // a censored supersede still concerns both its notes
+            .or_else(|| {
+                op.body
+                    .as_ref()
+                    .and_then(|b| b.get("new_id"))
+                    .and_then(Value::as_str)
+            })
     {
         let key = format!("note:{new}");
         if !objects.contains(&key) {
@@ -1765,9 +1773,17 @@ fn apply_set_status(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
 fn apply_supersede(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), CellError> {
     let old_id = Ulid::from_string(&body_str(op, "old_id")?)
         .map_err(|_| CellError::Invalid(format!("op {}: bad old_id", op.op_id)))?;
-    // A `purge` of the new note censors this body: the new note's content is
-    // gone, the closing of the old note's validity stays replayable. The
-    // old side alone — the new note does not materialize at all.
+    // A `purge` of the new note censors this body: the new note's content
+    // is gone, the closing of the old note's validity stays replayable.
+    // The old side alone — the new note does not materialize at all.
+    // v0.6.10 (J1): this branch is the INCREMENTAL order's road — a
+    // replay that walks the log in seq order meets the censored
+    // supersede BEFORE the purge that censored it, and the dominance
+    // cannot see a purge that has not arrived yet. Whatever this branch
+    // closes here, the purge's own application takes back: it
+    // rematerializes the old note with the dominance in force, and the
+    // dominated supersede closes nothing (the fast path and every
+    // rematerialization AFTER the purge skip the whole operation).
     if op
         .body
         .as_ref()
@@ -2081,6 +2097,131 @@ fn apply_purge(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     // v0.6 (P1): the purge dominates the note's whole derivation — its
     // conflict copies go with it
     super::material::purge_conflict_copies(tx, &id)?;
+    // v0.6.10 (J1): the purge dominates per OPERATION, and the halves it
+    // dominates may have LANDED already — a copy that applied the decide
+    // before the proposal's purge arrived holds the target's closing,
+    // and the purge's own state step never undid it (the target is not
+    // the purge's object). The state must equal what the set replays
+    // under the new rule, so the co-objects of every operation this
+    // purge dominates REMATERIALIZE here: their ops replay with the
+    // dominance in force and the dominated halves go. Local write,
+    // arrival and the verify rebuild all pass through this function, so
+    // every copy lands on the same state. The EDGES of a dominated link
+    // need no rematerialization: `purge_state` just deleted every row
+    // that names the purged id, and the guarded `materialize_edge`
+    // cannot recreate them.
+    //
+    // The pass is a TRANSITIVE closure, a worklist: taking a co-object
+    // away changes what the operations that lean on it derive (a
+    // supersede whose old note the domination revoked closes nothing
+    // and writes no link row — the fleet property's seed
+    // `6770163031176974400`), so the OTHER objects of the co-object's
+    // own operations follow it, and so on. The `seen` set bounds the
+    // walk at one materialization per object — the same bound the
+    // reconstruction's fixpoint pays.
+    let mut frontier: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(format!("note:{id}"));
+    {
+        let object = format!("note:{id}");
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT oo2.object FROM op_objects oo1
+             JOIN ops o ON o.op_id = oo1.op_id
+             JOIN op_objects oo2 ON oo2.op_id = oo1.op_id
+             WHERE oo1.object = ?1
+               AND o.kind NOT IN ('purge', 'revert_decision')
+               AND oo2.object != ?1
+               AND oo2.object LIKE 'note:%'",
+        )?;
+        let rows: Vec<String> = stmt.query_map([&object], |r| r.get(0))?.flatten().collect();
+        for object in rows {
+            if seen.insert(object.clone()) {
+                frontier.push(object);
+            }
+        }
+    }
+    // a PROPOSE whose target is the purged id names the target in its
+    // body only — the queue row is the index that still knows it. The
+    // proposal itself is a co-object: it does not materialize anymore
+    {
+        let mut stmt = tx.prepare("SELECT note_id FROM proposals WHERE target = ?1")?;
+        let rows: Vec<String> = stmt
+            .query_map([id.to_string()], |r| r.get(0))?
+            .flatten()
+            .collect();
+        for nid in rows {
+            let object = format!("note:{nid}");
+            if seen.insert(object.clone()) {
+                frontier.push(object);
+            }
+        }
+    }
+    while let Some(object) = frontier.pop() {
+        let Some(nid) = object.strip_prefix("note:") else {
+            // an edge object of the walk: its link and unlink operations
+            // re-derive under the dominance, nothing leans on it
+            if object.starts_with("edge:") {
+                super::material::materialize(tx, &object)?;
+            }
+            continue;
+        };
+        let Ok(nid) = Ulid::from_string(nid) else { continue };
+        // the purge already answered for its own id: a co-object that is
+        // itself purged has nothing to rematerialize
+        if super::material::note_purged_in_set(tx, &nid)? {
+            continue;
+        }
+        super::material::materialize(tx, &object)?;
+        // the EDGES that name this co-object re-derive with it: a link
+        // written while the co-object lived (before this purge arrived)
+        // may now point at a note the domination took away — the
+        // reconstruction parks that link (its endpoint is missing), and
+        // the live state must land on the same row (found by the fleet
+        // property, seed `2788425701518801064`). The DECLARED edges
+        // (`d…`) are their note's own state — they ride the note's
+        // materialization and never this pass (found by the compaction
+        // property, seed `6820126298563524126`: an edge with no
+        // operations of its own would be deleted and never reborn)
+        let named = format!("note:{nid}");
+        {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT 'edge:' || e.id FROM edges e
+                 WHERE e.id NOT LIKE 'd%'
+                   AND (e.src = ?2 OR e.dst = ?2 OR e.note_id = ?1)",
+            )?;
+            let edge_objects: Vec<String> = stmt
+                .query_map(rusqlite::params![nid.to_string(), named], |r| r.get(0))?
+                .flatten()
+                .collect();
+            for edge in edge_objects {
+                if seen.insert(edge.clone()) {
+                    frontier.push(edge);
+                }
+            }
+        }
+        // the operations that lean on this object follow it: their other
+        // objects derive from a state that just changed
+        {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT oo2.object FROM op_objects oo1
+                 JOIN ops o ON o.op_id = oo1.op_id
+                 JOIN op_objects oo2 ON oo2.op_id = oo1.op_id
+                 WHERE oo1.object = ?1
+                   AND o.kind NOT IN ('purge', 'revert_decision')
+                   AND oo2.object != ?1
+                   AND oo2.object LIKE 'note:%'",
+            )?;
+            let rows: Vec<String> = stmt
+                .query_map([&object], |r| r.get(0))?
+                .flatten()
+                .collect();
+            for next in rows {
+                if seen.insert(next.clone()) {
+                    frontier.push(next);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2383,6 +2524,14 @@ fn censor_purged_ops(
                         kept.insert(k.into(), v.clone());
                     }
                 }
+                // v0.6.10 (J1): the NEW note's id survives the censor — an
+                // id, not content. A copy that receives only the censored
+                // body must still index the operation under `note:<new>`
+                // (the purge's per-operation dominance and the
+                // rematerialization of the old note's co-object both ask
+                // the index), and without the id the receiving copy could
+                // neither see the dominance nor take the closing back.
+                kept.insert("new_id".into(), Value::String(id_str.clone()));
                 kept.insert("note".into(), Value::Null);
                 Some(kept)
             }
@@ -2502,16 +2651,20 @@ pub fn censor_shape_ok(op: &Op) -> bool {
     };
     match op.kind {
         OpKind::Supersede => {
-            // {old_id?, valid_to?, old_updated_at?, note: null} — the closing
-            // of the OLD note stays replayable, the new note's content goes
+            // {old_id?, valid_to?, old_updated_at?, new_id?, note: null} —
+            // the closing of the OLD note stays replayable, the new note's
+            // content goes; its ID survives (v0.6.10, J1: the index of a
+            // receiving copy needs it), and the v0.6.9 shape — no `new_id` —
+            // is still a valid censor's product
             fields.get("note") == Some(&Value::Null)
                 && fields.keys().all(|k| {
                     matches!(
                         k.as_str(),
-                        "old_id" | "valid_to" | "old_updated_at" | "note"
+                        "old_id" | "valid_to" | "old_updated_at" | "new_id" | "note"
                     )
                 })
                 && fields.get("old_id").is_none_or(is_ulid)
+                && fields.get("new_id").is_none_or(is_ulid)
                 && fields.get("valid_to").is_none_or(is_validity)
                 && fields.get("old_updated_at").is_none_or(is_at)
         }
@@ -2752,7 +2905,15 @@ fn apply_decide(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), CellE
     if body.get("censored").and_then(Value::as_bool) == Some(true) {
         // the purge of the proposal kept only what survives it: the closing
         // of the supersede target (its content is another note's history) —
-        // the target side alone, the proposal does not materialize at all
+        // the target side alone, the proposal does not materialize at all.
+        // v0.6.10 (J1): this branch is the INCREMENTAL order's road — a
+        // replay that walks the log in seq order meets the censored
+        // decide BEFORE the purge that censored it, and the dominance
+        // cannot see a purge that has not arrived yet. Whatever it
+        // closes here, the purge's own application takes back: it
+        // rematerializes the target with the dominance in force, and the
+        // dominated decide closes nothing (the fast path and every
+        // rematerialization AFTER the purge skip the whole operation).
         if let (Some(target), true) = (
             body.get("target")
                 .and_then(Value::as_str)

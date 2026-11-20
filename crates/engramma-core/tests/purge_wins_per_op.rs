@@ -382,6 +382,23 @@ fn an_unlink_of_an_edge_that_cited_a_purged_note_does_not_wait() {
             reader.ingest_op(op).unwrap(/* t */);
         }
     }
+    // the realistic order: the reader holds the LINK (the edge exists),
+    // purges the endpoint, and only then receives the unlink
+    let link_op = writer
+        .ops()
+        .unwrap(/* t */)
+        .iter()
+        .find(|op| op.kind == OpKind::Link)
+        .cloned()
+        .unwrap(/* the stage wrote one */);
+    reader.ingest_op(&link_op).unwrap(/* t */);
+    assert_eq!(
+        reader
+            .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM edges")
+            .unwrap(/* t */),
+        vec!["1".to_string()],
+        "the stage created the edge"
+    );
     reader.purge(&right.id, "diritto all'oblio", "tester").unwrap(/* t */);
     let unlink_op = writer
         .ops()

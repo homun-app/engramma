@@ -4079,6 +4079,18 @@ fn local_write_objects(
                 push(id, &mut ids);
             }
         }
+        // v0.6.10 (J1): a propose with a target is a two-object write —
+        // the purge of the target dominates the whole operation, and the
+        // local write is refused like every other dominated one (the
+        // arrival and the replay skip it; the queue row would name an
+        // id the set forgot)
+        OpKind::Propose => {
+            if payload.get("mode").and_then(Value::as_str) == Some("supersede")
+                && let Some(id) = id_of(payload.get("target"))
+            {
+                push(id, &mut ids);
+            }
+        }
         OpKind::RevertDecision => {
             let restored = payload.get("restore_target").and_then(|t| t.get("id"));
             if let Some(id) = id_of(restored) {
@@ -5416,8 +5428,10 @@ mod tests {
     }
 
     /// v0.3 (P2): a purge censors the supersede payloads where the note was
-    /// the NEW note (content out, closing of the old note replayable), and
-    /// the chain is recomputed over the censored digests.
+    /// the NEW note (content out, id kept, closing of the old note replayable
+    /// in the incremental order), and the chain is recomputed over the
+    /// censored digests. v0.6.10 (J1): the purge dominates the WHOLE
+    /// operation — the old note's closing goes with the new note's content.
     #[test]
     fn purge_censors_supersede_payloads_and_rehashes() {
         let dir = tempfile::tempdir().unwrap(/* test-only */);
@@ -5440,7 +5454,9 @@ mod tests {
         cell.purge(&new.id, "oblio", "t").unwrap(/* test-only */);
         let ops = cell.ops().unwrap(/* test-only */);
         // the supersede op (note_id = old) had `new` in its payload: the
-        // content is gone, the closing of `old` stays replayable
+        // content is gone, its ID stays (J1: the index of a receiving
+        // copy needs it), the closing of `old` stays replayable for the
+        // incremental order only
         let sup = ops
             .iter()
             .find(|o| o.kind == OpKind::Supersede)
@@ -5451,12 +5467,18 @@ mod tests {
             Some(&serde_json::Value::Null),
             "the new note's content must be censored out"
         );
+        assert_eq!(
+            sup.body.as_ref().and_then(|b| b.get("new_id")),
+            Some(&serde_json::Value::String(new.id.to_string())),
+            "the new note's id survives the censor"
+        );
         let vr = cell.verify().unwrap(/* test-only */);
         assert!(vr.ok(), "{vr:?}");
-        // the old note stays closed: the censored supersede still replays it
+        // v0.6.10 (J1): the dominated supersede closes nothing — the old
+        // note is open again, its validity with it
         let back = cell.get(&old.id).unwrap(/* test-only */);
-        assert_eq!(back.status, Status::Superseded);
-        assert!(back.valid_to.is_some());
+        assert_eq!(back.status, Status::Active);
+        assert!(back.valid_to.is_none());
         // and the new note is gone
         assert!(matches!(cell.get(&new.id), Err(CellError::NoteNotFound(_))));
     }
