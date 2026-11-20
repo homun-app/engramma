@@ -719,7 +719,72 @@ fn materialize_note(
     if ops::read_note_row(tx, id)?.is_none() {
         tx.execute("DELETE FROM supersedes WHERE old_id = ?1", [id.to_string()])?;
         purge_conflict_copies(tx, id)?;
+        // v0.6.10 (J1, the hunt's seed 9683753651273141986): a death
+        // must re-derive everything that NAMES the note — the EDGES
+        // (the purge's worklist does it for the co-objects it walks,
+        // but a note can also die through a materialization triggered
+        // by a late arrival, and that road skipped them) and the
+        // entities, with the same prune `purge_state` speaks
+        {
+            let named = format!("note:{id}");
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT 'edge:' || e.id FROM edges e
+                 WHERE e.id NOT LIKE 'd%'
+                   AND (e.src = ?2 OR e.dst = ?2 OR e.note_id = ?1)",
+            )?;
+            let edge_objects: Vec<String> = stmt
+                .query_map(rusqlite::params![id.to_string(), named], |r| r.get(0))?
+                .flatten()
+                .collect();
+            drop(stmt);
+            for edge in edge_objects {
+                materialize(tx, &edge)?;
+            }
+            tx.execute(
+                "UPDATE entities SET note_id = NULL WHERE note_id = ?1",
+                [id.to_string()],
+            )?;
+            tx.execute(
+                "UPDATE entities SET note_id = (
+                     SELECT n.id FROM notes n
+                     WHERE n.title IS entities.name COLLATE NOCASE
+                       AND n.status != 'deleted'
+                     ORDER BY n.updated_at DESC, n.id LIMIT 1
+                 )
+                 WHERE note_id IS NULL
+                   AND EXISTS (SELECT 1 FROM notes n
+                               WHERE n.title IS entities.name COLLATE NOCASE
+                                 AND n.status != 'deleted')",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM entities WHERE id NOT IN (
+                     SELECT e.id FROM entities e
+                     JOIN edges ed ON ed.src = e.name OR ed.dst = e.name
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM notes n
+                     WHERE n.id = entities.note_id
+                       AND n.status != 'deleted'
+                       AND n.title IS entities.name COLLATE NOCASE
+                 )",
+                [],
+            )?;
+        }
     }
+    // v0.6.10 (J1): the tags table is DERIVED from note_tags — a
+    // materialization that changed what the note carries (or that left
+    // no note at all) must not leave orphans behind. The redacted
+    // replay never creates them; the live state must not keep them (the
+    // hunt's seed 13144595116571598162: the tags of a note whose line
+    // died survived every path that deleted its rows)
+    tx.execute(
+        "DELETE FROM tags WHERE NOT EXISTS (
+             SELECT 1 FROM note_tags nt
+             WHERE nt.tag = tags.name OR nt.tag LIKE tags.name || '/%'
+         )",
+        [],
+    )?;
     restore_hlc_watermark(tx, watermark, None)?;
     Ok(())
 }
@@ -1395,6 +1460,19 @@ pub(crate) fn purge_conflict_copies(
             }
         }
     }
+    // v0.6.10 (J1, the hunt's seed 13144595116571598162): the copies'
+    // note_tags went with their rows, and the tags no note carries
+    // anymore must go too — the same prune `purge_state` runs for the
+    // purged note itself. Without it the live keeps orphan tags the
+    // reconstruction never creates (a copy's rows die here, not in a
+    // materialization that prunes)
+    tx.execute(
+        "DELETE FROM tags WHERE NOT EXISTS (
+             SELECT 1 FROM note_tags nt
+             WHERE nt.tag = tags.name OR nt.tag LIKE tags.name || '/%'
+         )",
+        [],
+    )?;
     Ok(())
 }
 
