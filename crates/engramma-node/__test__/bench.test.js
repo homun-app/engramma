@@ -54,11 +54,19 @@ test('a bench run leaves no engramma-node-* behind, failures included', async ()
   const before = engrammaNodeDirs();
   const run = await runBench('engine.test.js');
   assert.equal(run.code, 0, `the bench run itself must be green:\n${run.out}`);
-  const after = engrammaNodeDirs();
+  // the runner starts one process per file, in parallel: a sibling file's
+  // OWN bench folder is alive while this judge counts, and the slowest
+  // sibling (sync-pair) runs for tens of seconds. A leftover persists; a
+  // sibling's live folder goes with its process — wait for the quiet
+  // before judging, so only THIS run's folders are on trial
+  const extra = () => engrammaNodeDirs().filter((d) => !before.includes(d));
+  for (let i = 0; i < 120 && extra().length > 0; i += 1) {
+    await new Promise((r) => setTimeout(r, 1000));
+  }
   assert.deepEqual(
-    after,
-    before,
-    `engramma-node-* left behind: ${after.filter((d) => !before.includes(d)).join(', ')}`,
+    extra(),
+    [],
+    `engramma-node-* left behind: ${extra().join(', ')}`,
   );
 
   // ENGRAMMA_TEST_KEEP=1 is the declared escape: the folder STAYS and
