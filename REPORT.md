@@ -10713,3 +10713,21 @@ punto, il banco JS che misura il binario giusto, è chiuso e
 funziona. Le misure sono dentro le soglie. Resta alla release locale
 quello che la fase ha volutamente lasciato fuori: la fusione a righe e
 il proprietario delle righe, nella loro fase.
+
+## La build sul tag
+
+`scripts/build-sha.sh`, albero pulito, DOPO il tag: costruzione sul
+commit `4b39d93d13d0b386bafb6ecd9eb0e0be51da3d83` = tag `fase-v0.6.10`
+esatto (build sotto `nice`). I tre file dell'aggancio, letti dal disco
+dopo la build:
+
+- `engramma.darwin-arm64.node` **50 746 680 B**, SHA256
+  `5d4c3e8ca0349e3ffca4c85955b59099ef00da2b371e8ef625525ea6e6f0b63f`;
+- `index.js` 36 239 B, SHA256
+  `cd26043ecf56124be115f58a25368049dec67d48515109b31de588646280e311`;
+- `index.d.ts` 26 265 B, SHA256
+  `2d89f6ed6c98792290774ab49b050d3cc3408d295feea55635b86b025d88baeb`.
+
+Il `.node` cresce di ~59 KB contro la v0.6.9: la `repair()`, la
+`buildInfo()` e la regola per operazione. Nessun push: il tag è solo
+locale, come sempre.
