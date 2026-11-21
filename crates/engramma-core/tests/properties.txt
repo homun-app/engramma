@@ -25,6 +25,7 @@ crates/engramma-core/tests/props.rs random_ops_compact_and_purge_leave_no_roots
 crates/engramma-core/tests/props.rs purge_with_conflict_copies_leaves_no_roots
 crates/engramma-core/tests/props.rs export_import_equality
 crates/engramma-core/tests/props.rs hlc_monotonic
+crates/engramma-core/tests/props.rs purge_takes_only_its_family
 crates/engramma-mcp/tests/oauth_props.rs rfc1918_is_never_public
 crates/engramma-mcp/tests/oauth_props.rs loopback_linklocal_and_cgnat_are_never_public
 crates/engramma-mcp/tests/oauth_props.rs multicast_and_reserved_v4_are_never_public
