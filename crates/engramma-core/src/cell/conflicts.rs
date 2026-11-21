@@ -454,9 +454,45 @@ fn scan(tx: &Transaction<'_>, original: &Ulid) -> Result<Vec<NoteOpRow>, CellErr
             let op_id = Ulid::from_string(&op_id)
                 .map_err(|_| CellError::Db(format!("bad op id {op_id}")))?;
             let kind = OpKind::parse(&kind)?;
+            // v0.6.11 (K2's hunt, seed 16743842670308237750): a body
+            // write is EVERY write that sets the note's body — the birth
+            // by `put`, `propose` or `supersede` (the new note's body
+            // rides the supersede's own payload) included, exactly as
+            // the reference of DESIGN § 4.3 collects them. The scan kept
+            // only put and patch, and a note born by supersede arrived
+            // at its conflict derivation WITHOUT its birth: the ancestry
+            // and the fork started at the first patch, and the witness
+            // missed what the reference saw (engine no, reference yes).
+            // Rare before K1 — a supersede-born note whose old side was
+            // purged did not materialize at all under the whole-operation
+            // dominance — and common now: the new note lives
             let body = body_json
-                .filter(|_| matches!(kind, OpKind::PutNote | OpKind::PatchNote))
-                .and_then(|b| body_facts(&kind, &b));
+                .filter(|_| {
+                    matches!(
+                        kind,
+                        OpKind::PutNote | OpKind::PatchNote | OpKind::Propose | OpKind::Supersede
+                    )
+                })
+                .and_then(|b| {
+                    // a supersede sits in BOTH its notes' scans (it is an
+                    // operation of the old one and the new one): the body
+                    // it carries is the birth of the NEW note alone —
+                    // the old side sees the closing, never this body
+                    // (the reference's own guard, `note.id == original`)
+                    if kind == OpKind::Supersede
+                        && serde_json::from_str::<serde_json::Value>(b.as_str())
+                            .ok()
+                            .and_then(|v| {
+                                v.get("note").and_then(|n| n.get("id")).and_then(
+                                    |i| i.as_str().map(|id| id != original.to_string()),
+                                )
+                            })
+                            .unwrap_or(true)
+                    {
+                        return None;
+                    }
+                    body_facts(&kind, b.as_str())
+                });
             let parent = base.as_ref().and_then(|b| by_hash.get(b).copied());
             Ok(NoteOpRow {
                 hash,
@@ -473,7 +509,10 @@ fn scan(tx: &Transaction<'_>, original: &Ulid) -> Result<Vec<NoteOpRow>, CellErr
 }
 
 /// The `(body, updated_at)` a body write's payload carries: a put's
-/// whole note, a patch's `set.body`.
+/// whole note, a patch's `set.body`, and the birth of a `propose` or a
+/// `supersede` (the new note rides the payload's `note`: a censored
+/// supersede carries `note: null` and answers `None`, as a redacted
+/// body always did).
 fn body_facts(kind: &OpKind, body_json: &str) -> Option<BodyFacts> {
     let v: serde_json::Value = serde_json::from_str(body_json).ok()?;
     match kind {
@@ -484,8 +523,8 @@ fn body_facts(kind: &OpKind, body_json: &str) -> Option<BodyFacts> {
                 updated_at: v.get("updated_at")?.as_str()?.to_string(),
             })
         }
-        OpKind::PutNote => {
-            let note = v.get("note")?;
+        OpKind::PutNote | OpKind::Propose | OpKind::Supersede => {
+            let note = v.get("note")?.as_object()?;
             Some(BodyFacts {
                 text: note.get("body")?.as_str()?.to_string(),
                 updated_at: note.get("updated_at")?.as_str()?.to_string(),
