@@ -433,6 +433,45 @@ Notevoli:
   `pretest` di `npm test` e `test:electron` costruisce la CLI: il caso
   normale è sempre fresco.
 
+## Cosa riapre la purga, e come dirlo prima (v0.6.11, K1)
+
+- **La regola: il contenuto proprio resta, i riferimenti vanno.** Una
+  purga toglie la nota purgata, le sue copie di conflitto e ogni
+  RIFERIMENTO a lei (le righe `supersedes`, gli archi, le chiusure che
+  erano la SUA opera). Non toglie mai il contenuto proprio di un'altra
+  nota: corpo, intestazione, esistenza, stato. Quindi:
+  - dimenticare la VECCHIA di una sostituzione lascia la **nuova viva**
+    (è il flusso principale di Homun: l'agente corregge, l'utente
+    approva, poi dimentica il dato superato — e quello attuale resta);
+  - dimenticare la **correzione accettata** prima che l'utente ne
+    purghi il bersaglio lascia il bersaglio com'era;
+  - una proposta il cui bersaglio è stato dimenticato **resta in coda**:
+    il testo è dell'agente, l'utente può ancora vederlo e rifiutarlo,
+    e se l'accetta atterra come **nota nuova** (niente da chiudere).
+- **L'eccezione dichiarata: le RIAPERTURE.** Dimenticare la nota NUOVA
+  di una sostituzione — o la PROPOSTA accettata di una correzione —
+  **riapre** ciò che quella nota aveva chiuso: la vecchia torna allo
+  stato che aveva prima della chiusura (di solito `active`). È «come se
+  non fosse mai esistita», ed è giusto — ma per l'utente è una
+  sorpresa: il dato vecchio torna attuale. **L'interfaccia deve dirlo
+  PRIMA della purga.**
+- **`cell.purgePreview(id)` è l'anticipo, di sola lettura (nuova in
+  questa fase).** Prima non c'era un'API che lo dicesse; ora c'è:
+  ```js
+  const { reopens } = await cell.purgePreview(id);
+  // reopens: [{ id, title }] — le note che tornerebbero valide
+  ```
+  Una domanda, una lettura, nessuna operazione. Homun la chiama sulla
+  conferma della purga e, quando `reopens` non è vuoto, avverte:
+  **«tornerà valido: …»** con i titoli (o i corpi abbreviati) delle
+  note indicate — così l'utente sa che cosa sta per tornare attuale
+  prima di confermare l'oblio.
+- **Come si costruisce l'anticipo:** `purgePreview` legge le righe
+  `supersedes` il cui CHIUSORE è l'id (la vecchia di un supersede, il
+  bersaglio di una correzione accettata portano entrambe quella riga) e
+  nomina quelle ancora in stato `superseded`. La stessa regola decide
+  il rigioco: l'anticipo non può mentire.
+
 ## Un assistente che ricorda
 
 ```js
