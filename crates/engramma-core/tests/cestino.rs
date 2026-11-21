@@ -412,6 +412,7 @@ const READS_THE_NOTES: &[&str] = &[
     "note_ids",
     "note_ids_all",
     "get",
+    "purge_preview",
     "history",
     "note_version",
     "search",
@@ -469,6 +470,10 @@ fn the_bin_copy_appears_in_no_public_read() {
     b.history(&copy).unwrap(/* t */);
     walked.push("note_version");
     b.note_version(&copy).unwrap(/* t */);
+    // the purge preview reads the supersedes rows: the bin's copy closes
+    // nothing, and its own preview says so
+    walked.push("purge_preview");
+    b.purge_preview(&copy).unwrap(/* t */);
 
     // search, both views: the copy's token answers nothing
     walked.push("search");
@@ -719,6 +724,9 @@ fn the_taken_copy_answers_every_read_like_a_living_note() {
     b.history(&copy).unwrap(/* t */);
     walked.push("note_version");
     b.note_version(&copy).unwrap(/* t */);
+    // and the preview reads it like any living note
+    walked.push("purge_preview");
+    b.purge_preview(&copy).unwrap(/* t */);
 
     // search, both views: the copy's token answers
     walked.push("search");
