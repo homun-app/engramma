@@ -10731,3 +10731,108 @@ dopo la build:
 Il `.node` cresce di ~59 KB contro la v0.6.9: la `repair()`, la
 `buildInfo()` e la regola per operazione. Nessun push: il tag è solo
 locale, come sempre.
+
+## Verifica v0.6.10 (revisore, 2026-11-21)
+
+Fatta sul tag `fase-v0.6.10` (`4b39d93`), a priorità minima. Le sonde stanno
+nello scratchpad del revisore, fuori dal repo.
+
+### Cosa regge
+
+- **J2 è fatto bene.**
+  - `verify` gira in una transazione che fa sempre rollback. I `commit`
+    rimasti nel suo corpo toccano solo la copia di ricostruzione in memoria,
+    e l'istantanea si apre in `query_only`.
+  - Le scritture vere (`secure_delete`, gli indici, il grafo) stanno tutte
+    in `repair()`.
+  - La riparazione sposta il contenuto su un id nuovo, e la mappa non si
+    salva.
+- **J3 funziona, e ha già pagato in fase.**
+- **Lo SHA del tag** è riprodotto da `build-sha.sh` (`.node` `5d4c3e8c…`,
+  50 746 680 B).
+- **Le corse del revisore:**
+  - `npm test` 59/59;
+  - `test:electron` 59/59. Al primo giro 4 rossi, ma la causa era il
+    revisore: aveva riusato la stessa `ENGRAMMA_TEST_TMP` per le due
+    corse. Con una cartella fresca, verde;
+  - `purge_wins_per_op`, `repair`, `golden_cell`, `shared_verify`,
+    `cestino`, `forgetting` verdi in release.
+- **Tre cacce, e l'ultima intera e verde.** I quattro difetti trovati nel
+  codice nuovo sono giudicati e chiusi uno per uno: la regola della caccia
+  intera funziona.
+
+### Il difetto
+
+**Purgare una nota vecchia fa sparire la nota nuova che l'aveva
+sostituita (bloccante per la release locale).** La causa è la regola J1,
+**come il revisore l'ha scritta nella spec**: «un'operazione dominata dalla
+purga non rigioca **nessuna** delle sue metà». Il REPORT la applica
+fedelmente («la purga della vecchia lascia la nuova non nata»), ma la regola
+è sbagliata per le operazioni che, oltre a una relazione, creano
+**contenuto**.
+
+- *Sonda 1* (`zz_review_v0610.rs`):
+  1. `put` di A («il mio colore preferito è il rosso»);
+  2. `supersede(A → N)` con «… è il nero». N è `Active`;
+  3. `purge(A)`.
+
+  Ora `get(N)` risponde `NoteNotFound`, e `verify` è verde. Nella v0.6.9
+  la stessa sonda era verde: N sopravviveva.
+- *Sonda 2:*
+  1. la cella accetta le proposte;
+  2. l'agente propone la correzione di A in modalità supersede;
+  3. l'utente l'accetta, e P è `Active`;
+  4. `purge(A)`.
+
+  Ora P è `NoteNotFound`, e anche la `patch` di P cade. È il flusso
+  principale di Homun: l'agente corregge, tu approvi, poi dimentichi il
+  dato superato e **perdi quello attuale**.
+- **Nessuna caccia poteva vederlo:** il motore è coerente con sé stesso,
+  e `verify` è verde. Manca un **oracolo sul significato**.
+
+**La regola giusta:** una purga toglie la nota purgata, la sua famiglia (le
+copie) e **ogni riferimento a lei**. Non toglie mai il **contenuto proprio**
+di un'altra nota. Per un'operazione su (X, Y) con X purgato, la metà di Y si
+applica senza tutto ciò che nomina X:
+- `supersede(A → N)`, se si purga A: N nasce; spariscono la chiusura di A e
+  la riga `supersedes`;
+- `decide` di una correzione, se si purga il bersaglio: la proposta è
+  accettata e attiva; spariscono la chiusura del bersaglio e la riga;
+- `link`: la riga verso la nota purgata sparisce, e la nota che lo dichiara
+  resta;
+- **la direzione opposta resta com'è.** La purga della nota **nuova**
+  riapre la vecchia, perché la chiusura era opera della nuova. È coerente
+  con «come se non fosse mai esistita». Ma per l'utente è una sorpresa (il
+  dato vecchio torna attuale), quindi Homun deve dirlo prima di purgare.
+
+**L'oracolo che manca:** una proprietà metamorfica,
+`purge_takes_only_its_family`. Su una storia qualunque, purgare X lascia
+**ogni** altra nota viva e fuori dalla famiglia di X leggibile, con lo
+stesso corpo e lo stesso stato di prima, tranne le relazioni verso X e i
+casi dichiarati come la riapertura. Il dente: la regola di questa fase,
+rimessa su un ramo di prova, deve far cadere la proprietà.
+
+### Altre note
+
+- **Le cartelle `engramma-node-*`** lasciate dal banco JS in `$TMPDIR` erano
+  147, per **4,3 GB**, accumulate da tutte le corse dal 17 novembre in poi,
+  comprese quelle del revisore. Il revisore le ha guardate (dati di prova
+  sintetici) e tolte. Il banco deve pulire da sé: lo stesso cancello delle
+  `.tmp*`, esteso a queste.
+- **`target/` è a 24 G.** La decisione resta all'utente.
+
+### Verdetto
+
+**v0.6.10 NON consegnata, e NON da agganciare per Homun.** Nella v0.6.9 la
+sonda è verde, quindi la regressione è di questa fase. Per lo sviluppo
+resta la v0.6.9.
+
+**Release locale: non pronta.** La correzione è piccola, ma tocca il cuore
+della purga e va cacciata. Il revisore propone una **v0.6.11** con quattro
+cose:
+- la regola giusta («il contenuto proprio resta, i riferimenti vanno»);
+- la proprietà metamorfica, con il suo dente;
+- la pulizia del banco JS;
+- la caccia intera.
+
+J2 e J3 restano come sono.
