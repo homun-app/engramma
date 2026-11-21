@@ -242,9 +242,15 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
             // lapide that it did not see wins nothing; one whose base is the
             // lapide reopens it.
             for object in &objects {
+                // the purge's word on this half is asked ONCE: the
+                // tombstone guard and the application below share it (a
+                // put pays one dominance query, not two — the measured
+                // insert rate of K1's first cut paid two, +9% on the
+                // v0.6.3 base)
+                let dominated = half_dominated_by_purge(tx, op, object)?;
                 if let Some(nid) = object.strip_prefix("note:")
                     && let Ok(nid) = Ulid::from_string(nid)
-                    && !half_dominated_by_purge(tx, op, object)?
+                    && !dominated
                     && is_body_write(op, &nid)
                 {
                     match tombstone_rule(tx, op, &nid)? {
@@ -253,7 +259,7 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
                         TombstoneOutcome::NoTombstone => {}
                     }
                 }
-                match apply_half(tx, op, object) {
+                match apply_half(tx, op, object, dominated) {
                     Ok(()) => {}
                     Err(CellError::NoteNotFound(_)) => {
                         mark_pending(tx, object, &op.op_id.to_string())?;
@@ -283,7 +289,12 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
             // whole set
             for object in &objects {
                 if !to_materialize.contains(object) {
-                    apply_half(tx, op, object)?;
+                    apply_half(
+                        tx,
+                        op,
+                        object,
+                        half_dominated_by_purge(tx, op, object)?,
+                    )?;
                 }
             }
             for object in &to_materialize {
@@ -328,14 +339,22 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
     Ok(())
 }
 
-/// The half of one operation that concerns one object.
-fn apply_half(tx: &rusqlite::Transaction<'_>, op: &Op, object: &str) -> Result<(), CellError> {
+/// The half of one operation that concerns one object. `dominated` is
+/// the purge's word on this half, already asked by the caller (the
+/// arrival's fast path needs it before the application too, and a put
+/// must not pay the question twice).
+fn apply_half(
+    tx: &rusqlite::Transaction<'_>,
+    op: &Op,
+    object: &str,
+    dominated: bool,
+) -> Result<(), CellError> {
     // v0.6.11 (K1): the purge dominates per HALF. The half of the purged
     // object, and a half that only references the purged one (a closing,
     // an edge row) do not apply; the OTHER object's own content does —
     // without everything that names the purged id, which the apply
     // guards take away.
-    if half_dominated_by_purge(tx, op, object)? {
+    if dominated {
         return Ok(());
     }
     let Some(id) = object.strip_prefix("note:") else {
