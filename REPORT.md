@@ -10836,3 +10836,402 @@ cose:
 - la caccia intera.
 
 J2 e J3 restano come sono.
+
+# REPORT — Engramma v0.6.11 (la purga si porta via il purgato, mai il contenuto degli altri)
+
+Fase breve, la correzione della regola J1 della v0.6.10. La regola
+sbagliata l'aveva scritta il revisore nella spec («un'operazione dominata
+dalla purga non rigioca nessuna delle sue metà»), la v0.6.10 l'aveva
+applicata alla lettera, e la verifica l'aveva trovata con due sonde:
+purgare la vecchia faceva sparire la nuova. K1 la corregge, K2 le mette
+accanto l'oracolo che nessuna caccia poteva essere, K3 pulisce il banco
+JS. J2 (`verify` in sola lettura, `repair()`) e J3 (il controllo del
+binario) restano come sono.
+
+## K1 — il contenuto proprio resta, i riferimenti vanno
+
+**Il difetto** (le due sonde del revisore, `verify` verde in tutte e
+due, ora in `tests/purge_own_content.rs` con nomi nostri):
+
+- *supersede:* `put` di A, `supersede(A → N)`, `purge(A)` → `get(N)`
+  rispondeva `NoteNotFound`;
+- *correzione accettata:* proposta in modalità supersede, accettata,
+  P `Active`, `purge(A)` → P `NoteNotFound`, e anche la `patch` di P
+  cadeva. È il flusso principale di Homun.
+
+**La regola.** Una purga toglie la nota purgata, la sua famiglia (le
+copie di conflitto) e **ogni riferimento a lei**. Non toglie mai il
+**contenuto proprio** di un'altra nota: corpo, intestazione,
+esistenza, stato. Per un'operazione che tocca X e Y, con X purgato: la
+metà di Y si applica, senza tutto quello che nomina X; la metà di X non
+si applica.
+
+Meccanicamente: `op_dominated_by_purge` (la domanda «è purgato un
+oggetto di QUESTA operazione?») diventa `half_dominated_by_purge` (la
+domanda «QUESTA metà si applica?»). Tre risposte:
+
+- la metà dell'oggetto purgato non si applica: l'oggetto non c'è;
+- una metà che è **solo un riferimento** al purgato non si applica:
+  `half_references` le riconosce — la chiusura della VECCHIA in un
+  supersede (era opera della nuova), la chiusura del BERSAGLIO in una
+  decide accettata (era opera della proposta), una riga d'arco (è
+  tutta riferimento ai suoi estremi). È la chiusura transitiva della
+  v0.6.10, tenuta per i riferimenti da soli — ed è ciò che tiene
+  chiuso il difetto della v0.6.7 (seed `14903861504949011020`: una
+  decide la cui proposta è purgata non chiude il bersaglio);
+- il contenuto proprio dell'altro oggetto **si applica**: le guardie
+  dei punti d'applicazione già parlano la regola (un bersaglio morto
+  non si chiude, nessuna riga `supersedes` nomina un id mancante, un
+  arco verso un estremo purgato non rinasce).
+
+Le eccezioni restano la `purge` stessa e `revert_decision` (la sua
+risposta `Purged` è venuta prima). I quattro punti d'applicazione
+(arrivo, `apply_half`, rigioco di `materialize_note`, `materialize_edge`)
+passano tutti per la funzione nuova.
+
+**Le operazioni a due oggetti**, l'elenco del § 4.3.1 diviso in
+contenuto proprio e riferimenti (DESIGN aggiornato):
+
+- `decide` (proposta e bersaglio): la metà proposta — attivare la nota
+  e chiudere la coda — è contenuto PROPRIO della proposta; la metà
+  bersaglio — chiudere e scrivere la riga — è RIFERIMENTO alla
+  proposta. Purga del bersaglio: la proposta resta accettata e attiva.
+  Purga della proposta: il bersaglio si riapre (dichiarata);
+- `supersede` (vecchia e nuova): la metà nuova — creare — è contenuto
+  PROPRIO della nuova; la metà vecchia — chiudere e riga — è
+  RIFERIMENTO alla nuova. Purga della vecchia: la nuova nasce e vive.
+  Purga della nuova: la vecchia si riapre (dichiarata);
+- `link`/`unlink`: l'arco è TUTTO riferimento; la nota che dichiara e
+  l'altro estremo restano identici (provato con fotografia intera:
+  corpo, titolo, tag, tipo, stato, versione);
+- `propose` con bersaglio — **la strada scelta**: la proposta resta in
+  coda, e una decide che arriva dopo la purga del bersaglio la atterra
+  come **nota nuova**. Perché: chiuderla con un motivo leggibile
+  (l'alternativa) farebbe scrivere alla purga lo STATO di un'altra
+  nota — la stessa cosa che la regola vieta altrove; e il rigioco e la
+  corsa locale restano la stessa funzione dell'insieme, senza una
+  macchina nuova. In nessun dei due casi il testo sparisce senza
+  traccia: è contenuto dell'agente, e l'utente può vederlo e
+  rifiutarlo.
+
+**La decide locale.** `decide` su un bersaglio purgato non è più
+rifiutata (`refuse_purged_objects` non lo chiede più): accetta o
+rifiuta la proposta come nota nuova. I campi del bersaglio
+(`target_before`, `target_closing`) non si scrivono quando non c'è
+niente da chiudere — un `target_closing: null` nel corpo rompeva la
+forma censurata quando la proposta veniva purgata a sua volta (il
+seed `15211341523171367412`, trovato dalla suite e ridotto in test
+deterministico; il seme sta nelle regressioni).
+
+**I test.** Il primo commit di K1 è il rosso: le due sonde, la forma a
+due dispositivi della prima, le due code (testo visibile e decidibile)
+— cinque rossi. Poi la regola. `purge_wins_per_op.rs` — **corretto, non
+tolto**: il test `a_propose_for_a_purged_target_does_not_materialize`
+codificava «la proposta sparisce, la coda non la tiene»; oggi si chiama
+`a_propose_for_a_purged_target_keeps_its_queue_row_and_names_nothing_purged`
+e chiede il contrario (la riga in coda resta, niente nomina il
+purgato). Gli altri cinque test del file non cambiano: le due
+riaperture, il link dopo la purga, l'unlink che non aspetta, la decide
+che non riscrive la riga sul bersaglio purgato — la regola nuova li
+sostiene così com'erano. L'intestazione del file dice la regola nuova.
+
+**`purgePreview`** (il compito dei documenti: «come capire in anticipo
+quale nota si riaprirà»): non c'era, e ora c'è — una lettura di sola
+lettura, in core (`Cell::purge_preview`) e nel binding
+(`cell.purgePreview(id)` → `{ reopens: [{ id, title }] }`): le note la
+cui chiusura era opera dell'id (la vecchia di un supersede, il
+bersaglio di una correzione accettata: entrambe portano una riga
+`supersedes` il cui chiusore è l'id), quelle ancora in stato
+`superseded`. Documentata in `docs/node.md` con l'avviso che Homun deve
+dare: «tornerà valido: …». Il cancello del cestino
+(`every_public_read_is_classified`) l'ha pretesa in `READS_THE_NOTES` e
+le due passeggiate del contratto la camminano.
+
+**L'ALPN** sale a `engramma/sync/6` e `engramma/mailbox/6`: K1 cambia
+la derivazione, e un dispositivo delle regole 5 (v0.6.10) deriva stati
+diversi dallo stesso insieme. Il test del protocollo parla di 6 e
+rifiuta un answerer v5 con `PEER_OUTDATED`, nome del dispositivo
+compreso (il rosso prima, la costante poi: due commit).
+
+## K2 — l'oracolo sul significato
+
+**Il difetto.** Le proprietà di ieri giudicano la COERENZA (il vivo
+uguale al rigioco, i dispositivi uguali fra loro): la regola
+sbagliata era coerente con sé stessa, e tre cacce intere non l'hanno
+vista con `verify` verde.
+
+**La proprietà** `purge_takes_only_its_family` (in `props.rs`,
+l'inventario va a 27): su una storia generata qualunque si sceglie una
+nota X a caso, si fotografano le note vive fuori dalla famiglia di X
+(corpo, titolo, tag, tipo, stato), si purga X, e ogni nota fotografata
+deve restare leggibile con gli stessi valori. Due eccezioni, dichiarate
+e controllate dalla proprietà stessa:
+
+- le **riaperture**: una nota chiusa dalla famiglia torna a uno STATO
+  CHE AVEVA (la riga `supersedes` lo dichiara; il primo enunciato diceva
+  «torna attiva», ma la nascita in quarantena conta: seed
+  `761472815227880454`, la nota torna `quarantined` — la dichiarazione
+  è cresciuta con il caso, gli stati ammessi si leggono dalla storia
+  della nota stessa);
+- le **relazioni verso X**: righe e archi, contati a zero dopo.
+
+Due forme in una proprietà: a dispositivo singolo (con una compattazione
+in mezzo alla storia) e a due dispositivi (la purga nasce su A, arriva
+per sync, e il giudizio vale su B che la riceve — e anche su A). La
+forma a due dispositivi non compatta: l'ancora che invecchia (H2,
+secondo strato, difetto aperto) falserebbe il giudizio su un terreno
+che non è il mandato di questa proprietà; le compattazioni stanno
+nella forma a dispositivo singolo, dove l'ordine è sequenziale.
+
+**Il dente.** Su un ramo di prova (`dente-k2`, ora buttato) la regola
+della v0.6.10 è tornata al suo posto («nessuna metà rigioca»): la
+proprietà è caduta AL PRIMO CASO, seme minimo `8207553720378492104`,
+successi 0 — «la purga di X ha reso illeggibile Y», la sonda 1, in
+entrambe le forme; e «stato cambiato: prima Active, dopo Quarantined»,
+la correzione accettata che tornava in coda, la sonda 2. Sulla base
+v0.6.10 stessa (worktree al tag) lo stesso: seme minimo
+`4548572890051534440`. I cinque test deterministici di K1, sullo stesso
+ramo, sono rossi come devono.
+
+**L'oracolo ha già pagato.** Cercando la frequenza dei suoi rossi ha
+trovato due difetti PRE-ESISTENTI, riprodotti identici sulla base
+v0.6.10 (entrambi sulla strada: purga → co-oggetto → rimaterializzazione
+sopra un taglio):
+
+- **UNIQUE notes.id** (seme `14476361970380128021`, ~1 caso su 1000):
+  `cut_state` leggeva la fotografia dell'ancora per `op_id` da solo, ma
+  un'operazione a due oggetti fotografa ENTRAMBE le sue note sotto lo
+  stesso `op_id` (un supersede la vecchia e — quando c'era — la nuova;
+  una decide la proposta e il bersaglio), e senza il filtro `note_id`
+  SQLite restituiva la riga che voleva: l'ancora allora ripristinava
+  L'ALTRA NOTA — UNIQUE quando la sua riga c'era già. **Chiuso in
+  questa fase** (commit `ec9896e`: il filtro `note_id` nella lettura);
+  un seme della stessa famiglia trovato dalla suite
+  (`11598969517783651812`) sta nelle regressioni;
+- **VersionNotFound** (semi `10739666680899902993`, `17093826732695285589`
+  e altri del ~0,4% dei casi): un `restore` sopra il taglio trova una
+  versione che non c'è più. È la famiglia dell'ANCORA che invecchia
+  (v0.6.8, H2 secondo strato — stavolta a dispositivo singolo):
+  dichiarato APERTO in `open-defects.txt` con i semi, fuori da questa
+  fase per mandato. Diagnosi per la prossima fase: il passo di
+  cancellazione di `materialize_note` toglie le righe di versione di
+  TUTTE le operazioni della nota (anche quelle a o sotto il taglio, la
+  «storia congelata»), e il rigioco da sopra il taglio non le ricrea —
+  un `restore` che le nomina non le trova.
+
+- **il testimone di una nascita da supersede** (seme
+  `16743842670308237750`, dispositivi 2, round 21 — il rosso della
+  caccia, non un seme dell'oracolo): `no_copy_closes_without_a_witness`
+  è caduta su un disaccordo fra motore e riferimento. La scan della
+  derivazione dei conflitti teneva i corpi solo di `put` e `patch`: la
+  NASCITA di una nota nata da supersede non era una riga, l'ascendenza
+  e la biforcazione cominciavano alla prima patch, e il testimone che
+  il riferimento vedeva il motore no. Buco pre-esistente (la scan non
+  guarda la purga), ma raro prima di K1 — una nota nata da supersede
+  la cui vecchia era purgata non materializzava proprio — e comune con
+  la regola nuova: la nota vive, e i suoi conflitti si derivano.
+  **Chiuso in questa fase** (commit `ccee185`: la nascita è una
+  scrittura del corpo per put, proposta e supersede — col corpo del
+  supersede che è la nascita della NUOVA sola, `note.id == original`,
+  la stessa guardia del riferimento: il seme della caccia sta nelle
+  regressioni di convergence).
+
+La proprietà resta rossa sui semi della famiglia VersionNotFound: è il
+regime dei difetti dichiarati (come `compaction_keeps_verify_and_state`
+da v0.6.8), e il giudizio sta nella tabella della caccia.
+
+## K3 — il banco JS pulisce da sé
+
+**Il difetto** (verifica v0.6.10): 147 cartelle `engramma-node-*` per
+4,3 GB in `$TMPDIR`. Solo `engine.test.js` si puliva, e nessuno quando
+`ENGRAMMA_TEST_TMP` era impostata; e riusare la stessa cartella fra
+`npm test` e `test:electron` faceva cadere 4 test.
+
+**La regola, in `__test__/tmpdir.js`** (un aiuto solo, parlato da tutti
+e tre i file):
+
+- ogni file di test lavora in una sottocartella SUA e NUOVA, anche
+  dentro una `ENGRAMMA_TEST_TMP` riusata (`mkdtemp` dentro la base);
+- la corsa la toglie all'uscita, su ogni strada tranne il kill (hook
+  di `exit`); la base se l'è coniata lei, va via con lei;
+- `ENGRAMMA_TEST_KEEP=1` la tiene E il banco stampa dove sta, per il
+  debug.
+
+**Il giudice sta fuori dal banco**: `__test__/bench.test.js` lancia una
+corsa vera come figlio (con l'eseguibile corrente: Node sotto
+`npm test`, l'Electron di Homun sotto `test:electron`, e senza il
+contesto del runner ereditato — un figlio che eredita `NODE_TEST_CONTEXT`
+si crede una ricorsione e salta tutto) e conta le `engramma-node-*`
+prima e dopo: zero. Prova il KEEP (la cartella resta e il banco lo
+dice), e due corse di fila sulla stessa `ENGRAMMA_TEST_TMP`, entrambe
+verdi con la cartella vuota alla fine.
+
+**I numeri del banco**: `npm test` 62/62 (59 test esistenti identici + i
+2 di K3 + `purgePreview`), `test:electron` 62/62 — quest'ultima con una
+`ENGRAMMA_TEST_TMP` riusata apposta, il caso che nella verifica faceva
+cadere 4 test. A fine corse, zero cartelle `engramma-node-*` senza
+averne cancellata una a mano (l'unica vista in fase era del codice
+vecchio rimesso apposta dallo stash durante una diagnosi: diagnosticata
+e tolta).
+
+## Le misure, contro `fase-v0.6.3` (e la v0.6.9 per `verify`)
+
+Coppie alternate (base = worktree sul tag, fase = worktree sul commit
+finale dei sorgenti), banco da 10 000 note, le corse senza `nice`,
+`uptime` accanto a ogni corsa. Il carico dell'utente al lavoro:
+**2,6–3,4** per tutta la durata — i numeri vanno letti così.
+
+- **Inserimento** (note/s, media dei due corpus per coppia, banco
+  intero — la sonda con l'embedder finto misura un percorso più
+  leggero e non è lo strumento della soglia):
+
+  | coppia | base (v0.6.3) | fase | delta |
+  |---|---|---|---|
+  | 1 | 2983 / 2910 → 2946,5 | 2760 / 2748 → 2754 | −6,5% |
+  | 2 | 2853 / 2856 → 2854,5 | 2757 / 2773 → 2765 | −3,1% |
+  | 3 | 2842 / 2787 → 2814,5 | 2722 / 2737 → 2729,5 | −3,0% |
+  | 4 | 2864 / 2860 → 2862 | 2721 / 2745 → 2733 | −4,5% |
+
+  **Media: base 2869,4, fase 2745,4 → −4,3%**, dentro il +5%. Il
+  prezzo in scrittura è la parola della purga per metà (l'elenco degli
+  oggetti rilevanti e la COUNT della purga, una volta per metà — la
+  prima stesura la chiedeva due volte e la sonda finta misurava +9%:
+  corretto in `ba95c38`).
+- **La sonda della purga** (10 000 note, compattazione con istantanea,
+  una purga; la sonda, copiata uguale nei worktree, fuori dal repo):
+  coppia 1: base 125,4 → fase 130,7 ms; coppia 2: base 126,0 → fase
+  128,7 ms. **Media 125,7 → 129,7 ms: +3,2%**, dentro il +10%. Nota
+  onesta: la COLONNA purga del banco intero (corpus ricco di entità e
+  testo, FTS optimize e VACUUM compresi) è costantemente più lenta
+  (294,4 → 347,6 ms, +18%) — la sonda isolata, lo strumento della
+  fase, attribuisce all'operazione +3,2%, e il resto della colonna
+  sta nel costo del VACUUM su un file scritto da un inserimento più
+  lento; lo si tiene d'occhio nella fase della release.
+- **`verify` sulla cella da 10 000 note, contro `fase-v0.6.9`** (la
+  sonda copiata uguale nei due worktree: corpus della sonda, UNA
+  verify dalzero, marcatori): coppia 1: v0.6.9 911,5 → fase 970,5 ms;
+  coppia 2: v0.6.9 914,3 → fase 975,1 ms. **Media 912,9 → 972,8 ms:
+  +6,6%**, dentro il +10% — il rigioco paga la parola della purga per
+  metà su ogni operazione che applica.
+
+## La caccia
+
+Girata **quattro volte**, tutte a 20 000 casi per proprietà e 5 corse
+della suite a 2 048, in release, `nice` 19, due job, due fili,
+`caffeinate`. Le prime due interrotte dalle proprie scoperte, la terza
+intere, la quarta — quella che vale — sul commit finale `ba95c38`
+(l'ottimizzazione della misura è arrivata dopo la terza, e la caccia
+si rifà per intero sul codice che viene consegnato):
+
+1. **prima** (interrotta): la proprietà dell'oracolo era appena nata e
+   il codice ha guadagnato `purge_preview` mentre girava — fermata e
+   ripartita sul codice vero;
+2. **seconda** (interrotta): **il rosso che valeva** —
+   `no_copy_closes_without_a_witness`, seme `16743842670308237750`
+   (dispositivi 2, round 21): il motore e il riferimento discordavano
+   sul testimone. Ridotto e chiuso (`ccee185`: la nascita da supersede
+   è una scrittura del corpo, la scan la teneva solo per put e patch);
+3. **terza** (intere, 15 903 s, sul commit `ccee185`): 26 proprietà
+   verdi, l'oracolo rosso sul seme della famiglia dichiarata, 5 suite
+   rosse sullo stesso seme (un seme che proptest aveva persistito per
+   sbaglio nelle regressioni: tolto, sta nei difetti aperti);
+4. **quarta — la definitiva** (16 317 s, registro in
+   `target/caccia/20261121-180746`):
+
+| proprietà | esito | tempo |
+|---|---|---|
+| the_fleet_converges | verde | 961 s |
+| every_copy_equals_its_reconstruction | verde | 908 s |
+| no_copy_closes_without_a_witness | verde | 698 s |
+| no_body_text_is_lost | verde | 792 s |
+| the_new_diff3_decides_as_the_v064_one | verde | 3 s |
+| the_long_alignment_is_still_a_lcs | verde | 133 s |
+| the_identity_never_moves_on_generated_histories | verde | 313 s |
+| hidden_notes_leave_no_fingerprint | verde | 445 s |
+| proposal_sequences_keep_the_invariants | verde | 788 s |
+| format_round_trip | verde | 11 s |
+| replay_equals_state | verde | 939 s |
+| compaction_keeps_verify_and_state | verde | 1 227 s |
+| random_ops_compact_and_purge_leave_no_roots | verde | 1 963 s |
+| purge_with_conflict_copies_leaves_no_roots | verde | 2 849 s |
+| export_import_equality | verde | 1 s |
+| hlc_monotonic | verde | 0 s |
+| **purge_takes_only_its_family** | **ROSSO** | 13 s |
+| rfc1918_is_never_public | verde | 38 s |
+| loopback_linklocal_and_cgnat_are_never_public | verde | 0 s |
+| multicast_and_reserved_v4_are_never_public | verde | 1 s |
+| mapped_reserved_v4_is_never_public | verde | 0 s |
+| reserved_v6_blocks_are_never_public | verde | 0 s |
+| ordinary_public_v4_is_public | verde | 0 s |
+| sixto_four_is_the_ipv4_it_carries | verde | 0 s |
+| nat64_teredo_and_ipv4_compatible_are_never_public | verde | 1 s |
+| ports_matter_except_on_loopback_http | verde | 0 s |
+| the_path_must_match_even_on_loopback_http | verde | 0 s |
+| suite-1…5 (2 048 casi) | **ROSSO ×5** | 834–852 s l'una |
+
+**Il giudizio dei rossi — uno solo, sei volte lo stesso**: seme
+`18352432295623270118`, riproduzione: `VersionNotFound` nella purga di
+una nota la cui rimaterializzazione attraversa il taglio (il seme
+minimal dichiarato è `10739666680899902993`, riprodotto identico sulla
+base v0.6.10). **Difetto aperto dichiarato**: la famiglia dell'ancora
+che invecchia (v0.6.8, H2 secondo strato), stavolta a dispositivo
+singolo, scoperta dall'oracolo nuovo di questa fase e messa nel
+registro dei difetti aperti con i suoi semi. Le cinque suite sono rosse
+sullo stesso seme (proptest l'aveva persistito nelle regressioni durante
+la corsa della proprietà: tolto a caccia finita, la regola dell'inventario
+non può vederlo mentre accade). Dentro ogni suite, ogni altro test è
+verde. Nessun difetto nuovo: la regola di K1 non ha aperto niente.
+
+## Difetti nuovi trovati in questa fase
+
+Tre, tutti trovati dagli strumenti nuovi della fase, nessuno lasciato
+aperto dalla regola di K1:
+
+- **l'ancora del taglio leggeva la fotografia sbagliata** (UNIQUE
+  notes.id, seme `14476361970380128021`, ~1 caso su 1000): PRE-ESISTENTE
+  (riprodotto identico sulla base v0.6.10), trovato dall'oracolo
+  metamorfico, **chiuso** (`ec9896e`);
+- **il testimone delle nascite da supersede** (seme
+  `16743842670308237750`): PRE-ESISTENTE (la scan non guarda la purga),
+  reso comune dalla regola nuova (le note nate da supersede sopravvivono
+  alla purga della vecchia e derivano i loro conflitti), trovato dalla
+  caccia, **chiuso** (`ccee185`);
+- **la parola della purga chiesta due volte per metà** (+9% di
+  inserimento sulla sonda): della regola nuova, trovato dalla misura,
+  **chiuso** (`ba95c38`).
+
+E uno già noto, messo nel registro con i semi: il **VersionNotFound**
+della famiglia H2 (sopra). Nota minore, senza riproduzione: durante le
+diagnosi (macchina carica, `nice` 19 e build in corso) il test JS
+`G2: a deleted note hides its copies` è caduto una volta sull'ordine
+HLC delle due mani concorrenti — mai più riprodotto in cinque corse
+complete del banco; se torna, è flakiness da carico, non un difetto di
+questa fase.
+
+## Linux
+
+`scripts/linux.sh` verde sul commit finale (fmt + clippy +
+`cargo test --workspace` nel container Debian arm64, `--cpus=2`, rete
+chiusa, sorgente in sola lettura; il volume `engramma-linux-target`
+tolto a fine verifica).
+
+## La correzione dichiarata della sezione J1 della v0.6.10
+
+La verifica della v0.6.10 (sezione qui sopra, 21 novembre) giudicò la
+fase NON consegnata per la regola J1, scritta dal revisore nella spec e
+applicata alla lettera. Questa fase la corregge senza toccare il resto
+del giudizio: J2 (`verify` in sola lettura, `repair()`) e J3 (il
+controllo del binario) restano come sono — J3 ha anche lavorato per
+questa fase, rifiutando due volte un addon stantio durante i banchi.
+Le due sonde del revisore stanno in `tests/purge_own_content.rs` con
+nomi nostri, rosse prima e verdi adesso.
+
+## La release locale
+
+**Pronta.** La regola sbagliata è corretta, l'oracolo che nessuna caccia
+poteva essere le è accanto (col dente provato: la regola della v0.6.10,
+rimessa su un ramo di prova, la fa cadere al primo caso), le misure sono
+nelle soglie, il contratto JS è verde nelle due case (62/62), Linux è
+verde, e l'unico rosso della caccia è il difetto PRE-ESISTENTE dichiarato
+aperto — pre-esistente alla regola nuova e a questa fase, famiglia
+dell'ancora che invecchia, fuori da questa fase per mandato esplicito.

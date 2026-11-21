@@ -385,9 +385,11 @@ Notevoli:
 - **`NOTE_PURGED`.** «Dimentica per sempre» vuol dire che **quell'id non
   torna**: ogni scrittura che ha l'id purgato come oggetto — `put`,
   `patch`, `delete`, `restore`, `setStatus`, `confirm`, i `link` e gli
-  `unlink` da o verso la nota, `supersede`, le proposte e le decisioni
-  che la nominano — è rifiutata con `e.code === 'NOTE_PURGED'` e l'id
-  nel messaggio. Per riscrivere un contenuto simile serve una **nota
+  `unlink` da o verso la nota, `supersede`, le proposte che la
+  nominano — è rifiutata con `e.code === 'NOTE_PURGED'` e l'id nel
+  messaggio. (v0.6.11: la `decide` il cui BERSAGLIO è purgato non è più
+  fra i rifiuti — la decisione atterra la proposta come nota nuova,
+  vedi la sezione K1 qui sotto.) Per riscrivere un contenuto simile serve una **nota
   nuova, con un id nuovo**: passa un `id` diverso (o nessuno) alla
   `put`. `purge` sull'id continua a funzionare (l'oblio non chiude
   l'oblio), come sulla lapide.
