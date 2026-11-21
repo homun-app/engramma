@@ -10323,3 +10323,393 @@ Il revisore propone una **v0.6.10 breve**, solo questo:
 
 Poi la release locale. La fusione a righe e il proprietario delle righe
 vengono dopo, nella loro fase.
+
+# REPORT — Engramma v0.6.10 (la purga vince per operazione, e `verify` non tocca niente)
+
+Fase breve, di nuovo l'ultima prima della release locale: i due blocchi
+della verifica del revisore, chiusi. Base `main` @ `d366163` (verifica
+v0.6.9). Tre punti: J1 la purga che domina l'operazione intera, J2
+`verify` in sola lettura con la riparazione esplicita, J3 i test JS
+che rifiutano un binario stantio. L'ALPN sale a `engramma/sync/5` e
+`engramma/mailbox/5`: J1 è un cambio di derivazione (la semantica
+v0.5–v0.6.9 «la chiusura del bersaglio sopravvive alla purga della
+proposta» muore qui), e nessuno usa ancora la sync. La fusione a righe
+resta fuori, come chiesto: viene dopo la release locale, nella sua
+fase.
+
+## J1 — la purga vince per operazione (bloccante per la release locale)
+
+**Il difetto** (dichiarato aperto nella v0.6.9, seme
+`14903861504949011020`, proprietà `replay_equals_state`): una proposta
+in modalità supersede accettata dalla `decide`, la proposta purgata, e
+la chiusura transitiva porta via la riga `supersedes`; una scrittura
+sul bersaglio lo rimaterializza, e la `decide` — che è un'operazione
+del bersaglio pure — rigioca la sua metà e riscrive la riga. La
+guardia della v0.6.7 chiedeva «è purgato QUESTO oggetto?», e il
+bersaglio non lo è. Nel vivo la riga rinasceva nel rigioco e non nel
+locale (o il contrario, secondo chi materializza: il seme mostrò il
+rigioco col la riga in più, la riduzione a mano il vivo): `verify`
+rosso comunque.
+
+**La regola:** quando l'insieme contiene una purga di uno qualunque
+degli oggetti di un'operazione, l'operazione non rigioca **nessuna**
+delle sue metà. Una funzione sola, `op_dominated_by_purge`: l'elenco
+degli oggetti viene dall'indice `op_objects` (che sopravvive alla
+censura — per questo il censore della `supersede` tiene ora l'id della
+nota nuova in `new_id`: un id non è contenuto, e senza di esso una
+copia che riceve solo il corpo censurato non può né vedere la
+dominanza né riderivare il co-oggetto) più gli estremi che l'indice
+non porta: il bersaglio di una `propose`, gli estremi e la nota citata
+di `link`/`unlink` (la `unlink` li legge dalla riga quando c'è, e
+dall'op di `link` della stessa spigolo quando la purga l'ha già
+portata via). Eccezioni: la `purge` stessa (il suo scrub è lo stato
+che porta) e `revert_decision` (la sua risposta `RevertOutcome::Purged`
+arriva prima). Vale nell'arrivo (`apply_half`, e una `unlink`
+dominata non aspetta), nel rigioco (`materialize_note`,
+`materialize_edge`) e nella rimaterializzazione; la scrittura locale
+che la stessa domanda rifiuterebbe è quella che la I1 della v0.6.9
+rifiuta già — ora anche la `propose` PER un bersaglio purgato.
+
+**Le operazioni a due oggetti** (l'elenco del DESIGN § 4.3.1), ciascuna
+con una prova deterministica in `tests/purge_wins_per_op.rs`:
+
+- `decide` (proposta e bersaglio): la metà proposta attiva e chiude la
+  coda, la metà bersaglio chiude e scrive la riga `supersedes` (di
+  entrambe, `INSERT OR IGNORE`). La purga della proposta RIAPRE il
+  bersaglio; la purga del bersaglio lascia la riga morta con sé;
+- `supersede` (vecchia e nuova): la purga della nuova riapre la
+  vecchia, quella della vecchia lascia la nuova non nata;
+- `link`/`unlink` (i due estremi e la nota che dichiara): la purga di
+  un estremo porta via la riga e nessuna rimaterializzazione la ricrea
+  (gli arrivi dell'`apply_link` si rifiutano già da soli su un estremo
+  mancante: la strada del difetto era l'arco d'entità che cita la
+  nota purgata, che nessuno controllava);
+- `propose` con bersaglio: la proposta non materializza — nessuna
+  `decide` potrà mai accettarla.
+
+**La chiusura transitiva.** Le metà dominate possono essere già
+applicate quando la purga arriva: la purga applicata
+(`dominated_comaterialize`, la stessa funzione per `apply_purge` e per
+la `repair` di J2) rimaterializza i co-oggetti delle operazioni che
+domina — e, transitivamente, gli archi che li nominano e le
+operazioni che su di loro si appoggiano (un `supersede` il cui vecchio
+è morto non chiude e non scrive righe). Il lavoro è una worklist con
+un insieme di visti: al massimo una materializzazione per oggetto, lo
+stesso tetto del punto fisso della ricostruzione. I corpi censurati
+restano nella forma di sempre (i file v0.6.9 verificano byte per
+byte), ma la loro applicazione parziale vale solo nell'ordine
+incrementale: un rigioco che cammina il registro in seq incontra il
+corpo censurato PRIMA della purga che lo censì, e tutto ciò che quel
+ramo chiude, l'applicazione della purga se lo riprende.
+
+**Tre semi hanno insegnato la chiusura**, trovati dalle proprietà
+mentre la correzione nasceva (difetti del codice nuovo di questa fase,
+chiusi in essa; i semi stanno nei file delle regressioni):
+
+- `2788425701518801064` (flotta): un arco scritto mentre il co-oggetto
+  viveva sopravviveva nel vivo alla sua morte, mentre la
+  ricostruzione lo parcheggiava — la purga doveva rifare anche gli
+  archi che nominano il co-oggetto;
+- `6820126298563524126` (compattazione): il passo degli archi toccava
+  pure i bordi DICHIARATI (`d…`), che non hanno operazioni loro:
+  cancellati e mai più rinati — vanno esclusi, sono stato della loro
+  nota;
+- `6770163031176974400` (flotta): un livello di chiusura non bastava
+  — la supersede(92→93) lasciava la riga nel vivo quando la 91 purgata
+  portava via la 92: le operazioni che si appoggiano al co-oggetto
+  seguono, e la worklist è nata.
+
+**Quattro difetti nuovi hanno trovato le cacce**, tutti nel codice nuovo
+della fase, tutti chiusi in essa (commit `6488627` ed `e8f44d7`; i semi
+stanno nei file delle regressioni). La prima caccia ha trovato i primi
+due, la seconda — corsa sul commit che li chiudeva — gli altri due: la
+coda è il prezzo della regola nuova, e la caccia intera è lo strumento
+che la paga fino in fondo.
+
+- `4815300650940994822` (`replay_equals_state`, 13 873 successi prima):
+  la `decide` riscriveva la riga `supersedes` anche quando il BERSAGLIO
+  era morto — la sua creazione dominata da una purga dell'altro lato — e
+  se la riga sopravviveva dipendeva da quale metà aveva materializzato
+  per ultima (il vivo la perdeva al revert, il rigioco la teneva). La
+  regola che manca: **una nota che non materializza non lascia niente
+  che la nomini** — la decide non scrive la riga a bersaglio morto (né
+  col corpo intero né col censurato), e la materializzazione che finisce
+  senza riga toglie le righe `old_id` che la nominano;
+- `3695505122594015908` (`every_copy_equals_its_reconstruction`, 2
+  dispositivi): il vivo derivava una copia di conflitto il cui
+  originale era morto (creazione dominata), la ricostruzione no. Stessa
+  regola, altro braccio: la materializzazione senza riga CHIUDE le
+  copie della linea morta — la stessa chiusura transitiva che la purga
+  applica agli id che dimentica;
+- `13144595116571598162` (`replay_equals_state`, seconda caccia): i
+  tag orfani sopravvivevano nel vivo a ogni strada che cancellava le
+  righe `note_tags` senza potare (la chiusura delle copie, una
+  materializzazione parziale). La tavola dei tag è DERIVATA: la potatura
+  degli orfani vale a fine di OGNI materializzazione, non solo della
+  purga;
+- `9683753651273141986` (`the_fleet_converges`, 4 dispositivi, seconda
+  caccia): un arco verso una nota morta sopravviveva su un dispositivo
+  e non sugli altri — la morte era arrivata da una materializzazione
+  FUORI dalla worklist della purga (un arrivo tardivo), e quella strada
+  non rifaceva gli archi che la nota nominavano. Ogni morte ora è
+  completa: archi riderivati ed entità potate con le stesse parole
+  della purga, ovunque la nota muoia.
+
+**Le proprietà allargate** (commit `0f9f60a`): il generatore di
+`replay_equals_state` e `compaction_keeps_verify_and_state` ora cita
+note negli archi (estremi `note:` e nota dichiarata: prima solo
+entità, e un arco d'entità non incontra mai la regola) e purga anche
+dalla coda delle proposte (la purga cade su un lato o l'altro della
+`decide`); le scritture che rimaterializzano l'altro lato sono le
+patch e le decide che il generatore già scrive. La flotta
+(`the_fleet_converges`, `every_copy_equals_its_reconstruction`) copre
+gli arrivi in ordine qualunque per costruzione: consegna a frazione
+casuale e copia di riferimento in ordine totale.
+
+**I denti.** Su un ramo di prova (`probe/j1-per-object`, ora buttato)
+la guardia per oggetto è tornata al suo posto della v0.6.7 e la
+co-materializzazione è stata azzerata. Risultato: il seme dichiarato
+`14903861504949011020` con il generatore allargato è ROSSO
+(`replay_equals_state`, la riga `supersedes` 01P74263…→01P4299…), e
+con lui cadono tutte e sei le prove deterministiche — la `decide` del
+seme, la `decide` col bersaglio purgato, la `supersede` con la nuova
+purgata, `link` e `unlink` verso la purgata, la `propose` per un
+bersaglio purgato: «anche su un'operazione diversa dalla decide» è
+soddisfatto quattro volte. Su semi freschi, invece, 20 000 + 8 000
+casi di `replay_equals_state` e 6 000 di `compaction_keeps…` sono
+restati verdi: la strada del difetto è rara dell'ordine di una su
+ventimila (la caccia v0.6.9 ne aveva trovata una in 20 000), e il
+generatore allargato ha rimescolato i flussi — il seme dichiarato ne è
+il testimone, le prove deterministine la sua riduzione per sempre.
+
+**Chiusura:** il seme esce da `open-defects.txt` (commit `0f9f60a`);
+restano i due difetti aperti della sync (l'ancora che invecchia, la
+perdita di testo del cestino), fuori da questa fase per mandato.
+
+## J2 — `verify` non tocca niente, e la riparazione è esplicita (bloccante per la release locale)
+
+**Il difetto** (verifica v0.6.9): la riparazione delle note fantasma
+stava dentro `verify` — `purge_state` + `scrub_log` +
+`purge_conflict_copies` con `secure_delete`: irreversibile, annunciata
+solo dal campo `phantom_purged`.
+
+**`verify` è in sola lettura, per costruzione.** L'audit gira dentro
+una **transazione differita che fa sempre rollback** ( rollback su
+ogni strada d'uscita, per drop). La via del `PRAGMA query_only` — la
+prima provata — non può ospitarlo: l'`integrity-check` di FTS5 è per
+costruzione un comando che apre una transazione di scrittura, verde o
+rosso che sia, e la risposta era «attempt to write a readonly
+database». La transazione con rollback lascia una proprietà in più:
+ogni lettura dell'audit vede uno snapshot stabile. La prova
+deterministica misura i byte del file della cella (e del WAL, quando
+c'è) prima e dopo, a cella aperta — la chiusura di una connessione
+può fare checkpoint di un WAL preesistente, e la chiusura non è un
+atto di `verify`: identici, né una pagina né un digest si muove. Il
+campo `phantom_purged` cambia significato in «trovate», e `ok()` è
+falso quando ce n'è: l'esito dice che la cella ha bisogno di repair.
+
+**`Cell::repair()` è il passo esplicito** (`engramma repair` nella CLI,
+`cell.repair()` in JS). Per ogni fantasma, in una transazione per
+ciascuno: il contenuto della riga viva — corpo, titolo, tag, tipo,
+campi, fonte, lo stato — va in una nota nuova con un id nuovo, con una
+`put` normale sigillata come ogni scrittura locale; l'attore è
+`engramma:repair`, **classe agente** (`classify_actor`: la mano del
+motore, come ogni scrittura `mcp:` — l'autorità umana è il comando che
+ha lanciato la riparazione, non questa scrittura; e la `put` è l'unica
+scrittura del corpo sul nuovo id, quindi la classe non decide alcun
+conflitto). Poi la regola all'id vecchio, come la purga la applica:
+righe di stato, chiusura sulle copie, scrub del registro,
+`secure_delete`. L'interruzione è parte del contratto:
+`ENGRAMMA_TEST_REPAIR_STOP_AFTER` (l'iniezione test-only della
+disciplina v0.6.8-H3) ferma la passeggiata dopo N fantasmi, e la
+riconciliazione resta alla ripartenza — una passeggiata interrotta non
+deve cancellare il contenuto che non ha ancora spostato. Riparare due
+volte non fa niente la seconda. Il rapporto restituisce la **mappa
+vecchio → nuovo al chiamante**, e la mappa non si salva: l'id
+dimenticato non deve restare scritto in nessun posto nuovo (l'unica
+copia che resta dell'id vecchio è lo scheletro del registro — la riga
+della purga stessa, come per ogni purga di sempre).
+
+**Le celle già scritte.** I residui della v0.6.9 — le righe nate da
+metà che oggi non rigiocano più — se li prende la stessa chiamata: la
+riconciliazione finale ri-applica la regola a ogni id purgato e
+rideriva i co-oggetti delle operazioni dominate (la worklist di J1).
+La prova deterministica ne sintetizza una (la riga `supersedes`
+risorta, scritta a mano con SQL sullo stato che il motore v0.6.9
+lasciava), `verify` è rosso, `repair()` la sistema, `verify` verde.
+
+**Il contratto JS** (`docs/node.md`): `verify()` che trova (`ok: false`,
+`phantomPurged: [id]`, nessun byte mosso), `repair()` che risponde la
+mappa e va chiamata una volta; Homun usa la mappa subito per i suoi
+riferimenti (link nei messaggi, promemoria) e non la salva da nessuna
+parte.
+
+## J3 — i test JS rifiutano un binario che non è quello dei sorgenti
+
+**Il difetto** (verifica v0.6.9): `engine.test.js` cercava la CLI in
+`target/release` e poi `target/debug`, e usava la prima che trovava.
+
+**La regola.** `engramma --version` ora stampa versione, **commit** (col
+segno `-dirty` quando l'albero non era pulito) e **schema**:
+`engramma 0.1.0-dev (commit 97669d2, schema 22)` — il commit e il
+segno sporco li cuoce il build script (con `rerun-if-changed` su
+`.git/HEAD` e il ref del ramo, così un commit nuovo ricostruisce), lo
+schema lo legge dalla riga di `SCHEMA_VERSION` nel file della verità
+(`cell/schema.rs`: la stessa riga da cui viene la costante del
+codice). L'addon espone **`buildInfo()`** con le stesse due cose
+(letta dalla costante vera in Rust, non dall'env). Prima dei test
+della vista il banco confronta i due e **si rifiuta di partire**:
+«la CLI in … è del commit X (schema N), l'addon del commit Y (schema
+M): ricostruisci o imposta ENGRAMMA_BIN». Il `pretest` di `npm test` e
+`test:electron` costruisce la CLI (`nice -n 19`, due job): il caso
+normale è sempre fresco. Un binario che non dice il suo commit è
+rifiutato uguale. La prova deterministica: un finto binario che
+parla la forma vecchia, uno muto, uno che coincide — il primo e il
+secondo rifiutati col messaggio che nomina i due lati, il terzo
+passa. La disciplina ha pagato in fase, non solo in teoria: durante
+l'ultima corsa di controllo il banco stesso ha rifiutato l'addon
+rimasto al commit precedente mentre la CLI era già al nuovo — esatto
+il caso che J3 esiste per prendere.
+
+## Le misure, contro `fase-v0.6.3` (e la v0.6.9 per `verify`)
+
+Coppie alternate (base = worktree sul tag, fase = worktree sul commit
+finale dei sorgenti), banco da 10 000 note, le corse senza `nice`,
+`uptime` accanto a ogni corsa. Il carico è stato quello dell'utente al
+lavoro: **4,1–6,3** per tutta la durata — i numeri vanno letti così.
+
+- **Inserimento** (note/s, media dei due corpus per coppia):
+
+  | coppia | base (v0.6.3) | fase | delta |
+  |---|---|---|---|
+  | 1 | 2321 / 2369 → 2345 | 2165 / 2207 → 2186 | −6,8% |
+  | 2 | 2409 / 2557 → 2483 | 2566 / 2539 → 2552,5 | +2,8% |
+  | 3 (ordine ruotato) | 2392 / 2364 → 2378 | 2143 / 2545 → 2344 | −1,4% |
+  | 4 | 2341 / 2304 → 2322,5 | 2114 / 2312 → 2213 | −4,7% |
+
+  **Media: base 2382, fase 2324 → −2,4%**, dentro il +5%. La fase
+  guadagna la sonda per oggetto della J1 sulle operazioni a due
+  oggetti e perde il riparatore di fantasmi dentro `verify` — in
+  scrittura paga solo il primo, e il bilancio resta dalla parte del
+  risparmio.
+- **La sonda della purga** (10 000 note, compattazione con istantanea,
+  una purga; la sonda, copiata uguale nei worktree, fuori dal repo):
+  coppia 1: base 191,5 → fase 203,9 ms; coppia 2: base 224,7 → fase
+  184,6 ms. **Media 208,1 → 194,3 ms: −6,7%**, dentro il +10%.
+- **`verify` sulla cella da 10 000 note, contro `fase-v0.6.9`** (la
+  stessa sonda, nel worktree sul tag v0.6.9 e in quello della fase):
+  v0.6.9 145,3 / 142,4 → **fase 155,0 / 141,8: media 143,9 → 148,4 ms,
+  +3,2%**, dentro il +10% — la transazione che fa sempre rollback e la
+  rilevazione dei fantasmi al posto della loro cancellazione.
+
+## Le cacce, e il prezzo della regola nuova
+
+La caccia è girata **tre volte** — 20 000 casi per proprietà e 5 corse
+della suite a 2 048 ogni volta, in release, `nice` 19, due job, due
+fili, `caffeinate` — perché le prime due hanno trovato quello che
+dovevano trovare: la chiusura transitiva della J1 è codice NUOVO, e il
+suo ordine-dipendenza è il difetto che la caccia esiste per prendere.
+
+1. **Prima caccia** (sul commit `c12d485`): 11 096 s, **8 rossi** — due
+   difetti distinti, tutti gli altri rossi erano gli stessi semi
+   ripescati dai file delle regressioni. Giudicati: entrambi nuovi,
+   della fase. Chiusi in `6488627` (i semi 4815… e 3695…, sopra).
+2. **Seconda caccia** (su `6488627`): 10 021 s, **9 rossi** — di nuovo
+   due difetti nuovi (13144… e 9683…, sopra), il resto ripescate.
+   Chiusi in `e8f44d7`. Nota onesta: durante questa caccia la macchina
+   ha portato anche una corsa diagnostica nel worktree — i TEMPI se ne
+   sono accorti, non i verdetti (un rosso non dipende dal carico).
+3. **Terza caccia — quella della fase** (sul commit finale `e8f44d7`,
+   registro in `target/caccia/20261120-204402/`): 16 541 s, **0 rossi,
+   uscita 0**. Tutte le proprietà dell'inventario a 20 000 casi, le
+   cinque corse della suite a 2 048, i semi delle regressioni
+   (4815…, 3695…, 13144…, 9683…) ripescati per primi e verdi.
+
+| proprietà | casi | esito | tempo |
+|---|---|---|---|
+| `the_fleet_converges` | 20 000 | verde | 999 s |
+| `every_copy_equals_its_reconstruction` | 20 000 | verde | 908 s |
+| `no_copy_closes_without_a_witness` | 20 000 | verde | 744 s |
+| `no_body_text_is_lost` | 20 000 | verde | 888 s |
+| `the_new_diff3_decides_as_the_v064_one` | 20 000 | verde | 3 s |
+| `the_long_alignment_is_still_a_lcs` | 20 000 | verde | 145 s |
+| `the_identity_never_moves_on_generated_histories` | 20 000 | verde | 307 s |
+| `hidden_notes_leave_no_fingerprint` | 20 000 | verde | 456 s |
+| `proposal_sequences_keep_the_invariants` | 20 000 | verde | 675 s |
+| `format_round_trip` | 20 000 | verde | 4 s |
+| `replay_equals_state` | 20 000 | verde | 775 s |
+| `compaction_keeps_verify_and_state` | 20 000 | verde | 1 119 s |
+| `random_ops_compact_and_purge_leave_no_roots` | 20 000 | verde | 1 817 s |
+| `purge_with_conflict_copies_leaves_no_roots` | 20 000 | verde | 3 091 s |
+| `export_import_equality` | 20 000 | verde | 0 s |
+| `hlc_monotonic` | 20 000 | verde | 0 s |
+| `rfc1918_is_never_public` | 20 000 | verde | 40 s |
+| `loopback_linklocal_and_cgnat_are_never_public` | 20 000 | verde | 0 s |
+| `multicast_and_reserved_v4_are_never_public` | 20 000 | verde | 0 s |
+| `mapped_reserved_v4_is_never_public` | 20 000 | verde | 1 s |
+| `reserved_v6_blocks_are_never_public` | 20 000 | verde | 0 s |
+| `ordinary_public_v4_is_public` | 20 000 | verde | 1 s |
+| `sixto_four_is_the_ipv4_it_carries` | 20 000 | verde | 0 s |
+| `nat64_teredo_and_ipv4_compatible_are_never_public` | 20 000 | verde | 0 s |
+| `ports_matter_except_on_loopback_http` | 20 000 | verde | 1 s |
+| `the_path_must_match_even_on_loopback_http` | 20 000 | verde | 0 s |
+| suite-1 (core, 2 048) | 2 048 | verde | 962 s |
+| suite-2 (core, 2 048) | 2 048 | verde | 1 025 s |
+| suite-3 (core, 2 048) | 2 048 | verde | 921 s |
+| suite-4 (core, 2 048) | 2 048 | verde | 837 s |
+| suite-5 (core, 2 048) | 2 048 | verde | 822 s |
+
+Le due proprietà con difetti aperti dichiarati
+(`compaction_keeps_verify_and_state` per l'ancora che invecchia,
+`no_body_text_is_lost` per il cestino) sono verdi a 20 000 casi: i
+loro semi vivono fuori dalle regressioni e il caso non li ha pescati.
+
+## Le corse
+
+- **Il contratto JS**: `npm test` **59/59** — i 57 della v0.6.9
+  identici e verdi, più il fantasma che si sposta (J2) e il banco che
+  rifiuta il binario stantio (J3). `test:electron`: **59/59**. (Il
+  rifiuto è stato provato anche dal vivo: ricostruita la CLI senza
+  ricostruire l'addon, il banco si è rifiutato di partire col messaggio
+  che nomina i due commit — il caso esatto che J3 esiste per prendere.)
+- **Linux**: `scripts/linux.sh` verde (fmt, clippy `-D warnings`, test
+  del workspace nel container, `--cpus=2`).
+- **Le celle d'oro**: `golden_cell.rs` verde sulla `v068.sqlite` con la
+  verify in sola lettura; lo schema non cambia (22), nessuna cella
+  `v0610` da aggiungere.
+
+## La pulizia
+
+- `du -sh target`: **22 G all'inizio, 24 G alla fine** — le tre cacce e
+  le build dei worktree di misura. I registri della caccia stanno in
+  `target/caccia/` (tre cartelle) e restano finché il target vive. La
+  pulizia della cartella la decide l'utente: da qui non si cancella
+  niente.
+- `.tmp*` in `$TMPDIR`: **zero, senza che nessuna sia stata cancellata
+  a mano** — il motore non ne lascia. Ci sono invece **145 cartelle
+  `engramma-node-*`**, il banco JS della fase ne ha lasciata una per
+  ogni file di test per ogni corsa (comportamento preesistente: il
+  banco le crea in `$TMPDIR` e non le rimuove; `ENGRAMMA_TEST_TMP`
+  esiste per dirottarle). Diagnosi scritta, niente cancellato a mano.
+- I worktree della misura (`/tmp/eng-v063wt`, `/tmp/eng-v069wt`,
+  `/tmp/eng-v0610wt`) e i loro target: rimossi. Nessun processo
+  lasciato acceso.
+
+## Difetti nuovi trovati in questa fase
+
+Quattro, tutti nel codice nuovo della J1 (la chiusura transitiva e le
+sue strade), tutti trovati dalla caccia, giudicati e chiusi nella
+fase: i semi 4815…, 3695… (prima caccia), 13144…, 9683… (seconda) con
+le rispettive regole, sopra. Nessun difetto aperto nuovo; restano
+aperti i due dichiarati della sync (l'ancora che invecchia, la perdita
+di testo del cestino), fuori da questa fase per mandato.
+
+## La release locale: pronta
+
+I due blocchi della verifica v0.6.9 — la `decide` sopra la purga e il
+`verify` che cancella — sono chiusi, con le prove deterministiche, le
+proprietà allargate e tre cacce (l'ultima intera e verde). Il terzo
+punto, il banco JS che misura il binario giusto, è chiuso e
+funziona. Le misure sono dentro le soglie. Resta alla release locale
+quello che la fase ha volutamente lasciato fuori: la fusione a righe e
+il proprietario delle righe, nella loro fase.
