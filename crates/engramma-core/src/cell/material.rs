@@ -449,10 +449,21 @@ fn materialize_note(
                 })
                 .optional()?;
             if base_seq.is_some_and(|s| s <= cut) {
+                // v0.6.11 (K2's oracle): the snapshot is THIS note's — a
+                // two-object operation snapshots BOTH its notes under the
+                // same op_id (a supersede photographs the old side and,
+                // when it existed, the new one; a decide photographs the
+                // proposal and the target it closed), and without the
+                // note_id filter SQLite handed back whichever row it
+                // liked: the anchor then RESTORED THE OTHER NOTE — a
+                // UNIQUE notes.id when its row was already there, and a
+                // wrong anchor under it (the open defect's VersionNotFound
+                // is the same wrong row read the other way)
                 let snap: Option<(String, i64)> = tx
                     .query_row(
-                        "SELECT snapshot_json, version FROM note_versions WHERE op_id = ?1",
-                        [&op_id],
+                        "SELECT snapshot_json, version FROM note_versions
+                         WHERE op_id = ?1 AND note_id = ?2",
+                        rusqlite::params![op_id, id.to_string()],
                         |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()?;
