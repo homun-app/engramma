@@ -35,9 +35,10 @@ const engrammaBin = () =>
   if (cli) assertCliMatchesAddon(cli, buildInfo());
 }
 
-const TMP = process.env.ENGRAMMA_TEST_TMP
-  ? process.env.ENGRAMMA_TEST_TMP
-  : fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'engramma-node-'));
+// v0.6.11 (K3): the bench folder of this file — its own, new, and
+// cleaned at the end of the run (failures included); ENGRAMMA_TEST_KEEP
+// keeps it and says where it is
+const TMP = require('./tmpdir.js').testTmp('engine');
 const root = () => {
   const dir = path.join(TMP, `r-${Math.random().toString(36).slice(2, 8)}`);
   fs.rmSync(dir, { recursive: true, force: true });
@@ -1230,13 +1231,6 @@ test('ENGRAMMA_PULL_BASE: a local base, an altered file refuses to land (P1.5)',
   } finally {
     delete process.env.ENGRAMMA_PULL_BASE;
     server.close();
-  }
-});
-
-// the test root goes away with the last engine: no temp left behind
-process.on('exit', () => {
-  if (!process.env.ENGRAMMA_TEST_TMP) {
-    fs.rmSync(TMP, { recursive: true, force: true });
   }
 });
 

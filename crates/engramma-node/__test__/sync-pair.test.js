@@ -14,9 +14,9 @@ const path = require('node:path');
 const readline = require('node:readline');
 const { spawn } = require('node:child_process');
 
-const TMP = process.env.ENGRAMMA_TEST_TMP
-  ? process.env.ENGRAMMA_TEST_TMP
-  : fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'engramma-node-'));
+// v0.6.11 (K3): the bench folder of this file — its own, new, and
+// cleaned at the end of the run (failures included)
+const TMP = require('./tmpdir.js').testTmp('sync-pair');
 
 /** One device, its own Node process. */
 class Peer {

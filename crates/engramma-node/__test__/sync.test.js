@@ -13,9 +13,9 @@ const path = require('node:path');
 
 const { Engine } = require('..');
 
-const TMP = process.env.ENGRAMMA_TEST_TMP
-  ? process.env.ENGRAMMA_TEST_TMP
-  : fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'engramma-node-'));
+// v0.6.11 (K3): the bench folder of this file — its own, new, and
+// cleaned at the end of the run (failures included)
+const TMP = require('./tmpdir.js').testTmp('sync');
 const root = () => {
   const dir = path.join(TMP, `s-${Math.random().toString(36).slice(2, 8)}`);
   fs.rmSync(dir, { recursive: true, force: true });
