@@ -633,6 +633,51 @@ fn a_decide_accepted_over_a_purged_target_survives_the_purge_of_the_proposal() {
     assert!(report.ok(), "{:?}", report.mismatch);
 }
 
+/// La lettura che Homun fa PRIMA di purgare (v0.6.11, K1): la piccola
+/// API di sola lettura `purge_preview` nomina in anticipo le note che si
+/// RIAPRIRANNO — quelle la cui chiusura era opera della nota da
+/// dimenticare — perché l'interfaccia possa dire «tornerà valido: …».
+/// Non muove niente: chiederla due volte non cambia né la risposta né
+/// lo stato.
+#[test]
+fn purge_preview_names_the_reopenings_before_the_purge() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let cell = Cell::create(&dir.path().join("anticipo.sqlite"), "p", "tester")
+        .unwrap(/* test-only */);
+    let a = note_of(1, "il mio colore preferito è il rosso");
+    let mut n = note_of(3, "il mio colore preferito è il nero");
+    n.supersedes = vec![a.id];
+    cell.put_note(&a, "user").unwrap(/* test-only */);
+    cell.supersede(&a.id, &n, None, "user").unwrap(/* t */);
+
+    let preview = cell.purge_preview(&n.id).unwrap(/* test-only */);
+    assert_eq!(preview.len(), 1, "la vecchia si riaprirà");
+    assert_eq!(preview[0].id, a.id);
+    assert_eq!(preview[0].title.as_deref(), Some("titolo 1"));
+
+    // di sola lettura: la stessa risposta due volte, e la vecchia è
+    // ancora chiusa
+    assert_eq!(
+        cell.purge_preview(&n.id).unwrap(/* test-only */).len(),
+        1
+    );
+    assert_eq!(cell.get(&a.id).unwrap(/* t */).status, Status::Superseded);
+
+    // e una nota che non ha chiuso niente non riapre niente
+    assert!(
+        cell.purge_preview(&a.id).unwrap(/* test-only */).is_empty(),
+        "la vecchia non ha chiuso nessuno"
+    );
+
+    // dopo la purga, l'anticipo dice la verità di domani: la riga non
+    // c'è più
+    cell.purge(&n.id, "diritto all'oblio", "tester").unwrap(/* t */);
+    assert!(
+        cell.purge_preview(&n.id).unwrap(/* test-only */).is_empty(),
+        "la purgata non riapre più niente"
+    );
+}
+
 /// L'id che `note_of` conia (lettura condivisa fra le fasi del test).
 fn a_id(n: u16) -> Ulid {
     Ulid::from_string(&format!("01{:024}", n)).unwrap(/* test-only */)

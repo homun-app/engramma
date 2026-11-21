@@ -58,6 +58,59 @@ test('version is exported', () => {
   assert.match(version(), /^0\./);
 });
 
+// v0.6.11 (K1): the read-only preview of a purge — the notes whose
+// closing was this note's work REOPEN when it is forgotten. Homun warns
+// before the purge: «tornerà valido: …». The supersede is staged by the
+// CLI (the binding has no supersede of its own: corrections arrive from
+// the agent's tools), the same road the view tests walk.
+test('purgePreview() names the note that would reopen, and moves nothing', async () => {
+  const cli = engrammaBin();
+  if (!cli) return; // no binary around: the per-test assertion below says so
+  const run = (args) => {
+    const r = require('node:child_process').spawnSync(cli, args, { encoding: 'utf8' });
+    assert.equal(r.status, 0, `${args.join(' ')}\n${r.stdout}${r.stderr}`);
+    return r;
+  };
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  try {
+    const cell = await e.cell('riaperture');
+    const old = await cell.put({
+      body: 'il mio colore preferito è il rosso',
+      source: 'homun:test',
+      confidence: 'stated',
+    });
+    const file = path.join(TMP, 'nuova-nota.md');
+    fs.writeFileSync(file, 'il mio colore preferito è il nero\n');
+    run([
+      '--root', rootDir,
+      '--cell', 'riaperture',
+      'supersede', old.id, file,
+      '--source', 'homun:test', '--confidence', 'stated',
+    ]);
+    const notes = await cell.list();
+    const next = notes.find((n) => n.body.includes('nero'));
+    assert.ok(next, 'the supersede created the new note');
+
+    const preview = await cell.purgePreview(next.id);
+    assert.equal(preview.reopens.length, 1, 'the old note would reopen');
+    assert.equal(preview.reopens[0].id, old.id);
+
+    // read-only: asking twice changes nothing, and the old note is still
+    // closed
+    const again = await cell.purgePreview(next.id);
+    assert.deepEqual(again, preview);
+    const still = await cell.get(old.id);
+    assert.equal(still.status, 'superseded');
+
+    // and a note that closes nothing reopens nothing
+    const quiet = await cell.purgePreview(old.id);
+    assert.deepEqual(quiet.reopens, []);
+  } finally {
+    await e.close();
+  }
+});
+
 test('put/get/search/patch/delete/purge, the whole cycle', async () => {
   const e = await engine();
   const cell = await e.cell('famiglia');

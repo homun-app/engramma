@@ -2400,6 +2400,51 @@ impl Task for DeleteTask {
     reject_recode!();
 }
 
+pub struct PurgePreviewTask {
+    cell: CoreCell,
+    id: String,
+    _open: CellPermits,
+}
+
+impl Task for PurgePreviewTask {
+    type Output = Vec<engramma_core::cell::Reopening>;
+    type JsValue = PurgePreview;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let id = parse_ulid(&self.id)?;
+        self.cell.purge_preview(&id).map_err(cell_error)
+    }
+
+    fn resolve(&mut self, _env: Env, rows: Self::Output) -> Result<Self::JsValue> {
+        Ok(PurgePreview {
+            reopens: rows
+                .into_iter()
+                .map(|r| ReopenEntry {
+                    id: r.id.to_string(),
+                    title: r.title,
+                })
+                .collect(),
+        })
+    }
+}
+
+/// v0.6.11 (K1): the read-only preview of a purge.
+#[napi(object)]
+pub struct PurgePreview {
+    /// The notes that would REOPEN — back to the state they had before
+    /// the closing — when this note is forgotten.
+    pub reopens: Vec<ReopenEntry>,
+}
+
+/// One reopening of [`PurgePreview`].
+#[napi(object)]
+pub struct ReopenEntry {
+    /// The note that comes back.
+    pub id: String,
+    /// Its title, when it has one.
+    pub title: Option<String>,
+}
+
 pub struct ConflictsTask {
     cell: CoreCell,
     _open: CellPermits,
@@ -3005,6 +3050,20 @@ impl Cell {
             actor: self.actor.clone(),
             id,
             reason,
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// v0.6.11 (K1): what the purge of this note would take with it,
+    /// asked BEFORE the purge — read-only, nothing moves. Today it names
+    /// the REOPENINGS: the notes whose closing was this note's work (the
+    /// old side of a supersede, the target of an accepted correction).
+    /// Homun warns the user before forgetting: «tornerà valido: …».
+    #[napi(ts_return_type = "Promise<PurgePreview>")]
+    pub fn purge_preview(&self, env: Env, id: String) -> Result<AsyncTask<PurgePreviewTask>> {
+        Ok(AsyncTask::new(PurgePreviewTask {
+            cell: self.cell.clone(),
+            id,
             _open: self.enter(env)?,
         }))
     }

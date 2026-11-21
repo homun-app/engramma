@@ -195,6 +195,17 @@ pub struct VersionEntry {
     pub note: Note,
 }
 
+/// (v0.6.11, K1) One note the purge of `id` would REOPEN: the note
+/// itself (its id) and its title, for the screen that warns before
+/// forgetting — «tornerà valido: …».
+#[derive(Debug, Clone)]
+pub struct Reopening {
+    /// The note that comes back to the state it had before the closing.
+    pub id: Ulid,
+    /// Its title, when it has one.
+    pub title: Option<String>,
+}
+
 /// Report of [`Cell::purge`] (v0.3.1, P0.2): what was forgotten, and whether
 /// every byte is already gone from disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1755,6 +1766,36 @@ impl Cell {
     /// CLI says so). `[[Mentions]]` of this note in other notes remain:
     /// they are other notes.
     ///
+    /// (v0.6.11, K1) What the purge of `id` would take with it, asked
+    /// BEFORE the purge: read-only, no op, nothing moves. Today it names
+    /// the REOPENINGS — the notes whose closing was this note's work (the
+    /// old side of a supersede, the target of an accepted correction:
+    /// both carry a `supersedes` row whose closer is `id`). A reopening
+    /// is the one surprise the rule allows a purge, and Homun must say it
+    /// before the user forgets the datum.
+    ///
+    /// # Errors
+    /// [`CellError::Db`] on SQL failure.
+    pub fn purge_preview(&self, id: &Ulid) -> Result<Vec<Reopening>, CellError> {
+        let inner = self.lock()?;
+        let mut stmt = inner.conn.prepare(
+            "SELECT n.id, n.title FROM supersedes s
+             JOIN notes n ON n.id = s.old_id
+             WHERE s.new_id = ?1 AND n.status = 'superseded'
+             ORDER BY n.id",
+        )?;
+        let out: Vec<Reopening> = stmt
+            .query_map([id.to_string()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
+            .flatten()
+            .filter_map(|(id, title)| {
+                Ulid::from_string(&id).ok().map(|id| Reopening { id, title })
+            })
+            .collect();
+        Ok(out)
+    }
+
     /// # Errors
     /// [`CellError::Db`] on SQL or I/O failures.
     pub fn purge(&self, id: &Ulid, reason: &str, actor: &str) -> Result<PurgeReport, CellError> {
