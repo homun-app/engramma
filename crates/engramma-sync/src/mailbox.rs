@@ -7,7 +7,7 @@
 //! own signatures, and device NAMES never reach it (the list's rows it
 //! verifies carry keys).
 //!
-//! `engramma mailbox serve --root <dir>`: ALPN `engramma/mailbox/2` (the rules version of v0.6.4, D4 — the mailbox carries operations to materialize).
+//! `engramma mailbox serve --root <dir>`: ALPN `engramma/mailbox/6` (the rules version, riding with the sync one — the mailbox carries operations to materialize).
 //! Retention: 180 days by default, configurable; the purge request a
 //! device signs deletes the opaque ids of a note's envelopes AND VACUUMS,
 //! so no byte of the sealed bodies survives in the file.
@@ -20,7 +20,7 @@ use crate::registry::DeviceRegistry;
 use crate::{Error, Result};
 
 /// The mailbox's ALPN — the rules version rides with the sync one.
-pub const MAILBOX_ALPN: &[u8] = b"engramma/mailbox/5";
+pub const MAILBOX_ALPN: &[u8] = b"engramma/mailbox/6";
 /// Default retention: 180 days.
 pub const RETENTION_DAYS: i64 = 180;
 

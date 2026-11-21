@@ -29,16 +29,18 @@ use crate::{Error, Result};
 
 /// The ALPN of the sync protocol — and the version of the
 /// materialization rules (v0.6.4, D4; v0.6.5 brings the 3, v0.6.7 the
-/// 4): every change of the derivation bumps it, and peers on different
-/// versions refuse each other before a single operation moves. The
-/// v0.6.7 changes: the witness does not depend on the lapide (a write
-/// the lapide beat still attests what its author saw), and the copies
-/// of a deleted note follow the lapide — hidden from `conflicts()`,
-/// from search and from the proposals listing.
-pub const ALPN: &[u8] = b"engramma/sync/5";
+/// 4, v0.6.10 the 5): every change of the derivation bumps it, and
+/// peers on different versions refuse each other before a single
+/// operation moves. The v0.6.11 changes (K1): a purge takes the purged
+/// note, its family and every REFERENCE to it — never another note's
+/// own content; the halves of a two-object operation split (the
+/// surviving object's own content applies, the references to the
+/// purged one go), and a proposal for a purged target stays decidable
+/// in the queue.
+pub const ALPN: &[u8] = b"engramma/sync/6";
 /// The protocol version this build speaks (kept in the hello as a
 /// belt-and-braces check: the ALPN already gates the rules).
-pub const PROTOCOL_VERSION: u64 = 5;
+pub const PROTOCOL_VERSION: u64 = 6;
 /// A message is at most 1 MiB.
 pub const MAX_MESSAGE: usize = 1024 * 1024;
 
