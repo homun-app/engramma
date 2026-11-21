@@ -11235,3 +11235,15 @@ nelle soglie, il contratto JS è verde nelle due case (62/62), Linux è
 verde, e l'unico rosso della caccia è il difetto PRE-ESISTENTE dichiarato
 aperto — pre-esistente alla regola nuova e a questa fase, famiglia
 dell'ancora che invecchia, fuori da questa fase per mandato esplicito.
+
+## La build sul tag
+
+`scripts/build-sha.sh` sul tag `fase-v0.6.11` (commit
+`3405c407c32d306892d94c75441d7272d89abc00`, albero pulito), i tre file
+dell'aggancio di Homun letti dal disco dopo la build:
+
+| file | byte | SHA256 |
+|---|---|---|
+| `engramma.darwin-arm64.node` | 50 766 728 | `5cd74c36730709088a5e7e9f3a3576d35c7a70f3e2de43ec70eb2d6687ad925c` |
+| `index.js` | 36 239 | `cd26043ecf56124be115f58a25368049dec67d48515109b31de588646280e311` |
+| `index.d.ts` | 27 109 | `dd80c0ac3be544f622b49ccb7b84796ac6c2270bc08c38932ca9105e5694854b` |
