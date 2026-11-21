@@ -580,6 +580,59 @@ fn the_new_note_survives_the_purge_arriving_by_sync() {
     assert!(report.ok(), "{:?}", report.mismatch);
 }
 
+/// Il seme `15211341523171367412` della prima caccia di questa fase,
+/// ridotto a mano: una correzione accettata su un bersaglio purgato, e
+/// poi la purga della PROPOSTA. La decide accettata non ha niente da
+/// chiudere, e il suo corpo non deve portare campi vuoti (`target_closing:
+/// null`): quando la purga della proposta la censura, la forma censurata
+/// deve restare quella che il cancello del registro ammette.
+#[test]
+fn a_decide_accepted_over_a_purged_target_survives_the_purge_of_the_proposal() {
+    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let cell = Cell::create(&dir.path().join("decide-censura.sqlite"), "p", "tester")
+        .unwrap(/* test-only */);
+    let target = note_of(1, "la nota che il mondo correggeva");
+    let mut proposal = note_of(2, "la rettifica che resta sola");
+    proposal.status = Status::Quarantined;
+    cell.put_note(&target, "tester").unwrap(/* test-only */);
+    cell.set_policy(serde_json::json!({ "write": "propose" }), "tester")
+        .unwrap(/* test-only */);
+    cell.propose(
+        &ProposalInput {
+            note: proposal,
+            mode: ProposalMode::Supersede(target.id),
+            client: None,
+            reason: None,
+        },
+        "mcp:tester",
+        &ProposeContext::default(),
+    )
+    .unwrap(/* test-only */);
+
+    cell.purge(&target.id, "diritto all'oblio", "tester").unwrap(/* t */);
+    cell.decide(
+        &a_id(2),
+        &DecisionInput {
+            action: DecisionAction::Accept { edited: None },
+            reason: None,
+            review: None,
+        },
+        "tester",
+    )
+    .unwrap(/* test-only */);
+    assert_eq!(
+        cell.get(&a_id(2)).unwrap(/* test-only */).status,
+        Status::Active
+    );
+
+    // la purga della proposta censura la decide: la forma censurata deve
+    // passare il cancello, e la catena deve restare intera
+    cell.purge(&a_id(2), "diritto all'oblio", "tester").unwrap(/* t */);
+
+    let report = cell.verify().unwrap(/* test-only */);
+    assert!(report.ok(), "{:?}", report.mismatch);
+}
+
 /// L'id che `note_of` conia (lettura condivisa fra le fasi del test).
 fn a_id(n: u16) -> Ulid {
     Ulid::from_string(&format!("01{:024}", n)).unwrap(/* test-only */)

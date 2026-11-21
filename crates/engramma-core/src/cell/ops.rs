@@ -2137,7 +2137,10 @@ pub(crate) fn dominated_comaterialize(tx: &Transaction<'_>, id: &Ulid) -> Result
     }
     // a PROPOSE whose target is the purged id names the target in its
     // body only — the queue row is the index that still knows it. The
-    // proposal itself is a co-object: it does not materialize anymore
+    // proposal itself is a co-object: v0.6.11 (K1) keeps it ALIVE in the
+    // queue (its text is the agent's content, and a decide, if it comes,
+    // lands it as a new note), so its rematerialization writes the queue
+    // row back wherever an older state had lost it
     {
         let mut stmt = tx.prepare("SELECT note_id FROM proposals WHERE target = ?1")?;
         let rows: Vec<String> = stmt

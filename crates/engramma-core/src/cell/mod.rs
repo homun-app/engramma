@@ -4253,16 +4253,14 @@ fn local_write_objects(
                 push(id, &mut ids);
             }
         }
-        OpKind::Decide => {
-            if let Some(id) = id_of(payload.get("target")) {
-                push(id, &mut ids);
-            }
-        }
-        // v0.6.10 (J1): a propose with a target is a two-object write —
-        // the purge of the target dominates the whole operation, and the
-        // local write is refused like every other dominated one (the
-        // arrival and the replay skip it; the queue row would name an
-        // id the set forgot)
+        // v0.6.11 (K1): a decide is NOT refused over a purged TARGET —
+        // the target's half (the closing) is the dominated one, and the
+        // proposal's half lands: the decision accepts the text as a NEW
+        // note, or rejects it, with nothing to close (the target's
+        // existence, when it is not purged, is `decide_locked`'s own
+        // word). Every other two-object write keeps the rule: the
+        // supersede needs its old note (and closes it), a propose needs
+        // a living target, a link needs its endpoints.
         OpKind::Propose => {
             if payload.get("mode").and_then(Value::as_str) == Some("supersede")
                 && let Some(id) = id_of(payload.get("target"))

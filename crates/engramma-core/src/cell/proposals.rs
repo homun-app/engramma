@@ -1018,32 +1018,36 @@ impl Cell {
             };
             // the supersede target: it must exist now, and the decision
             // records what it was (the revert restores exactly that).
-            // v0.6.9 (I1): a target the set PURGED is the rule's word
-            // first — the status read below would answer `NoteNotFound`
-            // for a row the purge already took
+            // v0.6.11 (K1): a target the set PURGED is not a refusal —
+            // the proposal stays decidable and lands as a NEW note:
+            // nothing to close, no row to write, nothing to record (the
+            // closing was the target's half, and the purge took the
+            // target). The agent's text, which the user is accepting,
+            // is content that survives the purge.
             let mut target_before = None;
             let mut target_closing = None;
             if mode == "supersede" {
                 let Some(target) = target else {
                     return Err(CellError::Db("supersede proposal without target".into()));
                 };
-                super::refuse_purged_ids(&inner.conn, &[target])?;
-                let row = super::ops::read_note_status(&inner.conn, &target)?
-                    .ok_or_else(|| CellError::NoteNotFound(target.to_string()))?;
-                target_before = Some(serde_json::json!({
-                    "id": target.to_string(),
-                    "status": row.0.as_str(),
-                    "valid_to": row.1.as_ref().map(|v| v.to_db_string()),
-                }));
-                // the closing this decision will apply: the (possibly
-                // edited) note's valid_from, else the decision date —
-                // recorded so the purge's censor can keep it verbatim
-                let vf = edited
-                    .as_ref()
-                    .and_then(|e| e.valid_from)
-                    .or_else(|| self.note_valid_of(&inner, id).ok().flatten())
-                    .unwrap_or_else(|| Validity(decided_at.get().date(), None));
-                target_closing = Some(vf.to_db_string());
+                if !super::ops::note_purged(&inner.conn, &target)? {
+                    let row = super::ops::read_note_status(&inner.conn, &target)?
+                        .ok_or_else(|| CellError::NoteNotFound(target.to_string()))?;
+                    target_before = Some(serde_json::json!({
+                        "id": target.to_string(),
+                        "status": row.0.as_str(),
+                        "valid_to": row.1.as_ref().map(|v| v.to_db_string()),
+                    }));
+                    // the closing this decision will apply: the (possibly
+                    // edited) note's valid_from, else the decision date —
+                    // recorded so the purge's censor can keep it verbatim
+                    let vf = edited
+                        .as_ref()
+                        .and_then(|e| e.valid_from)
+                        .or_else(|| self.note_valid_of(&inner, id).ok().flatten())
+                        .unwrap_or_else(|| Validity(decided_at.get().date(), None));
+                    target_closing = Some(vf.to_db_string());
+                }
             }
             (target, target_before, target_closing, edited)
         };
@@ -1051,17 +1055,26 @@ impl Cell {
             DecisionAction::Accept { .. } => "accept",
             DecisionAction::Reject => "reject",
         };
-        let payload = serde_json::json!({
+        // v0.6.11 (K1): the target's bookkeeping keys ride only when there
+        // IS a target half to record — an accept over a purged target
+        // writes neither (nothing to close, nothing to restore), and a
+        // JSON `null` would not survive the censor's shape check when
+        // the proposal itself is forgotten later
+        let mut payload = serde_json::json!({
             "proposal": id.to_string(),
             "decision": decision,
             "reason": input.reason,
             "edited": edited.map(|n| n.to_json()),
             "target": target.map(|t| t.to_string()),
-            "target_before": target_before,
-            "target_closing": target_closing,
             "review": input.review.as_ref().map(ReviewMeta::to_json),
             "decided_at": decided_at.to_db_string(),
         });
+        if let Some(before) = target_before {
+            payload["target_before"] = before;
+        }
+        if let Some(closing) = target_closing {
+            payload["target_closing"] = Value::String(closing);
+        }
         let mut inner = self.lock()?;
         super::execute_op(&mut inner, OpKind::Decide, Some(*id), actor, payload)
     }

@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! v0.6.10 (J1): la purga vince per OPERAZIONE. Quando l'insieme contiene
-//! una purga di uno qualunque degli oggetti di un'operazione, l'operazione
-//! non rigioca NESSUNA delle sue metà — non solo la metà che tocca l'oggetto
-//! purgato. Le eccezioni sono la `purge` stessa (il suo scrub è lo stato che
-//! porta) e `revert_decision` (che ha la sua risposta `RevertOutcome::Purged`).
+//! v0.6.11 (K1): la purga si porta via il purgato, mai il contenuto degli
+//! altri. La dominanza della v0.6.10 (J1) saltava l'operazione INTERA
+//! quando un suo oggetto era purgato; quella regola, scritta dal revisore
+//! nella spec, faceva sparire la nota nuova di un supersede quando si
+//! purgava la vecchia (le due sonde della verifica, ridotte qui in
+//! `purge_own_content.rs`). La regola di oggi è per metà: la metà
+//! dell'oggetto purgato non si applica, e nemmeno una metà che è solo un
+//! RIFERIMENTO al purgato (la chiusura di una vecchia, di un bersaglio,
+//! una riga di arco); il contenuto proprio dell'altro oggetto si applica,
+//! senza quello che nomina il purgato. Le eccezioni restano la `purge`
+//! stessa (il suo scrub è lo stato che porta) e `revert_decision` (che ha
+//! la sua risposta `RevertOutcome::Purged`).
 //!
 //! Ogni operazione a due oggetti ha qui la sua prova deterministica, con la
 //! purga su un lato e la scrittura che rimaterializza l'altro:
@@ -13,7 +20,9 @@
 //! - `decide` con il bersaglio purgato (la riga che nomina l'id dimenticato);
 //! - `supersede` (vecchia e nuova);
 //! - `link` e `unlink` (i due estremi e la nota che dichiara);
-//! - `propose` con un bersaglio.
+//! - `propose` con un bersaglio (v0.6.11: la proposta resta in coda, il
+//!   suo testo è contenuto dell'agente — la prova nuova sta in
+//!   `purge_own_content.rs`).
 
 use engramma_core::cell::EdgeInput;
 use engramma_core::cell::ops::OpKind;
@@ -423,21 +432,26 @@ fn an_unlink_of_an_edge_that_cited_a_purged_note_does_not_wait() {
     assert!(report.ok(), "{:?}", report.mismatch);
 }
 
-/// `propose` with a target: the purge of the target dominates the propose
-/// — the proposal does not materialize, and a proposal already written
-/// goes with the target's purge. A correction of a note the set forgot is
-/// dead weight: nothing can accept it (the decide is dominated too).
+/// `propose` with a target — v0.6.11 (K1), CORRECTED: the v0.6.10 rule
+/// («the dominated propose materializes nothing: the proposal goes»)
+/// encoded the wrong behavior this file was born from. The proposal's
+/// text is the agent's content, and the user must be able to see it and
+/// refuse it: the purge of the target leaves it in the queue, and no
+/// rematerialization may lose it. The full new behavior (the queue stays
+/// decidable, an accept lands a new note) is in `purge_own_content.rs`;
+/// what stays HERE is the purge-dominance half this file guards: no row
+/// and no edge may name the purged target, whatever half replays.
 #[test]
-fn a_propose_for_a_purged_target_does_not_materialize() {
+fn a_propose_for_a_purged_target_keeps_its_queue_row_and_names_nothing_purged() {
     let dir = tempfile::tempdir().unwrap(/* test-only */);
     let cell = Cell::create(&dir.path().join("proposta-purga.sqlite"), "p", "tester")
-        .unwrap(/* t */);
+        .unwrap(/* test-only */);
     let target = note_of(1, "la nota che il mondo correggeva");
     let mut proposal = note_of(2, "la rettifica orfana");
     proposal.status = Status::Quarantined;
-    cell.put_note(&target, "tester").unwrap(/* t */);
+    cell.put_note(&target, "tester").unwrap(/* test-only */);
     cell.set_policy(serde_json::json!({ "write": "propose" }), "tester")
-        .unwrap(/* t */);
+        .unwrap(/* test-only */);
     cell.propose(
         &ProposalInput {
             note: proposal,
@@ -448,29 +462,42 @@ fn a_propose_for_a_purged_target_does_not_materialize() {
         "mcp:tester",
         &ProposeContext::default(),
     )
-    .unwrap(/* t */);
+    .unwrap(/* test-only */);
     assert!(
-        cell.note_ids_all().unwrap(/* t */).contains(&proposal_id(&cell, 2)),
+        cell.note_ids_all().unwrap(/* test-only */).contains(&proposal_id(&cell, 2)),
         "the stage wrote the proposal"
     );
 
-    cell.purge(&target.id, "diritto all'oblio", "tester").unwrap(/* t */);
+    cell.purge(&target.id, "diritto all'oblio", "tester").unwrap(/* test-only */);
 
     let pid = proposal_id(&cell, 2);
     assert!(
-        !cell.note_ids_all().unwrap(/* t */).contains(&pid),
-        "the dominated propose materializes nothing: the proposal goes"
+        cell.note_ids_all().unwrap(/* test-only */).contains(&pid),
+        "the proposal's text survives the purge of its target"
     );
     let queue: Vec<String> = cell
-        .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM proposals WHERE note_id != 'x' AND target IS NOT NULL")
-        .unwrap(/* t */);
+        .debug_column(&format!(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM proposals WHERE note_id = '{pid}'"
+        ))
+        .unwrap(/* test-only */);
     assert_eq!(
         queue.first().map(String::as_str),
+        Some("1"),
+        "the queue still holds the proposal for the purged target"
+    );
+    let rows: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM supersedes WHERE new_id = '{pid}' OR old_id = '{}'",
+            target.id
+        ))
+        .unwrap(/* test-only */);
+    assert_eq!(
+        rows.first().map(String::as_str),
         Some("0"),
-        "the queue holds no proposal for a purged target"
+        "no row may name the purged target"
     );
 
-    let report = cell.verify().unwrap(/* t */);
+    let report = cell.verify().unwrap(/* test-only */);
     assert!(report.ok(), "{:?}", report.mismatch);
 }
 
