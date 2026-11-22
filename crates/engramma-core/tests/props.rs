@@ -887,6 +887,377 @@ proptest! {
     fn purge_takes_only_its_family(seed in any::<u64>()) {
         purge_takes_only_its_family_body(seed);
     }
+
+    /// v0.6.12 (L2): **the frozen prefix is immutable.** After a
+    /// compaction (the cut at `head − 0/1/2`, as the generators already
+    /// walk), the photograph below — every version row BORN at or below
+    /// the cut, and every note's rematerialization ANCHOR (the first
+    /// above-cut operation in total order that photographed it) — is
+    /// history the cut froze. Then ANY operation that is not a
+    /// compaction or a purge lands: writes, supersedes, proposals and
+    /// decisions, edges, restores, rematerializations — on one device,
+    /// and across two (the judgment is the RECEIVER's). The photograph
+    /// must come back byte for byte. A PURGE may take rows away only
+    /// from its own family (itself and its conflict copies,
+    /// transitively): every other note's frozen rows stay.
+    #[test]
+    fn frozen_prefix_is_immutable(seed in any::<u64>()) {
+        frozen_prefix_body(seed);
+    }
+}
+
+/// The frozen prefix of a compacted cell, as the property photographs
+/// it: the version rows born at or below the cut, and each note's anchor
+/// row (the first above-cut operation in total order holding a
+/// photograph of it — the row `materialize_note` reads; v0.6.12, L1).
+fn frozen_prefix_photo(cell: &Cell) -> Vec<String> {
+    let mut photo = cell
+        .debug_column(
+            "SELECT 'row ' || note_id || ' v' || version || ' @' || op_id \
+               || ' ' || snapshot_json \
+             FROM note_versions nv \
+             WHERE (SELECT COALESCE(MAX(o.seq), 0) FROM ops o WHERE o.op_id = nv.op_id) \
+                   <= (SELECT COALESCE(MAX(seq), 0) FROM snapshots) \
+             ORDER BY note_id, version",
+        )
+        .unwrap_or_default();
+    // the anchor's IDENTITY (which operation photographed it) may be
+    // taken over by a later-held half that recorded the same content at
+    // the same number; what rule 4 freezes is the anchor's CONTENT —
+    // the state the cut left, at its version — so the photograph names
+    // the note, the number and the body, never the photographer
+    photo.extend(
+        cell.debug_column(
+            "SELECT 'anchor ' || nv.note_id || ' v' || nv.version \
+               || ' ' || nv.snapshot_json \
+             FROM note_versions nv \
+             JOIN ops o ON o.op_id = nv.op_id \
+             JOIN op_objects oo ON oo.op_id = o.op_id \
+             WHERE o.seq > (SELECT COALESCE(MAX(seq), 0) FROM snapshots) \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM ops o2 \
+                 JOIN op_objects oo2 ON oo2.op_id = o2.op_id \
+                 JOIN note_versions nv2 ON nv2.op_id = o2.op_id \
+                                   AND nv2.note_id = nv.note_id \
+                 WHERE oo2.object = oo.object AND o2.seq > (SELECT COALESCE(MAX(seq), 0) FROM snapshots) \
+                   AND (o2.hlc < o.hlc OR (o2.hlc = o.hlc AND o2.op_id < o.op_id)) \
+               ) \
+             ORDER BY nv.note_id",
+        )
+        .unwrap_or_default(),
+    );
+    photo.sort();
+    photo
+}
+
+/// The judgment of `frozen_prefix_is_immutable` (v0.6.12, L2): the
+/// frozen prefix never LOSES a row and never CHANGES one. It may GAIN an
+/// anchor: the first above-cut photograph of a note that had none is a
+/// new fact (the write that observed the frozen state), not a change —
+/// the row it photographs was already the state at the cut. A new
+/// `row` (born at or below the cut) cannot appear: the ≤-cut operation
+/// set is closed the moment the cut exists.
+fn assert_prefix_stable(
+    before: &[String],
+    after: &[String],
+    ctx: &str,
+) {
+    let lost: Vec<&String> = before.iter().filter(|r| !after.contains(*r)).collect();
+    assert!(
+        lost.is_empty(),
+        "{ctx}: the frozen prefix LOST rows: {lost:?}"
+    );
+    let added: Vec<&String> = after.iter().filter(|r| !before.contains(*r)).collect();
+    let not_anchors: Vec<&&String> =
+        added.iter().filter(|r| !r.starts_with("anchor ")).collect();
+    assert!(
+        not_anchors.is_empty(),
+        "{ctx}: the frozen prefix GAINED non-anchor rows: {not_anchors:?}"
+    );
+}
+
+/// The body of `frozen_prefix_is_immutable`: the two-device form (the
+/// judgment is the receiver's, where the rematerializations run) and the
+/// single-device one with the purge exception.
+fn frozen_prefix_body(seed: u64) {
+    use common::{cell_with, shared_init, union};
+    use std::sync::atomic::Ordering;
+    let mut s = seed | 1;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let word_of = |i: u16| {
+        format!(
+            "{}{}gelo",
+            char::from(b'a' + (i / 26) as u8),
+            char::from(b'a' + (i % 26) as u8)
+        )
+    };
+
+    // --- the two-device form: B writes offline, A compacts at its
+    // frontier, the union lands on both — the judgment is the
+    // RECEIVER's (out-of-order arrivals are where rematerializations
+    // live)
+    {
+        let init = shared_init(&format!("prefisso-gelo/{seed}"));
+        let (a, wa) = cell_with("a");
+        let (b, wb) = cell_with("b");
+        for cell in [&a, &b] {
+            cell.ingest_op(&init).unwrap(/* t */);
+        }
+        a.set_policy(serde_json::json!({ "write": "propose" }), "prop")
+            .unwrap(/* t */);
+        let mut living: Vec<ulid::Ulid> = Vec::new();
+        let mut tick: u64 = 0;
+        let mut i: u16 = 0;
+        let pick = |pool: &[ulid::Ulid], rnd: u64| {
+            pool.get((rnd % pool.len().max(1) as u64) as usize).copied()
+        };
+        for _round in 0..24 {
+            i += 1;
+            let dev = next() % 2;
+            let (cell, wall) = if dev == 0 { (&a, &wa) } else { (&b, &wb) };
+            match next() % 6 {
+                0 | 1 => {
+                    tick += 1;
+                    wall.store(common::K + tick, Ordering::SeqCst);
+                    let note = common::base_note(
+                        u32::from(i),
+                        &format!("{} [[Roma]]", word_of(i)),
+                    );
+                    if cell.put_note(&note, "prop:user").is_ok() {
+                        living.push(note.id);
+                    }
+                }
+                2 => {
+                    if let Some(id) = pick(&living, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let _ = cell.patch_note(
+                            &id,
+                            &NotePatch {
+                                body: Some(format!("{} [[Roma]]", word_of(100 + i))),
+                                ..Default::default()
+                            },
+                            "prop:user",
+                        );
+                    }
+                }
+                3 => {
+                    if let Some(id) = pick(&living, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let mut new = common::base_note(
+                            u32::from(500 + i),
+                            &format!("{} [[Roma]]", word_of(300 + i)),
+                        );
+                        new.supersedes = vec![id];
+                        if cell.supersede(&id, &new, None, "prop:user").is_ok() {
+                            living.push(new.id);
+                        }
+                    }
+                }
+                4 => {
+                    // a restore of a version the cell holds
+                    if let Some(id) = pick(&living, next())
+                        && let Ok(history) = cell.history(&id)
+                        && !history.is_empty()
+                    {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let v = history[(next() as usize) % history.len()].version;
+                        let _ = cell.restore(&id, v, "prop:user");
+                    }
+                }
+                _ => {
+                    for op in &union(&a, &b) {
+                        let _ = a.ingest_op(op);
+                        let _ = b.ingest_op(op);
+                    }
+                }
+            }
+        }
+        for op in &union(&a, &b) {
+            let _ = a.ingest_op(op);
+            let _ = b.ingest_op(op);
+        }
+        // BOTH compact at their stable frontier — the SAME set of
+        // operations everything confirmed — so the two prefixes are the
+        // same freeze and the photos compare as sets (a cut drawn below
+        // the frontier would pick a different op subset on each copy:
+        // the arrival orders differ, and with them the seq scales)
+        let _ = a.mark_shared();
+        let _ = b.mark_shared();
+        for _ in 0..2 {
+            for op in &union(&a, &b) {
+                let _ = a.ingest_op(op);
+                let _ = b.ingest_op(op);
+            }
+            let _ = a.record_session_ack("b000000000x");
+            let _ = b.record_session_ack("a000000000x");
+        }
+        let cut_a = a.stable_frontier().unwrap_or(0);
+        let cut_b = b.stable_frontier().unwrap_or(0);
+        if cut_a >= 1 && cut_b >= 1 {
+            let _ = a.compact(
+                cut_a,
+                &engramma_core::cell::CompactOptions {
+                    keep_snapshot: false,
+                },
+            );
+            let _ = b.compact(
+                cut_b,
+                &engramma_core::cell::CompactOptions {
+                    keep_snapshot: false,
+                },
+            );
+            let photo_a = frozen_prefix_photo(&a);
+            let photo_b = frozen_prefix_photo(&b);
+            // the exchanges resume: late arrivals, the receiver's
+            // rematerializations — the judgment is the RECEIVER's
+            for _ in 0..3 {
+                tick += 1;
+                wa.store(common::K + tick, Ordering::SeqCst);
+                if let Some(id) = pick(&living, next()) {
+                    let _ = a.patch_note(
+                        &id,
+                        &NotePatch {
+                            body: Some(format!("{} [[Roma]]", word_of(600 + i))),
+                            ..Default::default()
+                        },
+                        "prop:user",
+                    );
+                }
+                tick += 1;
+                wb.store(common::K + tick, Ordering::SeqCst);
+                if let Some(id) = pick(&living, next()) {
+                    let _ = b.patch_note(
+                        &id,
+                        &NotePatch {
+                            body: Some(format!("{} [[Roma]]", word_of(700 + i))),
+                            ..Default::default()
+                        },
+                        "prop:user",
+                    );
+                }
+                for op in &union(&a, &b) {
+                    let _ = a.ingest_op(op);
+                    let _ = b.ingest_op(op);
+                }
+            }
+            assert_prefix_stable(
+                &photo_a,
+                &frozen_prefix_photo(&a),
+                &format!("an arrival moved the WRITER's frozen prefix (seed {seed})"),
+            );
+            assert_prefix_stable(
+                &photo_b,
+                &frozen_prefix_photo(&b),
+                &format!("an arrival moved the RECEIVER's frozen prefix (seed {seed})"),
+            );
+        }
+    }
+
+    // --- the single-device form: one cell, the cut at head − 0/1/2, any
+    // non-compact non-purge operation, then the purge exception
+    {
+        let dir = tempfile::tempdir().unwrap(/* t */);
+        let cell = Cell::create(&dir.path().join("gelo.sqlite"), "p", "prop")
+            .unwrap(/* t */);
+        run_random_ops(&cell, seed, ops_count(seed));
+        let head: i64 = cell
+            .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
+            .unwrap_or_default()
+            .first()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let cut = head - (next() % 3) as i64;
+        if cut < 1 {
+            return;
+        }
+        cell.compact(
+            cut,
+            &engramma_core::cell::CompactOptions {
+                keep_snapshot: false,
+            },
+        )
+        .unwrap(/* t */);
+        let before = frozen_prefix_photo(&cell);
+        // any operation that is not a compaction or a purge — the mix of
+        // the generator, which writes, supersedes, proposes, decides,
+        // links, restores and rematerializes
+        run_random_ops(&cell, seed.wrapping_mul(5) | 1, ops_count(seed) / 2);
+        assert_prefix_stable(
+            &before,
+            &frozen_prefix_photo(&cell),
+            &format!("a plain operation moved the frozen prefix (seed {seed})"),
+        );
+        // the purge: only the family's rows may go
+        let ids = cell.debug_column("SELECT id FROM notes").unwrap_or_default();
+        let parsed: Vec<Ulid> = ids
+            .iter()
+            .filter_map(|s| Ulid::from_string(s).ok())
+            .collect();
+        if let Some(x) = parsed.get((next() as usize) % parsed.len().max(1)).copied() {
+            let family: std::collections::HashSet<String> = cell
+                .debug_column(&format!(
+                    "WITH RECURSIVE fam(id) AS (
+                         SELECT '{x}'
+                         UNION
+                         SELECT cc.copy_id FROM conflict_copies cc JOIN fam ON cc.original_id = fam.id
+                     )
+                     SELECT f.id FROM fam f"
+                ))
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            let before = frozen_prefix_photo(&cell);
+            // the declared REOPENINGS, read BEFORE the purge: the notes the
+            // family had closed (a `supersedes` row names the closer) —
+            // their closing was the family's work, and their photographs
+            // re-derive with the reopening like their live state does
+            let fam_list = family
+                .iter()
+                .map(|f| format!("'{f}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let reopened: std::collections::HashSet<String> = cell
+                .debug_column(&format!(
+                    "SELECT old_id FROM supersedes WHERE new_id IN ({fam_list})"
+                ))
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if cell.purge(&x, "prop", "prop").is_ok() {
+                let after = frozen_prefix_photo(&cell);
+                let lost: Vec<String> = before
+                    .iter()
+                    .filter(|row| !after.contains(*row))
+                    .cloned()
+                    .collect();
+                let offenders: Vec<String> = lost
+                    .iter()
+                    .filter(|row| {
+                        let id = row
+                            .split(' ')
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_string();
+                        !family.contains(&id) && !reopened.contains(&id)
+                    })
+                    .cloned()
+                    .collect();
+                assert!(
+                    offenders.is_empty(),
+                    "the purge of {x} took prefix rows of notes outside its family \
+                     and its reopenings (seed {seed}): {offenders:?}"
+                );
+            }
+        }
+    }
 }
 
 /// The body of `purge_takes_only_its_family`, on its own so the open
@@ -1345,13 +1716,31 @@ fn ops_count(seed: u64) -> u16 {
 
 /// The content of one note, as `purge_takes_only_its_family` photographs
 /// it (v0.6.11, K2): body, title, tags, type, state — the note's OWN
-/// content, which a purge of ANOTHER note may never change.
+/// content, which a purge of ANOTHER note may never change. v0.6.12 (L2)
+/// adds the VERSION HISTORY: the numbers and the bodies of every
+/// photograph the cell keeps — another note's history is that note's own
+/// content too, and the silent loss the v0.6.11 reviewer suspected could
+/// not make this oracle fall (found by the probe: a successful purge
+/// took the closing's photograph away).
 struct Shot {
     body: String,
     title: Option<String>,
     tags: Vec<String>,
     note_type: NoteType,
     status: Status,
+    history: Vec<String>,
+}
+
+/// The full version history of one note as the oracle photographs it:
+/// number, recording op and body, oldest first — «fin dove la cella li
+/// tiene».
+fn history_shot(cell: &Cell, id: &Ulid) -> Vec<String> {
+    cell.debug_column(&format!(
+        "SELECT CAST(version AS TEXT) || ' @' || substr(op_id, 1, 10) \
+           || ' corpo=' || json_extract(snapshot_json, '$.body') \
+         FROM note_versions WHERE note_id = '{id}' ORDER BY version"
+    ))
+    .unwrap_or_default()
 }
 
 /// A note with a row, drawn at random — the X the property purges.
@@ -1452,6 +1841,7 @@ fn shoot_outside_family(
                 tags: n.tags,
                 note_type: n.note_type,
                 status: n.status,
+                history: history_shot(cell, &uid),
             },
         ));
     }
@@ -1495,6 +1885,16 @@ fn judge_the_purge(
                 before.status, after.status
             );
         }
+        // v0.6.12 (L2): the history too — the numbers and the bodies of
+        // every photograph, identical after a purge outside the family
+        // (no declared exception: the reopening returns to a state the
+        // note HELD, and the photographs the purge's replay re-records
+        // were already there)
+        assert_eq!(
+            before.history,
+            history_shot(cell, id),
+            "storia delle versioni cambiata [{ctx}]: {id}"
+        );
     }
     // the declared second exception, checked: the relations toward x go
     let rows = cell
