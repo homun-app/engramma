@@ -26,7 +26,7 @@ fn golden_dir() -> PathBuf {
 /// schema change — the whole-object anchor migration opens it). A new
 /// golden lands here by NAME, and this list growing is the visible part
 /// of the rule.
-const GOLDEN_CELLS: &[&str] = &["v068", "v0612"];
+const GOLDEN_CELLS: &[&str] = &["v068", "v0612", "v0613"];
 
 /// The deterministic note id of the golden's note `i`
 /// (`01` + sixteen zeros + eight hex digits).
@@ -84,6 +84,7 @@ fn the_golden_cell_opens_verifies_and_holds_its_facts() {
         match *name {
             "v068" => v068_facts(&cell),
             "v0612" => v0612_facts(&cell),
+            "v0613" => v0613_facts(&cell),
             other => panic!("a golden with no facts to check: {other}"),
         }
     }
@@ -240,5 +241,62 @@ fn v0612_facts(cell: &Cell) {
     assert!(
         cell.verify().unwrap(/* t */).ok(),
         "the v0.6.12 golden verifies after the purge"
+    );
+}
+
+/// v0.6.13 (M1): this phase's golden. The agent's correction of the
+/// note 12 was proposed and ACCEPTED before the cut: the queue row and
+/// the registry row live at or below it, with the whole-object anchors
+/// beside them. The purge of the target must succeed and keep the
+/// queue whole — the reconstruction it forces reads the anchors this
+/// very engine wrote.
+fn v0613_facts(cell: &Cell) {
+    let pid = nid(13);
+    assert_eq!(
+        cell.get(&pid).unwrap(/* t */).status,
+        Status::Active,
+        "the accepted correction is active"
+    );
+    assert_eq!(
+        cell.get(&nid(12)).unwrap(/* t */).status,
+        Status::Superseded,
+        "the target closed by the acceptance"
+    );
+    let queue: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT mode || ' ' || state FROM proposals WHERE note_id = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(queue, vec!["supersede accepted".to_string()]);
+    let anchors: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM object_anchors WHERE note_id = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert!(
+        anchors.first().is_some_and(|n| n != "0"),
+        "the whole-object anchors are part of the golden"
+    );
+    // the purge of the target: it succeeds, and the queue stays whole
+    cell.purge(&nid(12), "dato superato", "homun:user")
+        .expect(/* t */ "the purge of the correction's target succeeds");
+    let queue: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT mode || ' ' || state FROM proposals WHERE note_id = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        queue,
+        vec!["supersede accepted".to_string()],
+        "the queue row survives the purge (the anchors restored it whole)"
+    );
+    assert_eq!(
+        cell.get(&pid).unwrap(/* t */).status,
+        Status::Active,
+        "the accepted text stands"
+    );
+    assert!(
+        cell.verify().unwrap(/* t */).ok(),
+        "the v0613 golden verifies after the purge"
     );
 }
