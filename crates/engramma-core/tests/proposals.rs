@@ -77,7 +77,6 @@ fn ids(cell: &Cell, text: &str) -> Vec<String> {
 // the queue
 // ---------------------------------------------------------------------------
 
-
 /// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
 /// (see tests/common/mod.rs).
 fn test_dir() -> tempfile::TempDir {

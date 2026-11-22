@@ -31,10 +31,7 @@ use super::ops::{self, Op, OpKind, Scope};
 /// its version slot: the row's number is the note's history, and the
 /// numbering must not drift with the set (the write bumped the counter
 /// where it first applied; a `restore` above may name that number).
-fn consume_version_slot(
-    tx: &rusqlite::Transaction<'_>,
-    id: &Ulid,
-) -> Result<(), CellError> {
+fn consume_version_slot(tx: &rusqlite::Transaction<'_>, id: &Ulid) -> Result<(), CellError> {
     tx.execute(
         "UPDATE notes SET version = version + 1 WHERE id = ?1",
         [id.to_string()],
@@ -339,12 +336,7 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
             // whole set
             for object in &objects {
                 if !to_materialize.contains(object) {
-                    apply_half(
-                        tx,
-                        op,
-                        object,
-                        half_dominated_by_purge(tx, op, object)?,
-                    )?;
+                    apply_half(tx, op, object, half_dominated_by_purge(tx, op, object)?)?;
                 }
             }
             for object in &to_materialize {
@@ -525,49 +517,48 @@ fn materialize_note(
     // the write-back below puts back byte for byte what it read — the
     // anchor cannot age with the cut again (H2's second layer).
     let mut anchor_row: Option<(String, i64, String, String)> = None;
-    let cut_state: Option<(crate::format::Note, i64)> = if cut > 0
-        && note_exists_at(tx, object, cut)?
-    {
-        let mut stmt = tx.prepare(
-            "SELECT o.op_id FROM ops o
+    let cut_state: Option<(crate::format::Note, i64)> =
+        if cut > 0 && note_exists_at(tx, object, cut)? {
+            let mut stmt = tx.prepare(
+                "SELECT o.op_id FROM ops o
              JOIN op_objects oo ON oo.op_id = o.op_id
              WHERE oo.object = ?1 AND o.seq > ?2
              ORDER BY o.hlc ASC, o.op_id ASC",
-        )?;
-        let op_ids: Vec<String> = stmt
-            .query_map(rusqlite::params![object, cut], |r| r.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(stmt);
-        let mut anchor: Option<(String, i64, String)> = None;
-        for op_id in op_ids {
-            let snap: Option<(String, i64)> = tx
-                .query_row(
-                    "SELECT snapshot_json, version FROM note_versions
+            )?;
+            let op_ids: Vec<String> = stmt
+                .query_map(rusqlite::params![object, cut], |r| r.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut anchor: Option<(String, i64, String)> = None;
+            for op_id in op_ids {
+                let snap: Option<(String, i64)> = tx
+                    .query_row(
+                        "SELECT snapshot_json, version FROM note_versions
                      WHERE op_id = ?1 AND note_id = ?2",
-                    rusqlite::params![op_id, id.to_string()],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            if let Some((json, version)) = snap {
-                anchor = Some((op_id, version, json));
-                break;
+                        rusqlite::params![op_id, id.to_string()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((json, version)) = snap {
+                    anchor = Some((op_id, version, json));
+                    break;
+                }
             }
-        }
-        match anchor {
-            None => None,
-            Some((op_id, version, json)) => {
-                let note = crate::format::Note::from_json(
-                    &serde_json::from_str::<serde_json::Value>(&json)
-                        .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?,
-                )
-                .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?;
-                anchor_row = Some((id.to_string(), version, op_id, json));
-                Some((note, version))
+            match anchor {
+                None => None,
+                Some((op_id, version, json)) => {
+                    let note = crate::format::Note::from_json(
+                        &serde_json::from_str::<serde_json::Value>(&json)
+                            .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?,
+                    )
+                    .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?;
+                    anchor_row = Some((id.to_string(), version, op_id, json));
+                    Some((note, version))
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // v0.6.12 (L1): the LIVE ROW before the delete step. When the note
     // existed at the cut but NO above-cut operation ever photographed it,
@@ -577,13 +568,12 @@ fn materialize_note(
     // reject-decide, a held write, a pending one): without this fallback
     // the replay started from zero and the note DIED instead of keeping
     // the frozen state (found by the oracle, seed 765420891842479779).
-    let live_row: Option<(crate::format::Note, i64)> = if cut > 0
-        && note_exists_at(tx, object, cut)?
-    {
-        ops::read_note_row(tx, id)?.map(|r| (r.note, r.version))
-    } else {
-        None
-    };
+    let live_row: Option<(crate::format::Note, i64)> =
+        if cut > 0 && note_exists_at(tx, object, cut)? {
+            ops::read_note_row(tx, id)?.map(|r| (r.note, r.version))
+        } else {
+            None
+        };
     // no photograph above the cut: the live row read below IS the state
     // at the cut (the note existed there, and nothing above the cut ever
     // changed it — else there would be a photograph)
@@ -746,9 +736,7 @@ fn materialize_note(
                     // half below: the lapide suppresses the EFFECT, and a
                     // `restore` above may name the version the write
                     // recorded where it first applied)
-                    if !purged
-                        && let Some(row) = ops::read_note_row(tx, id)?
-                    {
+                    if !purged && let Some(row) = ops::read_note_row(tx, id)? {
                         ops::snapshot(tx, id, row.version, &op.op_id)?;
                         // the held write still consumes its version slot
                         // (the original application bumped it; a

@@ -140,7 +140,11 @@ fn the_new_note_of_a_supersede_survives_the_purge_of_the_old() {
     cell.purge(&a.id, "dato superato", "user").unwrap(/* t */);
 
     let after = content_of(&cell, &n.id);
-    assert_same_note("la nuova sopravvive alla purga della vecchia", &before, &after);
+    assert_same_note(
+        "la nuova sopravvive alla purga della vecchia",
+        &before,
+        &after,
+    );
     assert_eq!(
         supersedes_rows(&cell, &a.id),
         0,
@@ -198,7 +202,11 @@ fn the_accepted_correction_survives_the_purge_of_its_target() {
     cell.purge(&a.id, "dato superato", "user").unwrap(/* t */);
 
     let after = content_of(&cell, &a_id(3));
-    assert_same_note("la correzione accettata sopravvive alla purga del bersaglio", &before, &after);
+    assert_same_note(
+        "la correzione accettata sopravvive alla purga del bersaglio",
+        &before,
+        &after,
+    );
     assert_eq!(
         supersedes_rows(&cell, &a.id),
         0,
@@ -667,10 +675,7 @@ fn purge_preview_names_the_reopenings_before_the_purge() {
 
     // di sola lettura: la stessa risposta due volte, e la vecchia è
     // ancora chiusa
-    assert_eq!(
-        cell.purge_preview(&n.id).unwrap(/* test-only */).len(),
-        1
-    );
+    assert_eq!(cell.purge_preview(&n.id).unwrap(/* test-only */).len(), 1);
     assert_eq!(cell.get(&a.id).unwrap(/* t */).status, Status::Superseded);
 
     // e una nota che non ha chiuso niente non riapre niente

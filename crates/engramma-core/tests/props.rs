@@ -957,19 +957,14 @@ fn frozen_prefix_photo(cell: &Cell) -> Vec<String> {
 /// the row it photographs was already the state at the cut. A new
 /// `row` (born at or below the cut) cannot appear: the ≤-cut operation
 /// set is closed the moment the cut exists.
-fn assert_prefix_stable(
-    before: &[String],
-    after: &[String],
-    ctx: &str,
-) {
+fn assert_prefix_stable(before: &[String], after: &[String], ctx: &str) {
     let lost: Vec<&String> = before.iter().filter(|r| !after.contains(*r)).collect();
     assert!(
         lost.is_empty(),
         "{ctx}: the frozen prefix LOST rows: {lost:?}"
     );
     let added: Vec<&String> = after.iter().filter(|r| !before.contains(*r)).collect();
-    let not_anchors: Vec<&&String> =
-        added.iter().filter(|r| !r.starts_with("anchor ")).collect();
+    let not_anchors: Vec<&&String> = added.iter().filter(|r| !r.starts_with("anchor ")).collect();
     assert!(
         not_anchors.is_empty(),
         "{ctx}: the frozen prefix GAINED non-anchor rows: {not_anchors:?}"
@@ -1024,10 +1019,7 @@ fn frozen_prefix_body(seed: u64) {
                 0 | 1 => {
                     tick += 1;
                     wall.store(common::K + tick, Ordering::SeqCst);
-                    let note = common::base_note(
-                        u32::from(i),
-                        &format!("{} [[Roma]]", word_of(i)),
-                    );
+                    let note = common::base_note(u32::from(i), &format!("{} [[Roma]]", word_of(i)));
                     if cell.put_note(&note, "prop:user").is_ok() {
                         living.push(note.id);
                     }
@@ -1196,7 +1188,9 @@ fn frozen_prefix_body(seed: u64) {
             &format!("a plain operation moved the frozen prefix (seed {seed})"),
         );
         // the purge: only the family's rows may go
-        let ids = cell.debug_column("SELECT id FROM notes").unwrap_or_default();
+        let ids = cell
+            .debug_column("SELECT id FROM notes")
+            .unwrap_or_default();
         let parsed: Vec<Ulid> = ids
             .iter()
             .filter_map(|s| Ulid::from_string(s).ok())
@@ -1241,11 +1235,7 @@ fn frozen_prefix_body(seed: u64) {
                 let offenders: Vec<String> = lost
                     .iter()
                     .filter(|row| {
-                        let id = row
-                            .split(' ')
-                            .nth(1)
-                            .unwrap_or_default()
-                            .to_string();
+                        let id = row.split(' ').nth(1).unwrap_or_default().to_string();
                         !family.contains(&id) && !reopened.contains(&id)
                     })
                     .cloned()
@@ -1268,387 +1258,389 @@ fn frozen_prefix_body(seed: u64) {
 /// `prop_assert!`s), so it is honest under both callers.
 fn purge_takes_only_its_family_body(seed: u64) {
     let mut s = seed | 1;
-        let mut next = move || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            s
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+
+    // --- the two-device form: the purge is BORN on A and arrives by
+    // sync; the judgment is B's, the receiver's
+    {
+        use common::{cell_with, shared_init, union};
+        use std::sync::atomic::Ordering;
+        let init = shared_init(&format!("oblio-significato/{seed}"));
+        let (a, wa) = cell_with("ma");
+        let (b, wb) = cell_with("mb");
+        for cell in [&a, &b] {
+            cell.ingest_op(&init).unwrap(/* t */);
+        }
+        // the cell takes proposals: the decide arm needs the policy
+        a.set_policy(serde_json::json!({ "write": "propose" }), "prop")
+                .unwrap(/* t */);
+        for op in &union(&a, &b) {
+            let _ = a.ingest_op(op);
+            let _ = b.ingest_op(op);
+        }
+        let word_of = |i: u16| {
+            format!(
+                "{}{}senso",
+                char::from(b'a' + (i / 26) as u8),
+                char::from(b'a' + (i % 26) as u8)
+            )
         };
-
-        // --- the two-device form: the purge is BORN on A and arrives by
-        // sync; the judgment is B's, the receiver's
-        {
-            use common::{cell_with, shared_init, union};
-            use std::sync::atomic::Ordering;
-            let init = shared_init(&format!("oblio-significato/{seed}"));
-            let (a, wa) = cell_with("ma");
-            let (b, wb) = cell_with("mb");
-            for cell in [&a, &b] {
-                cell.ingest_op(&init).unwrap(/* t */);
+        let mut living: Vec<ulid::Ulid> = Vec::new();
+        let mut queue: Vec<ulid::Ulid> = Vec::new();
+        let mut tick: u64 = 0;
+        let mut i: u16 = 0;
+        let pick = |pool: &[ulid::Ulid], rnd: u64| {
+            pool.get((rnd % pool.len().max(1) as u64) as usize).copied()
+        };
+        for _round in 0..28 {
+            i += 1;
+            let dev = next() % 2;
+            let (cell, wall) = if dev == 0 { (&a, &wa) } else { (&b, &wb) };
+            match next() % 7 {
+                0 | 1 => {
+                    // a fresh note (half the time born quarantined: the
+                    // hidden line walks the same roads)
+                    tick += 1;
+                    wall.store(common::K + tick, Ordering::SeqCst);
+                    let mut note =
+                        common::base_note(u32::from(i), &format!("{} [[Roma]]", word_of(i)));
+                    if next() % 4 == 0 {
+                        note.status = Status::Quarantined;
+                    }
+                    if cell.put_note(&note, "prop:user").is_ok() {
+                        living.push(note.id);
+                    }
+                }
+                2 => {
+                    // a concurrent patch — the conflict copies the
+                    // family closure has to walk
+                    if let Some(id) = pick(&living, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let _ = cell.patch_note(
+                            &id,
+                            &NotePatch {
+                                body: Some(format!("{} [[Roma]]", word_of(200 + i))),
+                                ..Default::default()
+                            },
+                            "prop:user",
+                        );
+                    }
+                }
+                3 => {
+                    // a supersede: the new note closes the old
+                    if let Some(id) = pick(&living, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let mut new = common::base_note(
+                            u32::from(900 + i),
+                            &format!("{} [[Roma]]", word_of(400 + i)),
+                        );
+                        new.supersedes = vec![id];
+                        if cell.supersede(&id, &new, None, "prop:user").is_ok() {
+                            living.push(new.id);
+                        }
+                    }
+                }
+                4 => {
+                    // a correction proposed and decided on the SAME
+                    // device (the queue row is local)
+                    if let Some(id) = pick(&living, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let mut p = common::base_note(
+                            u32::from(2000 + i),
+                            &format!("{} unica{i} [[Roma]]", word_of(600 + i)),
+                        );
+                        p.status = Status::Quarantined;
+                        let out = cell.propose(
+                            &engramma_core::cell::proposals::ProposalInput {
+                                note: p,
+                                mode: engramma_core::cell::proposals::ProposalMode::Supersede(id),
+                                client: None,
+                                reason: None,
+                            },
+                            "mcp:prop",
+                            &engramma_core::cell::proposals::ProposeContext::default(),
+                        );
+                        if let Ok(out) = out
+                            && let Some(pid) = out.id
+                        {
+                            queue.push(pid);
+                        }
+                    }
+                }
+                5 => {
+                    // the decision of a local queued proposal
+                    if let Some(pid) = pick(&queue, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let accept = next() % 2 == 0;
+                        let action = if accept {
+                            engramma_core::cell::proposals::DecisionAction::Accept { edited: None }
+                        } else {
+                            engramma_core::cell::proposals::DecisionAction::Reject
+                        };
+                        if cell
+                            .decide(
+                                &pid,
+                                &engramma_core::cell::proposals::DecisionInput {
+                                    action,
+                                    reason: None,
+                                    review: None,
+                                },
+                                "user:prop",
+                            )
+                            .is_ok()
+                            && accept
+                        {
+                            living.push(pid);
+                        }
+                        queue.retain(|n| n != &pid);
+                    }
+                }
+                _ => {
+                    // the sync: everything flows both ways
+                    for op in &union(&a, &b) {
+                        let _ = a.ingest_op(op);
+                        let _ = b.ingest_op(op);
+                    }
+                }
             }
-            // the cell takes proposals: the decide arm needs the policy
-            a.set_policy(serde_json::json!({ "write": "propose" }), "prop")
-                .unwrap(/* t */);
+        }
+        // the settle: both devices hold the whole set
+        for _ in 0..2 {
             for op in &union(&a, &b) {
                 let _ = a.ingest_op(op);
                 let _ = b.ingest_op(op);
             }
-            let word_of = |i: u16| {
-                format!(
-                    "{}{}senso",
-                    char::from(b'a' + (i / 26) as u8),
-                    char::from(b'a' + (i % 26) as u8)
-                )
-            };
-            let mut living: Vec<ulid::Ulid> = Vec::new();
-            let mut queue: Vec<ulid::Ulid> = Vec::new();
-            let mut tick: u64 = 0;
-            let mut i: u16 = 0;
-            let pick = |pool: &[ulid::Ulid], rnd: u64| {
-                pool.get((rnd % pool.len().max(1) as u64) as usize).copied()
-            };
-            for _round in 0..28 {
-                i += 1;
-                let dev = next() % 2;
-                let (cell, wall) = if dev == 0 { (&a, &wa) } else { (&b, &wb) };
-                match next() % 7 {
-                    0 | 1 => {
-                        // a fresh note (half the time born quarantined: the
-                        // hidden line walks the same roads)
-                        tick += 1;
-                        wall.store(common::K + tick, Ordering::SeqCst);
-                        let mut note = common::base_note(u32::from(i), &format!("{} [[Roma]]", word_of(i)));
-                        if next() % 4 == 0 {
-                            note.status = Status::Quarantined;
-                        }
-                        if cell.put_note(&note, "prop:user").is_ok() {
-                            living.push(note.id);
-                        }
-                    }
-                    2 => {
-                        // a concurrent patch — the conflict copies the
-                        // family closure has to walk
-                        if let Some(id) = pick(&living, next()) {
-                            tick += 1;
-                            wall.store(common::K + tick, Ordering::SeqCst);
-                            let _ = cell.patch_note(
-                                &id,
-                                &NotePatch {
-                                    body: Some(format!("{} [[Roma]]", word_of(200 + i))),
-                                    ..Default::default()
-                                },
-                                "prop:user",
-                            );
-                        }
-                    }
-                    3 => {
-                        // a supersede: the new note closes the old
-                        if let Some(id) = pick(&living, next()) {
-                            tick += 1;
-                            wall.store(common::K + tick, Ordering::SeqCst);
-                            let mut new = common::base_note(
-                                u32::from(900 + i),
-                                &format!("{} [[Roma]]", word_of(400 + i)),
-                            );
-                            new.supersedes = vec![id];
-                            if cell.supersede(&id, &new, None, "prop:user").is_ok() {
-                                living.push(new.id);
-                            }
-                        }
-                    }
-                    4 => {
-                        // a correction proposed and decided on the SAME
-                        // device (the queue row is local)
-                        if let Some(id) = pick(&living, next()) {
-                            tick += 1;
-                            wall.store(common::K + tick, Ordering::SeqCst);
-                            let mut p = common::base_note(
-                                u32::from(2000 + i),
-                                &format!("{} unica{i} [[Roma]]", word_of(600 + i)),
-                            );
-                            p.status = Status::Quarantined;
-                            let out = cell.propose(
-                                &engramma_core::cell::proposals::ProposalInput {
-                                    note: p,
-                                    mode: engramma_core::cell::proposals::ProposalMode::Supersede(id),
-                                    client: None,
-                                    reason: None,
-                                },
-                                "mcp:prop",
-                                &engramma_core::cell::proposals::ProposeContext::default(),
-                            );
-                            if let Ok(out) = out && let Some(pid) = out.id {
-                                queue.push(pid);
-                            }
-                        }
-                    }
-                    5 => {
-                        // the decision of a local queued proposal
-                        if let Some(pid) = pick(&queue, next()) {
-                            tick += 1;
-                            wall.store(common::K + tick, Ordering::SeqCst);
-                            let accept = next() % 2 == 0;
-                            let action = if accept {
-                                engramma_core::cell::proposals::DecisionAction::Accept {
-                                    edited: None,
-                                }
-                            } else {
-                                engramma_core::cell::proposals::DecisionAction::Reject
-                            };
-                            if cell
-                                .decide(
-                                    &pid,
-                                    &engramma_core::cell::proposals::DecisionInput {
-                                        action,
-                                        reason: None,
-                                        review: None,
-                                    },
-                                    "user:prop",
-                                )
-                                .is_ok()
-                                && accept
-                            {
-                                living.push(pid);
-                            }
-                            queue.retain(|n| n != &pid);
-                        }
-                    }
-                    _ => {
-                        // the sync: everything flows both ways
-                        for op in &union(&a, &b) {
-                            let _ = a.ingest_op(op);
-                            let _ = b.ingest_op(op);
-                        }
-                    }
-                }
-            }
-            // the settle: both devices hold the whole set
-            for _ in 0..2 {
-                for op in &union(&a, &b) {
-                    let _ = a.ingest_op(op);
-                    let _ = b.ingest_op(op);
-                }
-            }
-
-            // the purge is born on A; the judgment is B's, the receiver's
-            if let Some(x) = pick_a_note(&b, next()) {
-                let (shots, reopened) = shoot_outside_family(&b, &x);
-                tick += 1;
-                wa.store(common::K + tick, Ordering::SeqCst);
-                a.purge(&x, "prop", "prop:user").unwrap(/* t */);
-                for op in &union(&a, &b) {
-                    let _ = a.ingest_op(op);
-                    let _ = b.ingest_op(op);
-                }
-                judge_the_purge(&b, &x, &shots, &reopened, "ricevente");
-                // and the writer lands on the same judgment
-                judge_the_purge(&a, &x, &shots, &reopened, "scrittore");
-            }
         }
-        // --- the two-device form: the purge is BORN on A and arrives by
-        // sync; the judgment is B's, the receiver's
-        {
-            use common::{cell_with, shared_init, union};
-            use std::sync::atomic::Ordering;
-            let init = shared_init(&format!("oblio-significato/{seed}"));
-            let (a, wa) = cell_with("ma");
-            let (b, wb) = cell_with("mb");
-            for cell in [&a, &b] {
-                cell.ingest_op(&init).unwrap(/* t */);
-            }
-            // the cell takes proposals: the decide arm needs the policy
-            a.set_policy(serde_json::json!({ "write": "propose" }), "prop")
-                .unwrap(/* t */);
+
+        // the purge is born on A; the judgment is B's, the receiver's
+        if let Some(x) = pick_a_note(&b, next()) {
+            let (shots, reopened) = shoot_outside_family(&b, &x);
+            tick += 1;
+            wa.store(common::K + tick, Ordering::SeqCst);
+            a.purge(&x, "prop", "prop:user").unwrap(/* t */);
             for op in &union(&a, &b) {
                 let _ = a.ingest_op(op);
                 let _ = b.ingest_op(op);
             }
-            let word_of = |i: u16| {
-                format!(
-                    "{}{}senso",
-                    char::from(b'a' + (i / 26) as u8),
-                    char::from(b'a' + (i % 26) as u8)
-                )
-            };
-            let mut living: Vec<ulid::Ulid> = Vec::new();
-            let mut queue: Vec<ulid::Ulid> = Vec::new();
-            let mut tick: u64 = 0;
-            let mut i: u16 = 0;
-            let pick = |pool: &[ulid::Ulid], rnd: u64| {
-                pool.get((rnd % pool.len().max(1) as u64) as usize).copied()
-            };
-            for _round in 0..28 {
-                i += 1;
-                let dev = next() % 2;
-                let (cell, wall) = if dev == 0 { (&a, &wa) } else { (&b, &wb) };
-                match next() % 7 {
-                    0 | 1 => {
-                        // a fresh note (half the time born quarantined: the
-                        // hidden line walks the same roads)
-                        tick += 1;
-                        wall.store(common::K + tick, Ordering::SeqCst);
-                        let mut note = common::base_note(u32::from(i), &format!("{} [[Roma]]", word_of(i)));
-                        if next() % 4 == 0 {
-                            note.status = Status::Quarantined;
-                        }
-                        if cell.put_note(&note, "prop:user").is_ok() {
-                            living.push(note.id);
-                        }
-                    }
-                    2 => {
-                        // a concurrent patch — the conflict copies the
-                        // family closure has to walk
-                        if let Some(id) = pick(&living, next()) {
-                            tick += 1;
-                            wall.store(common::K + tick, Ordering::SeqCst);
-                            let _ = cell.patch_note(
-                                &id,
-                                &NotePatch {
-                                    body: Some(format!("{} [[Roma]]", word_of(200 + i))),
-                                    ..Default::default()
-                                },
-                                "prop:user",
-                            );
-                        }
-                    }
-                    3 => {
-                        // a supersede: the new note closes the old
-                        if let Some(id) = pick(&living, next()) {
-                            tick += 1;
-                            wall.store(common::K + tick, Ordering::SeqCst);
-                            let mut new = common::base_note(
-                                u32::from(900 + i),
-                                &format!("{} [[Roma]]", word_of(400 + i)),
-                            );
-                            new.supersedes = vec![id];
-                            if cell.supersede(&id, &new, None, "prop:user").is_ok() {
-                                living.push(new.id);
-                            }
-                        }
-                    }
-                    4 => {
-                        // a correction proposed and decided on the SAME
-                        // device (the queue row is local)
-                        if let Some(id) = pick(&living, next()) {
-                            tick += 1;
-                            wall.store(common::K + tick, Ordering::SeqCst);
-                            let mut p = common::base_note(
-                                u32::from(2000 + i),
-                                &format!("{} unica{i} [[Roma]]", word_of(600 + i)),
-                            );
-                            p.status = Status::Quarantined;
-                            let out = cell.propose(
-                                &engramma_core::cell::proposals::ProposalInput {
-                                    note: p,
-                                    mode: engramma_core::cell::proposals::ProposalMode::Supersede(id),
-                                    client: None,
-                                    reason: None,
-                                },
-                                "mcp:prop",
-                                &engramma_core::cell::proposals::ProposeContext::default(),
-                            );
-                            if let Ok(out) = out && let Some(pid) = out.id {
-                                queue.push(pid);
-                            }
-                        }
-                    }
-                    5 => {
-                        // the decision of a local queued proposal
-                        if let Some(pid) = pick(&queue, next()) {
-                            tick += 1;
-                            wall.store(common::K + tick, Ordering::SeqCst);
-                            let accept = next() % 2 == 0;
-                            let action = if accept {
-                                engramma_core::cell::proposals::DecisionAction::Accept {
-                                    edited: None,
-                                }
-                            } else {
-                                engramma_core::cell::proposals::DecisionAction::Reject
-                            };
-                            if cell
-                                .decide(
-                                    &pid,
-                                    &engramma_core::cell::proposals::DecisionInput {
-                                        action,
-                                        reason: None,
-                                        review: None,
-                                    },
-                                    "user:prop",
-                                )
-                                .is_ok()
-                                && accept
-                            {
-                                living.push(pid);
-                            }
-                            queue.retain(|n| n != &pid);
-                        }
-                    }
-                    _ => {
-                        // the sync: everything flows both ways
-                        for op in &union(&a, &b) {
-                            let _ = a.ingest_op(op);
-                            let _ = b.ingest_op(op);
-                        }
-                    }
-                }
-            }
-            // the settle: both devices hold the whole set
-            for _ in 0..2 {
-                for op in &union(&a, &b) {
-                    let _ = a.ingest_op(op);
-                    let _ = b.ingest_op(op);
-                }
-            }
-
-            // the purge is born on A; the judgment is B's, the receiver's
-            if let Some(x) = pick_a_note(&b, next()) {
-                let (shots, reopened) = shoot_outside_family(&b, &x);
-                tick += 1;
-                wa.store(common::K + tick, Ordering::SeqCst);
-                a.purge(&x, "prop", "prop:user").unwrap(/* t */);
-                for op in &union(&a, &b) {
-                    let _ = a.ingest_op(op);
-                    let _ = b.ingest_op(op);
-                }
-                judge_the_purge(&b, &x, &shots, &reopened, "ricevente");
-                // and the writer lands on the same judgment
-                judge_the_purge(&a, &x, &shots, &reopened, "scrittore");
-            }
-        }
-        // --- the single-device form: writes, supersede, proposals and
-        // decisions, edges, conflict copies, one compaction in the middle
-        {
-            let dir = common::test_dir();
-            let cell = Cell::create(&dir.path().join("meta.sqlite"), "p", "prop")
-                .unwrap(/* t */);
-            run_random_ops(&cell, seed, ops_count(seed) / 2);
-            // the compaction the story owes: a cut at (or below) the head,
-            // snapshot file half the time
-            let head: i64 = cell
-                .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
-                .unwrap_or_default()
-                .first()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let cut = head - (next() % 3) as i64;
-            if cut >= 1 {
-                let _ = cell.compact(
-                    cut,
-                    &engramma_core::cell::CompactOptions {
-                        keep_snapshot: next() % 2 == 0,
-                    },
-                );
-            }
-            run_random_ops(&cell, seed.wrapping_mul(3) | 1, ops_count(seed) / 2);
-
-            // a story with no note judges nothing
-            if let Some(x) = pick_a_note(&cell, next()) {
-                let (shots, reopened) = shoot_outside_family(&cell, &x);
-                cell.purge(&x, "prop", "prop").unwrap(/* t */);
-                judge_the_purge(&cell, &x, &shots, &reopened, "singolo");
-            }
+            judge_the_purge(&b, &x, &shots, &reopened, "ricevente");
+            // and the writer lands on the same judgment
+            judge_the_purge(&a, &x, &shots, &reopened, "scrittore");
         }
     }
+    // --- the two-device form: the purge is BORN on A and arrives by
+    // sync; the judgment is B's, the receiver's
+    {
+        use common::{cell_with, shared_init, union};
+        use std::sync::atomic::Ordering;
+        let init = shared_init(&format!("oblio-significato/{seed}"));
+        let (a, wa) = cell_with("ma");
+        let (b, wb) = cell_with("mb");
+        for cell in [&a, &b] {
+            cell.ingest_op(&init).unwrap(/* t */);
+        }
+        // the cell takes proposals: the decide arm needs the policy
+        a.set_policy(serde_json::json!({ "write": "propose" }), "prop")
+                .unwrap(/* t */);
+        for op in &union(&a, &b) {
+            let _ = a.ingest_op(op);
+            let _ = b.ingest_op(op);
+        }
+        let word_of = |i: u16| {
+            format!(
+                "{}{}senso",
+                char::from(b'a' + (i / 26) as u8),
+                char::from(b'a' + (i % 26) as u8)
+            )
+        };
+        let mut living: Vec<ulid::Ulid> = Vec::new();
+        let mut queue: Vec<ulid::Ulid> = Vec::new();
+        let mut tick: u64 = 0;
+        let mut i: u16 = 0;
+        let pick = |pool: &[ulid::Ulid], rnd: u64| {
+            pool.get((rnd % pool.len().max(1) as u64) as usize).copied()
+        };
+        for _round in 0..28 {
+            i += 1;
+            let dev = next() % 2;
+            let (cell, wall) = if dev == 0 { (&a, &wa) } else { (&b, &wb) };
+            match next() % 7 {
+                0 | 1 => {
+                    // a fresh note (half the time born quarantined: the
+                    // hidden line walks the same roads)
+                    tick += 1;
+                    wall.store(common::K + tick, Ordering::SeqCst);
+                    let mut note =
+                        common::base_note(u32::from(i), &format!("{} [[Roma]]", word_of(i)));
+                    if next() % 4 == 0 {
+                        note.status = Status::Quarantined;
+                    }
+                    if cell.put_note(&note, "prop:user").is_ok() {
+                        living.push(note.id);
+                    }
+                }
+                2 => {
+                    // a concurrent patch — the conflict copies the
+                    // family closure has to walk
+                    if let Some(id) = pick(&living, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let _ = cell.patch_note(
+                            &id,
+                            &NotePatch {
+                                body: Some(format!("{} [[Roma]]", word_of(200 + i))),
+                                ..Default::default()
+                            },
+                            "prop:user",
+                        );
+                    }
+                }
+                3 => {
+                    // a supersede: the new note closes the old
+                    if let Some(id) = pick(&living, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let mut new = common::base_note(
+                            u32::from(900 + i),
+                            &format!("{} [[Roma]]", word_of(400 + i)),
+                        );
+                        new.supersedes = vec![id];
+                        if cell.supersede(&id, &new, None, "prop:user").is_ok() {
+                            living.push(new.id);
+                        }
+                    }
+                }
+                4 => {
+                    // a correction proposed and decided on the SAME
+                    // device (the queue row is local)
+                    if let Some(id) = pick(&living, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let mut p = common::base_note(
+                            u32::from(2000 + i),
+                            &format!("{} unica{i} [[Roma]]", word_of(600 + i)),
+                        );
+                        p.status = Status::Quarantined;
+                        let out = cell.propose(
+                            &engramma_core::cell::proposals::ProposalInput {
+                                note: p,
+                                mode: engramma_core::cell::proposals::ProposalMode::Supersede(id),
+                                client: None,
+                                reason: None,
+                            },
+                            "mcp:prop",
+                            &engramma_core::cell::proposals::ProposeContext::default(),
+                        );
+                        if let Ok(out) = out
+                            && let Some(pid) = out.id
+                        {
+                            queue.push(pid);
+                        }
+                    }
+                }
+                5 => {
+                    // the decision of a local queued proposal
+                    if let Some(pid) = pick(&queue, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let accept = next() % 2 == 0;
+                        let action = if accept {
+                            engramma_core::cell::proposals::DecisionAction::Accept { edited: None }
+                        } else {
+                            engramma_core::cell::proposals::DecisionAction::Reject
+                        };
+                        if cell
+                            .decide(
+                                &pid,
+                                &engramma_core::cell::proposals::DecisionInput {
+                                    action,
+                                    reason: None,
+                                    review: None,
+                                },
+                                "user:prop",
+                            )
+                            .is_ok()
+                            && accept
+                        {
+                            living.push(pid);
+                        }
+                        queue.retain(|n| n != &pid);
+                    }
+                }
+                _ => {
+                    // the sync: everything flows both ways
+                    for op in &union(&a, &b) {
+                        let _ = a.ingest_op(op);
+                        let _ = b.ingest_op(op);
+                    }
+                }
+            }
+        }
+        // the settle: both devices hold the whole set
+        for _ in 0..2 {
+            for op in &union(&a, &b) {
+                let _ = a.ingest_op(op);
+                let _ = b.ingest_op(op);
+            }
+        }
+
+        // the purge is born on A; the judgment is B's, the receiver's
+        if let Some(x) = pick_a_note(&b, next()) {
+            let (shots, reopened) = shoot_outside_family(&b, &x);
+            tick += 1;
+            wa.store(common::K + tick, Ordering::SeqCst);
+            a.purge(&x, "prop", "prop:user").unwrap(/* t */);
+            for op in &union(&a, &b) {
+                let _ = a.ingest_op(op);
+                let _ = b.ingest_op(op);
+            }
+            judge_the_purge(&b, &x, &shots, &reopened, "ricevente");
+            // and the writer lands on the same judgment
+            judge_the_purge(&a, &x, &shots, &reopened, "scrittore");
+        }
+    }
+    // --- the single-device form: writes, supersede, proposals and
+    // decisions, edges, conflict copies, one compaction in the middle
+    {
+        let dir = common::test_dir();
+        let cell = Cell::create(&dir.path().join("meta.sqlite"), "p", "prop")
+                .unwrap(/* t */);
+        run_random_ops(&cell, seed, ops_count(seed) / 2);
+        // the compaction the story owes: a cut at (or below) the head,
+        // snapshot file half the time
+        let head: i64 = cell
+            .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
+            .unwrap_or_default()
+            .first()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let cut = head - (next() % 3) as i64;
+        if cut >= 1 {
+            let _ = cell.compact(
+                cut,
+                &engramma_core::cell::CompactOptions {
+                    keep_snapshot: next() % 2 == 0,
+                },
+            );
+        }
+        run_random_ops(&cell, seed.wrapping_mul(3) | 1, ops_count(seed) / 2);
+
+        // a story with no note judges nothing
+        if let Some(x) = pick_a_note(&cell, next()) {
+            let (shots, reopened) = shoot_outside_family(&cell, &x);
+            cell.purge(&x, "prop", "prop").unwrap(/* t */);
+            judge_the_purge(&cell, &x, &shots, &reopened, "singolo");
+        }
+    }
+}
 
 /// v0.6.12 (L1): the open defect's own seeds, deterministic — the hunt's
 /// `VersionNotFound` (`purge_takes_only_its_family`, seeds of the
@@ -1683,8 +1675,7 @@ fn stale_test_dirs_are_swept_and_foreign_ones_untouched() {
     // ours, STALE: the dir's own mtime set a week back
     let stale = common::test_dir();
     std::fs::write(stale.path().join("a.sqlite"), b"leftover").unwrap(/* t */);
-    let week_ago = std::time::SystemTime::now()
-        - std::time::Duration::from_secs(7 * 24 * 3600);
+    let week_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
     std::fs::File::open(stale.path())
         .unwrap(/* t */)
         .set_times(
@@ -1717,10 +1708,7 @@ fn stale_test_dirs_are_swept_and_foreign_ones_untouched() {
         "the stale engramma-test folder must go"
     );
     assert!(fresh.path().exists(), "a fresh folder survives the sweep");
-    assert!(
-        foreign.path().exists(),
-        "a foreign folder is never touched"
-    );
+    assert!(foreign.path().exists(), "a foreign folder is never touched");
     drop(fresh);
     drop(foreign);
 }
@@ -1826,10 +1814,7 @@ fn pick_a_note(cell: &Cell, rnd: u64) -> Option<Ulid> {
 /// to a STATE IT HAD, which is `active` most of the times but is
 /// whatever the note was before the closing (a quarantined birth
 /// included, seed `761472815227880454`).
-fn shoot_outside_family(
-    cell: &Cell,
-    x: &Ulid,
-) -> (Vec<(Ulid, Shot)>, Vec<(Ulid, Vec<Status>)>) {
+fn shoot_outside_family(cell: &Cell, x: &Ulid) -> (Vec<(Ulid, Shot)>, Vec<(Ulid, Vec<Status>)>) {
     let family: std::collections::HashSet<String> = cell
         .debug_column(&format!(
             "WITH RECURSIVE fam(id) AS (
@@ -1877,7 +1862,9 @@ fn shoot_outside_family(
         }
         reopened.push((*id, held));
     }
-    let ids = cell.debug_column("SELECT id FROM notes").unwrap_or_default();
+    let ids = cell
+        .debug_column("SELECT id FROM notes")
+        .unwrap_or_default();
     let mut shots = Vec::new();
     for id in ids {
         if family.contains(&id) {
@@ -1977,8 +1964,6 @@ fn judge_the_purge(
         "un arco nomina ancora la purgata [{ctx}]: {x}"
     );
 }
-
-
 
 /// A deterministic pseudo-random op sequence (xorshift). The target note is
 /// drawn at random among the known ones — pinning it to `notes.first()` let

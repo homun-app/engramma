@@ -1282,11 +1282,10 @@ impl Cell {
         // offline shape of `shared_verify.rs`) sorts above the cut and
         // passes untouched.
         {
-            let cut: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM snapshots",
-                [],
-                |r| r.get(0),
-            )?;
+            let cut: i64 =
+                tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
+                    r.get(0)
+                })?;
             if cut > 0 {
                 let shared: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM meta WHERE key = 'sync_shared' AND value = '1'",
@@ -1300,11 +1299,7 @@ impl Cell {
                              WHERE seq <= ?1
                                AND (hlc > ?2 OR (hlc = ?2 AND op_id > ?3))
                              LIMIT 1",
-                            rusqlite::params![
-                                cut,
-                                op.hlc.to_string(),
-                                op.op_id.to_string()
-                            ],
+                            rusqlite::params![cut, op.hlc.to_string(), op.op_id.to_string()],
                             |r| r.get(0),
                         )
                         .optional()?;
@@ -1843,7 +1838,9 @@ impl Cell {
             })?
             .flatten()
             .filter_map(|(id, title)| {
-                Ulid::from_string(&id).ok().map(|id| Reopening { id, title })
+                Ulid::from_string(&id)
+                    .ok()
+                    .map(|id| Reopening { id, title })
             })
             .collect();
         Ok(out)

@@ -76,7 +76,7 @@ fn test_dir() -> tempfile::TempDir {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
-    
+
 #[test]
     fn proposal_sequences_keep_the_invariants(
         seed in any::<u64>(),

@@ -483,9 +483,9 @@ fn scan(tx: &Transaction<'_>, original: &Ulid) -> Result<Vec<NoteOpRow>, CellErr
                         && serde_json::from_str::<serde_json::Value>(b.as_str())
                             .ok()
                             .and_then(|v| {
-                                v.get("note").and_then(|n| n.get("id")).and_then(
-                                    |i| i.as_str().map(|id| id != original.to_string()),
-                                )
+                                v.get("note")
+                                    .and_then(|n| n.get("id"))
+                                    .and_then(|i| i.as_str().map(|id| id != original.to_string()))
                             })
                             .unwrap_or(true)
                     {

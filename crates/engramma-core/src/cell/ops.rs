@@ -1903,7 +1903,6 @@ fn apply_supersede(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), Ce
             "INSERT OR IGNORE INTO supersedes (new_id, old_id) VALUES (?1, ?2)",
             rusqlite::params![new.id.to_string(), old_id.to_string()],
         )?;
-
     }
     Ok(())
 }
@@ -3121,9 +3120,7 @@ fn apply_decide(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), CellE
                 // LIVES — a decide whose target's creation was dominated
                 // (the note will never materialize) must not leave a
                 // phantom pointer behind, whatever half materializes
-                if (scope.wants(&id) || scope.wants(&target))
-                    && read_note(tx, &target)?.is_some()
-                {
+                if (scope.wants(&id) || scope.wants(&target)) && read_note(tx, &target)?.is_some() {
                     tx.execute(
                         "INSERT OR IGNORE INTO supersedes (new_id, old_id) VALUES (?1, ?2)",
                         rusqlite::params![id.to_string(), target.to_string()],

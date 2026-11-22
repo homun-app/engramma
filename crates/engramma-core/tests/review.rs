@@ -118,7 +118,6 @@ fn auto_policy(cell: &Cell, extra: serde_json::Value) {
 // the policy
 // ---------------------------------------------------------------------------
 
-
 /// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
 /// (see tests/common/mod.rs).
 fn test_dir() -> tempfile::TempDir {

@@ -21,9 +21,9 @@
 mod common;
 
 use common::{cell_with, shared_init, union};
-use engramma_core::cell::ops::{make_op, OpKind, OpParts};
-use engramma_core::cell::proposals::{DecisionAction, DecisionInput, ProposalInput, ProposalMode};
 use engramma_core::cell::CompactOptions;
+use engramma_core::cell::ops::{OpKind, OpParts, make_op};
+use engramma_core::cell::proposals::{DecisionAction, DecisionInput, ProposalInput, ProposalMode};
 use engramma_core::{Cell, Confidence, NotePatch, Status};
 use std::sync::atomic::Ordering;
 use ulid::Ulid;

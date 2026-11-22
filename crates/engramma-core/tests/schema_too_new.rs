@@ -11,7 +11,6 @@
 use engramma_core::cell::schema::SCHEMA_VERSION;
 use engramma_core::{Cell, CellError};
 
-
 /// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
 /// (see tests/common/mod.rs).
 fn test_dir() -> tempfile::TempDir {

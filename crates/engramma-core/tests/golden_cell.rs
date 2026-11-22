@@ -32,7 +32,6 @@ fn nid(i: u32) -> Ulid {
     Ulid::from_string(&format!("01{}{:08}", "0".repeat(16), i)).unwrap(/* the golden's own ids */)
 }
 
-
 /// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
 /// (see tests/common/mod.rs).
 fn test_dir() -> tempfile::TempDir {
