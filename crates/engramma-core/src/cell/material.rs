@@ -26,6 +26,12 @@ use super::ops::{self, Op, OpKind, Scope};
 /// compacted). Below the cut the payloads are gone — the state there is
 /// frozen and stable (P1.6 will make it the frontier), so materialization
 /// only ever replays ABOVE it, starting from the state the cut left.
+fn cut_seq(tx: &rusqlite::Transaction<'_>) -> Result<i64, CellError> {
+    let cut: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
+        r.get(0)
+    })?;
+    Ok(cut)
+}
 
 /// A held half — purge-dominated, or beaten by a lapide — still consumes
 /// its version slot: the row's number is the note's history, and the
@@ -59,13 +65,6 @@ fn note_exists_at(
     )?;
     Ok(n > 0)
 }
-fn cut_seq(tx: &rusqlite::Transaction<'_>) -> Result<i64, CellError> {
-    let cut: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
-        r.get(0)
-    })?;
-    Ok(cut)
-}
-
 /// Every stored operation concerning one object ABOVE the compaction cut, in
 /// total order.
 pub(crate) fn ops_concerning(

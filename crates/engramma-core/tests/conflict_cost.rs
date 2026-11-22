@@ -92,9 +92,6 @@ fn body_of(note_size: usize) -> String {
     b
 }
 
-/// Measure one copy's bytes: a quiet cell, then the same cell with `n`
-/// open copies, the difference over `n`.
-
 /// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
 /// (see tests/common/mod.rs).
 fn test_dir() -> tempfile::TempDir {
@@ -104,6 +101,8 @@ fn test_dir() -> tempfile::TempDir {
         .expect(/* test-only */ "a fresh folder")
 }
 
+/// Measure one copy's bytes: a quiet cell, then the same cell with `n`
+/// open copies, the difference over `n`.
 #[test]
 #[ignore = "a measurement, not an assertion"]
 fn bytes_per_copy_1k_and_10k() {

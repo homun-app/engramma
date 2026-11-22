@@ -109,12 +109,6 @@ fn supersedes_rows(cell: &Cell, named: &Ulid) -> usize {
     .unwrap_or(0)
 }
 
-/// Sonda 1 del revisore: `put` di A, `supersede(A → N)`, `purge(A)`. N è
-/// nata dal supersede: la sua esistenza è contenuto PROPRIO, e la purga
-/// della vecchia non può toglierla. Vanno via la chiusura di A (A stessa)
-/// e la riga `supersedes` che la nominava. Nella v0.6.10 `get(N)`
-/// rispondeva `NoteNotFound` con `verify` verde.
-
 /// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
 /// (see tests/common/mod.rs).
 fn test_dir() -> tempfile::TempDir {
@@ -124,6 +118,11 @@ fn test_dir() -> tempfile::TempDir {
         .expect(/* test-only */ "a fresh folder")
 }
 
+/// Sonda 1 del revisore: `put` di A, `supersede(A → N)`, `purge(A)`. N è
+/// nata dal supersede: la sua esistenza è contenuto PROPRIO, e la purga
+/// della vecchia non può toglierla. Vanno via la chiusura di A (A stessa)
+/// e la riga `supersedes` che la nominava. Nella v0.6.10 `get(N)`
+/// rispondeva `NoteNotFound` con `verify` verde.
 #[test]
 fn the_new_note_of_a_supersede_survives_the_purge_of_the_old() {
     let dir = test_dir();

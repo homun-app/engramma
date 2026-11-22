@@ -109,6 +109,15 @@ fn supersedes_rows(cell: &Cell, named: &Ulid) -> usize {
     .unwrap_or(0)
 }
 
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 /// The declared defect (v0.6.9, seed `14903861504949011020`, reduced by
 /// hand): a supersede-mode proposal is accepted, the proposal is purged,
 /// and a write on the TARGET rematerializes it. The decide is an operation
@@ -121,16 +130,6 @@ fn supersedes_rows(cell: &Cell, named: &Ulid) -> usize {
 /// replays NO half — the target is not closed by it anymore, the row does
 /// not come back, and the purge of the proposal reopens what the decide
 /// had closed.
-
-/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
-/// (see tests/common/mod.rs).
-fn test_dir() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("engramma-test-")
-        .tempdir()
-        .expect(/* test-only */ "a fresh folder")
-}
-
 #[test]
 fn the_target_half_of_a_decide_does_not_replay_over_the_purge_of_the_proposal_seed_14903() {
     let (_dir, cell, proposal, target) = decided_stage("decide-purga.sqlite");

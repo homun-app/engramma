@@ -1671,7 +1671,6 @@ fn purge_family_open_defect_seeds_run_clean() {
 /// any other process — is never touched.
 #[test]
 fn stale_test_dirs_are_swept_and_foreign_ones_untouched() {
-    let tmp = std::env::temp_dir();
     // ours, STALE: the dir's own mtime set a week back
     let stale = common::test_dir();
     std::fs::write(stale.path().join("a.sqlite"), b"leftover").unwrap(/* t */);
@@ -1814,7 +1813,9 @@ fn pick_a_note(cell: &Cell, rnd: u64) -> Option<Ulid> {
 /// to a STATE IT HAD, which is `active` most of the times but is
 /// whatever the note was before the closing (a quarantined birth
 /// included, seed `761472815227880454`).
-fn shoot_outside_family(cell: &Cell, x: &Ulid) -> (Vec<(Ulid, Shot)>, Vec<(Ulid, Vec<Status>)>) {
+type Shots = (Vec<(Ulid, Shot)>, Vec<(Ulid, Vec<Status>)>);
+
+fn shoot_outside_family(cell: &Cell, x: &Ulid) -> Shots {
     let family: std::collections::HashSet<String> = cell
         .debug_column(&format!(
             "WITH RECURSIVE fam(id) AS (

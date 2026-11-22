@@ -106,10 +106,6 @@ fn note_of(id: u16, body: &str) -> Note {
     }
 }
 
-/// P0.1: after a plain purge no root of the body survives in the cell file —
-/// the FTS5 `delete` alone leaves the stems in the old segments; only the
-/// `optimize` merge discards them.
-
 /// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
 /// (see tests/common/mod.rs).
 fn test_dir() -> tempfile::TempDir {
@@ -119,6 +115,9 @@ fn test_dir() -> tempfile::TempDir {
         .expect(/* test-only */ "a fresh folder")
 }
 
+/// P0.1: after a plain purge no root of the body survives in the cell file —
+/// the FTS5 `delete` alone leaves the stems in the old segments; only the
+/// `optimize` merge discards them.
 #[test]
 fn purge_scrubs_the_stems_from_the_file() {
     let dir = test_dir();

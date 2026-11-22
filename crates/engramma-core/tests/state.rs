@@ -51,10 +51,6 @@ fn found(cell: &Cell, text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The dangerous rewrite of the point: a quarantined note rewritten with
-/// `stated` confidence stays quarantined, out of the search; asking for
-/// `active` explicitly is refused.
-
 /// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
 /// (see tests/common/mod.rs).
 fn test_dir() -> tempfile::TempDir {
@@ -64,6 +60,9 @@ fn test_dir() -> tempfile::TempDir {
         .expect(/* test-only */ "a fresh folder")
 }
 
+/// The dangerous rewrite of the point: a quarantined note rewritten with
+/// `stated` confidence stays quarantined, out of the search; asking for
+/// `active` explicitly is refused.
 #[test]
 fn a_rewrite_preserves_quarantine() {
     let (_d, cell) = cell();

@@ -43,15 +43,6 @@ fn file_bytes(dir: &std::path::Path, name: &str) -> Vec<Vec<u8>> {
     out
 }
 
-/// v0.6.10 (J2): verify on a cell with a phantom changes NOTHING — the
-/// rows, the digest and the pages are identical before and after — and
-/// the report NAMES the phantom while the outcome says the cell needs
-/// repair. (v0.6.9's verify repaired in place: `purge_state` +
-/// `scrub_log` + `purge_conflict_copies` under `secure_delete`,
-/// irreversible, announced only by the `phantom_purged` field — a
-/// diagnosis must not destroy, and any future defect leaving a row on a
-/// purged id must ALARM, not silently lose the user's content.)
-
 /// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
 /// (see tests/common/mod.rs).
 fn test_dir() -> tempfile::TempDir {
@@ -61,6 +52,14 @@ fn test_dir() -> tempfile::TempDir {
         .expect(/* test-only */ "a fresh folder")
 }
 
+/// v0.6.10 (J2): verify on a cell with a phantom changes NOTHING — the
+/// rows, the digest and the pages are identical before and after — and
+/// the report NAMES the phantom while the outcome says the cell needs
+/// repair. (v0.6.9's verify repaired in place: `purge_state` +
+/// `scrub_log` + `purge_conflict_copies` under `secure_delete`,
+/// irreversible, announced only by the `phantom_purged` field — a
+/// diagnosis must not destroy, and any future defect leaving a row on a
+/// purged id must ALARM, not silently lose the user's content.)
 #[test]
 fn verify_touches_nothing_and_names_the_phantom() {
     let (dir, cell, phantom, _alive) = phantom_stage("verify-lettura.sqlite");

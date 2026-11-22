@@ -55,10 +55,6 @@ fn note_of(id: u16, body: &str) -> Note {
     }
 }
 
-/// The seed `1207186286826530307` reduced by hand: one note, one purge,
-/// one local `put` of the same id. The put must be refused, and the
-/// state must stay a function of the operations (`verify` green).
-
 /// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
 /// (see tests/common/mod.rs).
 fn test_dir() -> tempfile::TempDir {
@@ -68,6 +64,9 @@ fn test_dir() -> tempfile::TempDir {
         .expect(/* test-only */ "a fresh folder")
 }
 
+/// The seed `1207186286826530307` reduced by hand: one note, one purge,
+/// one local `put` of the same id. The put must be refused, and the
+/// state must stay a function of the operations (`verify` green).
 #[test]
 fn a_local_put_on_a_purged_id_is_refused_seed_1207() {
     let dir = test_dir();

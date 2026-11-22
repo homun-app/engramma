@@ -78,11 +78,6 @@ fn term(word: &str) -> String {
         .unwrap_or_else(|| word.to_string())
 }
 
-/// Every passage of state moves the FTS row in the SAME transaction as the
-/// operation: the base index answers the default view with exactly the
-/// visible notes, the hidden index holds exactly the quarantined ones, and
-/// a tombstone lives in neither.
-
 /// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
 /// (see tests/common/mod.rs).
 fn test_dir() -> tempfile::TempDir {
@@ -92,6 +87,10 @@ fn test_dir() -> tempfile::TempDir {
         .expect(/* test-only */ "a fresh folder")
 }
 
+/// Every passage of state moves the FTS row in the SAME transaction as the
+/// operation: the base index answers the default view with exactly the
+/// visible notes, the hidden index holds exactly the quarantined ones, and
+/// a tombstone lives in neither.
 #[test]
 fn status_passages_move_the_row_inside_the_operation() {
     let dir = test_dir();
