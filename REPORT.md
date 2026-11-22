@@ -11247,3 +11247,88 @@ dell'aggancio di Homun letti dal disco dopo la build:
 | `engramma.darwin-arm64.node` | 50 766 728 | `5cd74c36730709088a5e7e9f3a3576d35c7a70f3e2de43ec70eb2d6687ad925c` |
 | `index.js` | 36 239 | `cd26043ecf56124be115f58a25368049dec67d48515109b31de588646280e311` |
 | `index.d.ts` | 27 109 | `dd80c0ac3be544f622b49ccb7b84796ac6c2270bc08c38932ca9105e5694854b` |
+
+## Verifica v0.6.11 (revisore, 2026-11-22)
+
+Fatta sul tag `fase-v0.6.11` (`3405c40`), a priorità minima. Le sonde stanno
+nello scratchpad del revisore, fuori dal repo.
+
+### Cosa regge
+
+- **K1 è corretto.** Le due sonde del revisore della v0.6.10, girate sul
+  tag, sono verdi:
+  - dopo `supersede(A → N)` e `purge(A)`, N vive col suo corpo;
+  - dopo una correzione d'agente accettata e la purga del bersaglio, la
+    correzione resta `Active` e si modifica.
+
+  Anche le sonde su `link` e `supersede` della v0.6.9 sono verdi.
+  `purge_preview` dà a Homun l'anticipo delle riaperture.
+- **K2 è il pezzo che mancava, e ha morso subito.** La regola della v0.6.10,
+  rimessa su un ramo di prova, cade al primo caso. In più, l'oracolo ha
+  trovato due difetti veri che la coerenza non vedeva: la fotografia
+  sbagliata dell'ancora (chiuso) e il `VersionNotFound` (vedi sotto).
+- **K3:**
+  - zero `engramma-node-*` dopo le corse del revisore;
+  - `npm test` e `test:electron` 62/62.
+- **Lo SHA del tag** è riprodotto da `build-sha.sh` (`.node` `5cd74c36…`,
+  50 766 728 B).
+
+### Il difetto aperto, pesato
+
+**La purga fallisce, per sempre, su una nota il cui co-oggetto si
+rimaterializza attraversando un taglio** (`purge_takes_only_its_family`,
+semi `17093826732695285589` e `18352432295623270118`, riprodotti dal
+revisore). GLM lo dichiara aperto e preesistente. Il revisore aggiunge tre
+fatti:
+
+- **È su un dispositivo solo.** Basta una compattazione normale
+  (`head - keepLast`): `cell.purge(x)` risponde
+  `VersionNotFound(…, 2)`.
+- **Il fallimento è pulito ma permanente.**
+  - Il digest dello stato è identico prima e dopo, `verify` è verde prima e
+    dopo, e la nota resta `Active`.
+  - Una seconda purga fallisce allo stesso modo. Per quella nota
+    «dimentica per sempre» non funziona mai.
+- **Per l'uso locale è una regressione della v0.6.10, non un difetto
+  antico.** La strada (la purga che rimaterializza i co-oggetti) è nata con
+  la J1 della v0.6.10. Prima, su una cella sola, nessun percorso
+  rimaterializzava una nota attraverso il taglio.
+- **Secondo la diagnosi di GLM c'è di peggio:** `materialize_note`
+  cancella le righe di versione anche **sotto** il taglio, e il rigioco da
+  sopra non le ricrea. Quindi anche una purga che riesce può togliere in
+  silenzio la storia delle versioni di un'altra nota. Da confermare con
+  una sonda nella prossima fase.
+
+**La forma giusta,** lo stato dell'arte dell'event sourcing con istantanee:
+**il prefisso congelato è immutabile.** Una rimaterializzazione parte dallo
+stato al taglio e ricostruisce solo sopra di lui, e non cancella mai righe
+nate sotto il taglio. La stessa regola chiude anche la famiglia dell'ancora
+che invecchia (H2, secondo strato, sulla sync), perché è lo stesso errore:
+toccare la storia che il taglio ha congelato.
+
+### Altre note
+
+- **Tre `.tmp*` in `$TMPDIR`**, del 21 novembre alle 10:33, durante la fase:
+  `a.sqlite`, `b.sqlite` e `c.sqlite` con i loro WAL. Il REPORT non le conta
+  e non le diagnostica, mentre la spec chiedeva di farlo. Il revisore le
+  lascia al loro posto per la diagnosi.
+- **`target/` è a 25 G.**
+
+### Verdetto
+
+**v0.6.11 consegnata per lo sviluppo di Homun**, al posto della v0.6.9. K1,
+K2 e K3 reggono, e il contratto è quello che uscirà.
+
+**Release locale: pronta solo a una condizione.** Il difetto aperto ha
+bisogno di un taglio di compattazione: **senza compattazione non può
+nascere.** Quindi:
+- **con la compattazione spenta in Homun**, nessuna chiamata a
+  `compact()`, la release locale può partire sulla v0.6.11. Una memoria
+  personale cresce lenta, e la compattazione è manutenzione, non una
+  funzione per l'utente;
+- **con la compattazione accesa, no:** «dimentica per sempre» può fallire
+  per sempre su una nota.
+
+La correzione, cioè il prefisso congelato immutabile con la sua sonda sulla
+storia delle versioni, va in una fase sua. Solo dopo quella la
+compattazione si riaccende.
