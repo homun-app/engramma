@@ -63,6 +63,70 @@ test('version is exported', () => {
 // before the purge: «tornerà valido: …». The supersede is staged by the
 // CLI (the binding has no supersede of its own: corrections arrive from
 // the agent's tools), the same road the view tests walk.
+// v0.6.12 (L1): the frozen prefix, in the contract Homun leans on —
+// with the compaction ON again. A note closed by a supersede, a
+// compaction between the closing and the oblivion, then the purge of
+// the NEW note: on the v0.6.11 engine it failed FOREVER
+// (VersionNotFound); here it must succeed, the old note must reopen
+// with its own body, and its version history must be exactly what it
+// was (the history is the note's own content: the purge of another
+// note may never take it).
+test('compact() then purge() of a supersede: the purge succeeds, the other history intact', async () => {
+  const cli = engrammaBin();
+  if (!cli) return; // no binary around: the per-test assertion below says so
+  const run = (args) => {
+    const r = require('node:child_process').spawnSync(cli, args, { encoding: 'utf8' });
+    assert.equal(r.status, 0, `${args.join(' ')}\n${r.stdout}${r.stderr}`);
+    return r;
+  };
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  try {
+    const cell = await e.cell('oblio-con-taglio');
+    const old = await cell.put({
+      body: 'la prima mano [[Roma]]',
+      source: 'homun:test',
+      confidence: 'stated',
+    });
+    await cell.patch(old.id, { body: 'la seconda mano [[Roma]]' });
+    await cell.patch(old.id, { body: 'la terza mano [[Roma]]' });
+    const file = path.join(TMP, 'nota-che-chiude.md');
+    fs.writeFileSync(file, 'la nota che chiude [[Roma]]\n');
+    run([
+      '--root', rootDir,
+      '--cell', 'oblio-con-taglio',
+      'supersede', old.id, file,
+      '--source', 'homun:test', '--confidence', 'stated',
+    ]);
+    const notes = await cell.list();
+    const next = notes.find((n) => n.body.includes('la nota che chiude'));
+    assert.ok(next, 'the supersede created the new note');
+    const historyBefore = await cell.history(old.id);
+    assert.ok(historyBefore.length >= 2, 'the old note carries its versions');
+
+    // the compaction, the JS binding's own cut: keepLast ops stay live
+    const compact = await cell.compact(1);
+    assert.ok(compact.cutSeq >= 1, 'the cut landed');
+
+    // the purge of the NEW note: it must succeed
+    const report = await cell.purge(next.id, 'oblio con il taglio');
+    assert.equal(report.scrubbed, true, 'the scrub earned its name');
+
+    // the old note reopened with its own body, and its history is
+    // EXACTLY what it was before the purge
+    const after = await cell.get(old.id);
+    assert.equal(after.status, 'active', 'the declared reopening');
+    assert.equal(after.body, 'la terza mano [[Roma]]');
+    assert.deepEqual(
+      await cell.history(old.id),
+      historyBefore,
+      'the history of a note survives the purge of another note',
+    );
+  } finally {
+    await e.close();
+  }
+});
+
 test('purgePreview() names the note that would reopen, and moves nothing', async () => {
   const cli = engrammaBin();
   if (!cli) return; // no binary around: the per-test assertion below says so
