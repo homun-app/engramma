@@ -29,20 +29,22 @@ use crate::{Error, Result};
 
 /// The ALPN of the sync protocol — and the version of the
 /// materialization rules (v0.6.4, D4; v0.6.5 brings the 3, v0.6.7 the
-/// 4, v0.6.10 the 5, v0.6.11 the 6): every change of the derivation
-/// bumps it, and peers on different versions refuse each other before
-/// a single operation moves. The v0.6.12 changes (L1): the frozen
-/// prefix is immutable — a rematerialization never deletes or rewrites
-/// a version row born at or below the cut, a purge-dominated half
-/// still records the photograph of the pre-state it observed (another
-/// note's history is that note's own content), the anchor is the first
-/// above-cut operation in TOTAL order that photographed the note, and
-/// a shared cell refuses an arrival that falls inside the frozen
-/// prefix.
-pub const ALPN: &[u8] = b"engramma/sync/7";
+/// 4, v0.6.10 the 5, v0.6.11 the 6, v0.6.12 the 7): every change of
+/// the derivation bumps it, and peers on different versions refuse
+/// each other before a single operation moves. The v0.6.13 changes
+/// (M1): **the anchor is the whole object** — a reconstruction restores
+/// the queue row, the registry rows and the new side's `supersedes`
+/// rows at the state the cut left before replaying the tail (the
+/// v0.6.12 rules deleted them whole, and a row born at or below the
+/// cut never came back: a cancelled agent correction could turn
+/// `Active` again), and the purge of a closer reopens the old side the
+/// same way the whole-log replay leaves it. Rules 7 against rules 8
+/// derive different states from the same operations, and must refuse
+/// each other.
+pub const ALPN: &[u8] = b"engramma/sync/8";
 /// The protocol version this build speaks (kept in the hello as a
 /// belt-and-braces check: the ALPN already gates the rules).
-pub const PROTOCOL_VERSION: u64 = 7;
+pub const PROTOCOL_VERSION: u64 = 8;
 /// A message is at most 1 MiB.
 pub const MAX_MESSAGE: usize = 1024 * 1024;
 
