@@ -888,6 +888,21 @@ proptest! {
         purge_takes_only_its_family_body(seed);
     }
 
+    /// v0.6.13 (M3): **dalla quarantena si esce solo per decisione.**
+    /// Un invariante di STATO su storie generate qualunque — scritture
+    /// (anche esterne, nate in quarantena), proposte d'agente, decisioni
+    /// e annullamenti, supersede, cambi di stato, compattazioni a tagli
+    /// sotto la testa, purghe — giudicato dopo OGNI operazione, nella
+    /// forma a una cella e in quella a due dispositivi. Tre regole,
+    /// lette dal registro e dallo stato, mai dal meccanismo che li ha
+    /// prodotti: nessuna uscita dalla quarantena senza una decisione di
+    /// un attore non-agente; nessuna quarantena orfana (la riga di coda
+    /// c'è); una decisione annullata resta annullata.
+    #[test]
+    fn quarantine_exits_only_by_decision(seed in any::<u64>()) {
+        quarantine_exits_body(seed);
+    }
+
     /// v0.6.12 (L2): **the frozen prefix is immutable.** After a
     /// compaction (the cut at `head − 0/1/2`, as the generators already
     /// walk), the photograph below — every version row BORN at or below
@@ -921,11 +936,48 @@ fn frozen_prefix_photo(cell: &Cell) -> Vec<String> {
              ORDER BY note_id, version",
         )
         .unwrap_or_default();
+    // v0.6.13 (M2): the WHOLE-OBJECT anchors born at or below the cut
+    // are frozen like the version rows — they hold the derived state
+    // the cut left (the queue, the registry, the new side's rows), and
+    // a purge or an arrival may never rewrite them
+    photo.extend(
+        cell.debug_column(
+            "SELECT 'obj ' || oa.note_id || ' @' || oa.op_id || ' ' || oa.anchor_json \
+             FROM object_anchors oa \
+             WHERE (SELECT COALESCE(MAX(o.seq), 0) FROM ops o WHERE o.op_id = oa.op_id) \
+                   <= (SELECT COALESCE(MAX(seq), 0) FROM snapshots) \
+             ORDER BY oa.note_id, oa.op_id",
+        )
+        .unwrap_or_default(),
+    );
     // the anchor's IDENTITY (which operation photographed it) may be
     // taken over by a later-held half that recorded the same content at
     // the same number; what rule 4 freezes is the anchor's CONTENT —
     // the state the cut left, at its version — so the photograph names
     // the note, the number and the body, never the photographer
+    // v0.6.13 (M2): the IDENTITY of the derived rows born at or below
+    // the cut — the queue, the registry, the `supersedes` rows. Their
+    // CONTENT may change above the cut (a decision updates the queue);
+    // a row that was born under the cut may never DISAPPEAR (the
+    // v0.6.12 reconstruction deleted them whole, and a row born under
+    // the cut never came back)
+    photo.extend(
+        cell
+            .debug_column("SELECT 'q ' || note_id FROM proposals ORDER BY note_id")
+            .unwrap_or_default(),
+    );
+    photo.extend(
+        cell.debug_column(
+            "SELECT 'd ' || op_id || ' ' || proposal FROM decisions ORDER BY op_id",
+        )
+        .unwrap_or_default(),
+    );
+    photo.extend(
+        cell.debug_column(
+            "SELECT 's ' || new_id || ' ' || old_id FROM supersedes ORDER BY new_id, old_id",
+        )
+        .unwrap_or_default(),
+    );
     photo.extend(
         cell.debug_column(
             "SELECT 'anchor ' || nv.note_id || ' v' || nv.version \
@@ -964,10 +1016,18 @@ fn assert_prefix_stable(before: &[String], after: &[String], ctx: &str) {
         "{ctx}: the frozen prefix LOST rows: {lost:?}"
     );
     let added: Vec<&String> = after.iter().filter(|r| !before.contains(*r)).collect();
-    let not_anchors: Vec<&&String> = added.iter().filter(|r| !r.starts_with("anchor ")).collect();
+    let not_anchors: Vec<&&String> = added
+        .iter()
+        .filter(|r| {
+            !r.starts_with("anchor ")
+                && !r.starts_with("q ")
+                && !r.starts_with("d ")
+                && !r.starts_with("s ")
+        })
+        .collect();
     assert!(
         not_anchors.is_empty(),
-        "{ctx}: the frozen prefix GAINED non-anchor rows: {not_anchors:?}"
+        "{ctx}: the frozen prefix GAINED rows it was not allowed to gain: {not_anchors:?}"
     );
 }
 
@@ -1235,8 +1295,26 @@ fn frozen_prefix_body(seed: u64) {
                 let offenders: Vec<String> = lost
                     .iter()
                     .filter(|row| {
-                        let id = row.split(' ').nth(1).unwrap_or_default().to_string();
-                        !family.contains(&id) && !reopened.contains(&id)
+                        let mut it = row.split(' ');
+                        let kind = it.next().unwrap_or_default();
+                        let first = it.next().unwrap_or_default().to_string();
+                        let second = it.next().unwrap_or_default().to_string();
+                        match kind {
+                            // the queue row: the note's own
+                            "q" => !family.contains(&first),
+                            // the registry row: the proposal's own
+                            "d" => !family.contains(&second),
+                            // the `supersedes` row: either side's, and
+                            // the references to the purged go too
+                            "s" => {
+                                !family.contains(&first)
+                                    && !family.contains(&second)
+                                    && !reopened.contains(&first)
+                                    && first != x.to_string()
+                                    && second != x.to_string()
+                            }
+                            _ => !family.contains(&first) && !reopened.contains(&first),
+                        }
                     })
                     .cloned()
                     .collect();
@@ -1788,6 +1866,14 @@ struct Shot {
     note_type: NoteType,
     status: Status,
     history: Vec<String>,
+    /// v0.6.13 (M2): the queue row — mode, target, state, decider — the
+    /// content the invariant of the queue is judged on (K1 keeps the
+    /// row of a proposal whose target was purged, its own state intact)
+    queue: Option<String>,
+    /// the registry rows (op, decision, actor, the cancel's mark)
+    decisions: Vec<String>,
+    /// the `supersedes` rows where the note is the NEW side
+    supersedes: Vec<String>,
 }
 
 /// The full version history of one note as the oracle photographs it:
@@ -1798,6 +1884,37 @@ fn history_shot(cell: &Cell, id: &Ulid) -> Vec<String> {
         "SELECT CAST(version AS TEXT) || ' @' || substr(op_id, 1, 10) \
            || ' corpo=' || json_extract(snapshot_json, '$.body') \
          FROM note_versions WHERE note_id = '{id}' ORDER BY version"
+    ))
+    .unwrap_or_default()
+}
+
+/// v0.6.13 (M2): the queue row of one note — mode, target, state,
+/// decider — as the whole-object oracle photographs it.
+fn queue_shot(cell: &Cell, id: &Ulid) -> Option<String> {
+    cell.debug_column(&format!(
+        "SELECT mode || ' ' || COALESCE(target, '-') || ' ' || state \
+           || ' by ' || COALESCE(decided_by, '-') \
+         FROM proposals WHERE note_id = '{id}'"
+    ))
+    .unwrap_or_default()
+    .into_iter()
+    .next()
+}
+
+/// v0.6.13 (M2): the registry rows of one note's proposals, with the
+/// cancel's mark.
+fn decisions_shot(cell: &Cell, id: &Ulid) -> Vec<String> {
+    cell.debug_column(&format!(
+        "SELECT decision || ' by ' || actor || ' rev=' || COALESCE(reverted_by, '-') \
+         FROM decisions WHERE proposal = '{id}' ORDER BY op_id"
+    ))
+    .unwrap_or_default()
+}
+
+/// v0.6.13 (M2): the `supersedes` rows where the note is the NEW side.
+fn supersedes_shot(cell: &Cell, id: &Ulid) -> Vec<String> {
+    cell.debug_column(&format!(
+        "SELECT '->' || old_id FROM supersedes WHERE new_id = '{id}' ORDER BY old_id"
     ))
     .unwrap_or_default()
 }
@@ -1902,6 +2019,9 @@ fn shoot_outside_family(cell: &Cell, x: &Ulid) -> Shots {
                 note_type: n.note_type,
                 status: n.status,
                 history: history_shot(cell, &uid),
+                queue: queue_shot(cell, &uid),
+                decisions: decisions_shot(cell, &uid),
+                supersedes: supersedes_shot(cell, &uid),
             },
         ));
     }
@@ -1954,6 +2074,42 @@ fn judge_the_purge(
             before.history,
             history_shot(cell, id),
             "storia delle versioni cambiata [{ctx}]: {id}"
+        );
+        // v0.6.13 (M2): the WHOLE OBJECT — the queue row, the registry
+        // and the new side's rows. The declared exceptions stay those:
+        // the reopened notes (a state they held) and the rows that name
+        // the purged — a queue row whose TARGET was the purged note
+        // keeps its own state (K1), and the closing it lost opens the
+        // old side again
+        assert_eq!(
+            before.queue,
+            queue_shot(cell, id),
+            "riga di coda cambiata [{ctx}]: {id} (prima {:?}, dopo {:?})",
+            before.queue,
+            queue_shot(cell, id)
+        );
+        assert_eq!(
+            before.decisions,
+            decisions_shot(cell, id),
+            "registro delle decisioni cambiato [{ctx}]: {id}"
+        );
+        // the rows that NAME the purged may go (the purge takes every
+        // reference to it, the reopening included); every other row of
+        // the new side stands
+        let naming_x = |r: &String| r.contains(&format!("->{x}"));
+        assert_eq!(
+            before
+                .supersedes
+                .iter()
+                .filter(|r| !naming_x(r))
+                .cloned()
+                .collect::<Vec<_>>(),
+            supersedes_shot(cell, id)
+                .iter()
+                .filter(|r| !naming_x(r))
+                .cloned()
+                .collect::<Vec<_>>(),
+            "righe supersedes cambiate [{ctx}]: {id}"
         );
     }
     // the declared second exception, checked: the relations toward x go
@@ -2323,4 +2479,576 @@ fn spec_examples_valid_and_invalid() {
         m += 1;
     }
     assert!(m >= 8, "expected at least 8 invalid examples, found {m}");
+}
+
+// ---------------------------------------------------------------------------
+// v0.6.13 (M3): the quarantine exits only by decision — a state
+// invariant on generated stories, judged from the LOG and the state,
+// never from the mechanism that produced them.
+// ---------------------------------------------------------------------------
+
+/// One note's status, as the M3 oracle reads it.
+fn statuses_now(cell: &Cell) -> Vec<(String, String)> {
+    cell.debug_column("SELECT id || char(31) || status FROM notes")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            let (id, status) = r.split_once('\u{1f}')?;
+            Some((id.to_string(), status.to_string()))
+        })
+        .collect()
+}
+
+/// The seq of the LAST operation that QUARANTINED a note — the entry the
+/// exits must answer. Evidence that survives the cut: a `propose` (the
+/// skeleton says the kind), a `set_status`/`patch_note` whose payload
+/// still speaks, and any PHOTOGRAPH of a quarantined state (the version
+/// rows never go).
+fn last_quarantine_entry(cell: &Cell, id: &str) -> Option<i64> {
+    let via_ops = cell
+        .debug_column(&format!(
+            "SELECT CAST(COALESCE(MAX(o.seq), 0) AS TEXT) FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             LEFT JOIN op_payloads p ON p.op_id = o.op_id
+             WHERE oo.object = 'note:{id}'
+               AND (o.kind = 'propose'
+                    OR (o.kind = 'set_status'
+                        AND json_extract(p.body, '$.status') = 'quarantined')
+                    OR (o.kind = 'patch_note'
+                        AND json_extract(p.body, '$.set.confidence') = 'external'))"
+        ))
+        .unwrap_or_default()
+        .first()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|s| *s > 0);
+    let via_photos = cell
+        .debug_column(&format!(
+            "SELECT CAST(COALESCE(MAX(o.seq), 0) AS TEXT)
+             FROM note_versions nv JOIN ops o ON o.op_id = nv.op_id
+             WHERE nv.note_id = '{id}'
+               AND json_extract(nv.snapshot_json, '$.status') = 'quarantined'"
+        ))
+        .unwrap_or_default()
+        .first()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|s| *s > 0);
+    // the PHOTO evidence says «it was quarantined once» but never WHEN
+    // the entry happened: an exit's own pre-state photograph (a decide
+    // photographs the quarantined note it is about to lift) would pose
+    // as an entry and demand an exit AFTER itself. The seq comes from
+    // the entry OPERATIONS alone; a photo with no op behind it (the
+    // payload the cut took away) lowers the bar to «any exit at all».
+    if via_ops.is_some() {
+        via_ops
+    } else if via_photos.is_some() {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// Does the LOG hold a legitimate EXIT from quarantine for this note,
+/// after its last entry — a decision to ACCEPT by a human, a `confirm`,
+/// a `set_status` to active or a `restore` (each a human's own act; the
+/// engine's own word on the classes is `classify_actor`)? A purge's
+/// reopening is NOT one: it returns a state the note HAD — if that
+/// state was the quarantine, the note lands back in it.
+fn has_a_legitimate_exit(cell: &Cell, id: &str, after: i64) -> bool {
+    // the decisions the registry holds (their flavor and their actor
+    // survive the cut — the table is derived state, never redacted).
+    // The note can be the PROPOSAL (the decision lifts it) or the
+    // TARGET of the accepted correction (the decision closes it —
+    // visible as superseded, and the decision is the user's own word)
+    let accepted = cell
+        .debug_column(&format!(
+            "SELECT d.actor || char(31) || o.seq FROM decisions d
+             JOIN ops o ON o.op_id = d.op_id
+             LEFT JOIN proposals p ON p.note_id = d.proposal
+             WHERE (d.proposal = '{id}' OR p.target = '{id}')
+               AND d.decision = 'accept'"
+        ))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            let (actor, seq) = r.split_once('\u{1f}')?;
+            Some((actor.to_string(), seq.parse::<i64>().ok()?))
+        })
+        .any(|(actor, seq)| {
+            seq > after
+                && !matches!(
+                    engramma_core::cell::conflicts::classify_actor(&actor),
+                    engramma_core::cell::conflicts::ActorClass::Agent
+                )
+        });
+    if accepted {
+        return true;
+    }
+    // the human acts of the other exits: confirm, set_status→active,
+    // restore (payload readable above the cut; below it the corner is
+    // declared — the hunt's judgment reads the seed by hand)
+    // the human acts of the other exits — `confirm`, `set_status`,
+    // `restore` — read by KIND and ACTOR (both survive the cut; the
+    // payload's target is the declared corner: a `set_status` to
+    // quarantine may pose as an exit, and the case is read by hand)
+    cell.debug_column(&format!(
+        "SELECT o.actor || char(31) || CAST(o.seq AS TEXT)
+         FROM ops o
+         JOIN op_objects oo ON oo.op_id = o.op_id
+         WHERE oo.object = 'note:{id}' AND o.seq > {after}
+           AND o.kind IN ('confirm', 'set_status', 'restore')"
+    ))
+    .unwrap_or_default()
+    .into_iter()
+    .any(|r| {
+        let Some((actor, seq)) = r.split_once('\u{1f}') else {
+            return false;
+        };
+        seq.parse::<i64>().is_ok_and(|seq| {
+            seq > after
+                && !matches!(
+                    engramma_core::cell::conflicts::classify_actor(actor),
+                    engramma_core::cell::conflicts::ActorClass::Agent
+                )
+        })
+    })
+}
+
+/// v0.6.13 (M3): the invariant. Three rules, on the state a cell holds:
+/// 1. no exit without a decision — a note that WAS quarantined and is
+///    now VISIBLE (active or superseded) has, in the log, a legitimate
+///    exit after its last entry;
+/// 2. no orphan quarantine — every quarantined note born from a
+///    proposal holds its queue row (the user can see and decide it);
+/// 3. a cancelled decision stays cancelled — after a `revert_decision`,
+///    nothing but a NEW decision puts the note back in a visible state.
+fn judge_quarantine_invariant(cell: &Cell, ctx: &str) {
+    for (id, status) in statuses_now(cell) {
+        let visible = status == "active" || status == "superseded";
+        if visible
+            && let Some(entry) = last_quarantine_entry(cell, &id)
+            && !has_a_legitimate_exit(cell, &id, entry)
+        {
+            panic!(
+                "quarantine_exits_only_by_decision [{ctx}]: la nota {id} è `{status}` \
+                 senza una decisione che la spieghi (ingresso in quarantena a seq {entry})"
+            );
+        }
+        if status == "quarantined" {
+            // born from a proposal? the queue row must be there
+            let proposed: i64 = cell
+                .debug_column(&format!(
+                    "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
+                     JOIN op_objects oo ON oo.op_id = o.op_id
+                     WHERE oo.object = 'note:{id}' AND o.kind = 'propose'"
+                ))
+                .unwrap_or_default()
+                .first()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if proposed > 0 {
+                let row: i64 = cell
+                    .debug_column(&format!(
+                        "SELECT CAST(COUNT(*) AS TEXT) FROM proposals WHERE note_id = '{id}'"
+                    ))
+                    .unwrap_or_default()
+                    .first()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                assert!(
+                    row > 0,
+                    "quarantine_exits_only_by_decision [{ctx}]: la nota {id} è in quarantena \
+                     nata da una proposta, senza la sua riga di coda"
+                );
+            }
+        }
+    }
+    // rule 3: every CANCELLED decision that RULED THE QUEUE (the
+    // registry's mark alone is not enough — a concurrent cancel that
+    // lost the total order moves nothing, by declaration, and the
+    // accept it named still stands). When the queue says `reverted` the
+    // cancel DID move the note, and only a NEW decision may lift it
+    // back into a visible state.
+    let cancelled: Vec<(String, i64)> = cell
+        .debug_column(
+            "SELECT d.proposal || char(31) || CAST(r.seq AS TEXT)
+             FROM decisions d
+             JOIN ops r ON r.op_id = d.reverted_by
+             JOIN proposals p ON p.note_id = d.proposal
+             WHERE d.reverted_by IS NOT NULL AND p.state = 'reverted'",
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            let (p, s) = r.split_once('\u{1f}')?;
+            Some((p.to_string(), s.parse().ok()?))
+        })
+        .collect();
+    for (id, revert_seq) in cancelled {
+        let status: Option<String> = cell
+            .debug_column(&format!(
+                "SELECT status FROM notes WHERE id = '{id}'"
+            ))
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+        let visible = matches!(status.as_deref(), Some("active") | Some("superseded"));
+        if visible && !has_a_legitimate_exit(cell, &id, revert_seq) {
+            panic!(
+                "quarantine_exits_only_by_decision [{ctx}]: la decisione annullata di {id} \
+                 non basta — la nota è di nuovo visibile senza una nuova decisione"
+            );
+        }
+    }
+}
+
+/// The story the invariant runs on: writes (some born external, in
+/// quarantine), agent proposals and their decisions, cancellations,
+/// supersede, patches, state changes, compactions BELOW the head and
+/// purges — judged after EVERY operation.
+fn quarantine_exits_body(seed: u64) {
+    use common::test_dir;
+    let mut s = seed | 1;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let word_of = |i: u16| {
+        format!(
+            "{}{}ciliegia",
+            char::from(b'a' + (i / 26) as u8),
+            char::from(b'a' + (i % 26) as u8)
+        )
+    };
+    // --- the single-device form, with the compactions
+    {
+        let dir = test_dir();
+        let cell = Cell::create(&dir.path().join("quarantena.sqlite"), "p", "prop")
+            .unwrap(/* t */);
+        cell.set_policy(serde_json::json!({ "write": "propose" }), "prop")
+            .unwrap(/* t */);
+        let mut living: Vec<Ulid> = Vec::new();
+        let mut queue: Vec<Ulid> = Vec::new();
+        let mut decided: Vec<(Ulid, Ulid)> = Vec::new(); // (proposal, decision op)
+        let mut i: u16 = 0;
+        let pick = |pool: &[Ulid], rnd: u64| {
+            pool.get((rnd % pool.len().max(1) as u64) as usize).copied()
+        };
+        for _round in 0..36 {
+            i += 1;
+            match next() % 9 {
+                0 | 1 => {
+                    let mut fresh = any_note_of(next(), i + 100);
+                    fresh.body = format!("{} unica{i}", fresh.body);
+                    if next() % 4 == 0 {
+                        // born EXTERNAL: in quarantine from birth
+                        fresh.confidence = Confidence::External;
+                        fresh.status = Status::Quarantined;
+                        fresh.source = "import:web".into();
+                    }
+                    if cell.put_note(&fresh, "prop:user").is_ok() {
+                        living.push(fresh.id);
+                    }
+                }
+                2 => {
+                    // the agent proposes a correction (or a new fact)
+                    let mode = match pick(&living, next()) {
+                        Some(target) if next() % 2 == 0 => {
+                            engramma_core::cell::proposals::ProposalMode::Supersede(target)
+                        }
+                        _ => engramma_core::cell::proposals::ProposalMode::New,
+                    };
+                    let mut fresh = any_note_of(next(), i + 3000);
+                    fresh.body = format!("{} unica{i}", fresh.body);
+                    if let Ok(out) = cell.propose(
+                        &engramma_core::cell::proposals::ProposalInput {
+                            note: fresh,
+                            mode,
+                            client: None,
+                            reason: None,
+                        },
+                        "mcp:prop",
+                        &engramma_core::cell::proposals::ProposeContext::default(),
+                    )
+                        && let Some(pid) = out.id
+                    {
+                        queue.push(pid);
+                    }
+                }
+                3 => {
+                    // the user decides
+                    if let Some(pid) = pick(&queue, next()) {
+                        let accept = next() % 2 == 0;
+                        let action = if accept {
+                            engramma_core::cell::proposals::DecisionAction::Accept { edited: None }
+                        } else {
+                            engramma_core::cell::proposals::DecisionAction::Reject
+                        };
+                        if let Ok(op) = cell.decide(
+                            &pid,
+                            &engramma_core::cell::proposals::DecisionInput {
+                                action,
+                                reason: None,
+                                review: None,
+                            },
+                            "user@prop",
+                        ) {
+                            queue.retain(|n| n != &pid);
+                            decided.push((pid, op));
+                            if accept {
+                                living.push(pid);
+                            }
+                        }
+                    }
+                }
+                4 => {
+                    // the user cancels a decision
+                    let idx = (next() % decided.len().max(1) as u64) as usize;
+                    if let Some((pid, op)) = decided.get(idx).copied() {
+                        match cell.revert_decision(&op, "prop", "user@prop") {
+                            Ok(engramma_core::cell::proposals::RevertOutcome::Reverted {
+                                proposal,
+                                ..
+                            }) => {
+                                living.retain(|n| n != &proposal);
+                                queue.push(proposal);
+                            }
+                            _ => {}
+                        }
+                        let _ = pid;
+                    }
+                }
+                5 => {
+                    if let Some(id) = pick(&living, next()) {
+                        let _ = cell.patch_note(
+                            &id,
+                            &NotePatch {
+                                body: Some(format!("{} [[Roma]]", word_of(i))),
+                                ..Default::default()
+                            },
+                            "prop:user",
+                        );
+                    }
+                }
+                6 => {
+                    // the state changes, both directions
+                    if let Some(id) = pick(&living, next()) {
+                        let status = cell
+                            .debug_column(&format!(
+                                "SELECT status FROM notes WHERE id = '{id}'"
+                            ))
+                            .unwrap_or_default()
+                            .first()
+                            .cloned();
+                        let to = match status.as_deref() {
+                            Some("quarantined") => Status::Active,
+                            _ => Status::Quarantined,
+                        };
+                        let _ = cell.set_status(&id, to, "prop:user");
+                    }
+                }
+                7 => {
+                    // a supersede of an ACTIVE note (the quarantined
+                    // ones stay out: the exits list is the decisions' —
+                    // see the REPORT)
+                    let active: Vec<Ulid> = living
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            cell.debug_column(&format!(
+                                "SELECT status FROM notes WHERE id = '{id}'"
+                            ))
+                            .unwrap_or_default()
+                            .first()
+                            .is_some_and(|s| s == "active")
+                        })
+                        .collect();
+                    if let Some(id) = pick(&active, next()) {
+                        let mut new = any_note_of(next(), i + 5000);
+                        new.body = format!("{} unica{i}", new.body);
+                        new.supersedes = vec![id];
+                        if cell.supersede(&id, &new, None, "prop:user").is_ok() {
+                            living.retain(|n| n != &id);
+                            living.push(new.id);
+                        }
+                    }
+                }
+                _ => {
+                    // a compaction below the head, or a purge
+                    if next() % 2 == 0 {
+                        let head: i64 = cell
+                            .debug_column(
+                                "SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops",
+                            )
+                            .unwrap_or_default()
+                            .first()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        if head >= 2 {
+                            let cut = (head - (next() % 3) as i64).max(1);
+                            let _ = cell.compact(
+                                cut,
+                                &engramma_core::cell::CompactOptions {
+                                    keep_snapshot: next() % 2 == 0,
+                                },
+                            );
+                        }
+                    } else if let Some(id) = pick(&living, next()) {
+                        if cell.purge(&id, "prop", "prop:user").is_ok() {
+                            living.retain(|n| n != &id);
+                        }
+                    }
+                }
+            }
+            judge_quarantine_invariant(&cell, "singolo");
+        }
+        assert!(
+            cell.verify().unwrap(/* t */).ok(),
+            "verify: {:?}",
+            cell.verify().unwrap(/* t */).mismatch
+        );
+    }
+    // --- the two-device form: the judgments are BOTH devices', at
+    // every settle — the exits a sync carries must be explainable on
+    // the receiving side no less than on the writing one
+    {
+        use common::{cell_with, shared_init, union};
+        use std::sync::atomic::Ordering;
+        let init = shared_init(&format!("quarantena-due/{seed}"));
+        let (a, wa) = cell_with("qa");
+        let (b, wb) = cell_with("qb");
+        for cell in [&a, &b] {
+            cell.ingest_op(&init).unwrap(/* t */);
+        }
+        a.set_policy(serde_json::json!({ "write": "propose" }), "prop")
+            .unwrap(/* t */);
+        for op in &union(&a, &b) {
+            let _ = a.ingest_op(op);
+            let _ = b.ingest_op(op);
+        }
+        let mut living: Vec<Ulid> = Vec::new();
+        let mut queue: Vec<Ulid> = Vec::new();
+        let mut decided: Vec<(Ulid, Ulid)> = Vec::new();
+        let mut tick: u64 = 0;
+        let mut i: u16 = 0;
+        let pick = |pool: &[Ulid], rnd: u64| {
+            pool.get((rnd % pool.len().max(1) as u64) as usize).copied()
+        };
+        for _round in 0..24 {
+            i += 1;
+            let dev = next() % 2;
+            let (cell, wall) = if dev == 0 { (&a, &wa) } else { (&b, &wb) };
+            match next() % 6 {
+                0 => {
+                    tick += 1;
+                    wall.store(common::K + tick, Ordering::SeqCst);
+                    let mut fresh = any_note_of(next(), i + 100);
+                    fresh.body = format!("{} unica{i}", fresh.body);
+                    if cell.put_note(&fresh, "prop:user").is_ok() {
+                        living.push(fresh.id);
+                    }
+                }
+                1 => {
+                    let mode = match pick(&living, next()) {
+                        Some(target) if next() % 2 == 0 => {
+                            engramma_core::cell::proposals::ProposalMode::Supersede(target)
+                        }
+                        _ => engramma_core::cell::proposals::ProposalMode::New,
+                    };
+                    tick += 1;
+                    wall.store(common::K + tick, Ordering::SeqCst);
+                    let mut fresh = any_note_of(next(), i + 3000);
+                    fresh.body = format!("{} unica{i}", fresh.body);
+                    if let Ok(out) = cell.propose(
+                        &engramma_core::cell::proposals::ProposalInput {
+                            note: fresh,
+                            mode,
+                            client: None,
+                            reason: None,
+                        },
+                        "mcp:prop",
+                        &engramma_core::cell::proposals::ProposeContext::default(),
+                    )
+                        && let Some(pid) = out.id
+                    {
+                        queue.push(pid);
+                    }
+                }
+                2 => {
+                    if let Some(pid) = pick(&queue, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let accept = next() % 2 == 0;
+                        let action = if accept {
+                            engramma_core::cell::proposals::DecisionAction::Accept { edited: None }
+                        } else {
+                            engramma_core::cell::proposals::DecisionAction::Reject
+                        };
+                        if let Ok(op) = cell.decide(
+                            &pid,
+                            &engramma_core::cell::proposals::DecisionInput {
+                                action,
+                                reason: None,
+                                review: None,
+                            },
+                            "user@prop",
+                        ) {
+                            queue.retain(|n| n != &pid);
+                            decided.push((pid, op));
+                            if accept {
+                                living.push(pid);
+                            }
+                        }
+                    }
+                }
+                3 => {
+                    let idx = (next() % decided.len().max(1) as u64) as usize;
+                    if let Some((_, op)) = decided.get(idx).copied() {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        if let Ok(
+                            engramma_core::cell::proposals::RevertOutcome::Reverted { proposal, .. },
+                        ) = cell.revert_decision(&op, "prop", "user@prop")
+                        {
+                            living.retain(|n| n != &proposal);
+                            queue.push(proposal);
+                        }
+                    }
+                }
+                4 => {
+                    if let Some(id) = pick(&living, next()) {
+                        tick += 1;
+                        wall.store(common::K + tick, Ordering::SeqCst);
+                        let _ = cell.patch_note(
+                            &id,
+                            &NotePatch {
+                                body: Some(format!("{} [[Roma]]", word_of(100 + i))),
+                                ..Default::default()
+                            },
+                            "prop:user",
+                        );
+                    }
+                }
+                _ => {
+                    for op in &union(&a, &b) {
+                        let _ = a.ingest_op(op);
+                        let _ = b.ingest_op(op);
+                    }
+                }
+            }
+            // the settle judges BOTH — the receiver's state must be as
+            // explainable as the writer's
+            judge_quarantine_invariant(&a, "due/scrittore");
+            judge_quarantine_invariant(&b, "due/ricevente");
+        }
+        for op in &union(&a, &b) {
+            let _ = a.ingest_op(op);
+            let _ = b.ingest_op(op);
+        }
+        judge_quarantine_invariant(&a, "due/finale");
+        judge_quarantine_invariant(&b, "due/finale");
+        assert!(a.verify().unwrap(/* t */).ok(), "verify A");
+        assert!(b.verify().unwrap(/* t */).ok(), "verify B");
+    }
 }

@@ -37,3 +37,4 @@ crates/engramma-mcp/tests/oauth_props.rs sixto_four_is_the_ipv4_it_carries
 crates/engramma-mcp/tests/oauth_props.rs nat64_teredo_and_ipv4_compatible_are_never_public
 crates/engramma-mcp/tests/oauth_props.rs ports_matter_except_on_loopback_http
 crates/engramma-mcp/tests/oauth_props.rs the_path_must_match_even_on_loopback_http
+crates/engramma-core/tests/props.rs quarantine_exits_only_by_decision
