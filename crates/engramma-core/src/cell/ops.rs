@@ -1139,13 +1139,54 @@ fn fts_insert(
 }
 
 /// Save the current state of a note into `note_versions`.
-fn snapshot(tx: &Transaction<'_>, id: &Ulid, version: i64, op_id: &Ulid) -> Result<(), CellError> {
+/// Does this kind's application photograph the note it touches? (v0.6.12,
+/// L1: the purge-dominated halves that still record their pre-state are
+/// exactly the ones whose application would have.) The kinds that never
+/// wrote a version row — a link, a propose, the policy — record nothing
+/// under dominance either: dominance takes an EFFECT, not a history the
+/// operation never made.
+pub(crate) fn records_a_version(kind: OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::PutNote
+            | OpKind::PatchNote
+            | OpKind::SetStatus
+            | OpKind::Supersede
+            | OpKind::DeleteNote
+            | OpKind::Restore
+            | OpKind::Confirm
+            | OpKind::Decide
+            | OpKind::RevertDecision
+    )
+}
+
+/// Record the pre-state photograph of a note at `version`, under the
+/// operation that observed it. v0.6.12 (L1): **the frozen prefix is
+/// immutable** — a row whose recording operation sits at or below the
+/// compaction cut is history the cut froze (its payload is gone; the
+/// row can never be re-derived), and NO write may replace it: the guard
+/// turns the old `INSERT OR REPLACE` into a conditional one. Above the
+/// cut the row is live derivation and rewrites as it always did.
+pub(crate) fn snapshot(
+    tx: &Transaction<'_>,
+    id: &Ulid,
+    version: i64,
+    op_id: &Ulid,
+) -> Result<(), CellError> {
     let Some(row) = read_note(tx, id)? else {
         return Ok(());
     };
     tx.execute(
-        "INSERT OR REPLACE INTO note_versions (note_id, version, op_id, snapshot_json)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO note_versions (note_id, version, op_id, snapshot_json)
+         SELECT ?1, ?2, ?3, ?4
+         WHERE NOT EXISTS (
+             SELECT 1 FROM note_versions nv
+             WHERE nv.note_id = ?1 AND nv.version = ?2
+               AND nv.op_id IN (SELECT op_id FROM ops
+                                WHERE seq <= (SELECT COALESCE(MAX(seq), 0) FROM snapshots))
+         )
+         ON CONFLICT(note_id, version) DO UPDATE SET
+             op_id = excluded.op_id, snapshot_json = excluded.snapshot_json",
         rusqlite::params![
             id.to_string(),
             version,

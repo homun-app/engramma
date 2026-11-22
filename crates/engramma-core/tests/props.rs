@@ -1296,6 +1296,48 @@ fn purge_family_open_defect_seeds_run_clean() {
     }
 }
 
+/// v0.6.12 (L1, punto 5): the H2 second-layer seeds, deterministic —
+/// `compaction_keeps_verify_and_state` with the two seeds the v0.6.8
+/// declaration carried. They were ALREADY green on the v0.6.11 base
+/// (that phase's K2 — the anchor reads the RIGHT note's photograph —
+/// closed the manifestation they exposed), and the frozen-prefix rules
+/// keep them green: the anchor cannot age (rule 4) and a shared cell
+/// refuses an arrival under the cut. If one of them ever turns red, the
+/// H2 line goes back into `open-defects.txt`.
+#[test]
+fn compaction_h2_second_layer_seeds_stay_green() {
+    for seed in [11476711120049502961_u64, 10840318560449401940] {
+        let dir = tempfile::tempdir().unwrap(/* t */);
+        let path = dir.path().join("c.sqlite");
+        let cell = Cell::create(&path, "p", "prop").unwrap(/* t */);
+        run_random_ops(&cell, seed, ops_count(seed));
+        let before = cell.verify().unwrap(/* t */);
+        assert!(before.ok(), "pre-compaction verify: {:?}", before.mismatch);
+        let head: i64 = cell
+            .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+            .unwrap(/* t */)[0]
+            .parse()
+            .unwrap(/* t */);
+        let cut = head - (seed % 3) as i64;
+        let snap = cell
+            .compact(
+                cut,
+                &engramma_core::cell::CompactOptions { keep_snapshot: true },
+            )
+            .unwrap(/* t */)
+            .snapshot
+            .unwrap(/* keep_snapshot always writes one */);
+        assert!(snap.is_file());
+        run_random_ops(&cell, seed.wrapping_mul(3) | 1, 8);
+        let report = cell.verify().unwrap(/* t */);
+        assert!(
+            report.ok(),
+            "verify after compaction (seed {seed}): {:?}",
+            report.mismatch
+        );
+    }
+}
+
 /// How many ops a property case runs: 40–60, mixed by seed.
 fn ops_count(seed: u64) -> u16 {
     u16::try_from(40 + (seed % 21)).unwrap_or(40)

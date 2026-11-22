@@ -360,7 +360,7 @@ fn purge_of_the_target_leaves_the_queued_proposal_whole() {
         "the purge of the target changed the queued proposal's history"
     );
     let queued: Vec<String> = cell
-        .debug_column("SELECT note_id FROM proposals WHERE state = 'queued'")
+        .debug_column("SELECT note_id FROM proposals WHERE state IN ('pending', 'reverted')")
         .unwrap_or_default();
     assert!(
         queued.contains(&pid.to_string()),
@@ -470,7 +470,7 @@ fn a_shared_cell_refuses_an_arrival_under_the_cut() {
         .find(|o| o.kind == OpKind::PutNote)
         .unwrap(/* t */);
     let stale = make_op(OpParts {
-        op_id: Ulid::from_string(&format!("01{}{:010}", "0".repeat(10), 42)).unwrap(/* t */),
+        op_id: Ulid::from_string(&format!("01{}{:010}", "0".repeat(14), 42)).unwrap(/* t */),
         hlc: engramma_core::hlc::Hlc {
             physical_ms: common::K, // below the put's K+1
             counter: 0,

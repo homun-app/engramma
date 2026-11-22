@@ -26,6 +26,42 @@ use super::ops::{self, Op, OpKind, Scope};
 /// compacted). Below the cut the payloads are gone — the state there is
 /// frozen and stable (P1.6 will make it the frontier), so materialization
 /// only ever replays ABOVE it, starting from the state the cut left.
+
+/// A held half — purge-dominated, or beaten by a lapide — still consumes
+/// its version slot: the row's number is the note's history, and the
+/// numbering must not drift with the set (the write bumped the counter
+/// where it first applied; a `restore` above may name that number).
+fn consume_version_slot(
+    tx: &rusqlite::Transaction<'_>,
+    id: &Ulid,
+) -> Result<(), CellError> {
+    tx.execute(
+        "UPDATE notes SET version = version + 1 WHERE id = ?1",
+        [id.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Did this object already hold operations at or below the cut — was it
+/// BORN before the freeze? A note whose whole life sits above the cut
+/// did not exist at the cut: there is no state to anchor on, and the
+/// replay starts from zero (v0.6.12, L1; anchoring on a mid-life
+/// photograph made the version counter run away at every
+/// rematerialization).
+fn note_exists_at(
+    tx: &rusqlite::Transaction<'_>,
+    object: &str,
+    cut: i64,
+) -> Result<bool, CellError> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM ops o
+         JOIN op_objects oo ON oo.op_id = o.op_id
+         WHERE oo.object = ?1 AND o.seq <= ?2",
+        rusqlite::params![object, cut],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
 fn cut_seq(tx: &rusqlite::Transaction<'_>) -> Result<i64, CellError> {
     let cut: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
         r.get(0)
@@ -254,7 +290,21 @@ pub(crate) fn arrive(tx: &rusqlite::Transaction<'_>, op: &Op) -> Result<(), Cell
                     && is_body_write(op, &nid)
                 {
                     match tombstone_rule(tx, op, &nid)? {
-                        TombstoneOutcome::Wins => continue,
+                        TombstoneOutcome::Wins => {
+                            // v0.6.12 (L1): a write the lapide holds still
+                            // records its photograph and consumes its
+                            // version slot — the writer's copy applied and
+                            // bumped it, and the numbering must not drift
+                            // between copies
+                            if ops::records_a_version(op.kind)
+                                && !note_purged_in_set(tx, &nid)?
+                                && let Some(row) = ops::read_note_row(tx, &nid)?
+                            {
+                                ops::snapshot(tx, &nid, row.version, &op.op_id)?;
+                                consume_version_slot(tx, &nid)?;
+                            }
+                            continue;
+                        }
                         TombstoneOutcome::Reopens => ops::reopen_tombstone(tx, &nid)?,
                         TombstoneOutcome::NoTombstone => {}
                     }
@@ -355,6 +405,22 @@ fn apply_half(
     // without everything that names the purged id, which the apply
     // guards take away.
     if dominated {
+        // v0.6.12 (L1): a dominated half still records the photograph of
+        // the pre-state it observes — the version row is the note's OWN
+        // history, and the copy that receives the write after the purge
+        // must hold the same row the writer's earlier application
+        // recorded (the set, not the arrival order, decides the rows).
+        // The kinds that never photographed anything record nothing here
+        // either; a purged note has no row left to photograph.
+        if ops::records_a_version(op.kind)
+            && let Some(nid) = object.strip_prefix("note:")
+            && let Ok(nid) = Ulid::from_string(nid)
+            && !note_purged_in_set(tx, &nid)?
+            && let Some(row) = ops::read_note_row(tx, &nid)?
+        {
+            ops::snapshot(tx, &nid, row.version, &op.op_id)?;
+            consume_version_slot(tx, &nid)?;
+        }
         return Ok(());
     }
     let Some(id) = object.strip_prefix("note:") else {
@@ -439,69 +505,89 @@ fn materialize_note(
         .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
         .optional()?;
     // --- the state of the note at the cut. The cut froze what the ≤-cut
-    // operations produced (their payloads are gone; they cannot replay), so
-    // the anchor is the FIRST above-cut arrival whose `base` points BELOW
-    // the cut: its author had applied everything at or below the cut — the
-    // frontier's own promise — so its pre-state snapshot IS the state at the
-    // cut. No such anchor (the note was born above the cut): replay from
-    // zero. Pending arrivals above the cut never anchor: their bases point
-    // above it, whatever order they landed in.
-    let cut_state: Option<(crate::format::Note, i64)> = {
-        let mut anchor: Option<(String, i64)> = None;
+    // operations produced (their payloads are gone; they cannot replay),
+    // so the anchor is the FIRST above-cut operation in TOTAL order that
+    // photographed this note (v0.6.12, L1). Whatever applied that
+    // operation — the arrival fast path or a later materialization's
+    // replay — the photograph was taken at the note's state with every
+    // operation sorting before it applied; the first one above the cut in
+    // total order has exactly the ≤-cut set before it, so its row IS the
+    // state at the cut. The v0.6.8–v0.6.11 rule (the first arrival whose
+    // `base` points below the cut) read the author's promise where the
+    // photograph's content is what matters, and missed the halves whose
+    // base belongs to the OTHER note — a decide closing a target: its
+    // base leans on the proposal, and the target, left without an
+    // anchor, DIED in the replay instead of reopening. A note born above
+    // the cut (no operations at or below it) photographs nothing at its
+    // birth and anchors nothing: replay from zero. With no cut there is
+    // no prefix at all and everything replays from zero. The anchor row
+    // is frozen with the prefix (rule 4): this function READS it, and
+    // the write-back below puts back byte for byte what it read — the
+    // anchor cannot age with the cut again (H2's second layer).
+    let mut anchor_row: Option<(String, i64, String, String)> = None;
+    let cut_state: Option<(crate::format::Note, i64)> = if cut > 0
+        && note_exists_at(tx, object, cut)?
+    {
         let mut stmt = tx.prepare(
-            "SELECT o.op_id, o.base FROM ops o
+            "SELECT o.op_id FROM ops o
              JOIN op_objects oo ON oo.op_id = o.op_id
              WHERE oo.object = ?1 AND o.seq > ?2
-             ORDER BY o.seq ASC",
+             ORDER BY o.hlc ASC, o.op_id ASC",
         )?;
-        let rows: Vec<(String, Option<String>)> = stmt
-            .query_map(rusqlite::params![object, cut], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?
+        let op_ids: Vec<String> = stmt
+            .query_map(rusqlite::params![object, cut], |r| r.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
-        for (op_id, base) in rows {
-            let Some(base) = base else { continue };
-            let base_seq: Option<i64> = tx
-                .query_row("SELECT seq FROM ops WHERE content_hash = ?1", [base], |r| {
-                    r.get(0)
-                })
+        let mut anchor: Option<(String, i64, String)> = None;
+        for op_id in op_ids {
+            let snap: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT snapshot_json, version FROM note_versions
+                     WHERE op_id = ?1 AND note_id = ?2",
+                    rusqlite::params![op_id, id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
                 .optional()?;
-            if base_seq.is_some_and(|s| s <= cut) {
-                // v0.6.11 (K2's oracle): the snapshot is THIS note's — a
-                // two-object operation snapshots BOTH its notes under the
-                // same op_id (a supersede photographs the old side and,
-                // when it existed, the new one; a decide photographs the
-                // proposal and the target it closed), and without the
-                // note_id filter SQLite handed back whichever row it
-                // liked: the anchor then RESTORED THE OTHER NOTE — a
-                // UNIQUE notes.id when its row was already there, and a
-                // wrong anchor under it (the open defect's VersionNotFound
-                // is the same wrong row read the other way)
-                let snap: Option<(String, i64)> = tx
-                    .query_row(
-                        "SELECT snapshot_json, version FROM note_versions
-                         WHERE op_id = ?1 AND note_id = ?2",
-                        rusqlite::params![op_id, id.to_string()],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()?;
-                anchor = snap;
+            if let Some((json, version)) = snap {
+                anchor = Some((op_id, version, json));
                 break;
             }
         }
         match anchor {
             None => None,
-            Some((json, version)) => {
+            Some((op_id, version, json)) => {
                 let note = crate::format::Note::from_json(
                     &serde_json::from_str::<serde_json::Value>(&json)
                         .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?,
                 )
                 .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?;
+                anchor_row = Some((id.to_string(), version, op_id, json));
                 Some((note, version))
             }
         }
+    } else {
+        None
     };
+
+    // v0.6.12 (L1): the LIVE ROW before the delete step. When the note
+    // existed at the cut but NO above-cut operation ever photographed it,
+    // the live row IS the state at the cut — every operation that changes
+    // a note photographs it first, so a note with above-cut operations
+    // and no photograph is a note those operations never touched (a
+    // reject-decide, a held write, a pending one): without this fallback
+    // the replay started from zero and the note DIED instead of keeping
+    // the frozen state (found by the oracle, seed 765420891842479779).
+    let live_row: Option<(crate::format::Note, i64)> = if cut > 0
+        && note_exists_at(tx, object, cut)?
+    {
+        ops::read_note_row(tx, id)?.map(|r| (r.note, r.version))
+    } else {
+        None
+    };
+    // no photograph above the cut: the live row read below IS the state
+    // at the cut (the note existed there, and nothing above the cut ever
+    // changed it — else there would be a photograph)
+    let cut_state = cut_state.or(live_row);
     // --- delete the current state of the note
     if let Some(row) = ops::read_note_row(tx, id)?
         && let Some(idx) = ops::index_for(row.note.status)
@@ -562,11 +648,15 @@ fn materialize_note(
     // had applied
     let mut pending_since: Option<String> = None;
     let mut events: Vec<ReplayEvent> = Vec::new();
+    // v0.6.12 (L1): a PURGED note records nothing — its version rows are
+    // the family the right to be forgotten takes, and no replay of its
+    // own dominated operations may bring them back (the recording below
+    // serves the CO-object's history, never the purged note's)
+    let purged = note_purged_in_set(tx, id)?;
     // v0.6.4: the states the lapide's rollback erases — a lived copy's
     // birth row still wants its loser's state
     let mut erased_states: std::collections::HashMap<String, crate::format::Note> =
         std::collections::HashMap::new();
-    let purged = note_purged_in_set(tx, id)?;
     for op in &all {
         // v0.6.11 (K1): the purge dominates the replay per HALF — this
         // note's half of the operation goes when the note itself is
@@ -587,6 +677,29 @@ fn materialize_note(
         // carry), and so does the revert (its own Purged answer came
         // first).
         if half_dominated_by_purge(tx, op, object)? {
+            // v0.6.12 (L1): a dominated half still records the photograph
+            // of the pre-state it observed. The version row is the note's
+            // OWN history — «mai il contenuto proprio di un'altra nota» —
+            // and a `restore` above the cut may name it (the open defect:
+            // the closing's photograph went with the dominated half, and
+            // the purge failed forever with `VersionNotFound`). Recording
+            // here keeps the row a function of the set: the replay
+            // re-records on every copy what the first application
+            // recorded on the one that saw the write before the purge.
+            // The kinds that never photographed anything (a link, a
+            // propose) record nothing here either; a purged note keeps
+            // nothing at all.
+            if ops::records_a_version(op.kind)
+                && !purged
+                && let Some(row) = ops::read_note_row(tx, id)?
+            {
+                ops::snapshot(tx, id, row.version, &op.op_id)?;
+                // the held half still CONSUMES its version slot: the
+                // photograph keeps the number it had where the write
+                // first applied, and the `restore` that names it finds
+                // the row (the numbering cannot drift with the set)
+                consume_version_slot(tx, id)?;
+            }
             events.push(ReplayEvent {
                 hash: op.content_hash.clone(),
                 body: None,
@@ -626,7 +739,22 @@ fn materialize_note(
         if is_body_write(op, id) {
             match tombstone_rule(tx, op, id)? {
                 TombstoneOutcome::Wins => {
-                    // the tombstone wins: the write is stored, without effect
+                    // the tombstone wins: the write is stored, without
+                    // effect. v0.6.12 (L1): the photograph of the pre-state
+                    // it observed stays anyway — the version row is the
+                    // note's OWN history (the same rule as the dominated
+                    // half below: the lapide suppresses the EFFECT, and a
+                    // `restore` above may name the version the write
+                    // recorded where it first applied)
+                    if !purged
+                        && let Some(row) = ops::read_note_row(tx, id)?
+                    {
+                        ops::snapshot(tx, id, row.version, &op.op_id)?;
+                        // the held write still consumes its version slot
+                        // (the original application bumped it; a
+                        // `restore` above may name that number)
+                        consume_version_slot(tx, id)?;
+                    }
                     events.push(ReplayEvent {
                         hash: op.content_hash.clone(),
 
@@ -819,6 +947,27 @@ fn materialize_note(
          )",
         [],
     )?;
+    // v0.6.12 (L1, rule 4): **the anchor does not age.** The delete step
+    // and the replay above may have taken the anchor row away or
+    // replaced it under another op id (a header-only first writer
+    // re-records the key under its own); what the entry READ is what the
+    // exit writes back, byte for byte. Only the cut ever changes which
+    // row is the anchor, and by induction the row always holds the state
+    // at the cut it was born against — the aging of H2's second layer
+    // (an anchor that «carries the number it reached against the cut of
+    // then») cannot be written anymore. A purged note writes nothing,
+    // its anchor included.
+    if let Some((note_id, version, op_id, json)) = anchor_row
+        && !purged
+    {
+        tx.execute(
+            "INSERT INTO note_versions (note_id, version, op_id, snapshot_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(note_id, version) DO UPDATE SET
+                 op_id = ?3, snapshot_json = ?4",
+            rusqlite::params![note_id, version, op_id, json],
+        )?;
+    }
     restore_hlc_watermark(tx, watermark, None)?;
     Ok(())
 }

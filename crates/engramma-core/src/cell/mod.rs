@@ -1266,6 +1266,59 @@ impl Cell {
             tx.rollback()?;
             return Ok(false);
         }
+        // v0.6.12 (L1, punto 5): in a SHARED cell an arrival that falls
+        // INSIDE the frozen prefix — it sorts, in the total order, below
+        // an operation the cut already swallowed — is not replayed into
+        // the prefix: it is refused with a readable error, and the device
+        // realigns from the compaction snapshot. The stable frontier
+        // makes such an arrival impossible by construction (every live
+        // device confirmed everything at or below the cut, and an HLC
+        // that observed the frontier never goes back below it); one that
+        // arrives anyway is a device left behind — an old backup syncing
+        // again — and the frozen prefix is history, not a cache to
+        // re-derive. An UNSHARED cell keeps ingesting everything: its
+        // cut is its own maintenance, and the tests' fleets speak
+        // through it. A late write ABOVE the frontier (the healthy
+        // offline shape of `shared_verify.rs`) sorts above the cut and
+        // passes untouched.
+        {
+            let cut: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM snapshots",
+                [],
+                |r| r.get(0),
+            )?;
+            if cut > 0 {
+                let shared: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM meta WHERE key = 'sync_shared' AND value = '1'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if shared > 0 {
+                    let inside: Option<i64> = tx
+                        .query_row(
+                            "SELECT 1 FROM ops
+                             WHERE seq <= ?1
+                               AND (hlc > ?2 OR (hlc = ?2 AND op_id > ?3))
+                             LIMIT 1",
+                            rusqlite::params![
+                                cut,
+                                op.hlc.to_string(),
+                                op.op_id.to_string()
+                            ],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if inside.is_some() {
+                        return Err(CellError::Invalid(format!(
+                            "op {}: arriva sotto il taglio di compattazione ({cut}) di una \
+                             cella condivisa: il prefisso congelato non si rigioca — il \
+                             dispositivo si riallinea dall'istantanea",
+                            op.op_id
+                        )));
+                    }
+                }
+            }
+        }
         let expect = ops::content_hash(
             &op.op_id,
             &op.hlc,

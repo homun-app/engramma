@@ -32,3 +32,14 @@ cc 9b7d08aef0158a132bc8746fc24877479b9b293a3b46c598df31f90cb7e23e7d # shrinks to
 cc f04dc648510ff0aecce0b6e97e68d9faa20f196e7f247e741e54743c9591d2ec # shrinks to seed = 13144595116571598162
 cc edfb6b4ed27c75a88f6c33450a274b913606f55536ac6be778d7d2f35b79f714 # shrinks to seed = 15211341523171367412
 cc e752c6f240912db19b6a19ca05e42432570080ef4ee85a9587633e403410f707 # shrinks to seed = 11598969517783651812
+# v0.6.12 (L1): the purge_takes_only_its_family open defect is CLOSED
+# (the frozen prefix is immutable). Its seeds — 17093826732695285589,
+# 10739666680899902993 and the v0.6.11 hunt's 18352432295623270118 —
+# replay deterministically in purge_family_open_defect_seeds_run_clean
+# (props.rs): the failure persistence of this crate cannot write for
+# integration tests (the "failed to find lib.rs" warning every run
+# prints), so the deterministic test is the machine-checked regression
+# and this file stays the registry it has always been.
+cc ef410795fdf7747e46b2335cedc84a9ac86f37638b80cf91cb2494d596da08ca # shrinks to seed = 17938265990268234821
+cc 8c5886c7bae676c0ee07edc4e50b17f0d47ed4bd4622e6fc3280d97186775f7d # shrinks to seed = 765420891842479779
+cc 499c72839955cacfc72fef1e557fe8798702f590b324db7d00d047c9c5ff2269 # shrinks to seed = 8394280236933449584
