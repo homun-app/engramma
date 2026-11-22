@@ -11332,3 +11332,248 @@ nascere.** Quindi:
 La correzione, cioè il prefisso congelato immutabile con la sua sonda sulla
 storia delle versioni, va in una fase sua. Solo dopo quella la
 compattazione si riaccende.
+
+# Fase v0.6.12 — il prefisso congelato è immutabile
+
+Base `main` @ `a8002b3` (tag `fase-v0.6.11`). Correzione del difetto
+aperto `VersionNotFound`, l'oracolo che guarda anche la storia, e le tre
+cartelle `.tmp*` di mezzo $TMPDIR. Ogni build, test e caccia a priorità
+minima (`nice` 19, due job, due fili); i banchi di misura soli, senza
+`nice` e brevi, con `uptime` accanto a ogni corsa.
+
+## L1 — il prefisso congelato non si tocca
+
+### La diagnosi, rifatta da capo
+
+Il difetto dichiarato era: su una cella sola, dopo una compattazione
+normale, `purge(x)` risponde `VersionNotFound` per sempre. La traccia
+del seme `13599421094688720012` (estratto in questa fase dal primo
+fallimento) mostra il meccanismo intero: la purga della nota **nuova**
+di un supersede domina la metà di chiusura della **vecchia** (la
+chiusura era opera della nuova, regola della v0.6.11), la
+rimaterializzazione della vecchia cancellava le righe di versione di
+TUTTE le sue operazioni sopra il taglio — compresa la fotografia della
+chiusura — e il rigioco, con la chiusura dominata, non la riscriveva:
+il `restore` sopra il taglio che la nominava non la trovava più. La
+purga falliva, pulita e permanente.
+
+**E il sospetto della v0.6.11 era fondato**: la sonda della storia
+chieduta dal revisore (due note legate da un supersede, versioni della
+vecchia sotto il taglio, compattazione, purga della nuova) è ROSSA
+sulla base — la purga RIUSCIVA e la storia della vecchia perdeva la
+fotografia della chiusura in silenzio (`01M816ZKZZ`/`01M816ZM00` nella
+traccia della sonda, `frozen_prefix.rs`). La storia di una nota è
+contenuto SUO: anche la perdita silenziosa era la stessa regola rotta.
+
+Un secondo versante dello stesso difetto l'ha scoperto l'oracolo
+esteso: il bersaglio di una `decide` accettata, purgata la proposta,
+non riapriva — **moriva**. L'ancora di quel bersaglio non c'era, perché
+la regola dell'ancora («la prima arrivata con base sotto il taglio»)
+guardava la `base` dell'operazione, e la `base` di una `decide`
+appartiene alla proposta, non al bersaglio.
+
+### La regola, e la correzione
+
+L'istantanea al taglio è un fatto, non una cache (DESIGN § 4.4,
+riscritto in questa fase). In codice:
+
+- **`snapshot` non sostituisce più una riga nata a o sotto il taglio**
+  (`ops.rs`): il vecchio `INSERT OR REPLACE` diventa condizionale. Il
+  prefisso non si cancella e non si riscrive;
+- **una metà dominata dalla purga — e una scrittura battuta dalla
+  lapide — fotografa comunque il pre-stato che osserva e consuma il
+  suo slot di versione** (il contatore avanza senza effetto: la
+  numeratura non deriva con l'insieme, e il `restore` che nomina quel
+  numero lo trova). Una nota purgata non scrive nulla, nemmeno
+  l'ancora: la famiglia va con la purga (trovato dalla proprietà
+  dell'oblio, seme `16501804552761059444`: la riga rinasceva dopo lo
+  `purge_state` e il testo purgato sopravviveva nel file);
+- **l'ancora è la prima operazione sopra il taglio, nell'ordine
+  totale, che ha fotografato la nota** — qualsiasi operazione che
+  cambia una nota la fotografa prima, quindi la prima fotografia sopra
+  il taglio È lo stato al taglio. Nota nata sopra il taglio: nessuna
+  àncora, si rigioca da zero (un'àncora sul mità-vita faceva scappare
+  il contatore, trovato dalla sonda in questa fase). Nota che era al
+  taglio senza fotografie sopra di lui: la riga viva È lo stato al
+  taglio (nulla l'ha toccata, altrimenti ci sarebbe la fotografia —
+  seme `765420891842479779`, il bersaglio della decide rifiutata che
+  moriva);
+- **l'ancora non invecchia**: la rimaterializzazione la LEGGE e la
+  riporta byte per byte all'uscita. Con il taglio chiuso e la
+  fotografia sotto il taglio intoccabile, non c'è più niente da
+  riscrivere: la via del «rinfresco» della v0.6.8 leggeva un'àncora
+  già sbagliata e si alimentava da sé; questa regola chiude il cerchio
+  per induzione;
+- **la cella condivisa rifiuta l'arrivo che cada dentro il prefisso**
+  (sotto la testa d'ordine totale che il taglio ha inghiottito):
+  errore leggibile, il dispositivo si riallinea dall'istantanea. Il
+  codice di ieri non lo faceva (l'arrivo rigiocava dentro il prefisso):
+  era parte di L1, punto 5. La cella non condivisa e la forma sana del
+  ritardo offline (`shared_verify.rs`) passano intatte.
+
+### Il punto 5, l'esperimento dei semi di H2
+
+I due semi dichiarati della «secondo strato»
+(`compaction_keeps_verify_and_state`, `11476711120049502961` e
+`10840318560449401940`) sono **verdi già sulla base v0.6.11** (la K2 di
+quella fase — l'ancora legge la fotografia della nota GIUSTA — aveva
+chiuso la manifestazione che portavano; verificato con i semi fissati
+sulla base, in questa fase). Con le regole nuove restano verdi e
+diventano casi fissi del test deterministico
+`compaction_h2_second_layer_seeds_stay_green` (props.rs): se uno dei
+due torna rosso, la riga di H2 torna in `open-defects.txt`. La riga è
+stata tolta: il meccanismo dell'invecchiamento (l'ancora riscritta
+dalle rimaterializzazioni contro tagli via via più alti) con la regola
+4 è morto per costruzione, e la strada d'ingresso che restava (l'arrivo
+sotto il taglio in una cella condivisa) è rifiutata dal punto 5.
+
+### L'ALPN
+
+Le regole 6 e 7 derivano stati diversi dallo stesso insieme (righe di
+versione, numeratura, rifiuti d'arrivo): **`engramma/sync/7` e
+`engramma/mailbox/7`**, con il test `PEER_OUTDATED` fra le due versioni
+(`protocol_version.rs`, il rosso scritto prima delle costanti).
+
+## L2 — l'oracolo guarda anche la storia, e il prefisso ha la sua proprietà
+
+- `purge_takes_only_its_family` fotografa ora anche la **storia delle
+  versioni** di ogni nota viva fuori dalla famiglia (numeri, op e
+  corpi). Nessuna eccezione nuova: le riaperture tornano a stati che la
+  nota aveva, e le fotografie che il replay della purga ri-registra
+  erano già lì. I tre semi del difetto chiuso girano verdi col giudizio
+  nuovo (`purge_family_open_defect_seeds_run_clean`).
+- **`frozen_prefix_is_immutable`**, la proprietà 28ª dell'inventario:
+  dopo una compattazione (taglio `head − 0/1/2`), la fotografia del
+  prefisso (righe nate a o sotto il taglio + il CONTENUTO di ogni
+  ancóra: nota, numero, corpo) non perde e non cambia righe per
+  qualunque operazione che non sia compattazione o purga; un'ancóra
+  NUOVA può nascere (la prima fotografia sopra il taglio di una nota
+  che non l'aveva: un fatto). Per la purga: dal prefisso vanno solo
+  righe della famiglia e delle RIAPERTURE dichiarate (le fotografie
+  delle riaperte riderivano con la loro linea, come lo stato vivo:
+  seme `14121678188957148601`, trovato dalla proprietà stessa). Forma a
+  due dispositivi: entrambi compattano alla frontiera stabile (lo
+  stesso insieme congelato) e il giudizio è del ricevente.
+- **I denti**: la cancellazione di oggi (TUTTE le righe di versione
+  della nota) rimessa su un ramo di prova fa cadere la proprietà al
+  primo caso (seme `12788958809961974104`) e con lei la sonda della
+  storia. Ramo buttato.
+- **Il cancello dei semi era vacuo dalla v0.6.9**: `test_sources`
+  raccoglieva solo i sorgenti `.rs`, e il filtro sui file
+  `.proptest-regressions` non matchava mai. Corretto (collezionati
+  anche quelli); scoperto muovendo i semi di questa fase, perché il
+  seme del difetto dichiarato c'era finito dentro da una corsa di debug
+  e il cancello taceva.
+
+## L3 — le tre `.tmp*` senza diagnosi
+
+**La diagnosi**: le tre cartelle del 21 novembre, ore 10:33 (le 10:15
+dell'ultimo commit prima, `ec9896e`; l'amend del commit di prestazione
+dopo), contenevano `a.sqlite`, `b.sqlite` e `c.sqlite` — le celle di
+`purge_with_conflict_copies_leaves_no_roots` (a/b, attori `prop:user` e
+`prop:bot`) e di `replay_equals_state` (c, il mix completo del
+generatore). Sono i test in corsa su due fili quando il processo è
+morto: **un processo UCCISO** (SIGINT: un Ctrl-C su una corsa lunga)
+non fa unwind e le `Drop` delle `TempDir` non girano. Riprodotto in
+questa fase: un kill a metà corsa lascia le cartelle dei test in volo,
+stessa forma esatta (una senza WAL, una con WAL a zero, una con WAL
+pieno — come le originali); un test che FAILISCE non lascia niente (il
+panic fa l'unwind; provato sul ramo di prova con la proprietà
+dell'oblio fatta fallire: zero cartelle nuove).
+
+**Il buco corretto**: ogni cartella di test della suite ora si chiama
+`engramma-test-*` (`common::test_dir()`, e la stessa funzione locale
+nei file senza il modulo common), e `sweep_stale_test_dirs()` raccoglie
+le NOSTRE più vecchie di sei ore alla corsa successiva — mai le altrui,
+mai le fresche. Il test `stale_test_dirs_are_swept_and_foreign_ones_
+untouched` lo prova: la vecchia nostra va, la fresca nostra resta, la
+`.tmp*` altrui (anche vecchia) non si tocca. Le tre originali sono
+state tolte dopo questa diagnosi, e solo loro.
+
+## I test
+
+- **Rossi prima, verdi dopo**: la sonda della storia, il caso
+  chirurgico del `VersionNotFound` (con il taglio e il `restore` che
+  nomina la fotografia della chiusura), le quattro famiglie di
+  operazioni a due oggetti («compatta, poi purga l'uno»), il rifiuto
+  dell'arrivo sotto il taglio, l'ALPN 7 — tutto in `frozen_prefix.rs`
+  (8/8 verdi) e `protocol_version.rs`; i semi del difetto in
+  `purge_family_open_defect_seeds_run_clean`. Due dei test a due
+  oggetti (purga della vecchia, purga di un estremo) erano già verdi
+  sulla base e restano come guardie.
+- **Il contratto JS**: 63/63 su `node:test` e `test:electron` (i 62 di
+  ieri intatti, il nuovo: `compact()` e poi `purge()` di una nota legata
+  da supersede — la purga riesce, la vecchia riapre, la sua storia è
+  identica).
+- **Le celle d'oro**: `golden_cell.rs` verde (nessun cambio di schema
+  in questa fase: nessuna migrazione, nessuna cella nuova).
+- **La caccia**: (in corsa sul commit finale — tabella sotto).
+
+## Le misure
+
+Coppie alternate (base = worktree sul tag, fase = worktree sul commit
+finale), banco da 10 000 note, le corse senza `nice`, `uptime` accanto
+a ogni corsa. Il carico dell'utente al lavoro: **3,3–5,3** per tutta la
+durata — i numeri vanno letti così. Le sonde (copiate uguali nei
+worktree, fuori dal repo): corpus proprio di 10 000 note.
+
+- **Inserimento** (note/s, media dei due corpus, banco intero, mediana
+  di 2 giri per coppia):
+
+  | coppia | base (v0.6.3) | fase | delta |
+  |---|---|---|---|
+  | 1 | 2589 / 2591 → 2590,0 | 2491 / 2470 → 2480,5 | −4,2% |
+  | 2 | 2563 / 2622 → 2592,5 | 2477 / 2472 → 2474,5 | −4,6% |
+
+  **Media: base 2591,25, fase 2477,5 → −4,4%**, dentro il +5%. Il
+  prezzo in scrittura è la guardia della fotografia (il `NOT EXISTS`
+  del prefisso, una sonda in più per body write quando c'è un taglio).
+- **Ricerca** (ms, banco intero): p50 1,4 → 1,5 (+0,1 ms: al bordo
+  della risoluzione della misura); p95 2,25 → 2,35 (**+4,4%**, dentro
+  il +5%); testo+grafo p50 1,3/1,4 → 1,4, p95 2,15 → 2,2 (+2,3%).
+- **La sonda della purga** (10 000 note, compattazione con istantanea,
+  una purga): coppia 1: base 224,5 → fase 205,0 ms; coppia 2: base
+  181,1 → fase 206,3 ms. **Media 202,8 → 205,65 ms: +1,4%**, dentro il
+  +10%. (La COLONNA purga del banco intero, col VACUUM sul file scritto
+  da un inserimento più lento: 322,8 → 389,0 ms, +20,5% — lo stesso
+  fenomeno dichiarato dalla v0.6.11, da tenere d'occhio alla release.)
+- **`verify` su 10 000 note, contro `fase-v0.6.9`** (la sonda: UNA
+  verify dal taglio, marcatori): quattro coppie — base 141,7 / 142,8 /
+  143,8 / 145,0, fase 186,0 / 149,4 / 142,1 / 152,3. **Mediana: base
+  143,3 → fase 150,9, +5,3%**, dentro il +10% (la prima corsa fase a
+  186,0 ms è l'avvio a freddo della sonda nel worktree; le successive
+  149,4/142,1/152,3).
+- **NUOVA — `compact()` su 10 000 note col taglio a `head − 100`,
+  contro `fase-v0.6.11`**: coppia 1: base 123,5 → fase 121,8 ms;
+  coppia 2: base 122,6 → fase 126,7 ms. **Media 123,05 → 124,25 ms:
+  +1,0%**, dentro il +15% — e la misura dice una cosa che il progetto
+  voleva sapere: l'àncora del taglio nuovo non si CALCOLA alla
+  compattazione (esiste già: la prima fotografia sopra il taglio,
+  scritta quando la nota è cambiata); la compattazione non paga
+  niente per il prefisso congelato.
+
+## La caccia
+
+TABHELLA_CACCIA
+
+## Difetti nuovi trovati in questa fase
+
+1. **Una `decide` che rigioca durante una rimaterializzazione trova la
+   nota senza la sua riga di coda** («is not a proposal»),
+   `purge_takes_only_its_family`, seme `8394280236933449584`:
+   riprodotto IDENTICO sulla base v0.6.11 — pre-esistente, scoperto
+   dall'oracolo quando il `VersionNotFound` ha smesso di fermare le
+   purghe prima di arrivare lì. Dichiarato aperto in
+   `open-defects.txt`.
+2. **Il cancello dei semi dei difetti aperti era vacuo dalla v0.6.9**
+   (vedi L2): corretto in questa fase.
+3. La perdita silenziosa della storia sospettata dalla v0.6.11:
+   confermata VERA (era il difetto di L1) e chiusa.
+
+## La release locale, con la compattazione accesa
+
+PRONTA_STATO
+
+## La pulizia
+
+PULIZIA

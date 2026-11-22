@@ -99,10 +99,17 @@ Un estraneo che si finge un dispositivo: la connessione si chiude **prima di qua
 
 **Quello che il dispositivo aveva già lo tiene**: la revoca non cancella i dischi altrui. Le sei cifre e il biglietto monouso sono le difese dell'**abbinamento**; la rotazione è la difesa del **dopo**.
 
-## La versione delle regole (v0.6.5; la 4 in v0.6.7; la 5 in v0.6.10; la 6 in v0.6.11)
+## La versione delle regole (v0.6.5; la 4 in v0.6.7; la 5 in v0.6.10; la 6 in v0.6.11; la 7 in v0.6.12)
 
 L'ALPN **è** la versione delle regole di materializzazione:
-`engramma/sync/6` (e `engramma/mailbox/6` per la casella postale). Un
+`engramma/sync/7` (e `engramma/mailbox/7` per la casella postale).
+La v0.6.12 porta la `7`: **il prefisso congelato è immutabile** — le
+righe di versione nate a o sotto il taglio di compattazione non si
+toccano, le metà dominate dalla purga (e le scritture battute dalla
+lapide) fotografano il pre-stato e consumano il loro slot di versione,
+l'ancora della rimaterializzazione è la prima fotografia sopra il
+taglio nell'ordine totale e non invecchia mai, e una cella condivisa
+rifiuta con un errore leggibile l'arrivo che cada dentro il prefisso. Un
 dispositivo con regole diverse, davanti allo stesso insieme di
 operazioni, deriva stati diversi — quindi non devono scambiare
 nemmeno un'operazione. Il rifiuto avviene all'handshake: chi chiama

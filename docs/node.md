@@ -435,6 +435,31 @@ Notevoli:
   `pretest` di `npm test` e `test:electron` costruisce la CLI: il caso
   normale è sempre fresco.
 
+## La compattazione torna sicura (v0.6.12)
+
+La verifica della v0.6.11 lasciava la release locale a una condizione:
+**con la compattazione spenta**, perché «dimentica per sempre» poteva
+fallire per sempre su una nota il cui co-oggetto si rimaterializzava
+attraverso un taglio (`VersionNotFound`, pulito ma permanente). La
+v0.6.12 chiude quel difetto alla radice: **il prefisso congelato è
+immutabile** — ciò che è nato a o sotto il taglio (le righe di versione,
+l'ancora della rimaterializzazione, lo stato al taglio) non si cancella
+e non si riscrive mai, una metà dominata dalla purga fotografa comunque
+il pre-stato che ha osservato, e l'ancora non invecchia.
+
+Per Homun: **`compact(keepLast)` può stare acceso.** `keepLast` è
+quante operazioni restano vive sopra il taglio (il CLI e il binding
+tagliano a `head − keepLast`): la manutenzione di una memoria che
+cresce, non una funzione dell'utente. Il contratto lo dice nel test
+nuovo — `compact()` e poi `purge()` di una nota legata da una
+sostituzione: la purga riesce, la vecchia riapre col suo corpo, e la
+sua storia delle versioni resta identica (63/63, con i 62 di ieri
+intatti). Il difetto di sync che restava aperto (l'ancora che
+invecchia, H2 secondo strato) è chiuso anche lui: i suoi semi girano
+come casi fissi, e la cella condivisa rifiuta con un errore leggibile
+un arrivo che cada dentro il prefisso (il dispositivo si riallinea
+dall'istantanea).
+
 ## Cosa riapre la purga, e come dirlo prima (v0.6.11, K1)
 
 - **La regola: il contenuto proprio resta, i riferimenti vanno.** Una
