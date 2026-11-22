@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.4 (P0.1): the CLI's purge and the view's identity. A view nobody can

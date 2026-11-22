@@ -1210,10 +1210,7 @@ pub(crate) fn snapshot(
 /// photograph — the queue row, the registry rows, the `supersedes` rows
 /// of the new side. Read as JSON so the writer (`snapshot_object`) and
 /// the reader (`materialize_note`'s restore step) share one shape.
-pub(crate) fn derived_anchor_json(
-    tx: &Transaction<'_>,
-    id: &Ulid,
-) -> Result<String, CellError> {
+pub(crate) fn derived_anchor_json(tx: &Transaction<'_>, id: &Ulid) -> Result<String, CellError> {
     let mut anchor = serde_json::Map::new();
     let proposal: Option<String> = tx
         .query_row(
@@ -1228,7 +1225,10 @@ pub(crate) fn derived_anchor_json(
             |r| r.get(0),
         )
         .optional()?;
-    anchor.insert("proposals".into(), proposal.map_or(Value::Null, Value::String));
+    anchor.insert(
+        "proposals".into(),
+        proposal.map_or(Value::Null, Value::String),
+    );
     let mut stmt = tx.prepare(
         "SELECT json_array(op_id, proposal, decision, actor, decided_at, reason,
                            review_json, reverted_by)
@@ -1276,11 +1276,7 @@ pub(crate) fn derived_anchor_json(
 /// INSERT OR REPLACE is enough: the reader walks the ops in TOTAL order
 /// and takes the FIRST, so a later photograph under a later operation
 /// never hides an earlier one).
-fn snapshot_object(
-    tx: &Transaction<'_>,
-    id: &Ulid,
-    op_id: &Ulid,
-) -> Result<(), CellError> {
+fn snapshot_object(tx: &Transaction<'_>, id: &Ulid, op_id: &Ulid) -> Result<(), CellError> {
     let json = derived_anchor_json(tx, id)?;
     tx.execute(
         "INSERT INTO object_anchors (note_id, op_id, anchor_json)
@@ -2529,8 +2525,7 @@ pub(crate) fn purge_state(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellErr
     // take — read BEFORE the delete, so the reopenings below know who
     // the note closed
     let purged_old_sides: Vec<String> = if v0613_tables == 2 {
-        let mut stmt =
-            tx.prepare("SELECT DISTINCT old_id FROM supersedes WHERE new_id = ?1")?;
+        let mut stmt = tx.prepare("SELECT DISTINCT old_id FROM supersedes WHERE new_id = ?1")?;
         let sides: Vec<String> = stmt
             .query_map([&id_str], |r| r.get::<_, String>(0))?
             .flatten()
@@ -2610,7 +2605,10 @@ pub(crate) fn purge_state(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellErr
             )
             .unwrap_or_else(|_| before.to_json());
             if let Value::Object(map) = &mut header {
-                map.insert("status".into(), Value::String(before.status.as_str().into()));
+                map.insert(
+                    "status".into(),
+                    Value::String(before.status.as_str().into()),
+                );
                 let valid_to = before
                     .valid_to
                     .as_ref()

@@ -18,12 +18,12 @@ mod common;
 
 use common::{cell_with, shared_init};
 use engramma_core::cell::proposals::{
-    DecisionAction, DecisionInput, ProposeContext, ProposalInput, ProposalMode, RevertOutcome,
+    DecisionAction, DecisionInput, ProposalInput, ProposalMode, ProposeContext, RevertOutcome,
 };
 use engramma_core::format::{Note, NoteType};
 use engramma_core::{Cell, CellError, Confidence, Status};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use ulid::Ulid;
 
 use common::K;
@@ -283,7 +283,9 @@ fn a_rejection_above_the_cut_replays_over_the_whole_anchor() {
          produce senza taglio"
     );
     assert!(
-        with_cut.iter().any(|r| r.starts_with("q ") && r.contains(" rejected ")),
+        with_cut
+            .iter()
+            .any(|r| r.starts_with("q ") && r.contains(" rejected ")),
         "la coda del rifiuto c'è: {with_cut:?}"
     );
 }
@@ -358,10 +360,7 @@ fn a_supersede_below_the_cut_survives_the_reconstruction_and_reopens() {
         .iter()
         .find(|r| r.starts_with("n 01000000000000000000000001 "))
         .unwrap(/* la riga di A c'è */);
-    assert!(
-        a.contains(" active "),
-        "la purga di N riapre A: {a:?}"
-    );
+    assert!(a.contains(" active "), "la purga di N riapre A: {a:?}");
 }
 
 /// La forma «nata sotto il taglio, modificata sopra, poi ricostruita»
@@ -611,7 +610,11 @@ fn the_v23_migration_rebuilds_the_anchor_of_a_checkpoint_cell() {
             "SELECT anchor_json FROM object_anchors WHERE note_id = '{pid}'"
         ))
         .unwrap(/* t */);
-    assert_eq!(anchors.len(), 1, "la migrazione ha scritto un'ancora: {anchors:?}");
+    assert_eq!(
+        anchors.len(),
+        1,
+        "la migrazione ha scritto un'ancora: {anchors:?}"
+    );
     assert!(
         anchors[0].contains("accepted"),
         "l'ancora fotografa lo stato AL TAGLIO (la decisione accettata), non il vivo: {}",

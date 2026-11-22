@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! The service and the blind node over the REAL CLI (v0.6.1, P3–P5):

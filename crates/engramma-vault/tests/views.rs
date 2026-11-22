@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.4 (P0.1): a view has an IDENTITY, not a path. `vault init` writes a

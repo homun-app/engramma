@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! S1 (v0.6.2): the sync service in the LIBRARY. The same roads the CLI

@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! The end-to-end sync over iroh, on loopback (v0.6.1, P1): two devices,

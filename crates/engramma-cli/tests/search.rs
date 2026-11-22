@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! CLI plumbing for the v0.2.1 search additions: `--strict` and the

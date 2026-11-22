@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.6.5 (E5): `engramma conflicts show <cella> <copia>` — the read of

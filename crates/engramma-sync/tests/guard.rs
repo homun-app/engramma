@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! K1 (v0.6.1-ciclo): the write guard's DECISIONS. The cheap poll stays

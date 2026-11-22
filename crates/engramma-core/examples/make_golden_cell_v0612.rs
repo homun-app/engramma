@@ -22,7 +22,7 @@
 //! in files under `tests/golden/` are the artifact.
 
 use engramma_core::cell::proposals::{
-    DecisionAction, DecisionInput, ProposeContext, ProposalInput, ProposalMode,
+    DecisionAction, DecisionInput, ProposalInput, ProposalMode, ProposeContext,
 };
 use engramma_core::format::{At, Note, NoteType};
 use engramma_core::hlc::HlcClock;

@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! S1 (v0.6.2): the exclusive root lock, BETWEEN PROCESSES. The CLI's

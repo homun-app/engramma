@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! R3 / P5.2 (v0.6.1): the bootstrap measure, time and bytes on the wire.

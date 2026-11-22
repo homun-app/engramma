@@ -2985,7 +2985,8 @@ mod tests {
     }
 
     fn setup() -> (tempfile::TempDir, Cell) {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("t.sqlite"), "t", "tester")
             .unwrap(/* test-only */);
         // people
@@ -3069,7 +3070,8 @@ mod tests {
     /// German for «Zebedeo» and French for «tonno»; an uncertain question
     /// must not stem on one guess.
     fn short_questions_cell() -> (tempfile::TempDir, Cell) {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("corte.sqlite"), "corte", "t")
             .unwrap(/* test-only */);
         cell.put_note(
@@ -3209,7 +3211,8 @@ mod tests {
     /// English, and the histogram sees the same.
     #[test]
     fn an_english_cell_expands_only_in_english() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("en.sqlite"), "en", "t")
             .unwrap(/* test-only */);
         for (i, body) in [
@@ -3255,7 +3258,8 @@ mod tests {
     /// `max(50, k)` — the default profile (k ≤ 50) is unchanged.
     #[test]
     fn k_beyond_the_candidate_window_is_respected() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("k.sqlite"), "k", "tester")
             .unwrap(/* test-only */);
         const TOTAL: u16 = 120;
@@ -3709,7 +3713,8 @@ mod tests {
         // the LIMIT — the very pass this fix removes), "spesso" in 81% but
         // under the 1000-document floor, "pinco" in 50. The MATCH keeps the
         // terms that discriminate; the dropped term still counts as found.
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("freq.sqlite"), "t", "tester")
             .unwrap(/* test-only */);
         let mut pinco_id = None;
@@ -4083,7 +4088,8 @@ mod semantic_tests {
 
     /// A vault where the answer shares no term with the question.
     fn setup() -> (tempfile::TempDir, Cell) {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("s.sqlite"), "t", "tester")
             .unwrap(/* test-only */);
         // "In che città vive?" -> "Fabio abita a Milano" (Milano starts with M)
@@ -4280,7 +4286,8 @@ mod semantic_tests {
 
     #[test]
     fn two_cells_on_the_same_file_see_each_others_vectors() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let path = dir.path().join("two.sqlite");
         let a = Cell::create(&path, "t", "tester").unwrap(/* test-only */);
         a.put_note(&note(1, "Fabio abita a Milano", "Fabio vive a [[Milano]]."), "t")
@@ -4318,7 +4325,8 @@ mod semantic_tests {
 
     #[test]
     fn blue_green_mid_search_serves_the_old_model_only() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let path = dir.path().join("bg.sqlite");
         let cell = Cell::create(&path, "t", "tester").unwrap(/* test-only */);
         cell.put_note(&note(1, "Fabio abita a Milano", "Fabio vive a [[Milano]]."), "t")
@@ -4394,7 +4402,8 @@ mod semantic_tests {
 
     #[test]
     fn no_ready_model_means_text_only_behaviour() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("n.sqlite"), "t", "tester")
             .unwrap(/* test-only */);
         cell.put_note(&note(1, "Fabio abita a Milano", "Fabio vive a [[Milano]]."), "t")

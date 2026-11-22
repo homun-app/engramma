@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! R2 (v0.6.1, revisore): the relay the documents promise — `--relay <url>`

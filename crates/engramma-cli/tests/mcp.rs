@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration test for `engramma mcp`: spawn the real binary and speak

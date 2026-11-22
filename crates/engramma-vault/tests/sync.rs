@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! The markdown view tests (prompt v0.3, punto 4): every row of the

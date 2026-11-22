@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! R3 (v0.6.1, revisore): no quadratic cost on the wire. The regression

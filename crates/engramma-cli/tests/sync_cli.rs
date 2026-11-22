@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! The pairing over the REAL CLI (v0.6.1, P2): two roots, one invite that

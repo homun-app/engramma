@@ -4865,7 +4865,8 @@ mod tests {
     /// its GC for hours).
     #[test]
     fn retire_closes_the_connection_under_live_clones() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let path = dir.path().join("r.sqlite");
         let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
         for i in 1..=3_u16 {
@@ -4940,7 +4941,8 @@ mod tests {
     }
 
     fn test_cell() -> (tempfile::TempDir, Cell) {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("t.sqlite"), "test", "tester")
             .unwrap(/* test-only */);
         (dir, cell)
@@ -5272,7 +5274,8 @@ mod tests {
         // Two handles on the same file, like the Homun daemon and the CLI:
         // the second one runs with a wall clock one hour ahead. Writes must
         // carry strictly increasing HLCs in `seq` order, whichever wrote.
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let path = dir.path().join("two.sqlite");
         let a = Cell::create(&path, "p", "a").unwrap(/* test-only */);
         let b = Cell::open(&path).unwrap(/* test-only */);
@@ -5404,7 +5407,8 @@ mod tests {
         // changes_since(k) and ends in exactly the same state as a full
         // replay — for random k and the boundaries.
         for seed in 1..=6u64 {
-            let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+            let dir =
+                tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
             let path = dir.path().join(format!("inc-{seed}.sqlite"));
             let cell = Cell::create(&path, "inc", "t").unwrap(/* test-only */);
             replay_mix(&cell, seed, 36);
@@ -5531,7 +5535,8 @@ mod tests {
     /// frozen v1 form (envelope inside the payload, v1 hashes).
     #[test]
     fn migration_v1_to_v2_preserves_state_and_verifies() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let n = note(1, "nota vecchia [[Roma]]");
         // 1. a real (v2) cell with one note — the reference state
         let v2path = dir.path().join("ref.sqlite");
@@ -5649,7 +5654,8 @@ mod tests {
     /// chain verifies, the replay agrees, and the note is unfindable.
     #[test]
     fn purge_forgets_the_note_end_to_end() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let path = dir.path().join("purge.sqlite");
         let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
         let secret = "il codice segreto di Sofia e la parola d'ordine zanzara";
@@ -5710,7 +5716,8 @@ mod tests {
     /// operation — the old note's closing goes with the new note's content.
     #[test]
     fn purge_censors_supersede_payloads_and_rehashes() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let path = dir.path().join("sup.sqlite");
         let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
         let mut old = note(1, "Sofia abitava a [[Roma]]");
@@ -5764,7 +5771,8 @@ mod tests {
     /// v0.3.2 (P0.1): the default compaction is a checkpoint without a file.
     #[test]
     fn compact_then_write_then_verify() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let path = dir.path().join("c.sqlite");
         let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
         for i in 1..=5_u16 {
@@ -5810,7 +5818,8 @@ mod tests {
     /// compacted below the cut too, and verify says `ChainOnly`.
     #[test]
     fn checkpoint_compact_compacts_changes_since() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let path = dir.path().join("k.sqlite");
         let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
         for i in 1..=4_u16 {
@@ -5843,7 +5852,8 @@ mod tests {
     /// state digest no longer matches the file).
     #[test]
     fn tampered_snapshot_fails_verify() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let path = dir.path().join("c.sqlite");
         let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
         cell.put_note(&note(1, "da compattare [[Milano]]"), "t")

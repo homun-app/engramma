@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! R4 (v0.6.1, revisore): no envelope is lost in silence. An operation

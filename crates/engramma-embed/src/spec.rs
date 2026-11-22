@@ -267,7 +267,8 @@ mod tests {
 
     #[test]
     fn resolve_rejects_unknown_names() {
-        let tmp = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let tmp =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         assert!(matches!(
             resolve(tmp.path(), "non-esiste"),
             Err(EmbedError::ModelMissing(_))
@@ -280,7 +281,8 @@ mod tests {
 
     #[test]
     fn user_folder_manifest_round_trip() {
-        let tmp = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let tmp =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let dir = tmp.path().join("mymodel").join("rev1");
         std::fs::create_dir_all(&dir).unwrap(/* test-only */);
         let spec = ModelSpec {

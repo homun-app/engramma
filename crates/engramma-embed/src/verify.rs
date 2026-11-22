@@ -149,7 +149,8 @@ mod tests {
 
     #[test]
     fn verify_detects_missing_and_corrupt() {
-        let tmp = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let tmp =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let mut spec = ModelSpec::granite_97m();
         // a tiny stand-in model: the manifest points at a small file
         spec.files = vec![ModelFile {

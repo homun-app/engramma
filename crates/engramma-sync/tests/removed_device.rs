@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! R1 (v0.6.1, revisore): a REMOVED device enters only with the proof. The

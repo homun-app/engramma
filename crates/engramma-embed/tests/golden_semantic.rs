@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! The semantic golden questions (v0.2 §5): paraphrases with no shared root,

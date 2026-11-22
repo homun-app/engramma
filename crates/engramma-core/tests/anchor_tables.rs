@@ -59,10 +59,8 @@ fn every_table_with_a_note_column_is_anchor_or_declared_out() {
         let cols = cell
             .debug_column(&format!("SELECT name FROM pragma_table_info('{table}')"))
             .expect(/* t */ "readable");
-        let speaks_of_a_note = table == "notes"
-            || cols
-                .iter()
-                .any(|c| NOTE_COLUMNS.contains(&c.as_str()));
+        let speaks_of_a_note =
+            table == "notes" || cols.iter().any(|c| NOTE_COLUMNS.contains(&c.as_str()));
         if !speaks_of_a_note {
             continue;
         }

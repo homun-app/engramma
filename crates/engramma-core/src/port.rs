@@ -451,7 +451,8 @@ mod tests {
 
     #[test]
     fn export_then_import_reproduces_state() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("c.sqlite"), "famiglia", "t")
             .unwrap(/* test-only */);
         let fabio = note(
@@ -509,7 +510,8 @@ mod tests {
 
     #[test]
     fn import_closes_superseded_validity_at_the_citing_note() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let src = dir.path().join("vault");
         fs::create_dir_all(&src).unwrap(/* test-only */);
         // an old superseded note left open…
@@ -569,7 +571,8 @@ mod tests {
 
     #[test]
     fn obsidian_import_with_hidden_and_symlinks() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let vault = dir.path().join("vault");
         fs::create_dir_all(vault.join(".obsidian")).unwrap(/* test-only */);
         fs::create_dir_all(vault.join("notes")).unwrap(/* test-only */);
@@ -604,7 +607,8 @@ mod tests {
     /// when a header existed.
     #[test]
     fn obsidian_import_titles_plain_files_by_name() {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let vault = dir.path().join("v");
         std::fs::create_dir_all(&vault).unwrap(/* test-only */);
         std::fs::write(vault.join("Mele rosse.md"), "Mi piacciono.\n")

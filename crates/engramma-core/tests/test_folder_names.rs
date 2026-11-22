@@ -66,12 +66,7 @@ fn no_test_makes_a_folder_without_our_name() {
             continue;
         }
         if src.contains("tempfile::tempdir()") || src.contains("TempDir::new()") {
-            offenders.push(
-                f.strip_prefix(&root)
-                    .unwrap_or(f)
-                    .display()
-                    .to_string(),
-            );
+            offenders.push(f.strip_prefix(&root).unwrap_or(f).display().to_string());
         }
     }
     assert!(

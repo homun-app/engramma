@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.6 (P2): the device identity and the signed device list. One seed on

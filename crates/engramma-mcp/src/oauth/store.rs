@@ -1614,7 +1614,8 @@ mod tests {
     use super::*;
 
     fn store() -> (tempfile::TempDir, OAuthStore) {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let s = OAuthStore::open(&dir.path().join("oauth.db")).unwrap(/* test-only */);
         (dir, s)
     }

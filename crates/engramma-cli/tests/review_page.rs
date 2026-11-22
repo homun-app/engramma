@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.5 (P5): the local review page — every security point with its test,

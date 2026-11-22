@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.4.3 (P0.1): `cell drop` forgets the cell and ITS OWN files — the

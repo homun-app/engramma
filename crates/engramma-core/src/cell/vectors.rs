@@ -566,7 +566,8 @@ mod tests {
     }
 
     fn cell_with_notes() -> (tempfile::TempDir, Cell, Vec<Note>) {
-        let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let dir =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let cell = Cell::create(&dir.path().join("v.sqlite"), "t", "tester")
             .unwrap(/* test-only */);
         let notes: Vec<Note> = (1..=5)
@@ -626,7 +627,8 @@ mod tests {
         a.embed_pending(&e, 100).unwrap(/* test-only */);
         assert!(a.verify().unwrap(/* test-only */).ok());
 
-        let d2 = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+        let d2 =
+            tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let b = Cell::create(&d2.path().join("b.sqlite"), "t", "tester")
             .unwrap(/* test-only */);
         for n in &notes {
@@ -760,7 +762,8 @@ mod tests {
             dim: 8,
         };
         let measure = |max: usize| -> (usize, u64) {
-            let dir = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
+            let dir =
+                tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
             let cell = Cell::create(&dir.path().join("rows.sqlite"), "t", "tester")
                 .unwrap(/* test-only */);
             let notes: Vec<Note> = (1..=300)

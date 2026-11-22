@@ -1347,13 +1347,11 @@ fn correct_anchor_for_dominated_closing(
         return Ok(());
     }
     let seq: Option<i64> = tx
-        .query_row(
-            "SELECT seq FROM ops WHERE op_id = ?1",
-            [&op_id],
-            |r| r.get(0),
-        )
+        .query_row("SELECT seq FROM ops WHERE op_id = ?1", [&op_id], |r| {
+            r.get(0)
+        })
         .optional()?;
-    if !seq.is_some_and(|s| s <= cut) {
+    if seq.is_none_or(|s| s > cut) {
         // a dominated closing ABOVE the cut never applied: the anchor
         // cannot embed it, and the tail will skip it on its own
         return Ok(());

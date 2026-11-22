@@ -962,15 +962,12 @@ fn frozen_prefix_photo(cell: &Cell) -> Vec<String> {
     // v0.6.12 reconstruction deleted them whole, and a row born under
     // the cut never came back)
     photo.extend(
-        cell
-            .debug_column("SELECT 'q ' || note_id FROM proposals ORDER BY note_id")
+        cell.debug_column("SELECT 'q ' || note_id FROM proposals ORDER BY note_id")
             .unwrap_or_default(),
     );
     photo.extend(
-        cell.debug_column(
-            "SELECT 'd ' || op_id || ' ' || proposal FROM decisions ORDER BY op_id",
-        )
-        .unwrap_or_default(),
+        cell.debug_column("SELECT 'd ' || op_id || ' ' || proposal FROM decisions ORDER BY op_id")
+            .unwrap_or_default(),
     );
     photo.extend(
         cell.debug_column(
@@ -2685,9 +2682,7 @@ fn judge_quarantine_invariant(cell: &Cell, ctx: &str) {
         .collect();
     for (id, revert_seq) in cancelled {
         let status: Option<String> = cell
-            .debug_column(&format!(
-                "SELECT status FROM notes WHERE id = '{id}'"
-            ))
+            .debug_column(&format!("SELECT status FROM notes WHERE id = '{id}'"))
             .unwrap_or_default()
             .into_iter()
             .next();
@@ -2732,9 +2727,8 @@ fn quarantine_exits_body(seed: u64) {
         let mut queue: Vec<Ulid> = Vec::new();
         let mut decided: Vec<(Ulid, Ulid)> = Vec::new(); // (proposal, decision op)
         let mut i: u16 = 0;
-        let pick = |pool: &[Ulid], rnd: u64| {
-            pool.get((rnd % pool.len().max(1) as u64) as usize).copied()
-        };
+        let pick =
+            |pool: &[Ulid], rnd: u64| pool.get((rnd % pool.len().max(1) as u64) as usize).copied();
         for _round in 0..36 {
             i += 1;
             match next() % 9 {
@@ -2770,8 +2764,7 @@ fn quarantine_exits_body(seed: u64) {
                         },
                         "mcp:prop",
                         &engramma_core::cell::proposals::ProposeContext::default(),
-                    )
-                        && let Some(pid) = out.id
+                    ) && let Some(pid) = out.id
                     {
                         queue.push(pid);
                     }
@@ -2805,34 +2798,30 @@ fn quarantine_exits_body(seed: u64) {
                 4 => {
                     // the user cancels a decision
                     let idx = (next() % decided.len().max(1) as u64) as usize;
-                    if let Some((pid, op)) = decided.get(idx).copied() {
-                        match cell.revert_decision(&op, "prop", "user@prop") {
-                            Ok(engramma_core::cell::proposals::RevertOutcome::Reverted {
-                                proposal,
-                                ..
-                            }) => {
-                                living.retain(|n| n != &proposal);
-                                queue.push(proposal);
-                                // the supersede target REOPENED: it is a
-                                // living note again, and the purge arm
-                                // must be able to draw it (the shape of
-                                // the v0.6.12 security defect)
-                                let target = cell
-                                    .debug_column(&format!(
-                                        "SELECT COALESCE(target, '') FROM proposals \
-                                         WHERE note_id = '{proposal}'"
-                                    ))
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .next()
-                                    .and_then(|t| Ulid::from_string(&t).ok());
-                                if let Some(t) = target {
-                                    living.push(t);
-                                }
-                            }
-                            _ => {}
+                    if let Some((_pid, op)) = decided.get(idx).copied()
+                        && let Ok(engramma_core::cell::proposals::RevertOutcome::Reverted {
+                            proposal,
+                            ..
+                        }) = cell.revert_decision(&op, "prop", "user@prop")
+                    {
+                        living.retain(|n| n != &proposal);
+                        queue.push(proposal);
+                        // the supersede target REOPENED: it is a
+                        // living note again, and the purge arm must be
+                        // able to draw it (the shape of the v0.6.12
+                        // security defect)
+                        let target = cell
+                            .debug_column(&format!(
+                                "SELECT COALESCE(target, '') FROM proposals \
+                                 WHERE note_id = '{proposal}'"
+                            ))
+                            .unwrap_or_default()
+                            .into_iter()
+                            .next()
+                            .and_then(|t| Ulid::from_string(&t).ok());
+                        if let Some(t) = target {
+                            living.push(t);
                         }
-                        let _ = pid;
                     }
                 }
                 5 => {
@@ -2851,9 +2840,7 @@ fn quarantine_exits_body(seed: u64) {
                     // the state changes, both directions
                     if let Some(id) = pick(&living, next()) {
                         let status = cell
-                            .debug_column(&format!(
-                                "SELECT status FROM notes WHERE id = '{id}'"
-                            ))
+                            .debug_column(&format!("SELECT status FROM notes WHERE id = '{id}'"))
                             .unwrap_or_default()
                             .first()
                             .cloned();
@@ -2894,9 +2881,7 @@ fn quarantine_exits_body(seed: u64) {
                     // a compaction below the head, or a purge
                     if next() % 2 == 0 {
                         let head: i64 = cell
-                            .debug_column(
-                                "SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops",
-                            )
+                            .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
                             .unwrap_or_default()
                             .first()
                             .and_then(|v| v.parse().ok())
@@ -2910,10 +2895,10 @@ fn quarantine_exits_body(seed: u64) {
                                 },
                             );
                         }
-                    } else if let Some(id) = pick(&living, next()) {
-                        if cell.purge(&id, "prop", "prop:user").is_ok() {
-                            living.retain(|n| n != &id);
-                        }
+                    } else if let Some(id) = pick(&living, next())
+                        && cell.purge(&id, "prop", "prop:user").is_ok()
+                    {
+                        living.retain(|n| n != &id);
                     }
                 }
             }
@@ -2948,9 +2933,8 @@ fn quarantine_exits_body(seed: u64) {
         let mut decided: Vec<(Ulid, Ulid)> = Vec::new();
         let mut tick: u64 = 0;
         let mut i: u16 = 0;
-        let pick = |pool: &[Ulid], rnd: u64| {
-            pool.get((rnd % pool.len().max(1) as u64) as usize).copied()
-        };
+        let pick =
+            |pool: &[Ulid], rnd: u64| pool.get((rnd % pool.len().max(1) as u64) as usize).copied();
         for _round in 0..24 {
             i += 1;
             let dev = next() % 2;
@@ -2985,8 +2969,7 @@ fn quarantine_exits_body(seed: u64) {
                         },
                         "mcp:prop",
                         &engramma_core::cell::proposals::ProposeContext::default(),
-                    )
-                        && let Some(pid) = out.id
+                    ) && let Some(pid) = out.id
                     {
                         queue.push(pid);
                     }
@@ -3023,9 +3006,10 @@ fn quarantine_exits_body(seed: u64) {
                     if let Some((_, op)) = decided.get(idx).copied() {
                         tick += 1;
                         wall.store(common::K + tick, Ordering::SeqCst);
-                        if let Ok(
-                            engramma_core::cell::proposals::RevertOutcome::Reverted { proposal, .. },
-                        ) = cell.revert_decision(&op, "prop", "user@prop")
+                        if let Ok(engramma_core::cell::proposals::RevertOutcome::Reverted {
+                            proposal,
+                            ..
+                        }) = cell.revert_decision(&op, "prop", "user@prop")
                         {
                             living.retain(|n| n != &proposal);
                             queue.push(proposal);
@@ -3080,4 +3064,3 @@ fn quarantine_exits_body(seed: u64) {
         assert!(b.verify().unwrap(/* t */).ok(), "verify B");
     }
 }
-

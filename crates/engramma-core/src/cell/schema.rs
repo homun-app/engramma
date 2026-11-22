@@ -25,10 +25,10 @@ pub const ANCHOR_NOTE_TABLES: &[&str] = &[
     "note_versions", // the version photographs — the frozen history (v0.6.12, L1)
     "note_tags",     // a function of the note row (the reindex rebuilds them)
     "edges",         // the DECLARED rows (id LIKE 'd%') — a function of the note row;
-                     // the manual rows are objects of their own (materialize_edge)
-    "supersedes",    // the rows where the note is the NEW side
-    "proposals",     // the queue row
-    "decisions",     // the registry rows of the note's proposals
+    // the manual rows are objects of their own (materialize_edge)
+    "supersedes", // the rows where the note is the NEW side
+    "proposals",  // the queue row
+    "decisions",  // the registry rows of the note's proposals
 ];
 
 /// v0.6.13 (M2): the tables that hold a NOTE COLUMN and are NOT part of
@@ -38,9 +38,18 @@ pub const ANCHOR_NOTE_TABLES: &[&str] = &[
 /// is in neither, so the next new table cannot open the same hole a
 /// third time.
 pub const NON_ANCHOR_NOTE_TABLES: &[(&str, &str)] = &[
-    ("ops", "the log itself — the source the anchor serves, never derived state"),
-    ("op_objects", "the log's object index — ids only, alive under any redaction"),
-    ("op_payloads", "the log's payload store — redacted by the cut, censored by the purge"),
+    (
+        "ops",
+        "the log itself — the source the anchor serves, never derived state",
+    ),
+    (
+        "op_objects",
+        "the log's object index — ids only, alive under any redaction",
+    ),
+    (
+        "op_payloads",
+        "the log's payload store — redacted by the cut, censored by the purge",
+    ),
     (
         "entities",
         "a global derivation over the edges and the titles, re-derived by the \
@@ -530,17 +539,16 @@ fn migrate_rust(tx: &rusqlite::Transaction<'_>, v: i64) -> Result<(), crate::err
 ///   flavor of the last decision), NO anchor is written and the
 ///   reconstruction falls back to the live rows — the declared corner,
 ///   no worse than the engine the cell came from.
+///
 /// On a cell with a snapshot FILE the file itself is the cut state (a
 /// full copy taken at the compaction): its rows are read directly and
 /// the walk is short. The migration is idempotent — an anchor that
 /// already exists stays.
 fn migrate_anchors_v23(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
     use rusqlite::OptionalExtension;
-    let cut: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq), 0) FROM snapshots",
-        [],
-        |r| r.get(0),
-    )?;
+    let cut: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
+        r.get(0)
+    })?;
     if cut == 0 {
         return Ok(()); // no prefix: every reconstruction replays from zero
     }
@@ -622,8 +630,7 @@ fn migrate_anchors_v23(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::erro
                  WHERE oo.object = ?1 AND o.seq > ?2
                  ORDER BY o.hlc ASC, o.op_id ASC",
             )?;
-            let rows = stmt
-                .query_map(rusqlite::params![object, cut], |r| r.get::<_, String>(0))?;
+            let rows = stmt.query_map(rusqlite::params![object, cut], |r| r.get::<_, String>(0))?;
             rows.flatten().collect()
         };
         let mut anchor_op: Option<String> = None;
@@ -645,7 +652,7 @@ fn migrate_anchors_v23(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::erro
         }
         let (Some(anchor_op), Some(anchor_photo)) = (&anchor_op, &anchor_photo) else {
             continue; // no photograph above the cut: the live rows are
-                      // the anchor's fallback, as in v0.6.12
+            // the anchor's fallback, as in v0.6.12
         };
         let have: i64 = tx.query_row(
             "SELECT COUNT(*) FROM object_anchors WHERE note_id = ?1 AND op_id = ?2",
@@ -655,19 +662,17 @@ fn migrate_anchors_v23(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::erro
         if have > 0 {
             continue;
         }
-        let anchor_status: Option<String> = serde_json::from_str::<serde_json::Value>(
-            anchor_photo,
-        )
-        .ok()
-        .and_then(|v| {
-            v.get("status")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        });
+        let anchor_status: Option<String> = serde_json::from_str::<serde_json::Value>(anchor_photo)
+            .ok()
+            .and_then(|v| {
+                v.get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
         let json = match anchor_cut_state(tx, &id, cut, anchor_status, snap_conn.as_ref()) {
             Ok(Some(json)) => json,
             Ok(None) => continue, // the uncertain corner: no anchor, the
-                                  // live rows stand in
+            // live rows stand in
             Err(e) => return Err(e),
         };
         tx.execute(
@@ -765,13 +770,11 @@ fn anchor_cut_state(
              WHERE d.proposal = ?1 AND o.seq <= ?2
              ORDER BY d.op_id",
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![id_s, cut], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-            })?
-            .flatten()
-            .collect();
-        rows
+        stmt.query_map(rusqlite::params![id_s, cut], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .flatten()
+        .collect()
     };
     // the above-cut operations of the note, payloads whole — found
     // through the object index: a supersede whose NEW side is this note
@@ -783,13 +786,11 @@ fn anchor_cut_state(
              LEFT JOIN op_payloads p ON p.op_id = o.op_id
              WHERE o.seq > ?2 AND o.kind IN ('supersede', 'decide', 'revert_decision')",
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![id_s, cut, format!("note:{id_s}")], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?
-            .flatten()
-            .collect();
-        rows
+        stmt.query_map(rusqlite::params![id_s, cut, format!("note:{id_s}")], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .flatten()
+        .collect()
     };
     let above_reverts: Vec<String> = above
         .iter()
@@ -820,11 +821,9 @@ fn anchor_cut_state(
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string)
                     .or_else(|| {
-                        tx.query_row(
-                            "SELECT note_id FROM ops WHERE op_id = ?1",
-                            [op_id],
-                            |r| r.get::<_, String>(0),
-                        )
+                        tx.query_row("SELECT note_id FROM ops WHERE op_id = ?1", [op_id], |r| {
+                            r.get::<_, String>(0)
+                        })
                         .optional()
                         .ok()
                         .flatten()
@@ -892,13 +891,11 @@ fn anchor_cut_state(
              WHERE note_id = ?1 AND kind IN ('decide', 'revert_decision') AND seq <= ?2
              ORDER BY seq",
         )?;
-        let rows = stmt
-            .query_map(rusqlite::params![id_s, cut], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?
-            .flatten()
-            .collect();
-        rows
+        stmt.query_map(rusqlite::params![id_s, cut], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .flatten()
+        .collect()
     };
     let queue: Option<(String, Option<String>)> = if walk.is_empty() {
         // never decided at or below the cut: the row, if any, was born
@@ -973,9 +970,7 @@ fn anchor_cut_state(
     // an anchor that says «no queue row» while the walk found a
     // standing decision cannot be honest — the row the reconstruction
     // would restore disagrees with the note the anchor photographs
-    if live_proposal.is_none()
-        && queue.as_ref().is_some_and(|(_, s)| s.is_some())
-    {
+    if live_proposal.is_none() && queue.as_ref().is_some_and(|(_, s)| s.is_some()) {
         return Ok(None);
     }
     Ok(Some(

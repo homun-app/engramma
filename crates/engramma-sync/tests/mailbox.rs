@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.6 (P6): the blind mailbox. It stores SEALED envelopes by opaque id,

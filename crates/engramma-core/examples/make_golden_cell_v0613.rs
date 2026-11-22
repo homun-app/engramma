@@ -342,7 +342,11 @@ fn main() {
     // below the cut the final compaction takes
     a.set_policy(serde_json::json!({ "write": "propose" }), "homun:user")
         .unwrap(/* g */);
-    let target = note(12, NoteType::Fact, "il colore preferito è il rosso [[Roma]]");
+    let target = note(
+        12,
+        NoteType::Fact,
+        "il colore preferito è il rosso [[Roma]]",
+    );
     let target_id = target.id;
     next(&wa);
     a.put_note(&target, "homun:user").unwrap(/* g */);

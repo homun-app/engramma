@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.5.2: `engramma mcp --http` — the full OAuth 2.1 flow and the MCP

@@ -93,80 +93,80 @@ fn the_golden_cell_opens_verifies_and_holds_its_facts() {
 /// The v0.6.8 golden's own facts (every note it holds, its purges, its
 /// conflict copies, its searches, its vectors, its view).
 fn v068_facts(cell: &Cell) {
-        // the notes of every type are there, id-sorted and whole
-        let ids: Vec<Ulid> = cell.note_ids_all().unwrap(/* t */);
-        for i in 1..=10_u32 {
-            assert!(
-                ids.contains(&nid(i)),
-                "the golden's note {i} is there (v068)"
-            );
-        }
-        // the purge took its note and its family
+    // the notes of every type are there, id-sorted and whole
+    let ids: Vec<Ulid> = cell.note_ids_all().unwrap(/* t */);
+    for i in 1..=10_u32 {
         assert!(
-            !ids.contains(&nid(11)),
-            "the purged note is gone from the golden (v068)"
+            ids.contains(&nid(i)),
+            "the golden's note {i} is there (v068)"
         );
-        match cell.get(&nid(11)) {
-            Err(engramma_core::CellError::NoteNotFound(_)) => {}
-            other => panic!("the purged note answers nothing: {other:?}"),
-        }
+    }
+    // the purge took its note and its family
+    assert!(
+        !ids.contains(&nid(11)),
+        "the purged note is gone from the golden (v068)"
+    );
+    match cell.get(&nid(11)) {
+        Err(engramma_core::CellError::NoteNotFound(_)) => {}
+        other => panic!("the purged note answers nothing: {other:?}"),
+    }
 
-        // the states: a lapide, a superseded pair, a confirmed external
-        assert_eq!(cell.get(&nid(6)).unwrap(/* t */).status, Status::Deleted);
-        assert_eq!(cell.get(&nid(5)).unwrap(/* t */).status, Status::Superseded);
-        assert_eq!(cell.get(&nid(7)).unwrap(/* t */).status, Status::Active);
-        assert_eq!(cell.get(&nid(8)).unwrap(/* t */).status, Status::Active);
+    // the states: a lapide, a superseded pair, a confirmed external
+    assert_eq!(cell.get(&nid(6)).unwrap(/* t */).status, Status::Deleted);
+    assert_eq!(cell.get(&nid(5)).unwrap(/* t */).status, Status::Superseded);
+    assert_eq!(cell.get(&nid(7)).unwrap(/* t */).status, Status::Active);
+    assert_eq!(cell.get(&nid(8)).unwrap(/* t */).status, Status::Active);
 
-        // the open conflict: the winner's body on the note, the loser's
-        // on the copy; the closed one stays closed
-        assert_eq!(
-            cell.get(&nid(9)).unwrap(/* t */).body,
-            "prima riga\nmanopola smeraldo\nterza"
-        );
-        let open: Vec<_> = cell
+    // the open conflict: the winner's body on the note, the loser's
+    // on the copy; the closed one stays closed
+    assert_eq!(
+        cell.get(&nid(9)).unwrap(/* t */).body,
+        "prima riga\nmanopola smeraldo\nterza"
+    );
+    let open: Vec<_> = cell
             .conflicts()
             .unwrap(/* t */)
             .into_iter()
             .filter(|c| c.original_id == nid(9))
             .collect();
-        assert_eq!(open.len(), 1, "one open copy on the fact (v068)");
-        let copy = open[0].copy_id;
-        // the compaction cut took the payloads (conflict's copy_body
-        // answers None under it, as documented) — the copy's own notes
-        // row carries the loser's text
-        assert_eq!(
-            cell.get(&copy).unwrap(/* t */).body,
-            "prima riga\nocchiello turchino verso [[Namorio]]\nterza",
-            "the loser's body lives in its copy (v068)"
-        );
-        assert!(
-            cell.conflicts()
+    assert_eq!(open.len(), 1, "one open copy on the fact (v068)");
+    let copy = open[0].copy_id;
+    // the compaction cut took the payloads (conflict's copy_body
+    // answers None under it, as documented) — the copy's own notes
+    // row carries the loser's text
+    assert_eq!(
+        cell.get(&copy).unwrap(/* t */).body,
+        "prima riga\nocchiello turchino verso [[Namorio]]\nterza",
+        "the loser's body lives in its copy (v068)"
+    );
+    assert!(
+        cell.conflicts()
                 .unwrap(/* t */)
                 .iter()
                 .all(|c| c.original_id != nid(10)),
-            "the resolved conflict stays closed (v068)"
-        );
+        "the resolved conflict stays closed (v068)"
+    );
 
-        // three searches, three answers: the winner, the copy, a person
-        let hits = |q: &str| -> Vec<Ulid> {
-            cell.search(&Query::text(q).k(10))
+    // three searches, three answers: the winner, the copy, a person
+    let hits = |q: &str| -> Vec<Ulid> {
+        cell.search(&Query::text(q).k(10))
                 .unwrap(/* t */)
                 .into_iter()
                 .map(|h| h.note.id)
                 .collect()
-        };
-        assert!(
-            hits("manopola smeraldo").contains(&nid(9)),
-            "the winner's body answers (v068)"
-        );
-        assert!(
-            hits("occhiello turchino").contains(&copy),
-            "the copy's body answers (v068)"
-        );
-        assert!(
-            hits("Giulia").contains(&nid(1)),
-            "the person note answers (v068)"
-        );
+    };
+    assert!(
+        hits("manopola smeraldo").contains(&nid(9)),
+        "the winner's body answers (v068)"
+    );
+    assert!(
+        hits("occhiello turchino").contains(&copy),
+        "the copy's body answers (v068)"
+    );
+    assert!(
+        hits("Giulia").contains(&nid(1)),
+        "the person note answers (v068)"
+    );
 }
 
 /// v0.6.13 (M1): the v0.6.12 golden's facts. The cell was compacted by

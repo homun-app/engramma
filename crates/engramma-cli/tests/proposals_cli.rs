@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.5 (P4): the CLI surfaces of the queue — `proposals`, `decisions`,

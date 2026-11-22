@@ -1,4 +1,3 @@
-
 // SPDX-License-Identifier: Apache-2.0
 
 //! The latency measure of v0.6.1 (P5.3): FIFTY local writes, then the pass
