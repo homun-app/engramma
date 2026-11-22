@@ -4833,15 +4833,23 @@ fn compare_states(a: &Connection, b: &Connection) -> Result<Option<String>, Cell
                 let _ = i;
                 x != y
             })
-            .map(|(_, (x, _))| x.to_string())
+            .map(|(_, (x, y))| (x.to_string(), Some(y.to_string())))
             .unwrap_or_else(|| {
                 if la.len() > lb.len() {
-                    la[lb.len()].to_string()
+                    (la[lb.len()].to_string(), None)
                 } else {
-                    lb[la.len()].to_string()
+                    (lb[la.len()].to_string(), None)
                 }
             });
-        return Ok(Some(format!("state differs around: {first}")));
+        // v0.6.13 (M1): both sides of the first difference — one line
+        // alone never said which world was wrong
+        return Ok(Some(match first.1 {
+            Some(other) => format!(
+                "state differs around: {}\n  the other side holds: {other}",
+                first.0
+            ),
+            None => format!("state differs around: {} (one side only)", first.0),
+        }));
     }
     Ok(None)
 }

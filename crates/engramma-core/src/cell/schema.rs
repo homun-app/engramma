@@ -8,11 +8,79 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
+
+/// v0.6.13 (M1/M2): the tables of one note's ANCHOR — the derived rows
+/// a reconstruction DELETES and the whole-object photograph restores.
+/// Enumerated from the schema (the test `anchor_tables` walks
+/// `sqlite_master` and holds this list honest: a new table with a note
+/// column must land here, or in [`NON_ANCHOR_NOTE_TABLES`] with its
+/// reason). The note row itself anchors through its version
+/// photographs; the queue, the registry and the new side's `supersedes`
+/// rows through `object_anchors`; the tags and the declared edges are
+/// functions of the note row, rebuilt by the reindex over the anchor's
+/// content.
+pub const ANCHOR_NOTE_TABLES: &[&str] = &[
+    "notes",         // the note row (its photograph is note_versions)
+    "note_versions", // the version photographs — the frozen history (v0.6.12, L1)
+    "note_tags",     // a function of the note row (the reindex rebuilds them)
+    "edges",         // the DECLARED rows (id LIKE 'd%') — a function of the note row;
+                     // the manual rows are objects of their own (materialize_edge)
+    "supersedes",    // the rows where the note is the NEW side
+    "proposals",     // the queue row
+    "decisions",     // the registry rows of the note's proposals
+];
+
+/// v0.6.13 (M2): the tables that hold a NOTE COLUMN and are NOT part of
+/// one note's anchor — each with its reason. The pair with
+/// [`ANCHOR_NOTE_TABLES`] is the single hand-written list: the schema
+/// test reads `sqlite_master` and fails when a table with a note column
+/// is in neither, so the next new table cannot open the same hole a
+/// third time.
+pub const NON_ANCHOR_NOTE_TABLES: &[(&str, &str)] = &[
+    ("ops", "the log itself — the source the anchor serves, never derived state"),
+    ("op_objects", "the log's object index — ids only, alive under any redaction"),
+    ("op_payloads", "the log's payload store — redacted by the cut, censored by the purge"),
+    (
+        "entities",
+        "a global derivation over the edges and the titles, re-derived by the \
+         reindex, the death-clean and the purge",
+    ),
+    (
+        "conflict_copies",
+        "the conflict derivation's own memory — rebuilt by every materialization",
+    ),
+    (
+        "note_heads",
+        "the visible head — written by the conflict derivation at every pass",
+    ),
+    (
+        "note_vectors",
+        "embeddings recomputed from the notes; a tombstone deletes them",
+    ),
+    (
+        "pending_objects",
+        "LOCAL bookkeeping of this copy (what waits), never replicated state",
+    ),
+    (
+        "object_anchors",
+        "the anchor store itself — derived, written by the photographs, taken \
+         by the purge with the note it belongs to",
+    ),
+    (
+        "vault_files",
+        "the markdown view's reconciliation state — it describes a folder the \
+         cell does not own (outside the log, stripped from the snapshots)",
+    ),
+    (
+        "vault_conflicts",
+        "the view's `.conflitto` copies on disk — outside the log",
+    ),
+];
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version i + 1.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 22] = [
+pub const MIGRATIONS: [&str; 23] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -374,6 +442,26 @@ CREATE TABLE IF NOT EXISTS note_heads (note_id TEXT PRIMARY KEY,
                                        content_hash TEXT NOT NULL)
 WITHOUT ROWID;
 "#,
+    r#"
+-- v23 (v0.6.13, M1): the WHOLE-OBJECT ANCHOR. The compaction cut froze
+-- the version photographs (v0.6.12, L1) but not the OTHER derived rows
+-- of a note: `materialize_note` deleted the queue row, the registry
+-- rows, the `supersedes` rows of the new side without looking at the
+-- cut, and a row born at or below it never came back — an agent's
+-- correction cancelled by the user turned `Active` again after a purge
+-- of its target, invisible to the queue. From here every note
+-- photograph (`ops::snapshot`) also photographs the derived rows of
+-- the WHOLE object, under the same operation, and a reconstruction
+-- restores them before replaying the tail. DERIVED (a function of the
+-- set and the cut), never part of the replicated digest; the purge of
+-- a note takes its rows with it (the queue metadata is payload-body
+-- content). The Rust side of this migration back-fills the photographs
+-- a compacted v0.6.12 cell never took (see `migrate_anchors_v23`).
+CREATE TABLE object_anchors (note_id TEXT NOT NULL,
+                             op_id TEXT NOT NULL,
+                             anchor_json TEXT NOT NULL,
+                             PRIMARY KEY (note_id, op_id));
+"#,
 ];
 
 /// Rust-side migration steps, run right after the SQL of version `v`.
@@ -418,7 +506,489 @@ fn migrate_rust(tx: &rusqlite::Transaction<'_>, v: i64) -> Result<(), crate::err
     if v == 22 {
         migrate_heads_v22(tx)?;
     }
+    if v == 23 {
+        migrate_anchors_v23(tx)?;
+    }
     Ok(())
+}
+
+/// The Rust side of migration v23 (v0.6.13, M1): back-fill the
+/// WHOLE-OBJECT anchors a compacted cell never took. The engine of
+/// v0.6.12 photographed the note row alone; a cell it compacted holds
+/// no `object_anchors` rows, and the derived rows born at or below its
+/// cut would still be lost by the first reconstruction. For every note
+/// with operations above the cut and an anchor photograph, the derived
+/// state AT THE CUT is rebuilt and stored under the same operation:
+/// - the `supersedes` rows of the new side and the `decisions` rows:
+///   the live rows minus the effects of the above-cut operations (their
+///   payloads are whole — the effects are computable);
+/// - the queue row: its birth fields are immutable (the live row holds
+///   them), its state and its decision fields come from the walk of the
+///   decide/revert skeletons at or below the cut and the anchor
+///   photograph's word on the note's status. Where the walk cannot say
+///   it with certainty (a status change at or below the cut hides the
+///   flavor of the last decision), NO anchor is written and the
+///   reconstruction falls back to the live rows — the declared corner,
+///   no worse than the engine the cell came from.
+/// On a cell with a snapshot FILE the file itself is the cut state (a
+/// full copy taken at the compaction): its rows are read directly and
+/// the walk is short. The migration is idempotent — an anchor that
+/// already exists stays.
+fn migrate_anchors_v23(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
+    use rusqlite::OptionalExtension;
+    let cut: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM snapshots",
+        [],
+        |r| r.get(0),
+    )?;
+    if cut == 0 {
+        return Ok(()); // no prefix: every reconstruction replays from zero
+    }
+    // the snapshot file of the cut, when there is one: its derived
+    // tables ARE the state at the cut (a copy made by the compaction
+    // itself, before any tail operation applied)
+    let snap_file: Option<String> = tx
+        .query_row("SELECT file FROM snapshots WHERE seq = ?1", [cut], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten();
+    let cell_dir: Option<std::path::PathBuf> = {
+        let mut stmt = tx.prepare("PRAGMA database_list")?;
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .flatten()
+            .collect();
+        drop(stmt);
+        rows.into_iter()
+            .find(|(n, _, _)| *n == 0)
+            .and_then(|(_, _, path)| {
+                let p = std::path::PathBuf::from(&path);
+                p.parent().map(std::path::Path::to_path_buf)
+            })
+    };
+    let snap_conn = match (&snap_file, &cell_dir) {
+        (Some(file), Some(dir)) => {
+            let path = dir.join(file);
+            if path.exists() {
+                rusqlite::Connection::open_with_flags(
+                    &path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    // every note with operations above the cut: the only ones whose
+    // reconstruction will ever ask for an anchor
+    let objects: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT oo.object FROM op_objects oo
+             JOIN ops o ON o.op_id = oo.op_id
+             WHERE o.seq > ?1 AND oo.object LIKE 'note:%'",
+        )?;
+        let rows = stmt.query_map([cut], |r| r.get::<_, String>(0))?;
+        rows.flatten().collect()
+    };
+    for object in objects {
+        let Some(id) = object.strip_prefix("note:") else {
+            continue;
+        };
+        let Ok(id) = ulid::Ulid::from_string(id) else {
+            continue;
+        };
+        // a purged note keeps nothing (and the purge of it takes the
+        // rows this would write)
+        let purged: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = ?1 AND o.kind = 'purge'",
+            [&object],
+            |r| r.get(0),
+        )?;
+        if purged > 0 {
+            continue;
+        }
+        // the anchor operation: the first above-cut operation in TOTAL
+        // order that photographed the note (the same walk
+        // `materialize_note` runs)
+        let op_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT o.op_id FROM ops o
+                 JOIN op_objects oo ON oo.op_id = o.op_id
+                 WHERE oo.object = ?1 AND o.seq > ?2
+                 ORDER BY o.hlc ASC, o.op_id ASC",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![object, cut], |r| r.get::<_, String>(0))?;
+            rows.flatten().collect()
+        };
+        let mut anchor_op: Option<String> = None;
+        let mut anchor_photo: Option<String> = None;
+        for op_id in op_ids {
+            let snap: Option<String> = tx
+                .query_row(
+                    "SELECT snapshot_json FROM note_versions
+                     WHERE op_id = ?1 AND note_id = ?2",
+                    rusqlite::params![op_id, id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if snap.is_some() {
+                anchor_op = Some(op_id);
+                anchor_photo = snap;
+                break;
+            }
+        }
+        let (Some(anchor_op), Some(anchor_photo)) = (&anchor_op, &anchor_photo) else {
+            continue; // no photograph above the cut: the live rows are
+                      // the anchor's fallback, as in v0.6.12
+        };
+        let have: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM object_anchors WHERE note_id = ?1 AND op_id = ?2",
+            rusqlite::params![id.to_string(), anchor_op],
+            |r| r.get(0),
+        )?;
+        if have > 0 {
+            continue;
+        }
+        let anchor_status: Option<String> = serde_json::from_str::<serde_json::Value>(
+            anchor_photo,
+        )
+        .ok()
+        .and_then(|v| {
+            v.get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+        let json = match anchor_cut_state(tx, &id, cut, anchor_status, snap_conn.as_ref()) {
+            Ok(Some(json)) => json,
+            Ok(None) => continue, // the uncertain corner: no anchor, the
+                                  // live rows stand in
+            Err(e) => return Err(e),
+        };
+        tx.execute(
+            "INSERT INTO object_anchors (note_id, op_id, anchor_json)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(note_id, op_id) DO NOTHING",
+            rusqlite::params![id.to_string(), anchor_op, json],
+        )?;
+    }
+    Ok(())
+}
+
+/// The derived state of one note at the cut, as the v23 migration
+/// computes it: `None` in the declared uncertain corner. With a
+/// snapshot connection the rows come from the file (the exact state at
+/// the cut — a copy the compaction itself took); without one, the live
+/// rows roll the above-cut effects back — in memory, for the JSON this
+/// builds: the migration never writes a derived row.
+fn anchor_cut_state(
+    tx: &rusqlite::Transaction<'_>,
+    id: &ulid::Ulid,
+    cut: i64,
+    anchor_status: Option<String>,
+    snap: Option<&rusqlite::Connection>,
+) -> Result<Option<String>, crate::error::CellError> {
+    use rusqlite::OptionalExtension;
+    let id_s = id.to_string();
+    let proposal_json = "SELECT json_object(
+                     'mode', mode, 'target', target, 'proposer', proposer, 'client', client,
+                     'reason', reason, 'state', state, 'proposed_at', proposed_at,
+                     'decision_op', decision_op, 'decided_by', decided_by,
+                     'decided_at', decided_at, 'decision_reason', decision_reason,
+                     'review_json', review_json, 'auto_failed', auto_failed)
+             FROM proposals WHERE note_id = ?1";
+    // --- the snapshot file speaks first: its rows ARE the cut state
+    if let Some(snap) = snap {
+        let tables: i64 = snap.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN ('proposals', 'decisions', 'supersedes')",
+            [],
+            |r| r.get(0),
+        )?;
+        if tables == 3 {
+            let proposal: Option<String> = snap
+                .query_row(proposal_json, [&id_s], |r| r.get(0))
+                .optional()?;
+            let mut stmt = snap.prepare(
+                "SELECT json_array(op_id, proposal, decision, actor, decided_at, reason,
+                                   review_json, reverted_by)
+                 FROM decisions WHERE proposal = ?1 ORDER BY op_id",
+            )?;
+            let decisions: Vec<serde_json::Value> = stmt
+                .query_map([&id_s], |r| r.get::<_, String>(0))?
+                .flatten()
+                .filter_map(|d| serde_json::from_str(&d).ok())
+                .collect();
+            drop(stmt);
+            let mut stmt = snap.prepare(
+                "SELECT json_array(new_id, old_id) FROM supersedes
+                 WHERE new_id = ?1 ORDER BY old_id",
+            )?;
+            let supersedes: Vec<serde_json::Value> = stmt
+                .query_map([&id_s], |r| r.get::<_, String>(0))?
+                .flatten()
+                .filter_map(|d| serde_json::from_str(&d).ok())
+                .collect();
+            return Ok(Some(
+                serde_json::json!({
+                    "proposals": proposal,
+                    "decisions": decisions,
+                    "supersedes": supersedes,
+                })
+                .to_string(),
+            ));
+        }
+    }
+    // --- no file (a checkpoint): roll the above-cut effects back over
+    // the live rows. The above-cut payloads are whole, so every effect
+    // is computable; the queue row's DECIDED fields of a decision at or
+    // below the cut come from that decision's registry row.
+    //
+    // supersedes (new_id = id): the live rows minus what the above-cut
+    // operations inserted, plus what their reverts deleted
+    let mut cut_supersedes: Vec<String> = {
+        let mut stmt = tx.prepare("SELECT old_id FROM supersedes WHERE new_id = ?1")?;
+        let rows = stmt.query_map([&id_s], |r| r.get::<_, String>(0))?;
+        rows.flatten().collect()
+    };
+    // decisions (proposal = id): the live rows born at or below the
+    // cut, with the marks the above-cut reverts left undone (in memory)
+    let mut cut_decisions: Vec<(String, Option<String>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT d.op_id, d.reverted_by FROM decisions d
+             JOIN ops o ON o.op_id = d.op_id
+             WHERE d.proposal = ?1 AND o.seq <= ?2
+             ORDER BY d.op_id",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![id_s, cut], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
+            .flatten()
+            .collect();
+        rows
+    };
+    // the above-cut operations of the note, payloads whole — found
+    // through the object index: a supersede whose NEW side is this note
+    // carries the OTHER note as its `note_id`
+    let above: Vec<(String, String, Option<String>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT o.op_id, o.kind, p.body FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id AND oo.object = ?3
+             LEFT JOIN op_payloads p ON p.op_id = o.op_id
+             WHERE o.seq > ?2 AND o.kind IN ('supersede', 'decide', 'revert_decision')",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![id_s, cut, format!("note:{id_s}")], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .flatten()
+            .collect();
+        rows
+    };
+    let above_reverts: Vec<String> = above
+        .iter()
+        .filter(|(_, k, _)| k == "revert_decision")
+        .map(|(op, _, _)| op.clone())
+        .collect();
+    for (_, reverted_by) in cut_decisions.iter_mut() {
+        if let Some(rv) = reverted_by.as_deref()
+            && above_reverts.iter().any(|r| r == rv)
+        {
+            *reverted_by = None;
+        }
+    }
+    for (op_id, kind, body) in &above {
+        let body: Option<serde_json::Value> = body
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| crate::error::CellError::Db(format!("bad payload of {op_id}: {e}")))?;
+        match kind.as_str() {
+            "supersede" => {
+                // a supersede WHOSE NEW SIDE is this note inserted
+                // (id, old) — the op's own `note_id` names the old side,
+                // and the censored shape keeps the ids only
+                let old = body
+                    .as_ref()
+                    .and_then(|b| b.get("old_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        tx.query_row(
+                            "SELECT note_id FROM ops WHERE op_id = ?1",
+                            [op_id],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()
+                    });
+                if let Some(old) = old {
+                    cut_supersedes.retain(|o| o != &old);
+                }
+            }
+            "decide" => {
+                if body
+                    .as_ref()
+                    .and_then(|b| b.get("decision"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("accept")
+                    && let Some(t) = body
+                        .as_ref()
+                        .and_then(|b| b.get("target"))
+                        .and_then(serde_json::Value::as_str)
+                {
+                    cut_supersedes.retain(|o| o != t);
+                }
+                cut_decisions.retain(|(op, _)| op != op_id);
+            }
+            "revert_decision" => {
+                if let Some(t) = body
+                    .as_ref()
+                    .and_then(|b| b.get("restore_target"))
+                    .and_then(|v| v.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    && !cut_supersedes.contains(&t.to_string())
+                {
+                    cut_supersedes.push(t.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    cut_supersedes.sort();
+    // the registry rows at the cut, with their full fields (the live
+    // rows hold them — a ≤-cut decision's row is never rewritten,
+    // except by the reverts whose marks were undone above)
+    let mut decisions_json: Vec<serde_json::Value> = Vec::new();
+    for (op_id, reverted_by) in &cut_decisions {
+        let row: Option<String> = tx
+            .query_row(
+                "SELECT json_array(?1, ?2, decision, actor, decided_at, reason, review_json, ?3)
+                 FROM decisions WHERE op_id = ?1",
+                rusqlite::params![op_id, id_s, reverted_by],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(None); // the live cell lost the row: not said honestly
+        };
+        decisions_json.push(
+            serde_json::from_str(&row)
+                .map_err(|e| crate::error::CellError::Db(format!("bad decisions row: {e}")))?,
+        );
+    }
+    // the queue row: the walk of the decide/revert skeletons at or
+    // below the cut, with the anchor photograph's word on the status
+    let walk: Vec<(String, String, i64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT op_id, kind, seq FROM ops
+             WHERE note_id = ?1 AND kind IN ('decide', 'revert_decision') AND seq <= ?2
+             ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![id_s, cut], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .flatten()
+            .collect();
+        rows
+    };
+    let queue: Option<(String, Option<String>)> = if walk.is_empty() {
+        // never decided at or below the cut: the row, if any, was born
+        // pending and nothing at or below the cut touched it
+        Some(("pending".into(), None))
+    } else {
+        let (last_op, last_kind, last_seq) = walk.last().cloned().unwrap(/* not empty */);
+        if last_kind == "revert_decision" {
+            Some(("reverted".into(), None))
+        } else {
+            // the last event is a decision: its flavor from the anchor
+            // photograph, when nothing at or below the cut muddied the
+            // status the decision left
+            let mudded: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM ops
+                 WHERE note_id = ?1 AND seq > ?2 AND seq <= ?3
+                   AND kind IN ('delete_note', 'set_status', 'put_note', 'patch_note',
+                                'supersede', 'confirm', 'restore')",
+                rusqlite::params![id_s, last_seq, cut],
+                |r| r.get(0),
+            )?;
+            match (anchor_status.as_deref(), mudded) {
+                (Some("active"), 0) => Some(("accepted".into(), Some(last_op))),
+                (Some("deleted"), 0) => Some(("rejected".into(), Some(last_op))),
+                _ => None, // the declared uncertain corner
+            }
+        }
+    };
+    // assemble: the live queue row with the walk's word on state and
+    // decided fields (the standing decision's registry row holds them)
+    let live_proposal: Option<String> = tx
+        .query_row(proposal_json, [&id_s], |r| r.get(0))
+        .optional()?;
+    let proposals_value = match (&queue, &live_proposal) {
+        (None, _) => serde_json::Value::Null,
+        (_, None) => serde_json::Value::Null,
+        (Some((state, standing)), Some(json)) => {
+            let mut p: serde_json::Value = serde_json::from_str(json)
+                .map_err(|e| crate::error::CellError::Db(format!("bad proposals row: {e}")))?;
+            p["state"] = serde_json::Value::String(state.clone());
+            match standing {
+                Some(op) => {
+                    let decided: Option<serde_json::Value> = tx
+                        .query_row(
+                            "SELECT json_object('decided_by', actor, 'decided_at', decided_at,
+                                                'decision_reason', reason,
+                                                'review_json', review_json)
+                             FROM decisions WHERE op_id = ?1",
+                            [op],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()?
+                        .and_then(|s| serde_json::from_str(&s).ok());
+                    let Some(d) = decided else {
+                        return Ok(None); // the fields cannot be said honestly
+                    };
+                    p["decision_op"] = serde_json::Value::String(op.clone());
+                    for k in ["decided_by", "decided_at", "decision_reason", "review_json"] {
+                        p[k] = d.get(k).cloned().unwrap_or(serde_json::Value::Null);
+                    }
+                }
+                None => {
+                    p["decision_op"] = serde_json::Value::Null;
+                    for k in ["decided_by", "decided_at", "decision_reason", "review_json"] {
+                        p[k] = serde_json::Value::Null;
+                    }
+                }
+            }
+            serde_json::Value::String(p.to_string())
+        }
+    };
+    // an anchor that says «no queue row» while the walk found a
+    // standing decision cannot be honest — the row the reconstruction
+    // would restore disagrees with the note the anchor photographs
+    if live_proposal.is_none()
+        && queue.as_ref().is_some_and(|(_, s)| s.is_some())
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        serde_json::json!({
+            "proposals": proposals_value,
+            "decisions": decisions_json,
+            "supersedes": cut_supersedes
+                .iter()
+                .map(|old| serde_json::json!([id_s, old]))
+                .collect::<Vec<_>>(),
+        })
+        .to_string(),
+    ))
 }
 
 /// The Rust side of migration v22 (v0.6.5, E1): backfill the visible

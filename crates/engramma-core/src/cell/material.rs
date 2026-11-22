@@ -516,6 +516,16 @@ fn materialize_note(
     // the write-back below puts back byte for byte what it read — the
     // anchor cannot age with the cut again (H2's second layer).
     let mut anchor_row: Option<(String, i64, String, String)> = None;
+    // v0.6.13 (M1): the derived half of the WHOLE-OBJECT anchor — the
+    // queue row, the registry rows and the `supersedes` rows of the new
+    // side as they were when the anchor's photograph was taken. The
+    // photograph of the note and the photograph of its object are taken
+    // by the same operation (`ops::snapshot`), so the same op id answers
+    // both; when the photograph is missing (a cell the older engine
+    // compacted, before the migration could back-fill it) the LIVE
+    // derived rows stand in — read here, before the delete step below
+    // takes them away.
+    let mut derived_anchor: Option<String> = None;
     let cut_state: Option<(crate::format::Note, i64)> =
         if cut > 0 && note_exists_at(tx, object, cut)? {
             let mut stmt = tx.prepare(
@@ -551,7 +561,15 @@ fn materialize_note(
                             .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?,
                     )
                     .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?;
-                    anchor_row = Some((id.to_string(), version, op_id, json));
+                    anchor_row = Some((id.to_string(), version, op_id.clone(), json));
+                    derived_anchor = tx
+                        .query_row(
+                            "SELECT anchor_json FROM object_anchors
+                         WHERE note_id = ?1 AND op_id = ?2",
+                            rusqlite::params![id.to_string(), op_id],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
                     Some((note, version))
                 }
             }
@@ -576,7 +594,27 @@ fn materialize_note(
     // no photograph above the cut: the live row read below IS the state
     // at the cut (the note existed there, and nothing above the cut ever
     // changed it — else there would be a photograph)
-    let cut_state = cut_state.or(live_row);
+    let mut cut_state = cut_state.or(live_row);
+    // v0.6.13 (M1): a closing at or below the cut whose closer the set
+    // purged is work the anchor must not resurrect — the frozen state
+    // goes back to what it was before the closing, exactly like the
+    // whole-log replay leaves it (there the dominated closing never
+    // applies)
+    if let Some((note, _)) = &mut cut_state {
+        correct_anchor_for_dominated_closing(tx, id, cut, note)?;
+    }
+    // the derived rows read BEFORE the delete step: the fallback for a
+    // photograph the older engine never took (v0.6.13, M1 — the
+    // migration back-fills what it can; what it cannot, the live rows
+    // hold, and the idempotent replay of the tail converges over them)
+    let derived_live = if cut > 0 && note_exists_at(tx, object, cut)? {
+        Some(ops::derived_anchor_json(tx, id)?)
+    } else {
+        None
+    };
+    let derived_anchor = derived_anchor.or(derived_live);
+    // a purged note keeps nothing: not the note row, not its object
+    let purged = note_purged_in_set(tx, id)?;
     // --- delete the current state of the note
     if let Some(row) = ops::read_note_row(tx, id)?
         && let Some(idx) = ops::index_for(row.note.status)
@@ -626,6 +664,17 @@ fn materialize_note(
     if let Some((note, version)) = &cut_state {
         ops::restore_note(tx, note, *version)?;
         ops::reindex_note_row(tx, id)?;
+        // v0.6.13 (M1): the object comes back WHOLE — the derived rows
+        // the delete step took return at the state the anchor
+        // photographed, and the tail replays over them. The tags and
+        // the declared edges are functions of the note row (the reindex
+        // above rebuilt them); the queue, the registry and the
+        // `supersedes` rows of the new side are not.
+        if let Some(json) = &derived_anchor
+            && !purged
+        {
+            ops::restore_derived_anchor(tx, id, json)?;
+        }
     } else if let Some((original, note)) = conflict_copy_state(tx, id)? {
         restore_conflict_copy(tx, id, &original, &note)?;
     }
@@ -637,11 +686,9 @@ fn materialize_note(
     // had applied
     let mut pending_since: Option<String> = None;
     let mut events: Vec<ReplayEvent> = Vec::new();
-    // v0.6.12 (L1): a PURGED note records nothing — its version rows are
-    // the family the right to be forgotten takes, and no replay of its
-    // own dominated operations may bring them back (the recording below
-    // serves the CO-object's history, never the purged note's)
-    let purged = note_purged_in_set(tx, id)?;
+    // (`purged` was read before the delete step — v0.6.13, M1: the
+    // restore of the object refuses it for a purged note, whose every
+    // row the right to be forgotten takes)
     // v0.6.4: the states the lapide's rollback erases — a lived copy's
     // birth row still wants its loser's state
     let mut erased_states: std::collections::HashMap<String, crate::format::Note> =
@@ -1203,6 +1250,119 @@ fn tombstone_rule(
     } else {
         Ok(TombstoneOutcome::Wins)
     }
+}
+
+/// v0.6.13 (M1): the NEWEST closing of a note — the `supersede` or
+/// `decide` operation that closed it over another note (the closer),
+/// with the word of the set on that closer: when the closer is PURGED,
+/// the closing was its work, and the right to be forgotten (K1: the
+/// closing of a supersede's old side is the NEW note's work) takes it
+/// back — a note the anchor froze CLOSED must reopen, exactly like the
+/// replay of the whole log would leave it (the no-cut world: the
+/// dominated closing never applies). For a `supersede` the note is the
+/// OLD side (`note_id`); for a `decide` it is the TARGET (the proposal
+/// is `note_id`). The `op_objects` index answers both — the ids only,
+/// alive under any redaction, so a closing at or below the cut is
+/// found long after its payload is gone.
+pub(crate) fn newest_closing_of(
+    tx: &rusqlite::Transaction<'_>,
+    id: &Ulid,
+) -> Result<Option<(String, String, bool)>, CellError> {
+    // (op_id, closer object, dominated?)
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT o.op_id,
+                    CASE WHEN o.note_id = ?1 THEN oo2.object ELSE o.note_id END
+             FROM ops o
+             JOIN op_objects oo1 ON oo1.op_id = o.op_id AND oo1.object = ?2
+             JOIN op_objects oo2 ON oo2.op_id = o.op_id
+                  AND oo2.object != ?2 AND oo2.object LIKE 'note:%'
+             WHERE o.kind IN ('supersede', 'decide')
+               AND ((o.kind = 'supersede' AND o.note_id = ?1)
+                    OR (o.kind = 'decide' AND o.note_id IS NOT NULL AND o.note_id != ?1))
+             ORDER BY o.seq DESC LIMIT 1",
+            rusqlite::params![id.to_string(), format!("note:{id}")],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((op_id, closer)) = row else {
+        return Ok(None);
+    };
+    let dominated = closer
+        .strip_prefix("note:")
+        .and_then(|n| Ulid::from_string(n).ok())
+        .map(|n| note_purged_in_set(tx, &n))
+        .transpose()?
+        .unwrap_or(false);
+    Ok(Some((op_id, closer, dominated)))
+}
+
+/// v0.6.13 (M1): the state a note had BEFORE its newest closing — the
+/// photograph the closing operation itself took (a closing always
+/// photographs the old side), when the cell still holds it.
+fn pre_closing_state(
+    tx: &rusqlite::Transaction<'_>,
+    id: &Ulid,
+    closing_op: &str,
+) -> Result<Option<crate::format::Note>, CellError> {
+    let json: Option<String> = tx
+        .query_row(
+            "SELECT snapshot_json FROM note_versions WHERE note_id = ?1 AND op_id = ?2",
+            rusqlite::params![id.to_string(), closing_op],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(json) = json else {
+        return Ok(None);
+    };
+    crate::format::Note::from_json(
+        &serde_json::from_str::<serde_json::Value>(&json)
+            .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))?,
+    )
+    .map(Some)
+    .map_err(|e| CellError::Db(format!("corrupt version snapshot: {e}")))
+}
+
+/// v0.6.13 (M1): undo, in the anchor's state, a closing at or below the
+/// cut whose closer the set purged — the anchor froze the CLOSED state
+/// and the tail cannot un-close it (the closing's payload is gone).
+/// Status and validity alone: the rest of the object is the note's own,
+/// and the version numbering already aligns (a dominated half still
+/// consumes its slot, v0.6.12 L1). The correction is the same word the
+/// replay of the whole log speaks, where the dominated closing never
+/// applies.
+fn correct_anchor_for_dominated_closing(
+    tx: &rusqlite::Transaction<'_>,
+    id: &Ulid,
+    cut: i64,
+    note: &mut crate::format::Note,
+) -> Result<(), CellError> {
+    if note.status != crate::format::Status::Superseded {
+        return Ok(());
+    }
+    let Some((op_id, _closer, dominated)) = newest_closing_of(tx, id)? else {
+        return Ok(());
+    };
+    if !dominated {
+        return Ok(());
+    }
+    let seq: Option<i64> = tx
+        .query_row(
+            "SELECT seq FROM ops WHERE op_id = ?1",
+            [&op_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if !seq.is_some_and(|s| s <= cut) {
+        // a dominated closing ABOVE the cut never applied: the anchor
+        // cannot embed it, and the tail will skip it on its own
+        return Ok(());
+    }
+    if let Some(before) = pre_closing_state(tx, id, &op_id)? {
+        note.status = before.status;
+        note.valid_to = before.valid_to;
+    }
+    Ok(())
 }
 
 /// The deterministic id of a conflict copy (DESIGN §4.3):

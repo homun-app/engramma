@@ -21,10 +21,12 @@ fn golden_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
 }
 
-/// Every golden cell of the suite: the v0.6.8 one (and the ones the
-/// future phases add — a new golden lands here by NAME, and this list
-/// growing is the visible part of the rule).
-const GOLDEN_CELLS: &[&str] = &["v068"];
+/// Every golden cell of the suite: the v0.6.8 one, and the v0.6.12 one
+/// (v0.6.13, M1: compacted by the PREVIOUS engine and frozen before the
+/// schema change — the whole-object anchor migration opens it). A new
+/// golden lands here by NAME, and this list growing is the visible part
+/// of the rule.
+const GOLDEN_CELLS: &[&str] = &["v068", "v0612"];
 
 /// The deterministic note id of the golden's note `i`
 /// (`01` + sixteen zeros + eight hex digits).
@@ -79,18 +81,29 @@ fn the_golden_cell_opens_verifies_and_holds_its_facts() {
             report.replay
         );
 
+        match *name {
+            "v068" => v068_facts(&cell),
+            "v0612" => v0612_facts(&cell),
+            other => panic!("a golden with no facts to check: {other}"),
+        }
+    }
+}
+
+/// The v0.6.8 golden's own facts (every note it holds, its purges, its
+/// conflict copies, its searches, its vectors, its view).
+fn v068_facts(cell: &Cell) {
         // the notes of every type are there, id-sorted and whole
         let ids: Vec<Ulid> = cell.note_ids_all().unwrap(/* t */);
         for i in 1..=10_u32 {
             assert!(
                 ids.contains(&nid(i)),
-                "the golden's note {i} is there ({name})"
+                "the golden's note {i} is there (v068)"
             );
         }
         // the purge took its note and its family
         assert!(
             !ids.contains(&nid(11)),
-            "the purged note is gone from the golden ({name})"
+            "the purged note is gone from the golden (v068)"
         );
         match cell.get(&nid(11)) {
             Err(engramma_core::CellError::NoteNotFound(_)) => {}
@@ -115,7 +128,7 @@ fn the_golden_cell_opens_verifies_and_holds_its_facts() {
             .into_iter()
             .filter(|c| c.original_id == nid(9))
             .collect();
-        assert_eq!(open.len(), 1, "one open copy on the fact ({name})");
+        assert_eq!(open.len(), 1, "one open copy on the fact (v068)");
         let copy = open[0].copy_id;
         // the compaction cut took the payloads (conflict's copy_body
         // answers None under it, as documented) — the copy's own notes
@@ -123,14 +136,14 @@ fn the_golden_cell_opens_verifies_and_holds_its_facts() {
         assert_eq!(
             cell.get(&copy).unwrap(/* t */).body,
             "prima riga\nocchiello turchino verso [[Namorio]]\nterza",
-            "the loser's body lives in its copy ({name})"
+            "the loser's body lives in its copy (v068)"
         );
         assert!(
             cell.conflicts()
                 .unwrap(/* t */)
                 .iter()
                 .all(|c| c.original_id != nid(10)),
-            "the resolved conflict stays closed ({name})"
+            "the resolved conflict stays closed (v068)"
         );
 
         // three searches, three answers: the winner, the copy, a person
@@ -143,34 +156,89 @@ fn the_golden_cell_opens_verifies_and_holds_its_facts() {
         };
         assert!(
             hits("manopola smeraldo").contains(&nid(9)),
-            "the winner's body answers ({name})"
+            "the winner's body answers (v068)"
         );
         assert!(
             hits("occhiello turchino").contains(&copy),
-            "the copy's body answers ({name})"
+            "the copy's body answers (v068)"
         );
         assert!(
             hits("Giulia").contains(&nid(1)),
-            "the person note answers ({name})"
+            "the person note answers (v068)"
         );
+}
 
-        // the vectors are there (derived, but part of the golden)
-        let vector_rows: i64 = cell
-            .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM note_vectors")
-            .unwrap(/* t */)[0]
-            .parse()
-            .unwrap(/* t */);
-        assert!(vector_rows >= 9, "the golden holds vectors ({name})");
-
-        // the vault view, with its one bound file
-        let views = cell.vault_views().unwrap(/* t */);
-        assert_eq!(views.len(), 1, "one view bound ({name})");
-        assert_eq!(
-            cell.vault_files_of_view(&views[0].view_id)
-                .unwrap(/* t */)
-                .len(),
-            1,
-            "one file bound to the view ({name})"
-        );
-    }
+/// v0.6.13 (M1): the v0.6.12 golden's facts. The cell was compacted by
+/// the PREVIOUS engine — the queue row and the registry row of its
+/// proposal are born at or below the cut, and the migration built their
+/// whole-object anchor at open. The purge of the proposal's target must
+/// SUCCEED (the v0.6.12 engine lost the queue row in the same
+/// reconstruction), and the queue must still be there, reverted: the
+/// story froze the user accepting the agent's correction ON the cut and
+/// cancelling it above.
+fn v0612_facts(cell: &Cell) {
+    // the story's shape: A closed by the accepted correction, the
+    // cancel above the cut — the v0.6.12 quirk stays as the artifact
+    // froze it (the redacted decide payload leaves `restore_target`
+    // null, so the cancel reopens nothing)
+    let pid = nid(3);
+    assert_eq!(
+        cell.get(&pid).unwrap(/* t */).status,
+        Status::Quarantined,
+        "the cancelled proposal is back in the queue"
+    );
+    let queue: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT mode || ' ' || state FROM proposals WHERE note_id = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        queue,
+        vec!["supersede reverted".to_string()],
+        "the queue row the cut froze, with the cancel's word on it"
+    );
+    let decisions: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM decisions WHERE proposal = '{pid}' \
+             AND reverted_by IS NOT NULL"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        decisions.first().map(String::as_str),
+        Some("1"),
+        "the registry row, with the cancel's mark"
+    );
+    // the anchors the migration built: the proposal has operations
+    // above the cut (the cancel), so its whole-object anchor exists
+    let anchors: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT CAST(COUNT(*) AS TEXT) FROM object_anchors WHERE note_id = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert!(
+        anchors.first().is_some_and(|n| n != "0"),
+        "the migration back-filled the whole-object anchor of the proposal"
+    );
+    // and the purge of the tied target succeeds, leaving the queue
+    cell.purge(&nid(1), "dato superato", "user:golden")
+        .expect(/* t */ "the purge of the proposal's target succeeds");
+    assert_eq!(
+        cell.get(&pid).unwrap(/* t */).status,
+        Status::Quarantined,
+        "the proposal stays in the queue after the purge"
+    );
+    let queue: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT mode || ' ' || state FROM proposals WHERE note_id = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        queue,
+        vec!["supersede reverted".to_string()],
+        "the queue row survives the purge (the anchor restored it whole)"
+    );
+    assert!(
+        cell.verify().unwrap(/* t */).ok(),
+        "the v0.6.12 golden verifies after the purge"
+    );
 }

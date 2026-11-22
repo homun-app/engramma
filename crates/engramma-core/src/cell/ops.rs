@@ -1167,6 +1167,14 @@ pub(crate) fn records_a_version(kind: OpKind) -> bool {
 /// row can never be re-derived), and NO write may replace it: the guard
 /// turns the old `INSERT OR REPLACE` into a conditional one. Above the
 /// cut the row is live derivation and rewrites as it always did.
+///
+/// v0.6.13 (M1): the photograph now takes the WHOLE OBJECT — beside the
+/// note row, the derived rows a reconstruction deletes (the queue row,
+/// the registry rows, the `supersedes` rows of the new side) are
+/// photographed under the SAME operation, so the anchor of a note is
+/// the object it was, not one field of it. A row born at or below the
+/// cut that an above-cut operation MODIFIED comes back to the state it
+/// had at the cut, then the tail replays over it.
 pub(crate) fn snapshot(
     tx: &Transaction<'_>,
     id: &Ulid,
@@ -1194,6 +1202,176 @@ pub(crate) fn snapshot(
             row.note.to_json().to_string()
         ],
     )?;
+    snapshot_object(tx, id, op_id)?;
+    Ok(())
+}
+
+/// v0.6.13 (M1): the DERIVED rows of one note's object, as one
+/// photograph — the queue row, the registry rows, the `supersedes` rows
+/// of the new side. Read as JSON so the writer (`snapshot_object`) and
+/// the reader (`materialize_note`'s restore step) share one shape.
+pub(crate) fn derived_anchor_json(
+    tx: &Transaction<'_>,
+    id: &Ulid,
+) -> Result<String, CellError> {
+    let mut anchor = serde_json::Map::new();
+    let proposal: Option<String> = tx
+        .query_row(
+            "SELECT json_object(
+                     'mode', mode, 'target', target, 'proposer', proposer, 'client', client,
+                     'reason', reason, 'state', state, 'proposed_at', proposed_at,
+                     'decision_op', decision_op, 'decided_by', decided_by,
+                     'decided_at', decided_at, 'decision_reason', decision_reason,
+                     'review_json', review_json, 'auto_failed', auto_failed)
+             FROM proposals WHERE note_id = ?1",
+            [id.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    anchor.insert("proposals".into(), proposal.map_or(Value::Null, Value::String));
+    let mut stmt = tx.prepare(
+        "SELECT json_array(op_id, proposal, decision, actor, decided_at, reason,
+                           review_json, reverted_by)
+         FROM decisions WHERE proposal = ?1 ORDER BY op_id",
+    )?;
+    let decisions: Vec<String> = stmt
+        .query_map([id.to_string()], |r| r.get::<_, String>(0))?
+        .flatten()
+        .collect();
+    drop(stmt);
+    anchor.insert(
+        "decisions".into(),
+        Value::Array(
+            decisions
+                .into_iter()
+                .map(|d| serde_json::from_str(&d).unwrap_or(Value::Null))
+                .collect(),
+        ),
+    );
+    let mut stmt = tx.prepare(
+        "SELECT json_array(new_id, old_id) FROM supersedes WHERE new_id = ?1 ORDER BY old_id",
+    )?;
+    let supersedes: Vec<String> = stmt
+        .query_map([id.to_string()], |r| r.get::<_, String>(0))?
+        .flatten()
+        .collect();
+    drop(stmt);
+    anchor.insert(
+        "supersedes".into(),
+        Value::Array(
+            supersedes
+                .into_iter()
+                .map(|d| serde_json::from_str(&d).unwrap_or(Value::Null))
+                .collect(),
+        ),
+    );
+    Ok(Value::Object(anchor).to_string())
+}
+
+/// Write the whole-object photograph under `op_id` (v0.6.13, M1): the
+/// derived rows as they are NOW — the caller photographs the pre-state,
+/// the same moment the note row is photographed. Like the version
+/// photograph, the row rewrites above the cut and stays put below it
+/// (the guard inside `snapshot` reads the cut once; here the simpler
+/// INSERT OR REPLACE is enough: the reader walks the ops in TOTAL order
+/// and takes the FIRST, so a later photograph under a later operation
+/// never hides an earlier one).
+fn snapshot_object(
+    tx: &Transaction<'_>,
+    id: &Ulid,
+    op_id: &Ulid,
+) -> Result<(), CellError> {
+    let json = derived_anchor_json(tx, id)?;
+    tx.execute(
+        "INSERT INTO object_anchors (note_id, op_id, anchor_json)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(note_id, op_id) DO UPDATE SET anchor_json = ?3",
+        rusqlite::params![id.to_string(), op_id.to_string(), json],
+    )?;
+    Ok(())
+}
+
+/// Restore the derived rows of one note's object from a photograph
+/// (v0.6.13, M1): the caller deleted them whole; this puts back exactly
+/// what the photograph holds — the queue row, the registry rows, the
+/// `supersedes` rows of the new side. The tail replays over them.
+pub(crate) fn restore_derived_anchor(
+    tx: &Transaction<'_>,
+    id: &Ulid,
+    json: &str,
+) -> Result<(), CellError> {
+    let anchor: Value = serde_json::from_str(json)
+        .map_err(|e| CellError::Db(format!("corrupt object anchor for {id}: {e}")))?;
+    if let Some(p) = anchor
+        .get("proposals")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+    {
+        let s = |k: &str| p.get(k).and_then(Value::as_str);
+        tx.execute(
+            "INSERT INTO proposals (note_id, mode, target, proposer, client, reason, state,
+                                    proposed_at, decision_op, decided_by, decided_at,
+                                    decision_reason, review_json, auto_failed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                id.to_string(),
+                s("mode").unwrap_or("new"),
+                s("target"),
+                s("proposer").unwrap_or(""),
+                s("client"),
+                s("reason"),
+                s("state").unwrap_or("pending"),
+                s("proposed_at").unwrap_or(""),
+                s("decision_op"),
+                s("decided_by"),
+                s("decided_at"),
+                s("decision_reason"),
+                s("review_json"),
+                p.get("auto_failed").and_then(Value::as_i64).unwrap_or(0),
+            ],
+        )?;
+    }
+    if let Some(rows) = anchor.get("decisions").and_then(Value::as_array) {
+        for row in rows {
+            let s = |i: usize| row.get(i).and_then(Value::as_str);
+            tx.execute(
+                "INSERT OR REPLACE INTO decisions (op_id, proposal, decision, actor, decided_at,
+                                                   reason, review_json, reverted_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    s(0).unwrap_or(""),
+                    id.to_string(),
+                    s(2).unwrap_or("accept"),
+                    s(3).unwrap_or(""),
+                    s(4).unwrap_or(""),
+                    s(5),
+                    s(6),
+                    s(7),
+                ],
+            )?;
+        }
+    }
+    if let Some(rows) = anchor.get("supersedes").and_then(Value::as_array) {
+        for row in rows {
+            let s = |i: usize| row.get(i).and_then(Value::as_str);
+            if let (Some(new), Some(old)) = (s(0), s(1)) {
+                // a row that names a note the set PURGED does not come
+                // back (K1): the photograph is older than the purge,
+                // and the purge's word is newer than the anchor's
+                let purged = match Ulid::from_string(old) {
+                    Ok(o) => super::material::note_purged_in_set(tx, &o)?,
+                    Err(_) => false,
+                };
+                if purged {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO supersedes (new_id, old_id) VALUES (?1, ?2)",
+                    rusqlite::params![new, old],
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2320,11 +2498,23 @@ pub(crate) fn purge_state(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellErr
     tx.execute("DELETE FROM notes WHERE id = ?1", [&id_str])?;
     tx.execute("DELETE FROM note_versions WHERE note_id = ?1", [&id_str])?;
     tx.execute("DELETE FROM note_tags WHERE note_id = ?1", [&id_str])?;
-    // v0.5 (P1): the queue row and the decisions about the proposal go with
-    // the note — the reason and the reviewer metadata are payload-body
-    // content, and the right to be forgotten must reach them
-    tx.execute("DELETE FROM proposals WHERE note_id = ?1", [&id_str])?;
-    tx.execute("DELETE FROM decisions WHERE proposal = ?1", [&id_str])?;
+    // v0.6.13 (M1): the whole-object anchors of the note go with it —
+    // the queue metadata they photograph is payload-body content, and
+    // the right to be forgotten reaches the photographs like the rows.
+    // (The purge also runs INSIDE compaction snapshot files, whose
+    // schema may predate the table — the guard keeps the old files
+    // scrubbable; the reconstruction-time correction covers them.)
+    let v0613_tables: i64 = tx.query_row(
+        "SELECT (SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'object_anchors')
+              + (SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'op_objects')",
+        [],
+        |r| r.get(0),
+    )?;
+    if v0613_tables == 2 {
+        tx.execute("DELETE FROM object_anchors WHERE note_id = ?1", [&id_str])?;
+    }
     // tags no note carries anymore (directly or through a descendant): the
     // redacted replay never creates them, so the live state must not keep
     // them either
@@ -2335,10 +2525,156 @@ pub(crate) fn purge_state(tx: &Transaction<'_>, id: &Ulid) -> Result<(), CellErr
          )",
         [],
     )?;
+    // v0.6.13 (M1): the old sides of the rows this purge is about to
+    // take — read BEFORE the delete, so the reopenings below know who
+    // the note closed
+    let purged_old_sides: Vec<String> = if v0613_tables == 2 {
+        let mut stmt =
+            tx.prepare("SELECT DISTINCT old_id FROM supersedes WHERE new_id = ?1")?;
+        let sides: Vec<String> = stmt
+            .query_map([&id_str], |r| r.get::<_, String>(0))?
+            .flatten()
+            .collect();
+        drop(stmt);
+        sides
+    } else {
+        Vec::new()
+    };
     tx.execute(
         "DELETE FROM supersedes WHERE new_id = ?1 OR old_id = ?1",
         [&id_str],
     )?;
+    // v0.6.13 (M1): the reopenings the purge owes. A closing was the
+    // CLOSER's work on the old side (K1); when the closer is the note
+    // being forgotten, the closing goes with it — and on a cell with a
+    // cut the old side cannot earn that back by replay (the closing's
+    // payload is gone). The live row goes back to the state the closing
+    // itself photographed (status and validity alone: the body, the
+    // dates and the version are the note's own), the same word the
+    // whole-log replay speaks where the dominated closing never
+    // applies. `dominated_comaterialize` walks the old sides anyway
+    // (the operations name them): a reconstruction that anchors above
+    // the cut corrects its anchor the same way (material.rs). The
+    // guard skips the schemas that predate the index this reads.
+    if v0613_tables == 2 {
+        for old in purged_old_sides {
+            let Some(a) = Ulid::from_string(&old).ok() else {
+                continue;
+            };
+            let trow = read_note(tx, &a)?;
+            let Some(trow) = trow else {
+                continue;
+            };
+            if trow.note.status != Status::Superseded {
+                continue; // open already, or a later word stands (a lapide)
+            }
+            let newest = super::material::newest_closing_of(tx, &a)?;
+            let Some((closing_op, closer, dominated)) = newest else {
+                continue;
+            };
+            // the closing's closer is the note being forgotten HERE: its
+            // purge is in force by this very call — also inside a
+            // compaction SNAPSHOT FILE, whose frozen log can never hold
+            // the purge operation itself (the scrub runs on behalf of a
+            // purge that happened in the live cell), and in the verify
+            // rebuild, where the row this read began from is already gone
+            let dominated = dominated || closer == format!("note:{id_str}");
+            if !dominated {
+                continue; // another closing, whose closer lives, stands
+            }
+            let json: Option<String> = tx
+                .query_row(
+                    "SELECT snapshot_json FROM note_versions
+                     WHERE note_id = ?1 AND op_id = ?2",
+                    rusqlite::params![old, closing_op],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(json) = json else {
+                continue; // no honest pre-state to return to: the row stands
+            };
+            let before = Note::from_json(
+                &serde_json::from_str::<Value>(&json)
+                    .map_err(|e| CellError::Db(format!("corrupt snapshot: {e}")))?,
+            )
+            .map_err(|e| CellError::Db(format!("corrupt snapshot: {e}")))?;
+            // both carriers of the status move together (the column the
+            // queries filter on, and the header the note is rebuilt from)
+            let mut header: Value = serde_json::from_str(
+                &tx.query_row(
+                    "SELECT frontmatter_json FROM notes WHERE id = ?1",
+                    [&old],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap_or_default(),
+            )
+            .unwrap_or_else(|_| before.to_json());
+            if let Value::Object(map) = &mut header {
+                map.insert("status".into(), Value::String(before.status.as_str().into()));
+                let valid_to = before
+                    .valid_to
+                    .as_ref()
+                    .map(|v| v.to_db_string())
+                    .unwrap_or_default();
+                map.insert(
+                    "valid_to".into(),
+                    if valid_to.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(valid_to)
+                    },
+                );
+            }
+            tx.execute(
+                "UPDATE notes SET status = ?2, valid_to = ?3, frontmatter_json = ?4 WHERE id = ?1",
+                rusqlite::params![
+                    old,
+                    before.status.as_str(),
+                    valid_to_db(&before.valid_to),
+                    header.to_string(),
+                ],
+            )?;
+            // the index discipline every status change pays (v0.6, P0):
+            // the row moves only when the status crosses the split —
+            // superseded and active live in the SAME index, and a
+            // quarantine-bound reopening walks to the hidden one. The
+            // edges follow the note (the declared ones carry its
+            // validity too; the manual ones its status alone).
+            let idx_old = index_for(Status::Superseded);
+            let idx_new = index_for(before.status);
+            if idx_old != idx_new {
+                if let Some(idx) = idx_old {
+                    let table = idx.table();
+                    let in_index: i64 = tx.query_row(
+                        &format!("SELECT COUNT(*) FROM {table}_docsize WHERE id = ?1"),
+                        [trow.rowid],
+                        |r| r.get(0),
+                    )?;
+                    if in_index > 0 {
+                        fts_delete_row(
+                            tx,
+                            idx,
+                            trow.rowid,
+                            trow.note.title.as_deref().unwrap_or(""),
+                            &trow.body_norm,
+                            &trow.tags_text,
+                        )?;
+                    }
+                }
+                reindex_note(tx, &a, None)?;
+            } else {
+                tx.execute(
+                    "UPDATE edges SET status = ?2 WHERE note_id = ?1",
+                    rusqlite::params![old, before.status.as_str()],
+                )?;
+                tx.execute(
+                    "UPDATE edges SET valid_to = ?2
+                     WHERE note_id = ?1 AND id LIKE 'd%'",
+                    rusqlite::params![old, valid_to_db(&before.valid_to)],
+                )?;
+            }
+        }
+    }
     // the edges the note declares (derived and manual alike), and every
     // edge that NAMES it as an endpoint (v0.6, P1: a manual edge pointing
     // at the purged note would survive on the copies that built it before
@@ -3020,9 +3356,13 @@ fn apply_decide(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<(), CellE
     // decision that arrived too late.
     if scope.wants(&id) && state != "pending" && state != "reverted" {
         if state == "accepted" || state == "rejected" {
+            // v0.6.13 (M1): OR REPLACE — the reconstruction of an
+            // already-decided proposal replays this record over the
+            // restored rows, and the registry row is deterministic from
+            // the operation itself
             tx.execute(
-                "INSERT INTO decisions (op_id, proposal, decision, actor, decided_at, reason,
-                                        review_json)
+                "INSERT OR REPLACE INTO decisions (op_id, proposal, decision, actor, decided_at,
+                                                   reason, review_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     op.op_id.to_string(),
@@ -3222,6 +3562,14 @@ fn apply_revert_decision(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<
         reopen_target(tx, op, body, decided_at, scope)?;
         return Ok(());
     }
+    // the proposal note goes back to the queue — the photograph comes
+    // FIRST (v0.6.13, M1): the whole-object anchor holds the state this
+    // operation FOUND, and the queue/registry updates below are its
+    // effect, never part of what it observed
+    let old = read_note(tx, &id)?;
+    if let Some(old) = &old {
+        snapshot(tx, &id, old.version, &op.op_id)?;
+    }
     // cancel the decision — once. A revert that finds nothing to cancel (a
     // concurrent revert won the total order, or the decision is unknown
     // here yet) is the record of a cancelled cancellation: no state moves.
@@ -3244,14 +3592,12 @@ fn apply_revert_decision(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<
             op.op_id
         )));
     }
-    // the proposal note goes back to the queue
-    let Some(old) = read_note(tx, &id)? else {
+    let Some(old) = old else {
         return Err(CellError::Invalid(format!(
             "op {}: the proposal note {id} is gone",
             op.op_id
         )));
     };
-    snapshot(tx, &id, old.version, &op.op_id)?;
     let mut note = old.note.clone();
     note.status = Status::Quarantined;
     note.updated_at = decided_at;
@@ -3264,7 +3610,10 @@ fn apply_revert_decision(tx: &Transaction<'_>, op: &Op, scope: Scope) -> Result<
 }
 
 /// Reopen the supersede target a revert restores, when the recorded state is
-/// there, the target still exists, and the scope asks for its half.
+/// there, the target still exists, and the scope asks for its half. The
+/// `supersedes` row the decision wrote is BOTH halves' work (like the
+/// insert in `apply_decide`, v0.6.13 M1): whichever side a copy
+/// rematerializes, the row lands and goes the same.
 fn reopen_target(
     tx: &Transaction<'_>,
     op: &Op,
@@ -3280,6 +3629,16 @@ fn reopen_target(
         .and_then(Value::as_str)
         .and_then(|s| Ulid::from_string(s).ok())
         .ok_or_else(|| CellError::Invalid(format!("op {}: bad restore_target", op.op_id)))?;
+    // v0.6.13 (M1): the row goes in BOTH halves — the reconstruction of
+    // the PROPOSAL alone must not leave behind the closing its own
+    // cancellation undid
+    tx.execute(
+        "DELETE FROM supersedes WHERE new_id = ?1 AND old_id = ?2",
+        rusqlite::params![
+            op.note_id.map(|n| n.to_string()).unwrap_or_default(),
+            t_id.to_string()
+        ],
+    )?;
     if !scope.wants(&t_id) {
         return Ok(());
     }
@@ -3300,13 +3659,6 @@ fn reopen_target(
         write_note(tx, &t, true, false)?;
         reindex_note(tx, &t_id, Some(&trow))?;
     }
-    tx.execute(
-        "DELETE FROM supersedes WHERE new_id = ?1 AND old_id = ?2",
-        rusqlite::params![
-            op.note_id.map(|n| n.to_string()).unwrap_or_default(),
-            t_id.to_string()
-        ],
-    )?;
     Ok(())
 }
 

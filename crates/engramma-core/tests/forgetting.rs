@@ -436,9 +436,15 @@ fn snapshot_purge_censors_the_supersede_inside_it() {
         "verify after the in-snapshot censor: {:?}",
         report.mismatch
     );
-    // the old note is still closed, the censored supersede still replays it
+    // v0.6.13 (M1): the old note REOPENS — the closing was the purged
+    // note's work on it (K1's own reading), and the cell with a cut
+    // must land where the whole-log replay lands: there the dominated
+    // supersede closes nothing. (Before, the cut froze the closed state
+    // and no reconstruction ever re-derived it — the censored shape
+    // still replays in the SNAPSHOT, whose scrub reopens the old side
+    // the same way.)
     let back = cell.get(&old.id).unwrap(/* test-only */);
-    assert_eq!(back.status, Status::Superseded);
+    assert_eq!(back.status, Status::Active);
     drop(cell);
     assert_forgotten(dir.path(), "sopr", &needles);
 }
@@ -960,6 +966,7 @@ fn a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint() {
              DROP TABLE IF EXISTS pending_objects;
              DROP TABLE IF EXISTS conflict_copies;
              DROP TABLE IF EXISTS device_acks;  -- v18  -- v17
+             DROP TABLE IF EXISTS object_anchors;  -- v23 (v0.6.13, M1)
              UPDATE meta SET value = '9' WHERE key = 'schema_version';
              DELETE FROM meta WHERE key = 'dump_v13';",
         )

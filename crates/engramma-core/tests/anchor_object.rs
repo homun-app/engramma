@@ -22,7 +22,8 @@ use engramma_core::cell::proposals::{
 };
 use engramma_core::format::{Note, NoteType};
 use engramma_core::{Cell, CellError, Confidence, Status};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use ulid::Ulid;
 
 use common::K;
@@ -497,5 +498,138 @@ fn the_purge_of_a_proposal_target_succeeds_after_the_cut() {
         queue(&cell, &pid),
         vec!["supersede accepted".to_string()],
         "la coda della proposta accettata sopravvive alla purga"
+    );
+}
+
+/// La migrazione v23 costruisce le ancore che una cella compattata con
+/// un CHECKPOINT (senza file di copia) non ha mai preso: la storia
+/// della correzione annullata viene costruita qui, poi fatta tornare
+/// indietro allo schema della v0.6.12 (la tabella delle ancore via, la
+/// versione via) e riaperta. La purga del bersaglio deve riuscire e la
+/// coda restare — la migrazione ha ricostruito lo stato al taglio
+/// (rollback degli effetti sopra il taglio) senza il file che lo
+/// fotografò.
+#[test]
+fn the_v23_migration_rebuilds_the_anchor_of_a_checkpoint_cell() {
+    use engramma_core::hlc::HlcClock;
+    let dir = common::test_dir();
+    let path = dir.path().join("migrazione.sqlite");
+    {
+        let cell = Cell::open_bare(&path).unwrap(/* t */);
+        let wall = Arc::new(AtomicU64::new(common::K));
+        let w = Arc::clone(&wall);
+        cell.inject_clock(HlcClock::new("am0000000000x".to_string(), move || {
+            w.load(Ordering::SeqCst)
+        }))
+        .unwrap(/* t */);
+        let n = Arc::new(std::sync::Mutex::new(0_u64));
+        cell.inject_minter(Arc::new(move || {
+            let mut g = n.lock().map_err(|_| CellError::Db("mint".into()))?;
+            *g += 1;
+            let h = blake3::hash(format!("ancora/mig/{}", *g).as_bytes());
+            let b = h.as_bytes();
+            let mut randomness: u128 = 0;
+            for x in &b[..10] {
+                randomness = (randomness << 8) | u128::from(*x);
+            }
+            let op_id = Ulid::from_parts(common::K, randomness);
+            let mut salt = [0_u8; 16];
+            salt.copy_from_slice(&b[10..26]);
+            Ok((op_id, salt))
+        }))
+        .unwrap(/* t */);
+        cell.ingest_op(&shared_init("ancora/migrazione")).unwrap(/* t */);
+        cell.set_policy(serde_json::json!({ "write": "propose" }), "cli")
+            .unwrap(/* t */);
+        wall.store(common::K + 1, Ordering::SeqCst);
+        cell.put_note(&note(1, "il mio colore preferito è il rosso [[Roma]]"), "user")
+            .unwrap(/* t */);
+        let mut proposal = note(10, "la correzione della migrazione [[Roma]]");
+        proposal.status = Status::Quarantined;
+        wall.store(common::K + 2, Ordering::SeqCst);
+        let out = cell
+            .propose(
+                &ProposalInput {
+                    note: proposal,
+                    mode: ProposalMode::Supersede(nid(1)),
+                    client: None,
+                    reason: None,
+                },
+                "mcp:agente",
+                &ProposeContext::default(),
+            )
+            .unwrap(/* t */);
+        let pid = out.id.unwrap(/* t */);
+        wall.store(common::K + 3, Ordering::SeqCst);
+        let decision = cell
+            .decide(
+                &pid,
+                &DecisionInput {
+                    action: DecisionAction::Accept { edited: None },
+                    reason: None,
+                    review: None,
+                },
+                "user",
+            )
+            .unwrap(/* t */);
+        // il taglio come CHECKPOINT: nessun file di copia
+        cell.compact(
+            head(&cell),
+            &engramma_core::cell::CompactOptions { keep_snapshot: false },
+        )
+        .unwrap(/* t */);
+        wall.store(common::K + 4, Ordering::SeqCst);
+        cell.revert_decision(&decision, "ci ho ripensato", "user")
+            .unwrap(/* t */);
+        assert!(
+            cell.verify().unwrap(/* t */).ok(),
+            "verify verde prima del ritorno indietro"
+        );
+    }
+    // il ritorno indietro allo schema v0.6.12: le ancore via, la
+    // versione via — quello che una cella compattata dalla v0.6.12 sa
+    // di questa storia
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap(/* t */);
+        conn.execute_batch(
+            "DROP TABLE object_anchors;
+             UPDATE meta SET value = '22' WHERE key = 'schema_version';",
+        )
+        .unwrap(/* t */);
+    }
+    // la riapertura: la migrazione v23 gira sul checkpoint (rollback,
+    // nessun file) e la purga del bersaglio riesce con la coda intatta
+    let cell = Cell::open(&path).unwrap(/* t */);
+    let pid = nid(10);
+    assert_eq!(
+        cell.get(&pid).unwrap(/* t */).status,
+        Status::Quarantined,
+        "la proposta annullata è in quarantena dopo la migrazione"
+    );
+    let anchors: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT anchor_json FROM object_anchors WHERE note_id = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(anchors.len(), 1, "la migrazione ha scritto un'ancora: {anchors:?}");
+    assert!(
+        anchors[0].contains("accepted"),
+        "l'ancora fotografa lo stato AL TAGLIO (la decisione accettata), non il vivo: {}",
+        anchors[0]
+    );
+    cell.purge(&nid(1), "dato superato", "user").unwrap(/* t */);
+    assert_eq!(
+        cell.get(&pid).unwrap(/* t */).status,
+        Status::Quarantined,
+        "la proposta resta in quarantena dopo la purga"
+    );
+    assert_eq!(
+        queue(&cell, &pid),
+        vec!["supersede reverted".to_string()],
+        "la coda sopravvive alla purga grazie all'ancora migrata"
+    );
+    assert!(
+        cell.verify().unwrap(/* t */).ok(),
+        "verify verde dopo la purga"
     );
 }

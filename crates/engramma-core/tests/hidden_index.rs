@@ -185,6 +185,7 @@ fn a_v13_cell_migrates_its_hidden_rows() {
              DROP TABLE IF EXISTS pending_objects;
              DROP TABLE IF EXISTS conflict_copies;
              DROP TABLE IF EXISTS device_acks;  -- v18  -- v17
+             DROP TABLE IF EXISTS object_anchors;  -- v23 (v0.6.13, M1)
              UPDATE meta SET value = '13' WHERE key = 'schema_version';",
         )
         .unwrap(/* test-only */);
