@@ -11771,3 +11771,120 @@ loro posto (le cache dei test del CLI); nessun processo acceso. In
 `$TMPDIR` ci sono anche un file `sonda-freddezza.log` e una cartella
 vuota `sonda-t-SmTu`, del 20 e del 21 novembre: precedenti a questa
 fase, non mie, non toccati.
+
+## Verifica v0.6.12 (revisore, 2026-11-22)
+
+Fatta sul tag `fase-v0.6.12` (`3e7b7c6`), a priorità minima. Le sonde stanno
+nello scratchpad del revisore, fuori dal repo.
+
+### Cosa regge
+
+- **L1 chiude il `VersionNotFound`, e il sospetto della v0.6.11 era vero.**
+  Una purga riuscita toglieva in silenzio una versione della storia di
+  un'altra nota. Ora `frozen_prefix.rs` 8/8 e `purge_own_content.rs` 11/11.
+  Le sonde del revisore della v0.6.9 e della v0.6.10 sono verdi.
+- **Il commit dopo la caccia** (`0ff51d5`) nel motore sposta soltanto
+  `cut_seq` sotto la sua doc, senza cambiarla. Il revisore ha guardato il
+  diff, e la caccia non va rifatta per questo.
+- **Il contratto JS:** 63/63 in Node e in Electron, con cartelle nuove.
+  Dopo le corse nessuna `engramma-node-*`.
+- **Lo SHA del tag è riprodotto**, costruendo sul tag: `.node` `d2119c27…`,
+  50 784 728 B. Costruito su HEAD dà un altro SHA (`89163247…`), ed è
+  giusto: il binario porta il commit (J3), e HEAD non è il tag. Lo SHA vale
+  solo costruito sul tag, come dice `build-sha.sh`.
+- **Il verdetto di GLM è onesto:** «con la compattazione accesa NON pronta»,
+  con i due difetti dichiarati e riprodotti sulla base.
+
+### I due difetti, pesati
+
+Il revisore li ha riprodotti tutti e due sul tag, coi semi di GLM, e li ha
+tracciati. **Sono un difetto solo, ed è la regola di L1 applicata a metà.**
+
+`materialize_note` (`material.rs`, circa riga 607) ora tiene le righe di
+versione nate a o sotto il taglio. Ma le righe vicine si cancellano ancora
+**tutte**, senza guardare il taglio:
+- `proposals`, la coda;
+- `decisions`;
+- `supersedes`;
+- gli archi dichiarati.
+
+Il rigioco riparte solo da sopra il taglio, quindi una riga nata da un
+`propose` o da una `decide` sotto il taglio non torna più. Il prefisso
+congelato non è solo le versioni: è **ogni riga derivata** nata a o sotto
+il taglio.
+
+- **Seme `8394280236933449584`:** la `decide` sopra il taglio trova la
+  proposta senza la sua riga di coda («is not a proposal»), e la purga
+  fallisce. Il revisore ha provato due volte: **fallisce anche al secondo
+  tentativo**. È pulito: `verify` è verde e la nota resta com'era. È lo
+  stesso sintomo del `VersionNotFound`: quella nota non si dimentica più.
+- **Seme `9848218401348450188`, il più grave.** Traccia del revisore: una
+  proposta d'agente in modalità supersede, accettata dall'utente (op 16,
+  sul taglio) e poi **annullata** dall'utente (`revert_decision`, op 17,
+  sopra il taglio), torna in quarantena. Poi si purga il bersaglio. Il
+  risultato:
+  - la proposta diventa **`Active`**;
+  - la sua riga sparisce dalla coda;
+  - `verify` resta verde.
+
+  **Il contenuto dell'agente diventa attivo contro la decisione
+  dell'utente, e l'utente non lo vede più in coda.** La quarantena è il
+  confine delle scritture d'agente, ed è la base del modello dei permessi
+  della v0.7.0.
+
+  La sonda deterministica del revisore (`zz_review_v0612.rs`, quattro
+  casi) lo riproduce senza il generatore:
+
+  | caso | dopo la purga del bersaglio |
+  |---|---|
+  | accettata, annullata, **senza** taglio | `Quarantined`, coda `reverted`: giusto |
+  | accettata, taglio, annullata | **`Active`, coda vuota** |
+  | pendente, con o senza taglio | `Quarantined`, coda `pending`: giusto |
+
+**Le due proprietà non potevano vederlo**, per lo stesso motivo:
+- `frozen_prefix_is_immutable` fotografa versioni e ancore, non la coda, le
+  decisioni, le relazioni;
+- `purge_takes_only_its_family` guarda lo stato, ma non la coda.
+
+È lo stesso cieco della v0.6.11 un livello più in giù. **La correzione del
+revisore:** la spec della v0.6.12 elencava «le righe di versione, l'ancora,
+lo stato al taglio», ed era troppo stretta. Il principio va scritto per
+ogni riga derivata, e la proprietà deve fotografarle tutte.
+
+**Il sospetto aperto:** anche `supersedes` e gli archi dichiarati si
+cancellano senza guardare il taglio, e `restore_note` non li ricrea. Una
+nota nata da un supersede sotto il taglio e poi rimaterializzata potrebbe
+perdere la riga `supersedes`. Allora la purga della nuova non riaprirebbe
+più la vecchia. Non è provato: va provato nella prossima fase.
+
+### Altre note
+
+- **Le otto `.tmp*` vuote** delle 12:01–12:10 sono rimaste. GLM le ha
+  lasciate perché non è riuscito ad attribuirle, e non le ha tolte a mano:
+  corretto. La prossima fase dà il prefisso `engramma-test-` alle cartelle
+  dei test di **ogni** crate, non solo del nucleo, così ogni resto si
+  attribuisce dal nome.
+- **In `$TMPDIR` ci sono 3,9 G di cache dei test del CLI**
+  (`engramma-cli-relay`, `engramma-cli-plain`), più il volume Docker
+  `engramma-linux-target`. Vanno contati con `target/` (25 G) quando
+  l'utente decide la pulizia.
+- **Un `git add -A <percorso>`**, dichiarato da GLM: sono entrati solo i
+  file giusti.
+
+### Verdetto
+
+**v0.6.12 consegnata per lo sviluppo di Homun**, al posto della v0.6.11:
+- toglie una perdita silenziosa di storia;
+- il binding ha la stessa superficie (stessi `index.js` e `index.d.ts`).
+
+**Release locale: come prima, solo con la compattazione spenta.** Senza un
+taglio, i due difetti non nascono: lo dice il controllo di GLM, e lo
+conferma la sonda del revisore senza taglio. Con la compattazione accesa,
+no: c'è una strada riproducibile per cui una proposta d'agente annullata
+dall'utente diventa attiva.
+
+**La prossima fase:**
+- il prefisso congelato vale per ogni riga derivata;
+- le proprietà la fotografano tutta;
+- un invariante di sicurezza: «una nota esce dalla quarantena solo per una
+  decisione dell'utente».
