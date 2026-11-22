@@ -11361,8 +11361,8 @@ purga falliva, pulita e permanente.
 chieduta dal revisore (due note legate da un supersede, versioni della
 vecchia sotto il taglio, compattazione, purga della nuova) è ROSSA
 sulla base — la purga RIUSCIVA e la storia della vecchia perdeva la
-fotografia della chiusura in silenzio (`01M816ZKZZ`/`01M816ZM00` nella
-traccia della sonda, `frozen_prefix.rs`). La storia di una nota è
+fotografia della chiusura in silenzio (`purge_of_the_new_note_leaves_the_old_ones_history_whole`,
+in `frozen_prefix.rs`: prima le versioni 1, 2, 3; dopo 1, 2). La storia di una nota è
 contenuto SUO: anche la perdita silenziosa era la stessa regola rotta.
 
 Un secondo versante dello stesso difetto l'ha scoperto l'oracolo
@@ -11392,7 +11392,7 @@ riscritto in questa fase). In codice:
   totale, che ha fotografato la nota** — qualsiasi operazione che
   cambia una nota la fotografa prima, quindi la prima fotografia sopra
   il taglio È lo stato al taglio. Nota nata sopra il taglio: nessuna
-  àncora, si rigioca da zero (un'àncora sul mità-vita faceva scappare
+  àncora, si rigioca da zero (un'àncora su una fotografia di metà vita faceva scappare
   il contatore, trovato dalla sonda in questa fase). Nota che era al
   taglio senza fotografie sopra di lui: la riga viva È lo stato al
   taglio (nulla l'ha toccata, altrimenti ci sarebbe la fotografia —
@@ -11445,8 +11445,8 @@ versione, numeratura, rifiuti d'arrivo): **`engramma/sync/7` e
 - **`frozen_prefix_is_immutable`**, la proprietà 28ª dell'inventario:
   dopo una compattazione (taglio `head − 0/1/2`), la fotografia del
   prefisso (righe nate a o sotto il taglio + il CONTENUTO di ogni
-  ancóra: nota, numero, corpo) non perde e non cambia righe per
-  qualunque operazione che non sia compattazione o purga; un'ancóra
+  àncora: nota, numero, corpo) non perde e non cambia righe per
+  qualunque operazione che non sia compattazione o purga; un'àncora
   NUOVA può nascere (la prima fotografia sopra il taglio di una nota
   che non l'aveva: un fatto). Per la purga: dal prefisso vanno solo
   righe della famiglia e delle RIAPERTURE dichiarate (le fotografie
@@ -11467,19 +11467,35 @@ versione, numeratura, rifiuti d'arrivo): **`engramma/sync/7` e
 
 ## L3 — le tre `.tmp*` senza diagnosi
 
-**La diagnosi**: le tre cartelle del 21 novembre, ore 10:33 (le 10:15
-dell'ultimo commit prima, `ec9896e`; l'amend del commit di prestazione
-dopo), contenevano `a.sqlite`, `b.sqlite` e `c.sqlite` — le celle di
-`purge_with_conflict_copies_leaves_no_roots` (a/b, attori `prop:user` e
-`prop:bot`) e di `replay_equals_state` (c, il mix completo del
-generatore). Sono i test in corsa su due fili quando il processo è
-morto: **un processo UCCISO** (SIGINT: un Ctrl-C su una corsa lunga)
-non fa unwind e le `Drop` delle `TempDir` non girano. Riprodotto in
-questa fase: un kill a metà corsa lascia le cartelle dei test in volo,
-stessa forma esatta (una senza WAL, una con WAL a zero, una con WAL
-pieno — come le originali); un test che FAILISCE non lascia niente (il
-panic fa l'unwind; provato sul ramo di prova con la proprietà
-dell'oblio fatta fallire: zero cartelle nuove).
+**La diagnosi.** Le tre cartelle del 21 novembre, ore 10:33 (l'ultimo
+commit prima è `ec9896e`, delle 10:15), contenevano `a.sqlite`,
+`b.sqlite` e `c.sqlite`. Chi le ha scritte, letto dai file (in copia,
+in sola lettura): `a.sqlite` e `b.sqlite` sono le celle di
+`purge_with_conflict_copies_leaves_no_roots` (9 put, 9 purghe, 8
+patch, attori `prop:user` e `prop:bot`: quella proprietà, e nessun
+altro test, ha questa forma); `c.sqlite` è molto probabilmente
+`replay_equals_state` (il mix completo del generatore, e nessuna riga
+in `snapshots`: la compattazione ne lascerebbe una). Sono test che
+girano su due fili: i tre in volo quando il processo è morto. Non era
+un test a tre dispositivi, come faceva pensare il nome: tre cartelle,
+una per cella, di due test diversi.
+
+**Perché non si sono pulite.** Le tre vie della spec, provate:
+
+- *un test che fallisce* (panico): **non è questa** — il panico fa
+  l'unwind e le `Drop` girano. Provato: `replay_equals_state` fatta
+  fallire apposta, `$TMPDIR` fermo (3 → 3);
+- *`into_path()`, `keep()`, `forget`*: nessuno, né nei test né nei
+  sorgenti del nucleo;
+- *un processo ucciso*: **è questa**. Provato: una corsa dei props
+  interrotta con SIGINT a metà lascia quattro cartelle, quelle dei
+  test in volo. Stesso fenomeno, non stessa forma: le mie avevano
+  tutte un WAL con dentro qualcosa, le originali no (`a.sqlite`
+  senza WAL, `b.sqlite` con WAL a zero); perché, non lo so — può
+  dipendere dal momento del checkpoint alla morte.
+
+Un processo muore senza unwind anche per un abort o un SIGKILL: i
+file non dicono quale dei tre sia stato, né chi l'abbia voluto.
 
 **Il buco corretto**: ogni cartella di test della suite ora si chiama
 `engramma-test-*` (`common::test_dir()`, e la stessa funzione locale
@@ -11498,8 +11514,9 @@ state tolte dopo questa diagnosi, e solo loro.
   operazioni a due oggetti («compatta, poi purga l'uno»), il rifiuto
   dell'arrivo sotto il taglio, l'ALPN 7 — tutto in `frozen_prefix.rs`
   (8/8 verdi) e `protocol_version.rs`; i semi del difetto in
-  `purge_family_open_defect_seeds_run_clean`. Due dei test a due
-  oggetti (purga della vecchia, purga di un estremo) erano già verdi
+  `purge_family_open_defect_seeds_run_clean`. Tre dei test a due
+  oggetti (purga della vecchia, purga di un estremo, e la storia della
+  proposta accettata quando si purga il bersaglio) erano già verdi
   sulla base e restano come guardie.
 - **Il contratto JS**: 63/63 su `node:test` e `test:electron` (i 62 di
   ieri intatti, il nuovo: `compact()` e poi `purge()` di una nota legata
@@ -11507,13 +11524,17 @@ state tolte dopo questa diagnosi, e solo loro.
   identica).
 - **Le celle d'oro**: `golden_cell.rs` verde (nessun cambio di schema
   in questa fase: nessuna migrazione, nessuna cella nuova).
-- **La caccia**: (in corsa sul commit finale — tabella sotto).
+- **La caccia**: nella sua sezione, sotto.
+- **Linux** (`scripts/linux.sh`, container a due CPU): verde — fmt,
+  clippy con `-D warnings`, 79 binari di test, zero rossi. L'oracolo
+  della purga porta due difetti dichiarati che scattano solo su alcuni
+  sorteggi: in quella corsa a 128 casi non li ha pescati.
 
 ## Le misure
 
 Coppie alternate (base = worktree sul tag, fase = worktree sul commit
 finale), banco da 10 000 note, le corse senza `nice`, `uptime` accanto
-a ogni corsa. Il carico dell'utente al lavoro: **3,3–5,3** per tutta la
+a ogni corsa. Il carico dell'utente al lavoro: **3,0–5,3** per tutta la
 durata — i numeri vanno letti così. Le sonde (copiate uguali nei
 worktree, fuori dal repo): corpus proprio di 10 000 note.
 
@@ -11528,9 +11549,14 @@ worktree, fuori dal repo): corpus proprio di 10 000 note.
   **Media: base 2591,25, fase 2477,5 → −4,4%**, dentro il +5%. Il
   prezzo in scrittura è la guardia della fotografia (il `NOT EXISTS`
   del prefisso, una sonda in più per body write quando c'è un taglio).
-- **Ricerca** (ms, banco intero): p50 1,4 → 1,5 (+0,1 ms: al bordo
-  della risoluzione della misura); p95 2,25 → 2,35 (**+4,4%**, dentro
-  il +5%); testo+grafo p50 1,3/1,4 → 1,4, p95 2,15 → 2,2 (+2,3%).
+- **Ricerca** (ms, banco intero, media delle quattro righe — due
+  corpus per coppia): `ricerca` p50 **1,40 → 1,50** (+0,1 ms: uno
+  scatto dello strumento, che non risolve meglio di 0,1 ms; come
+  percentuale fa +7,1%, FUORI dal +5% — non so dire se sia un costo
+  vero o arrotondamento); `ricerca` p95 2,275 → 2,35 (**+3,3%**);
+  `testo+grafo` p50 1,35 → 1,40 (+3,7%); `testo+grafo` p95 2,275 →
+  2,25 (**−1,1%**). Le due p95 sono dentro il +5%; la mediana della
+  colonna `ricerca`, letta come percentuale, non lo è.
 - **La sonda della purga** (10 000 note, compattazione con istantanea,
   una purga): coppia 1: base 224,5 → fase 205,0 ms; coppia 2: base
   181,1 → fase 206,3 ms. **Media 202,8 → 205,65 ms: +1,4%**, dentro il
@@ -11554,26 +11580,169 @@ worktree, fuori dal repo): corpus proprio di 10 000 note.
 
 ## La caccia
 
-TABHELLA_CACCIA
+Girata **una volta**, intera: 28 proprietà a 20 000 casi e 5 corse della
+suite a 2 048, in release, `nice` 19, due job, due fili, `caffeinate`.
+**20 607 s**, registro in `target/caccia/20261122-123521`.
+
+**Su quale codice.** Non sul commit finale, e lo dico com'è. La caccia
+è partita da `24cfdc3`; il commit di fmt (`295c7c6`, solo spazi) è
+entrato durante la prima proprietà. L'ultimo commit (`0ff51d5`) è
+venuto dopo: sposta l'helper delle cartelle di test sopra ai commenti
+doc in nove file di test, mette un alias di tipo nell'oracolo, sposta
+la definizione di `cut_seq` sotto la sua doc senza cambiarla, e
+aggiorna `open-defects.txt`. Nulla di ciò che cambia il comportamento
+del motore — ma la caccia non l'ho rifatta: sei ore del Mac. Dopo
+`0ff51d5` sono girati il giro Linux intero, la suite del nucleo e il
+banco JS. Se la si vuole sul commit letterale è una corsa da rifare;
+la mia raccomandazione è di no, perché la fase che chiude i due
+difetti sotto la rifà comunque sul suo commit finale.
+
+| proprietà | esito | tempo |
+|---|---|---|
+| the_fleet_converges | verde | 1 169 s |
+| every_copy_equals_its_reconstruction | verde | 1 103 s |
+| no_copy_closes_without_a_witness | verde | 704 s |
+| no_body_text_is_lost | verde | 737 s |
+| the_new_diff3_decides_as_the_v064_one | verde | 3 s |
+| the_long_alignment_is_still_a_lcs | verde | 134 s |
+| the_identity_never_moves_on_generated_histories | verde | 349 s |
+| hidden_notes_leave_no_fingerprint | verde | 642 s |
+| proposal_sequences_keep_the_invariants | verde | 704 s |
+| format_round_trip | verde | 4 s |
+| replay_equals_state | verde | 871 s |
+| compaction_keeps_verify_and_state | verde | 1 214 s |
+| random_ops_compact_and_purge_leave_no_roots | verde | 1 850 s |
+| purge_with_conflict_copies_leaves_no_roots | verde | 3 218 s |
+| export_import_equality | verde | 1 s |
+| hlc_monotonic | verde | 0 s |
+| **purge_takes_only_its_family** | **ROSSO** | 241 s |
+| frozen_prefix_is_immutable | verde | 1 822 s |
+| rfc1918_is_never_public | verde | 40 s |
+| loopback_linklocal_and_cgnat_are_never_public | verde | 1 s |
+| multicast_and_reserved_v4_are_never_public | verde | 0 s |
+| mapped_reserved_v4_is_never_public | verde | 1 s |
+| reserved_v6_blocks_are_never_public | verde | 0 s |
+| ordinary_public_v4_is_public | verde | 1 s |
+| sixto_four_is_the_ipv4_it_carries | verde | 0 s |
+| nat64_teredo_and_ipv4_compatible_are_never_public | verde | 0 s |
+| ports_matter_except_on_loopback_http | verde | 1 s |
+| the_path_must_match_even_on_loopback_http | verde | 0 s |
+| suite-1 … suite-5 (engramma-core, 2 048 casi) | **ROSSO** ×5 | 1 156 / 1 139 / 1 144 / 1 234 / 1 124 s |
+
+**Il `VersionNotFound` non compare in nessuno dei 33 file del
+registro.** In tutta la caccia c'è un seme rosso solo,
+`9848218401348450188`, nell'oracolo e nelle cinque suite: proptest lo
+aveva persistito nel registro delle regressioni, e ogni corsa lo
+rigiocava per primo. La riga è stata tolta.
+
+`no_body_text_is_lost` è stata verde a 20 000 casi: non ha pescato i
+semi della perdita del cestino, che non ho riportati a mano in questa
+fase. La riga resta dichiarata.
+
+**Il giudizio sul rosso** (`purge_takes_only_its_family`, seme
+`9848218401348450188`, braccio a dispositivo singolo): *difetto
+pre-esistente, dichiarato aperto*. Dopo la purga di una nota, un'altra
+nota fuori dalla famiglia passa da `Quarantined` ad `Active` (`stato
+cambiato: prima Quarantined, dopo Active`). Riprodotto sulla base
+v0.6.11 (worktree sul tag, seme fissato): stesso messaggio, stessa
+nota.
 
 ## Difetti nuovi trovati in questa fase
 
-1. **Una `decide` che rigioca durante una rimaterializzazione trova la
-   nota senza la sua riga di coda** («is not a proposal»),
-   `purge_takes_only_its_family`, seme `8394280236933449584`:
-   riprodotto IDENTICO sulla base v0.6.11 — pre-esistente, scoperto
-   dall'oracolo quando il `VersionNotFound` ha smesso di fermare le
-   purghe prima di arrivare lì. Dichiarato aperto in
-   `open-defects.txt`.
-2. **Il cancello dei semi dei difetti aperti era vacuo dalla v0.6.9**
+Trovati in questa fase non vuol dire nati in questa fase: i primi due
+sono riprodotti identici sulla base v0.6.11.
+
+1. **La purga di una nota fuori famiglia fa tornare ATTIVA una nota che
+   era in quarantena.** `purge_takes_only_its_family`, seme
+   `9848218401348450188` (la caccia, a 20 000). Pre-esistente.
+   **Dichiarato aperto.**
+2. **Una purga fallisce quando la rimaterializzazione rigioca una
+   `decide` la cui proposta sta sotto il taglio**: `purge` risponde
+   `Invalid(… is not a proposal)`. `purge_takes_only_its_family`, seme
+   `8394280236933449584` (a 128 casi, in locale). Pre-esistente: il
+   `VersionNotFound` fermava quelle purghe prima di arrivare qui.
+   **Dichiarato aperto.** Ipotesi di causa, non verificata: la
+   rimaterializzazione cancella la riga di coda della proposta
+   aspettandosi che il `propose` la riscriva, ma il `propose` è sotto
+   il taglio e non rigioca più — la famiglia del difetto chiuso (stato
+   derivato che il taglio ha congelato e il rigioco non trova). Non ho
+   verificato se, come il `VersionNotFound`, sia permanente al secondo
+   tentativo.
+3. **Il cancello dei semi dei difetti aperti era vacuo dalla v0.6.9**
    (vedi L2): corretto in questa fase.
-3. La perdita silenziosa della storia sospettata dalla v0.6.11:
-   confermata VERA (era il difetto di L1) e chiusa.
+4. La perdita silenziosa della storia che la verifica v0.6.11
+   sospettava: confermata VERA (era il difetto di L1) e chiusa.
+
+**I due dichiarati nascono solo con la compattazione.** Un controllo
+per ciascuno: lo stesso seme fissato, lo stesso braccio, con la
+compattazione e senza. Col taglio rossi (il controllo positivo); senza
+taglio verdi. Vale per quelle due storie: non è la prova che l'oracolo
+sia verde senza compattazione.
 
 ## La release locale, con la compattazione accesa
 
-PRONTA_STATO
+**NON PRONTA.**
+
+Il difetto di questa fase è chiuso: il `VersionNotFound` non compare
+in una caccia intera, il prefisso congelato ha la sua proprietà verde
+a 20 000 casi, e le misure sono dentro le soglie (inserimento −4,4%,
+le p95 della ricerca dentro il +5%, purga +1,4%, `verify` +5,3%,
+`compact` +1,0%) — con un dubbio dichiarato sulla mediana della
+ricerca, sopra.
+
+Ma l'oracolo, liberato dal `VersionNotFound`, ha mostrato due altri
+difetti che **nascono solo con un taglio**, e uno dei due fa fallire
+una purga — sul flusso principale di Homun: una proposta dell'agente
+accettata, una compattazione, e «dimentica per sempre» di una nota che
+la tocca risponde con un errore. È lo stesso sintomo che la fase
+doveva togliere, con un'altra causa. Per questo non la chiamo pronta:
+con la compattazione accesa resta una strada conosciuta e riproducibile
+per la quale una nota non si dimentica.
+
+Sono pre-esistenti sulla v0.6.11, non regressioni di questa fase; la
+v0.6.11 non li vedeva perché il suo difetto era più a monte e li
+copriva. Con la compattazione spenta i due semi sono verdi: la
+condizione della v0.6.11 (compattazione spenta) resta la strada sicura,
+e la v0.6.12 può prendere il posto della v0.6.11 — ma, ripeto, l'ho
+provato su due storie.
+
+**Cosa consiglio.** Una fase breve di seguito, della stessa forma di
+questa: i due semi come test rossi, la correzione (per il secondo,
+l'ipotesi di cui sopra: le righe di coda e di decisione di una proposta
+il cui `propose` sta a o sotto il taglio sono prefisso congelato, e
+sopravvivono alla rimaterializzazione), la caccia intera sul commit
+finale. Fino ad allora Homun tiene la compattazione spenta.
 
 ## La pulizia
 
-PULIZIA
+- **`du -sh target`**: 25 G all'inizio (la verifica v0.6.11 lo misurava
+  a 25 G; il mio primo `du`, all'avvio della caccia, 25 G) e 25 G alla
+  fine. Non ho cancellato niente in `target/`.
+- **`.tmp*` in `$TMPDIR` alla fine: 8, non zero.** Sono vuote, nate
+  oggi fra le 12:01 e le 12:10. Non sono riuscito ad attribuirle: i
+  comandi di quella finestra (`npm run build`, `npm test`,
+  `test:electron`), rifatti tutti e tre, non ne creano nessuna
+  (conteggio fermo a 8 dopo ciascuno), e né il banco JS né i sorgenti
+  di runtime di CLI, sync, node e mcp usano il prefisso `.tmp`. Non le
+  ho tolte: non ho dimostrato che sono di questa fase, e `$TMPDIR` è
+  condiviso con il lavoro dell'utente. Le tre di L3 le ho tolte io,
+  dopo la diagnosi, e solo quelle.
+- **`engramma-node-*`: 0. `engramma-test-*`: 0**, senza cancellarle a
+  mano.
+- **Fuori dal conteggio della spec, ma sul disco.** Le due cache
+  persistenti dei test del CLI, `engramma-cli-relay` (2,1 G) e
+  `engramma-cli-plain` (1,8 G) in `$TMPDIR`: le crea il repo per
+  progetto (una volta per macchina), le ha ricostruite questa fase.
+  Una terza, `engramma-cli-testrelay` (1,9 G), l'avevo creata io a
+  mano durante il debug, e l'ho tolta. Il volume Docker
+  `engramma-linux-target` resta: l'intestazione di `linux.sh` dice di
+  toglierlo a fine fase, la spec di questa fase non lo elenca, e non
+  cancello ciò che non mi è stato chiesto di cancellare.
+- **Una volta ho usato `git add -A <percorso>`** (il commit di L3,
+  limitato a `crates/engramma-core/tests`), e la regola diceva niente
+  `-A`. Verificato dopo: sono entrati i 25 file che avevo modificato,
+  niente di più.
+- **Nessun processo lasciato acceso** (caccia, `caffeinate`, cargo,
+  container: controllato con `pgrep` e `docker ps` a fine fase). I
+  tre worktree di prova e le sonde delle misure, fuori dal repo, sono
+  stati tolti.

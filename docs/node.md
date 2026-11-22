@@ -435,7 +435,7 @@ Notevoli:
   `pretest` di `npm test` e `test:electron` costruisce la CLI: il caso
   normale è sempre fresco.
 
-## La compattazione torna sicura (v0.6.12)
+## La compattazione: un difetto chiuso, e perché resta spenta (v0.6.12)
 
 La verifica della v0.6.11 lasciava la release locale a una condizione:
 **con la compattazione spenta**, perché «dimentica per sempre» poteva
@@ -445,20 +445,34 @@ v0.6.12 chiude quel difetto alla radice: **il prefisso congelato è
 immutabile** — ciò che è nato a o sotto il taglio (le righe di versione,
 l'ancora della rimaterializzazione, lo stato al taglio) non si cancella
 e non si riscrive mai, una metà dominata dalla purga fotografa comunque
-il pre-stato che ha osservato, e l'ancora non invecchia.
-
-Per Homun: **`compact(keepLast)` può stare acceso.** `keepLast` è
-quante operazioni restano vive sopra il taglio (il CLI e il binding
-tagliano a `head − keepLast`): la manutenzione di una memoria che
-cresce, non una funzione dell'utente. Il contratto lo dice nel test
-nuovo — `compact()` e poi `purge()` di una nota legata da una
-sostituzione: la purga riesce, la vecchia riapre col suo corpo, e la
+il pre-stato che ha osservato, e l'ancora non invecchia. Il contratto lo
+dice nel test nuovo — `compact()` e poi `purge()` di una nota legata da
+una sostituzione: la purga riesce, la vecchia riapre col suo corpo, e la
 sua storia delle versioni resta identica (63/63, con i 62 di ieri
 intatti). Il difetto di sync che restava aperto (l'ancora che
-invecchia, H2 secondo strato) è chiuso anche lui: i suoi semi girano
-come casi fissi, e la cella condivisa rifiuta con un errore leggibile
-un arrivo che cada dentro il prefisso (il dispositivo si riallinea
-dall'istantanea).
+invecchia, H2 secondo strato) è chiuso anche lui, e la cella condivisa
+rifiuta con un errore leggibile un arrivo che cada dentro il prefisso.
+
+**Per Homun: la compattazione resta spenta, per ora.** Liberato dal
+`VersionNotFound`, l'oracolo della purga ha mostrato due altri difetti
+che nascono **solo con un taglio** (provati con e senza compattazione
+sullo stesso seme), entrambi pre-esistenti sulla v0.6.11 e dichiarati
+aperti in `open-defects.txt`:
+
+- una purga **fallisce** (`is not a proposal`) quando la
+  rimaterializzazione rigioca una decisione la cui proposta sta sotto
+  il taglio — è il flusso delle correzioni accettate: «dimentica per
+  sempre» risponde con un errore;
+- la purga di una nota fuori famiglia fa tornare **attiva** una nota
+  che era in quarantena.
+
+Fino alla fase che li chiude, `compact(keepLast)` non si chiama. Quando
+si potrà: `keepLast` è quante operazioni restano vive sopra il taglio
+(il CLI e il binding tagliano a `head − keepLast`); è la manutenzione di
+una memoria che cresce, non una funzione dell'utente. Con la
+compattazione spenta i due semi sono verdi, e la condizione della
+v0.6.11 resta la strada sicura (la v0.6.12 al posto della v0.6.11).
+I numeri e i giudizi sono nel REPORT della fase.
 
 ## Cosa riapre la purga, e come dirlo prima (v0.6.11, K1)
 
