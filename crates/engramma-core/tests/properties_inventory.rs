@@ -56,7 +56,15 @@ fn test_sources(root: &Path) -> Vec<PathBuf> {
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if p.extension().is_some_and(|x| x == "rs") {
+                } else if p
+                    .extension()
+                    .is_some_and(|x| x == "rs" || x == "proptest-regressions")
+                {
+                    // v0.6.12 (L2): the regression files too — the open
+                    // defects' seed gate read ONLY the .rs sources, and no
+                    // .proptest-regressions file ever reached it: the gate
+                    // was vacuous since v0.6.9 (found while moving this
+                    // phase's own seeds)
                     out.push(p);
                 }
             }
