@@ -1659,6 +1659,20 @@ fn purge_family_open_defect_seeds_run_clean() {
     }
 }
 
+/// v0.6.13 (M1): the two seeds of the v0.6.12 declaration, deterministic
+/// — the queue and the registry born at or below the cut that the
+/// reconstruction of v0.6.12 deleted. The purge must SUCCEED and the
+/// judgment must hold with the WHOLE object photographed (the queue
+/// included, once M2 widens the oracle's shot). Red on the v0.6.12 base:
+/// `8394…` fails the purge («is not a proposal»), `9848…` turns a
+/// reverted proposal `Active`.
+#[test]
+fn purge_family_defect_seeds_of_v0613_run_clean() {
+    for seed in [8394280236933449584_u64, 9848218401348450188] {
+        purge_takes_only_its_family_body(seed);
+    }
+}
+
 /// v0.6.12 (L3): the sweeper. A run KILLED mid-flight (a Ctrl-C on a
 /// long hunt) leaves behind whatever test folders were in flight — the
 /// three `.tmp*` of the 21st of November were exactly that, with
