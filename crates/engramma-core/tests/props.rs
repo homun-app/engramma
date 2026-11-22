@@ -2813,6 +2813,22 @@ fn quarantine_exits_body(seed: u64) {
                             }) => {
                                 living.retain(|n| n != &proposal);
                                 queue.push(proposal);
+                                // the supersede target REOPENED: it is a
+                                // living note again, and the purge arm
+                                // must be able to draw it (the shape of
+                                // the v0.6.12 security defect)
+                                let target = cell
+                                    .debug_column(&format!(
+                                        "SELECT COALESCE(target, '') FROM proposals \
+                                         WHERE note_id = '{proposal}'"
+                                    ))
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .next()
+                                    .and_then(|t| Ulid::from_string(&t).ok());
+                                if let Some(t) = target {
+                                    living.push(t);
+                                }
                             }
                             _ => {}
                         }
@@ -3013,6 +3029,18 @@ fn quarantine_exits_body(seed: u64) {
                         {
                             living.retain(|n| n != &proposal);
                             queue.push(proposal);
+                            let target = cell
+                                .debug_column(&format!(
+                                    "SELECT COALESCE(target, '') FROM proposals \
+                                     WHERE note_id = '{proposal}'"
+                                ))
+                                .unwrap_or_default()
+                                .into_iter()
+                                .next()
+                                .and_then(|t| Ulid::from_string(&t).ok());
+                            if let Some(t) = target {
+                                living.push(t);
+                            }
                         }
                     }
                 }
@@ -3052,3 +3080,4 @@ fn quarantine_exits_body(seed: u64) {
         assert!(b.verify().unwrap(/* t */).ok(), "verify B");
     }
 }
+
