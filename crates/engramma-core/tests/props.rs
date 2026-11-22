@@ -885,7 +885,18 @@ proptest! {
     /// verde.)
     #[test]
     fn purge_takes_only_its_family(seed in any::<u64>()) {
-        let mut s = seed | 1;
+        purge_takes_only_its_family_body(seed);
+    }
+}
+
+/// The body of `purge_takes_only_its_family`, on its own so the open
+/// defect's seeds can run as a DETERMINISTIC regression (v0.6.12, L1):
+/// proptest's minimal failing case is a `seed` value, and this function
+/// is exactly what a case runs — the plain test below replays the
+/// declared seeds with no generation in between. It panics (never
+/// `prop_assert!`s), so it is honest under both callers.
+fn purge_takes_only_its_family_body(seed: u64) {
+    let mut s = seed | 1;
         let mut next = move || {
             s ^= s << 13;
             s ^= s >> 7;
@@ -1266,6 +1277,22 @@ proptest! {
                 judge_the_purge(&cell, &x, &shots, &reopened, "singolo");
             }
         }
+    }
+
+/// v0.6.12 (L1): the open defect's own seeds, deterministic — the hunt's
+/// `VersionNotFound` (`purge_takes_only_its_family`, seeds of the
+/// v0.6.11 declaration, and the v0.6.11 hunt's own). After a compaction
+/// the purge must SUCCEED, and every living note outside the family must
+/// read the same as before. Red on the v0.6.11 base; the seeds also ride
+/// the regression file once the fix lands.
+#[test]
+fn purge_family_open_defect_seeds_run_clean() {
+    for seed in [
+        17093826732695285589_u64,
+        10739666680899902993,
+        18352432295623270118,
+    ] {
+        purge_takes_only_its_family_body(seed);
     }
 }
 
