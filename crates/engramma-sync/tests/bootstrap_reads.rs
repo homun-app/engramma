@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! R3 (v0.6.1, revisore): no quadratic cost on the wire. The regression
@@ -5,6 +6,8 @@
 //! needs every operation of a 1000-op cell — and demands them LINEAR: a
 //! fixed number per envelope at most, never one per operation. The
 //! counter is test-only (`SharedCell::log_reads`).
+
+mod common;
 
 use engramma_core::format::{Note, NoteType};
 use engramma_core::{Cell, Confidence, Status};
@@ -50,7 +53,7 @@ fn note(id: u32, body: &str) -> Note {
 /// queries — never one read per envelope.
 #[test]
 fn the_bootstrap_of_a_thousand_ops_reads_the_log_a_fixed_number_of_times() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     std::fs::create_dir_all(dir.path().join("cells")).unwrap(/* t */);
     let key = DeviceKey::load_or_create(dir.path()).unwrap(/* t */);
     let reg = DeviceRegistry::open(dir.path()).unwrap(/* t */);

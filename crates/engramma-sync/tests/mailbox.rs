@@ -1,9 +1,12 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.6 (P6): the blind mailbox. It stores SEALED envelopes by opaque id,
 //! reconciles them, delivers them — and when a device's purge arrives,
 //! signed, the bytes are REALLY gone from the file. The file never holds
 //! note text or an op_id (the string-search proves it).
+
+mod common;
 
 use engramma_sync::crypto::{EpochKey, seal_op};
 use engramma_sync::device::DeviceKey;
@@ -14,7 +17,7 @@ use engramma_sync::registry::DeviceRegistry;
 
 #[test]
 fn the_store_holds_envelopes_by_opaque_id() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let store = MailboxStore::open(dir.path()).unwrap(/* t */);
     let key = EpochKey::generate().unwrap(/* t */);
     let sync_id = key.cell_sync_id();
@@ -46,7 +49,7 @@ fn the_store_holds_envelopes_by_opaque_id() {
 
 #[test]
 fn a_signed_purge_really_deletes_the_bytes() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let store = MailboxStore::open(dir.path()).unwrap(/* t */);
     let key = EpochKey::generate().unwrap(/* t */);
     let sync_id = key.cell_sync_id();
@@ -96,7 +99,7 @@ fn a_signed_purge_really_deletes_the_bytes() {
 
 #[test]
 fn retention_expires_old_envelopes() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let store = MailboxStore::open(dir.path()).unwrap(/* t */);
     let key = EpochKey::generate().unwrap(/* t */);
     let sync_id = key.cell_sync_id();

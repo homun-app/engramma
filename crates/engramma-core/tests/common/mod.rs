@@ -994,3 +994,14 @@ pub fn ref_lcs_matches(base: &[&str], side: &[&str]) -> Vec<(usize, usize)> {
     }
     out
 }
+
+#[cfg(test)]
+mod sweep_gate {
+    /// v0.6.13 (M4): the sweeper rides at the start of the suite —
+    /// whatever a killed run left behind goes, before the new folders
+    /// multiply.
+    #[test]
+    fn stale_test_dirs_are_swept_at_suite_start() {
+        super::sweep_stale_test_dirs();
+    }
+}

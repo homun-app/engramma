@@ -1,8 +1,11 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration test for `engramma verify`: the vector coverage per model
 //! must appear in the human output and in `--json` (v0.2.1, P1.4 — the
 //! REPORT v0.2 claimed it and the command never showed it).
+
+mod common;
 
 use std::process::Command;
 
@@ -66,7 +69,7 @@ fn run(root: &std::path::Path, json: bool) -> (String, String) {
 
 #[test]
 fn verify_reports_coverage_per_model() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let root = dir.path().join("root");
     std::fs::create_dir_all(root.join("cells")).unwrap(/* test-only */);
     let cell = Cell::create(&root.join("cells/default.sqlite"), "default", "t")
@@ -115,7 +118,7 @@ fn verify_reports_coverage_per_model() {
 /// exit code is 5 (`pending: ["vault"]`), like the WAL case.
 #[test]
 fn cli_purge_reaches_the_view_or_exits_five() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let root = dir.path().join("root");
     std::fs::create_dir_all(&root).unwrap(/* test-only */);
     let cmd = || {

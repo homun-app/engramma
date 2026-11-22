@@ -1,8 +1,11 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! The markdown view tests (prompt v0.3, punto 4): every row of the
 //! reconciliation table, the guards, the echo, the fixed-point property and
 //! the watch integration.
+
+mod common;
 
 use engramma_core::format::{At, Lang, Note, NoteType, ParseMode};
 use engramma_core::{Cell, CellError, Confidence, NotePatch, Status, Validity};
@@ -70,7 +73,7 @@ fn vid(vault: &Vault) -> String {
 /// init exports one file per note; sync is a no-op right after (echo).
 #[test]
 fn init_then_sync_is_a_noop() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     vault.cell().put_note(&note(1, "prima", "corpo [[Milano]]"), "t")
         .unwrap(/* test-only */);
@@ -84,7 +87,7 @@ fn init_then_sync_is_a_noop() {
 /// file changed, note unchanged → the note is updated from the file.
 #[test]
 fn changed_file_updates_the_note() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     let n = note(1, "prima", "corpo iniziale [[Roma]]");
     vault.cell().put_note(&n, "t").unwrap(/* test-only */);
@@ -109,7 +112,7 @@ fn changed_file_updates_the_note() {
 /// note changed from the cell, file untouched → the file is rewritten.
 #[test]
 fn changed_note_rewrites_the_file() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     let n = note(2, "seconda", "corpo [[Milano]]");
     vault.cell().put_note(&n, "t").unwrap(/* test-only */);
@@ -138,7 +141,7 @@ fn changed_note_rewrites_the_file() {
 /// both changed → conflict: the cell wins, the file's version is a copy.
 #[test]
 fn conflict_cell_wins_with_a_copy() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     let n = note(3, "terza", "versione base [[Roma]]");
     vault.cell().put_note(&n, "t").unwrap(/* test-only */);
@@ -183,7 +186,7 @@ fn conflict_cell_wins_with_a_copy() {
 /// WITH the id.
 #[test]
 fn file_without_id_becomes_a_note_and_gets_one() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     vault.sync_once(false).unwrap(/* t */); // settle init
     write(
@@ -210,7 +213,7 @@ fn file_without_id_becomes_a_note_and_gets_one() {
 /// rename and move: same id, new path — no delete, no new note.
 #[test]
 fn moved_file_keeps_its_note() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     let n = note(4, "quarta", "da spostare [[Milano]]");
     vault.cell().put_note(&n, "t").unwrap(/* test-only */);
@@ -234,7 +237,7 @@ fn moved_file_keeps_its_note() {
 /// once the guard stops everything until forced.
 #[test]
 fn vanished_file_deletes_the_note_and_the_guard_stops_mass_deletions() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     // a real-sized vault: one deletion is under every threshold
     let n = note(5, "quinta", "da cancellare [[Roma]]");
@@ -287,7 +290,7 @@ fn vanished_file_deletes_the_note_and_the_guard_stops_mass_deletions() {
 /// a broken header never touches the cell: error in the report, retry later.
 #[test]
 fn broken_header_is_reported_and_leaves_the_cell_alone() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     vault.sync_once(false).unwrap(/* t */);
     write(&vault, "rotta.md", "---\ntitle: manca tutto\nqualcosa: {[");
@@ -308,7 +311,7 @@ fn broken_header_is_reported_and_leaves_the_cell_alone() {
 /// a file cannot promote an external note to active (the cell's rule).
 #[test]
 fn file_cannot_promote_an_external_note() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     let mut n = note(6, "sesta", "voci dal web [[Milano]]");
     n.confidence = Confidence::External;
@@ -335,7 +338,7 @@ fn file_cannot_promote_an_external_note() {
 /// the purge deletes the note: the next reconciliation removes its file.
 #[test]
 fn purged_note_loses_its_file() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     let n = note(7, "settima", "da purgare [[Roma]]");
     vault.cell().put_note(&n, "t").unwrap(/* test-only */);
@@ -358,7 +361,7 @@ fn purged_note_loses_its_file() {
 #[test]
 fn random_edits_converge_to_a_fixed_point() {
     for seed in 1..=8_u64 {
-        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let dir = common::test_dir();
         let vault = setup(dir.path());
         let mut s = seed | 1;
         let mut next = move || {
@@ -531,7 +534,7 @@ fn random_edits_converge_to_a_fixed_point() {
 /// watch: a hand edit becomes a note update within seconds.
 #[test]
 fn watch_updates_the_note_within_three_seconds() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     let n = note(9, "watch", "versione iniziale [[Milano]]");
     vault.cell().put_note(&n, "t").unwrap(/* test-only */);
@@ -593,7 +596,7 @@ use Validity as _;
 /// sync does nothing.
 #[test]
 fn obsidian_header_file_imports_with_its_own_fields() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     vault.sync_once(false).unwrap(/* test-only */); // settle init
     write(
@@ -644,7 +647,7 @@ fn obsidian_header_file_imports_with_its_own_fields() {
 /// the body.
 #[test]
 fn obsidian_import_reads_the_header_too() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let src = dir.path().join("vault");
     std::fs::create_dir_all(&src).unwrap(/* test-only */);
     std::fs::write(
@@ -678,7 +681,7 @@ fn obsidian_import_reads_the_header_too() {
 /// and left alone instead of stealing the binding back and forth.
 #[test]
 fn one_file_per_note_no_second_export_no_ping_pong() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     vault.sync_once(false).unwrap(/* test-only */); // settle init
     write(
@@ -727,7 +730,7 @@ fn one_file_per_note_no_second_export_no_ping_pong() {
 /// the body anywhere in the view folder, without any sync.
 #[test]
 fn purge_takes_the_conflict_copy_and_the_file_now() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     let secret_body = "il quokkaviolaceo zibellinotremante segreto";
     let n = note(11, "segreta", secret_body);
@@ -820,7 +823,7 @@ fn purge_takes_the_conflict_copy_and_the_file_now() {
 /// conflict copies and their rows all go.
 #[test]
 fn unreachable_view_is_pending_and_the_next_sync_finishes() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     let secret_body = "il quokkaviolaceo segreto della vista";
     let n = note(12, "nascosta", secret_body);
@@ -910,7 +913,7 @@ fn unreachable_view_is_pending_and_the_next_sync_finishes() {
 /// header existed. The rewrite adds `title:` to the new block.
 #[test]
 fn plain_file_title_is_the_file_name() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     write(&vault, "Mele rosse.md", "Mi piacciono.\n");
     let r = vault.sync_once(false).unwrap(/* test-only */);
@@ -935,7 +938,7 @@ fn plain_file_title_is_the_file_name() {
 /// the second sync of a quiet view is an EMPTY report, warnings included.
 #[test]
 fn second_sync_of_a_quiet_view_is_empty_warnings_included() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     write(
         &vault,
@@ -963,7 +966,7 @@ fn second_sync_of_a_quiet_view_is_empty_warnings_included() {
 /// the state field like it wins conflicts.
 #[test]
 fn a_hand_edited_file_cannot_launder_a_quarantined_note() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let vault = setup(dir.path());
     let mut n = note(1, "segreto", "il pin del lucchetto e quokkaviolaceo7");
     n.confidence = Confidence::External;

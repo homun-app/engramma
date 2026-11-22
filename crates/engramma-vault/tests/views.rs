@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.4 (P0.1): a view has an IDENTITY, not a path. `vault init` writes a
@@ -7,6 +8,8 @@
 //! reaches the view at its NEW place. A view nobody can reach can be
 //! unbound (`vault unbind`), and a purge only stays pending for a view
 //! that still HOLDS something of the note.
+
+mod common;
 
 use std::path::Path;
 
@@ -54,7 +57,7 @@ fn setup(dir: &Path) -> (Vault, Note) {
 /// The manifest carries the view id, and the cell has exactly one view.
 #[test]
 fn init_writes_a_view_id_and_binds_one_view() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let (vault, _) = setup(dir.path());
     let manifest = std::fs::read_to_string(vault.root().join("engramma.json")).unwrap(/* t */);
     let v: serde_json::Value = serde_json::from_str(&manifest).unwrap(/* test-only */);
@@ -74,7 +77,7 @@ fn init_writes_a_view_id_and_binds_one_view() {
 /// purge that follows finds the view there and forgets the file.
 #[test]
 fn moved_view_is_one_row_with_the_new_root_and_purge_reaches_it() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let (vault, n) = setup(dir.path());
     let old_root = vault.root().to_path_buf();
     let new_root = dir.path().join("altrove");
@@ -134,7 +137,7 @@ fn moved_view_is_one_row_with_the_new_root_and_purge_reaches_it() {
 /// sync, keeping the binding the migration gave its root.
 #[test]
 fn v03x_view_adopts_a_view_id_at_first_sync() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let (vault, _) = setup(dir.path());
     // strip the manifest's view_id: what a v0.3.2 binary left on disk
     let manifest = vault.root().join("engramma.json");
@@ -166,7 +169,7 @@ fn v03x_view_adopts_a_view_id_at_first_sync() {
 /// complete even though the folder is gone.
 #[test]
 fn unbind_removes_the_bindings_and_keeps_the_files() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let (vault, n) = setup(dir.path());
     let file = vault
         .cell()
@@ -204,7 +207,7 @@ fn unbind_removes_the_bindings_and_keeps_the_files() {
 /// root) instead of adding a second view.
 #[test]
 fn v032_cell_migrates_roots_to_views_and_the_first_sync_adopts() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let db = dir.path().join("v032.sqlite");
     let cell = Cell::create(&db, "t", "tester").unwrap(/* t */);
     let vault_dir = dir.path().join("vista");
@@ -268,6 +271,7 @@ fn v032_cell_migrates_roots_to_views_and_the_first_sync_adopts() {
              DROP TABLE IF EXISTS pending_objects;
              DROP TABLE IF EXISTS conflict_copies;
              DROP TABLE IF EXISTS device_acks;  -- v18  -- v17
+             DROP TABLE IF EXISTS object_anchors;  -- v23 (v0.6.13, M1)
              DELETE FROM meta WHERE key = 'dump_v13';",
         )
         .unwrap(/* test-only */);
@@ -308,7 +312,7 @@ fn v032_cell_migrates_roots_to_views_and_the_first_sync_adopts() {
 /// base file) stays the user's and is warned about ONCE, not at every sync.
 #[test]
 fn pre_v032_conflict_copy_is_registered_and_purged() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let (vault, n) = setup(dir.path());
     // the bound file, as the last sync saw it
     let bound: Vec<String> = {
@@ -362,7 +366,7 @@ fn pre_v032_conflict_copy_is_registered_and_purged() {
 /// user's, warned about once — the second quiet sync says nothing.
 #[test]
 fn orphan_conflict_copy_is_warned_once_and_stays() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let (vault, _) = setup(dir.path());
     let orphan = "fact/sconosciuta.conflitto-2025-06-01T12_00_00.md";
     std::fs::create_dir_all(vault.root().join("fact")).unwrap(/* t */);

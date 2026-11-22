@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! S1 (v0.6.2): the sync service in the LIBRARY. The same roads the CLI
@@ -5,6 +6,8 @@
 //! given by a test function instead of a stdin line, the share, the write
 //! that crosses, the removal that hears back — plus the exclusive root
 //! lock (`SYNC_BUSY`) and the per-cell guard.
+
+mod common;
 
 use std::time::Duration;
 
@@ -46,7 +49,7 @@ struct Root {
 
 impl Root {
     fn new(tag: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = common::test_dir();
         let root = dir.path().join(tag);
         std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
         Self { _dir: dir, root }
@@ -572,7 +575,7 @@ fn every_textual_form_of_a_ticket_normalizes() {
 fn the_second_lock_taker_leaves_the_holders_pid_alone() {
     use engramma_sync::service::try_lock_root;
 
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let holder = try_lock_root(dir.path()).unwrap(/* t */);
     // the holder's pid is in the file (here: staged by hand, so the test
     // does not read its own pid back)

@@ -211,7 +211,7 @@ mod tests {
             assert!(req.path.starts_with("/test/repo/resolve/"), "{}", req.path);
             (200, payload.to_string())
         });
-        let tmp = tempfile::tempdir().unwrap(/* test-only */);
+        let tmp = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let spec = spec_with(sha);
         let report = pull(tmp.path(), &spec, Some(&server.url()), Duration::from_secs(5))
             .unwrap(/* test-only */);
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn wrong_sha256_leaves_no_residue() {
         let server = FakeServer::start(|_| (200, "totally not the model".to_string()));
-        let tmp = tempfile::tempdir().unwrap(/* test-only */);
+        let tmp = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let spec = spec_with("00".repeat(32));
         let err = pull(tmp.path(), &spec, Some(&server.url()), Duration::from_secs(5))
             .unwrap_err(/* test-only */);
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn http_404_is_a_remote_error() {
         let server = FakeServer::start(|_| (404, "gone".to_string()));
-        let tmp = tempfile::tempdir().unwrap(/* test-only */);
+        let tmp = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         let spec = spec_with("00".repeat(32));
         let err = pull(tmp.path(), &spec, Some(&server.url()), Duration::from_secs(5))
             .unwrap_err(/* test-only */);

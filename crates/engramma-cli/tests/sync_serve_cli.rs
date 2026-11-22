@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! The service and the blind node over the REAL CLI (v0.6.1, P3–P5):
@@ -5,6 +6,8 @@
 //! convivenza), the one-pass `sync run`, the mailbox node between two
 //! devices that never meet, three devices with concurrent writes and a
 //! device that comes back, the removal with its rotation.
+
+mod common;
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -272,7 +275,7 @@ struct Root {
 
 impl Root {
     fn new(tag: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = common::test_dir();
         let root = dir.path().join(tag);
         std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
         run(&root, &["init"]);
@@ -470,7 +473,7 @@ fn the_blind_node_carries_and_forgets() {
     bounded("the_blind_node", 600, || {
         let a = Root::new("mbx-a");
         let b = Root::new("mbx-b");
-        let node_dir = tempfile::tempdir().unwrap(/* t */);
+        let node_dir = common::test_dir();
         let node_root = node_dir.path().join("node");
         std::fs::create_dir_all(&node_root).unwrap(/* t */);
         // the cell with a SECRET body (the needle the node must never hold)
@@ -566,7 +569,7 @@ fn the_blind_node_carries_and_forgets() {
 
 /// One note written through the real CLI (armed with the device signer).
 fn add_note(root: &std::path::Path, who: &str) {
-    let file = tempfile::tempdir().unwrap(/* t */);
+    let file = common::test_dir();
     let path = file.path().join("nota.md");
     std::fs::write(&path, format!("scritta concorrente di {who}")).unwrap(/* t */);
     let (ok, _, err) = run(
@@ -881,7 +884,7 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
         let a = Root::new("code-a");
         let b = Root::new("code-b");
         let stranger = Root::new("code-s");
-        let node_dir = tempfile::tempdir().unwrap(/* t */);
+        let node_dir = common::test_dir();
         let node_root = node_dir.path().join("node");
         std::fs::create_dir_all(&node_root).unwrap(/* t */);
         // the cell on A, shared
@@ -1235,7 +1238,7 @@ fn the_serve_cycle_pushes_a_second_process_write() {
     let _ = serve_a.first_json();
     std::thread::sleep(Duration::from_secs(2));
     // the write, from a SECOND process on A's root (the CLI itself)
-    let file = tempfile::tempdir().unwrap(/* t */);
+    let file = common::test_dir();
     let path = file.path().join("nota.md");
     std::fs::write(&path, "la nota scritta da un altro processo").unwrap(/* t */);
     let (ok, _, err) = run(

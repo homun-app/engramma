@@ -2400,6 +2400,238 @@ impl Task for DeleteTask {
     reject_recode!();
 }
 
+/// v0.6.13 (M1): what `propose` is asked to store. The note is born
+/// quarantined whatever its `status` says; `mode` is `new` or
+/// `supersede` (with `target`).
+#[napi(object)]
+pub struct ProposeInput {
+    /// The note (same shape `put` takes).
+    pub note: NoteInput,
+    /// `new` (a fresh fact) or `supersede` (a correction of `target`).
+    pub mode: String,
+    /// The superseded note, when `mode` is `supersede`.
+    pub target: Option<String>,
+    /// The client the assistant DECLARED (`clientInfo`): registered,
+    /// never an identity.
+    pub client: Option<String>,
+    /// The assistant's stated motivation.
+    pub reason: Option<String>,
+}
+
+/// What `propose` did: `pending` (queued), `duplicate` (refused), or
+/// `accepted`/`rejected` (a policy reviewer decided inside the call —
+/// not on this surface today, the field is the contract's own).
+#[napi(object)]
+pub struct ProposalOutcome {
+    /// `pending` | `duplicate` | `accepted` | `rejected`.
+    pub status: String,
+    /// The proposal's note id, when the proposal was written.
+    pub id: Option<String>,
+    /// The existing twin, on `duplicate`.
+    pub existing: Option<String>,
+    /// Who decided, when a reviewer did.
+    pub decided_by: Option<String>,
+    /// Why, when a reviewer did.
+    pub decision_reason: Option<String>,
+}
+
+/// What `decide` is asked to do.
+#[napi(object)]
+pub struct DecideInput {
+    /// `accept` (activate; `edited` may fix the text while accepting)
+    /// or `reject` (tombstone — the text stays, the decision can be
+    /// undone from the CLI).
+    pub action: String,
+    /// The text the human fixed while accepting, when any.
+    pub edited: Option<NoteInput>,
+    /// The motivation, kept with the decision.
+    pub reason: Option<String>,
+}
+
+/// One row of the proposals queue.
+#[napi(object)]
+pub struct ProposalRow {
+    /// The proposed note.
+    pub id: String,
+    /// `new` or `supersede`.
+    pub mode: String,
+    /// The superseded note, when a correction.
+    pub target: Option<String>,
+    /// Who proposed (the propose op's actor).
+    pub proposer: String,
+    /// The declared client, when any.
+    pub client: Option<String>,
+    /// The stated motivation, when any.
+    pub reason: Option<String>,
+    /// `pending` | `accepted` | `rejected` | `reverted`.
+    pub state: String,
+    /// When the proposal was made.
+    pub proposed_at: String,
+    /// Who decided, when decided.
+    pub decided_by: Option<String>,
+    /// When, when decided.
+    pub decided_at: Option<String>,
+    /// Why, when decided.
+    pub decision_reason: Option<String>,
+    /// An automatic review was attempted and failed: the proposal
+    /// waits for a human.
+    pub auto_failed: bool,
+    /// The note as it stands.
+    pub note: NoteView,
+}
+
+pub struct ProposeTask {
+    cell: CoreCell,
+    actor: String,
+    input: ProposeInput,
+    _open: CellPermits,
+}
+
+impl Task for ProposeTask {
+    type Output = engramma_core::cell::proposals::ProposalOutcome;
+    type JsValue = ProposalOutcome;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let id = match &self.input.note.id {
+            Some(s) => parse_ulid(s)?,
+            None => engramma_core::id::new_ulid().map_err(cell_error)?,
+        };
+        let note = build_note(&self.input.note, id)?;
+        let mode = match (self.input.mode.as_str(), &self.input.target) {
+            ("supersede", Some(t)) => {
+                engramma_core::cell::proposals::ProposalMode::Supersede(resolve_id(&self.cell, t)?)
+            }
+            _ => engramma_core::cell::proposals::ProposalMode::New,
+        };
+        self.cell
+            .propose(
+                &engramma_core::cell::proposals::ProposalInput {
+                    note,
+                    mode,
+                    client: self.input.client.clone(),
+                    reason: self.input.reason.clone(),
+                },
+                &self.actor,
+                &engramma_core::cell::proposals::ProposeContext::default(),
+            )
+            .map_err(cell_error)
+    }
+
+    fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
+        Ok(ProposalOutcome {
+            status: match out.status {
+                engramma_core::cell::proposals::ProposalStatus::Pending => "pending".into(),
+                engramma_core::cell::proposals::ProposalStatus::Duplicate => "duplicate".into(),
+                engramma_core::cell::proposals::ProposalStatus::Accepted => "accepted".into(),
+                engramma_core::cell::proposals::ProposalStatus::Rejected => "rejected".into(),
+            },
+            id: out.id.map(|i| i.to_string()),
+            existing: out.existing.map(|i| i.to_string()),
+            decided_by: out.decided_by,
+            decision_reason: out.decision_reason,
+        })
+    }
+
+    reject_recode!();
+}
+
+pub struct DecideTask {
+    cell: CoreCell,
+    actor: String,
+    id: String,
+    action: DecideInput,
+    _open: CellPermits,
+}
+
+impl Task for DecideTask {
+    type Output = Ulid;
+    type JsValue = String;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let id = resolve_id(&self.cell, &self.id)?;
+        let action = match self.action.action.as_str() {
+            "reject" => engramma_core::cell::proposals::DecisionAction::Reject,
+            _ => {
+                let edited = match &self.action.edited {
+                    Some(e) => {
+                        let eid = match &e.id {
+                            Some(s) => parse_ulid(s)?,
+                            None => id,
+                        };
+                        Some(build_note(e, eid)?)
+                    }
+                    None => None,
+                };
+                engramma_core::cell::proposals::DecisionAction::Accept { edited }
+            }
+        };
+        self.cell
+            .decide(
+                &id,
+                &engramma_core::cell::proposals::DecisionInput {
+                    action,
+                    reason: self.action.reason.clone(),
+                    review: None,
+                },
+                &self.actor,
+            )
+            .map_err(cell_error)
+    }
+
+    fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
+        Ok(out.to_string())
+    }
+
+    reject_recode!();
+}
+
+pub struct ProposalsTask {
+    cell: CoreCell,
+    _open: CellPermits,
+}
+
+impl Task for ProposalsTask {
+    type Output = Vec<engramma_core::cell::proposals::ProposalRow>;
+    type JsValue = Vec<ProposalRow>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        self.cell
+            .proposals(&engramma_core::cell::proposals::ProposalsFilter::default())
+            .map_err(cell_error)
+    }
+
+    fn resolve(&mut self, env: Env, out: Self::Output) -> Result<Self::JsValue> {
+        let mut rows = Vec::with_capacity(out.len());
+        for row in out {
+            let note = note_view(&self.cell, &row.note)?;
+            rows.push(ProposalRow {
+                id: row.id.to_string(),
+                mode: match row.mode {
+                    engramma_core::cell::proposals::ProposalMode::New => "new".into(),
+                    engramma_core::cell::proposals::ProposalMode::Supersede(_) => {
+                        "supersede".into()
+                    }
+                },
+                target: row.target.map(|t| t.to_string()),
+                proposer: row.proposer,
+                client: row.client,
+                reason: row.reason,
+                state: row.state.as_str().to_string(),
+                proposed_at: row.proposed_at,
+                decided_by: row.decided_by,
+                decided_at: row.decided_at,
+                decision_reason: row.decision_reason,
+                auto_failed: row.auto_failed,
+                note,
+            });
+        }
+        let _ = env;
+        Ok(rows)
+    }
+
+    reject_recode!();
+}
+
 pub struct PurgePreviewTask {
     cell: CoreCell,
     id: String,
@@ -3064,6 +3296,52 @@ impl Cell {
         Ok(AsyncTask::new(PurgePreviewTask {
             cell: self.cell.clone(),
             id,
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// v0.6.13 (M1): propose a fact — the note is born quarantined, in
+    /// the queue, invisible to the search, until a decision says
+    /// otherwise. The actor is the cell's own (an agent for Homun);
+    /// `revertDecision` stays out of the binding (declared by the
+    /// phase: it lives in the CLI's review).
+    #[napi(ts_return_type = "Promise<ProposalOutcome>")]
+    pub fn propose(&self, env: Env, input: ProposeInput) -> Result<AsyncTask<ProposeTask>> {
+        Ok(AsyncTask::new(ProposeTask {
+            cell: self.cell.clone(),
+            actor: self.actor.clone(),
+            input,
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// v0.6.13 (M1): decide a queued proposal — `accept` activates the
+    /// note (and closes the supersede target), `reject` tombstones it.
+    /// Returns the decision op's id.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn decide(
+        &self,
+        env: Env,
+        id: String,
+        action: DecideInput,
+    ) -> Result<AsyncTask<DecideTask>> {
+        Ok(AsyncTask::new(DecideTask {
+            cell: self.cell.clone(),
+            actor: self.actor.clone(),
+            id,
+            action,
+            _open: self.enter(env)?,
+        }))
+    }
+
+    /// v0.6.13 (M1): the proposals queue (every state, oldest first).
+    /// The rows the agent's conflict copies derive stay hidden from the
+    /// LISTING while their original holds a lapide (the bin's own
+    /// rule), but their rows are here.
+    #[napi(ts_return_type = "Promise<ProposalRow[]>")]
+    pub fn proposals(&self, env: Env) -> Result<AsyncTask<ProposalsTask>> {
+        Ok(AsyncTask::new(ProposalsTask {
+            cell: self.cell.clone(),
             _open: self.enter(env)?,
         }))
     }

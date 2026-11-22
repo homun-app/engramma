@@ -127,6 +127,67 @@ test('compact() then purge() of a supersede: the purge succeeds, the other histo
   }
 });
 
+// v0.6.13 (M1): the whole-object anchor, in the contract Homun leans
+// on. An agent's correction (the new `propose`), the user's `decide`
+// accept, the compaction, then the purge of the target: the queue row
+// born under the cut must SURVIVE the reconstruction the purge forces
+// (on the v0.6.12 engine it vanished and the proposal turned active
+// against the user's word). `revertDecision` stays out of the binding
+// by declaration: its case lives in the Rust tests.
+test('propose() then decide() then compact() then purge(): the queue row survives whole', async () => {
+  const cli = engrammaBin();
+  if (!cli) return; // no binary around: the per-test assertion below says so
+  const run = (args) => {
+    const r = require('node:child_process').spawnSync(cli, args, { encoding: 'utf8' });
+    assert.equal(r.status, 0, `${args.join(' ')}\n${r.stdout}${r.stderr}`);
+    return r;
+  };
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  try {
+    const cell = await e.cell('ancora-intera');
+    const base = await cell.put({
+      body: 'il mio colore preferito è il rosso [[Roma]]',
+      source: 'homun:test',
+      confidence: 'stated',
+    });
+    // the cell opens to proposals (the binding carries no policy
+    // surface: the CLI sets it, the same road the view tests walk)
+    run(['--root', rootDir, '--cell', 'ancora-intera', 'policy', 'set', 'write=propose']);
+    const out = await cell.propose({
+      note: {
+        body: 'il mio colore preferito è il nero [[Roma]]',
+        source: 'homun:test',
+        confidence: 'stated',
+      },
+      mode: 'supersede',
+      target: base.id,
+      reason: "l'utente l'ha detto",
+    });
+    assert.equal(out.status, 'pending', 'the correction waits in the queue');
+    await cell.decide(out.id, { action: 'accept' });
+    let rows = await cell.proposals();
+    let row = rows.find((r) => r.id === out.id);
+    assert.ok(row, 'the row is in the queue');
+    assert.equal(row.state, 'accepted', 'the user accepted it');
+    assert.equal((await cell.get(out.id)).status, 'active', 'the note is active');
+
+    // the compaction, then the purge of the target: the reconstruction
+    // the purge forces must keep the queue row whole
+    const compact = await cell.compact(1);
+    assert.ok(compact.cutSeq >= 1, 'the cut landed');
+    const report = await cell.purge(base.id, 'dato superato');
+    assert.equal(report.scrubbed, true, 'the scrub earned its name');
+    rows = await cell.proposals();
+    row = rows.find((r) => r.id === out.id);
+    assert.ok(row, 'the row survived the purge (the whole-object anchor)');
+    assert.equal(row.state, 'accepted', 'its own state, intact');
+    assert.equal((await cell.get(out.id)).status, 'active', 'the accepted text stands');
+  } finally {
+    await e.close();
+  }
+});
+
 test('purgePreview() names the note that would reopen, and moves nothing', async () => {
   const cli = engrammaBin();
   if (!cli) return; // no binary around: the per-test assertion below says so

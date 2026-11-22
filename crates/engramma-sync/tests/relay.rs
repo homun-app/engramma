@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! R2 (v0.6.1, revisore): the relay really exists. iroh's LOCAL relay
@@ -7,6 +8,8 @@
 //! The pass summary must say which road each session rode, and a root with
 //! `--no-relay` must fail the same round CLEANLY — a summary row, not an
 //! error.
+
+mod common;
 
 use std::time::Duration;
 
@@ -68,8 +71,8 @@ struct Pair {
 
 impl Pair {
     fn new() -> Self {
-        let dir_a = tempfile::tempdir().unwrap(/* t */);
-        let dir_b = tempfile::tempdir().unwrap(/* t */);
+        let dir_a = common::test_dir();
+        let dir_b = common::test_dir();
         std::fs::create_dir_all(dir_a.path().join("cells")).unwrap(/* t */);
         std::fs::create_dir_all(dir_b.path().join("cells")).unwrap(/* t */);
         let key_a = DeviceKey::load_or_create(dir_a.path()).unwrap(/* t */);
@@ -390,8 +393,8 @@ async fn a_peer_with_dead_direct_roads_is_reached_through_the_relay_within_ten_s
             .await
             .expect(/* loopback */ "the local relay");
         let choice = RelayChoice::Own(relay_url.to_string());
-        let dir_a = tempfile::tempdir().unwrap(/* t */);
-        let dir_b = tempfile::tempdir().unwrap(/* t */);
+        let dir_a = common::test_dir();
+        let dir_b = common::test_dir();
         std::fs::create_dir_all(dir_a.path().join("cells")).unwrap(/* t */);
         std::fs::create_dir_all(dir_b.path().join("cells")).unwrap(/* t */);
         let key_a = DeviceKey::load_or_create(dir_a.path()).unwrap(/* t */);

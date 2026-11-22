@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! The pairing over the REAL CLI (v0.6.1, P2): two roots, one invite that
@@ -5,6 +6,8 @@
 //! sides — and the shared cell that arrives whole. Plus the refusals: the
 //! expired ticket, the reused ticket, the man in the middle with someone
 //! else's ticket, and the code way in with its burnt channel (P4).
+
+mod common;
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -41,7 +44,7 @@ struct Root {
 
 impl Root {
     fn new(tag: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = common::test_dir();
         let root = dir.path().join(tag);
         std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
         run(&root, &["init"], b"");

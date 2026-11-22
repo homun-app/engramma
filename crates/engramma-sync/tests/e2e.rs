@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! The end-to-end sync over iroh, on loopback (v0.6.1, P1): two devices,
@@ -5,6 +6,8 @@
 //! the whole production road: the crate's own wire form, the SharedCell
 //! adapter with epoch keys from the keystore, the arrival gate (signature,
 //! membership, adopt coverage) and its refusals.
+
+mod common;
 
 use engramma_core::cell::ops::{Op, OpParts};
 use engramma_core::format::{Note, NoteType};
@@ -72,8 +75,8 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let dir_a = tempfile::tempdir().unwrap(/* t */);
-        let dir_b = tempfile::tempdir().unwrap(/* t */);
+        let dir_a = common::test_dir();
+        let dir_b = common::test_dir();
         std::fs::create_dir_all(dir_a.path().join("cells")).unwrap(/* t */);
         std::fs::create_dir_all(dir_b.path().join("cells")).unwrap(/* t */);
         let key_a = DeviceKey::load_or_create(dir_a.path()).unwrap(/* t */);
@@ -287,7 +290,7 @@ async fn two_devices_converge_over_loopback() {
 /// device's is refused before any exchange.
 #[tokio::test]
 async fn a_stranger_is_refused_before_any_exchange() {
-    let dir_a = tempfile::tempdir().unwrap(/* t */);
+    let dir_a = common::test_dir();
     let key_a = DeviceKey::load_or_create(dir_a.path()).unwrap(/* t */);
     let reg_a = DeviceRegistry::open(dir_a.path()).unwrap(/* t */);
     reg_a.create_first(&key_a, "portatile").unwrap(/* t */);

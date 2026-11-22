@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! The semantic golden questions (v0.2 §5): paraphrases with no shared root,
@@ -8,6 +9,8 @@
 //!
 //! Needs the real models (see `fidelity.rs` for
 //! `ENGRAMMA_SKIP_MODEL_TESTS=1`).
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,7 +54,7 @@ fn vault_files() -> Vec<PathBuf> {
 }
 
 fn golden_cell() -> (tempfile::TempDir, Cell) {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let cell = Cell::create(&dir.path().join("famiglia.sqlite"), "famiglia", "golden")
         .unwrap(/* test-only */);
     for f in vault_files() {

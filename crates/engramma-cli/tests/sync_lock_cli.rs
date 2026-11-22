@@ -1,9 +1,12 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! S1 (v0.6.2): the exclusive root lock, BETWEEN PROCESSES. The CLI's
 //! `sync serve` holds `<root>/sync.lock`; a service in ANOTHER process on
 //! the same root answers `SYNC_BUSY` — and the CLI answers its own line
 //! and exit code when the lock is someone else's.
+
+mod common;
 
 use std::io::BufRead;
 use std::process::{Command, Stdio};
@@ -56,7 +59,7 @@ fn serve_json(root: &std::path::Path) -> (std::process::Child, serde_json::Value
 /// process, is told `SYNC_BUSY` — and told so at a single pass too.
 #[test]
 fn the_cli_serve_and_the_library_service_share_one_lock() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let root = dir.path().join("r");
     std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
     let (mut child, v) = serve_json(&root);
@@ -97,7 +100,7 @@ fn the_cli_serve_and_the_library_service_share_one_lock() {
 /// answers a dedicated line and a dedicated exit code.
 #[test]
 fn the_cli_refuses_a_root_the_library_serves() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let root = dir.path().join("r");
     std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
     let svc = engramma_sync::service::SyncService::start(&root).unwrap(/* t */);

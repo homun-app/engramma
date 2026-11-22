@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! R3 / P5.2 (v0.6.1): the bootstrap measure, time and bytes on the wire.
@@ -10,6 +11,8 @@
 //! The sender side of a session whose peer needs EVERY operation of an
 //! `N`-op cell: `ids()` once, one envelope per id. The number of
 //! operations is the first argument of the measure (1000, 10000).
+
+mod common;
 
 use engramma_core::format::{Note, NoteType};
 use engramma_core::{Cell, Confidence, Status};
@@ -50,7 +53,7 @@ fn note(id: u32, body: &str) -> Note {
 }
 
 fn bench(n: u32) {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     std::fs::create_dir_all(dir.path().join("cells")).unwrap(/* t */);
     let key = DeviceKey::load_or_create(dir.path()).unwrap(/* t */);
     let reg = DeviceRegistry::open(dir.path()).unwrap(/* t */);

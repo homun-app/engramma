@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.6 (P2): the device identity and the signed device list. One seed on
@@ -6,6 +7,8 @@
 //! signature that names its author by construction. The revocation
 //! dominates: a removed device never comes back through the door it left
 //! by, and the last device cannot be removed at all.
+
+mod common;
 
 use engramma_sync::device::DeviceKey;
 use engramma_sync::registry::{DeviceRegistry, RegistryKind};
@@ -16,7 +19,7 @@ fn key_of(seed: u8) -> DeviceKey {
 
 #[test]
 fn the_seed_file_is_created_once_with_strict_permissions() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let a = DeviceKey::load_or_create(dir.path()).unwrap(/* test-only */);
     let b = DeviceKey::load_or_create(dir.path()).unwrap(/* test-only */);
     assert_eq!(
@@ -53,7 +56,7 @@ fn hex_of(bytes: &[u8]) -> String {
 
 #[test]
 fn the_list_grows_and_shrinks_under_signatures() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let reg = DeviceRegistry::open(dir.path()).unwrap(/* test-only */);
     let laptop = key_of(1);
     let mac = key_of(2);
@@ -118,7 +121,7 @@ fn the_list_grows_and_shrinks_under_signatures() {
 
 #[test]
 fn a_forged_or_late_arrival_is_refused() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let reg = DeviceRegistry::open(dir.path()).unwrap(/* test-only */);
     let laptop = key_of(1);
     let mac = key_of(2);
@@ -178,8 +181,8 @@ fn a_forged_or_late_arrival_is_refused() {
 fn the_registry_travels_between_devices() {
     // two roots, one registry: the ops of one arrive at the other, and the
     // members agree
-    let dir_a = tempfile::tempdir().unwrap(/* t */);
-    let dir_b = tempfile::tempdir().unwrap(/* t */);
+    let dir_a = common::test_dir();
+    let dir_b = common::test_dir();
     let a = DeviceRegistry::open(dir_a.path()).unwrap(/* t */);
     let b = DeviceRegistry::open(dir_b.path()).unwrap(/* t */);
     let laptop = key_of(1);

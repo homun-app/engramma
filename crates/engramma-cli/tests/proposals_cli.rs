@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.5 (P4): the CLI surfaces of the queue — `proposals`, `decisions`,
@@ -5,6 +6,8 @@
 //! is covered by the core tests; what these prove is the plumbing: filters,
 //! actors, exit codes, --json shapes, the confirmation flow of the bulk
 //! revert, and the editor path of `proposals accept --edit`.
+
+mod common;
 
 use std::process::Command;
 
@@ -44,7 +47,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = common::test_dir();
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap(/* t */);
         let out = Command::new(env!("CARGO_BIN_EXE_engramma"))

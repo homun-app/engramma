@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.6.5 (E5): `engramma conflicts show <cella> <copia>` — the read of
@@ -5,6 +6,8 @@
 //! can never show. The scene is built with the core's own API (two
 //! devices, concurrent body writes, the loser's copy), then the CLI
 //! reads it.
+
+mod common;
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -116,7 +119,7 @@ fn sync(a: &engramma_core::Cell, b: &engramma_core::Cell) {
 
 #[test]
 fn conflicts_show_reads_the_quarantined_copy() {
-    let root = tempfile::tempdir().unwrap(/* test-only */);
+    let root = common::test_dir();
     std::fs::create_dir(root.path().join("cells")).unwrap(/* t */);
     let a = engramma_core::Cell::create(
         &root.path().join("cells").join("a.sqlite"),

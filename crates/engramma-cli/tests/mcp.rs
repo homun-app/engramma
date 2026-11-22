@@ -1,9 +1,12 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration test for `engramma mcp`: spawn the real binary and speak
 //! JSON-RPC over stdio (initialize → tools/list → tools/call), including the
 //! check that a cell not named in `--cells` is unreachable even when the tool
 //! is called with its name.
+
+mod common;
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -108,7 +111,7 @@ fn cell_root(root: &std::path::Path) -> std::path::PathBuf {
 
 #[test]
 fn mcp_stdio_roundtrip_and_isolation() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let cells = cell_root(dir.path());
     let note = make_cell(
         &cells,
@@ -360,7 +363,7 @@ fn mcp_stdio_roundtrip_and_isolation() {
 
 #[test]
 fn mcp_single_cell_is_the_default() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let cells = cell_root(dir.path());
     make_cell(
         &cells,
@@ -439,7 +442,7 @@ fn mcp_single_cell_is_the_default() {
 
 #[test]
 fn mcp_without_cells_refuses() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     cell_root(dir.path());
     let out = Command::new(env!("CARGO_BIN_EXE_engramma"))
         .args(["mcp", "--root"])
@@ -570,7 +573,7 @@ fn tool_payload(res: &serde_json::Value) -> serde_json::Value {
 
 #[test]
 fn the_tool_list_is_exact_with_and_without_write() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cells = cell_root(dir.path());
     make_cell(&cells, "scrivibile", "Fabio nuota in piscina.");
 
@@ -637,7 +640,7 @@ fn the_tool_list_is_exact_with_and_without_write() {
 
 #[test]
 fn a_proposal_lands_in_the_queue_and_a_duplicate_is_refused() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cells = cell_root(dir.path());
     make_cell(&cells, "mem", "Fabio nuota in piscina.");
     open_with_policy(&cells, "mem", serde_json::json!({ "write": "propose" }));
@@ -701,7 +704,7 @@ fn a_proposal_lands_in_the_queue_and_a_duplicate_is_refused() {
 
 #[test]
 fn a_cell_outside_the_write_list_refuses_without_revealing_more() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cells = cell_root(dir.path());
     make_cell(&cells, "aperta", "Fabio nuota in piscina.");
     make_cell(&cells, "sola_lettura", "Nota su [[Torino]].");
@@ -737,7 +740,7 @@ fn a_cell_outside_the_write_list_refuses_without_revealing_more() {
 
 #[test]
 fn confirm_without_elicitation_capability_stays_pending_with_a_pointer() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cells = cell_root(dir.path());
     make_cell(&cells, "mem", "Fabio nuota in piscina.");
     open_with_policy(&cells, "mem", serde_json::json!({ "write": "confirm" }));
@@ -758,7 +761,7 @@ fn confirm_without_elicitation_capability_stays_pending_with_a_pointer() {
 
 #[test]
 fn confirm_with_the_server_requested_form_accepts_rejects_and_cancels() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cells = cell_root(dir.path());
     make_cell(&cells, "mem", "Fabio nuota in piscina.");
     open_with_policy(&cells, "mem", serde_json::json!({ "write": "confirm" }));
@@ -813,7 +816,7 @@ fn confirm_with_the_server_requested_form_accepts_rejects_and_cancels() {
 
 #[test]
 fn confirm_with_the_2026_input_required_round() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cells = cell_root(dir.path());
     make_cell(&cells, "mem", "Fabio nuota in piscina.");
     open_with_policy(&cells, "mem", serde_json::json!({ "write": "confirm" }));
@@ -916,7 +919,7 @@ fn confirm_with_the_2026_input_required_round() {
 /// displaced answer: over HTTP that would be an oracle on hidden notes.
 #[test]
 fn mcp_search_is_indistinguishable_with_hidden_notes() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cells = cell_root(dir.path());
     {
         let cell = Cell::create(&cells.join("gatti.sqlite"), "gatti", "test").unwrap(/* t */);
@@ -990,7 +993,7 @@ fn mcp_search_is_indistinguishable_with_hidden_notes() {
 /// either); it was silently ignored before.
 #[test]
 fn compat_chatgpt_over_stdio_is_a_usage_error() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     cell_root(dir.path());
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_engramma"))
         .arg("--root")

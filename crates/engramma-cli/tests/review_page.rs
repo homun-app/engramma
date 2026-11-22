@@ -1,9 +1,12 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.5 (P5): the local review page — every security point with its test,
 //! then the human flows. The server is the real binary, spoken to over
 //! loopback HTTP; the hostile-Host case uses raw TCP (a client library may
 //! refuse to send a lying Host header, which is exactly the point).
+
+mod common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -64,7 +67,7 @@ fn still() -> ureq::Agent {
 }
 
 fn start() -> Server {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let root = dir.path().join("root");
     std::fs::create_dir_all(&root).unwrap(/* t */);
     let mut s = start_at(&root, None);
@@ -293,7 +296,7 @@ fn two_review_servers_on_different_ports_never_share_the_cookie() {
     // v0.5.2 (P0): the cookie's NAME carries the port, so the token of one
     // `engramma review` never travels to another one open at the same time
     // (nor to anything else on that host).
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let root = dir.path().join("root");
     std::fs::create_dir_all(&root).unwrap(/* t */);
     let a = start_at(&root, Some(free_port()));

@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! K1 (v0.6.1-ciclo): the write guard's DECISIONS. The cheap poll stays
@@ -11,6 +12,8 @@
 //!
 //! And the ack comes AFTER the pass: a local write that lands mid-pass is
 //! handed to another pass (`finish_pass` says so), never swallowed.
+
+mod common;
 
 use std::time::Duration;
 
@@ -54,7 +57,7 @@ fn scene_cells(
     tag: &str,
     names: &[&str],
 ) -> (tempfile::TempDir, DataVersionWatch, Cell, Option<Cell>) {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let root = dir.path().join(tag);
     std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
     for name in names {

@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! The latency measure of v0.6.1 (P5.3): FIFTY local writes, then the pass
@@ -11,6 +12,8 @@
 //! era's shape), the wall time of the pass that pulls all fifty, and the
 //! incremental pass that follows ONE more write (the steady-state latency
 //! a `sync serve` sees at every local write).
+
+mod common;
 
 use engramma_core::format::{Note, NoteType};
 use engramma_core::{Cell, Confidence, Status};
@@ -57,8 +60,8 @@ fn note(id: u32, body: &str) -> Note {
 #[ignore = "una misura, non un test: cargo test -- --ignored --nocapture"]
 async fn the_fifty_writes_latency() {
     let bound = tokio::time::timeout(std::time::Duration::from_secs(300), async {
-        let dir_a = tempfile::tempdir().unwrap(/* t */);
-        let dir_b = tempfile::tempdir().unwrap(/* t */);
+        let dir_a = common::test_dir();
+        let dir_b = common::test_dir();
         std::fs::create_dir_all(dir_a.path().join("cells")).unwrap(/* t */);
         std::fs::create_dir_all(dir_b.path().join("cells")).unwrap(/* t */);
         let key_a = DeviceKey::load_or_create(dir_a.path()).unwrap(/* t */);

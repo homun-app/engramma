@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.4.3 (P0.1): `cell drop` forgets the cell and ITS OWN files — the
@@ -7,6 +8,8 @@
 //! real snapshot is never listed by `cell list`; a cell CANNOT be created
 //! with a snapshot-shaped name (reserved: `x-snap-7` would ride with x's
 //! drop and never be listed).
+
+mod common;
 
 use std::process::Command;
 
@@ -44,7 +47,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let dir = common::test_dir();
         let root = dir.path().join("root");
         std::fs::create_dir_all(root.join("cells")).unwrap(/* test-only */);
         Fixture { _dir: dir, root }

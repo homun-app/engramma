@@ -1,14 +1,17 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! CLI plumbing for the v0.2.1 search additions: `--strict` and the
 //! `support` field in the JSON output (the ranking behaviour lives in the
 //! golden tests, with the real model).
 
+mod common;
+
 use std::process::Command;
 
 #[test]
 fn strict_flag_and_support_field_travel_the_cli() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let root = dir.path().join("root");
     let run = |args: &[&str]| -> String {
         let out = Command::new(env!("CARGO_BIN_EXE_engramma"))

@@ -1,9 +1,12 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! R2 (v0.6.1, revisore): the relay the documents promise — `--relay <url>`
 //! and `--no-relay` on every command that binds an endpoint, the choice
 //! saved in the root so `sync serve` does not ask again, an explicit flag
 //! winning over what is saved.
+
+mod common;
 
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -91,7 +94,7 @@ struct Root {
 
 impl Root {
     fn new(tag: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = common::test_dir();
         let root = dir.path().join(tag);
         std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
         run(&root, &["init"]);
@@ -404,7 +407,7 @@ fn the_invite_ticket_carries_the_relay_from_the_binary() {
 fn the_node_ticket_carries_the_relay_from_the_binary() {
     let relay_url = local_relay();
     let bin = test_relay_bin();
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let node_root = dir.path().join("node");
     std::fs::create_dir_all(&node_root).unwrap(/* t */);
     let mut child = spawn_json(

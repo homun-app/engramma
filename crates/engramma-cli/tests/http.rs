@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.5.2: `engramma mcp --http` — the full OAuth 2.1 flow and the MCP
@@ -6,6 +7,8 @@
 //! router (the library's two test hatches let the flow live on 127.0.0.1),
 //! the CLI-only rules run the binary itself. No network beyond loopback,
 //! exactly like the review-page tests.
+
+mod common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -65,7 +68,7 @@ struct Server {
 
 impl Server {
     fn start(cfg_patch: impl FnOnce(&mut HttpConfig)) -> Server {
-        let keep = tempfile::tempdir().unwrap(/* t */);
+        let keep = common::test_dir();
         let root = keep.path().join("root");
         std::fs::create_dir_all(&root).unwrap(/* t */);
         let mut cfg = HttpConfig {
@@ -817,7 +820,7 @@ fn bin_ok(root: &std::path::Path, args: &[&str]) {
 }
 
 fn start_bin(extra: &[&str]) -> BinServer {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let root = dir.path().join("root");
     std::fs::create_dir_all(&root).unwrap(/* t */);
     bin_ok(&root, &["init"]);
@@ -965,7 +968,7 @@ fn bin_token(s: &BinServer) -> String {
 
 #[test]
 fn the_cli_refuses_what_it_must_refuse() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let root = dir.path().join("root");
     std::fs::create_dir_all(&root).unwrap(/* t */);
     bin_ok(&root, &["init"]);
@@ -1734,11 +1737,11 @@ fn the_chatgpt_wrappers_exist_only_with_the_flag() {
 #[test]
 fn search_and_fetch_wrap_the_engine_over_http() {
     let (gpt_url, _g) = cimd_doc(CHATGPT_CIMD);
-    let keep = tempfile::tempdir().unwrap(/* t */);
+    let keep = common::test_dir();
     let root = keep.path().join("root");
     std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
     {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = common::test_dir();
         let c = engramma_core::Cell::create(&dir.path().join("x.sqlite"), "default", "t")
             .unwrap(/* t */);
         drop(c);
@@ -2377,7 +2380,7 @@ fn compat_wrappers_belong_to_the_chatgpt_grant_alone() {
     let (gpt_url, _g) = cimd_doc(CHATGPT_CIMD);
     let (codex_url, _c) = cimd_doc(CODEX_CIMD);
     let (claude_url, _l) = cimd_doc(CLAUDE_CIMD);
-    let keep = tempfile::tempdir().unwrap(/* t */);
+    let keep = common::test_dir();
     let root = keep.path().join("root");
     std::fs::create_dir_all(&root).unwrap(/* t */);
     // the cell the server exposes (empty: the tool LIST is the test)
@@ -2386,7 +2389,7 @@ fn compat_wrappers_belong_to_the_chatgpt_grant_alone() {
         root.join("cells/famiglia.sqlite"),
         {
             // a real (empty) cell: the server opens it at startup
-            let dir = tempfile::tempdir().unwrap(/* t */);
+            let dir = common::test_dir();
             let c = engramma_core::Cell::create(&dir.path().join("x.sqlite"), "famiglia", "t")
                 .unwrap(/* t */);
             drop(c);
@@ -2697,11 +2700,11 @@ fn oauth_deny_all_refuses_every_waiting_request() {
 #[test]
 fn the_session_map_is_bounded_and_the_evicted_answer_404() {
     let (gpt_url, _g) = cimd_doc(CHATGPT_CIMD);
-    let keep = tempfile::tempdir().unwrap(/* t */);
+    let keep = common::test_dir();
     let root = keep.path().join("root");
     std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
     {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = common::test_dir();
         let c = engramma_core::Cell::create(&dir.path().join("x.sqlite"), "famiglia", "t")
             .unwrap(/* t */);
         drop(c);

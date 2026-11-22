@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! R1 (v0.6.1, revisore): a REMOVED device enters only with the proof. The
@@ -5,6 +6,8 @@
 //! which the author chooses. Every test here builds the envelopes exactly
 //! as the wire would carry them, and every refusal must name the gate that
 //! refused, never any note text.
+
+mod common;
 
 use engramma_core::cell::ops::{self, MerkleStep, Op, OpKind, OpParts};
 use engramma_core::format::{Note, NoteType};
@@ -71,8 +74,8 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let dir_a = tempfile::tempdir().unwrap(/* t */);
-        let dir_b = tempfile::tempdir().unwrap(/* t */);
+        let dir_a = common::test_dir();
+        let dir_b = common::test_dir();
         std::fs::create_dir_all(dir_a.path().join("cells")).unwrap(/* t */);
         std::fs::create_dir_all(dir_b.path().join("cells")).unwrap(/* t */);
         let key_a = DeviceKey::load_or_create(dir_a.path()).unwrap(/* t */);

@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.4 (P0.1): the CLI's purge and the view's identity. A view nobody can
@@ -5,6 +6,8 @@
 //! files or conflict copies OF THAT NOTE to THAT view; otherwise there is
 //! nothing to delete there and the purge is complete (exit 0). The message
 //! names the view and suggests both `vault sync` and `vault unbind`.
+
+mod common;
 
 use std::process::Command;
 
@@ -41,7 +44,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(notes: u16) -> Self {
-        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let dir = common::test_dir();
         let root = dir.path().join("root");
         std::fs::create_dir_all(&root).unwrap(/* test-only */);
         let mut plain = Command::new(env!("CARGO_BIN_EXE_engramma"));

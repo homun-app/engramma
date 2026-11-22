@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn missing_config_is_none_and_broken_is_an_error() {
-        let tmp = tempfile::tempdir().unwrap(/* test-only */);
+        let tmp = tempfile::Builder::new().prefix("engramma-test-").tempdir().unwrap(/* test-only */);
         assert!(load_config(tmp.path()).unwrap(/* test-only */).is_none());
         std::fs::write(
             tmp.path().join("config.json"),

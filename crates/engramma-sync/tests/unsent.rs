@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: Apache-2.0
 
 //! R4 (v0.6.1, revisore): no envelope is lost in silence. An operation
@@ -6,6 +7,8 @@
 //! must leave a trace: a row of the pass summary (`unsent`) and an EVENT
 //! in the root that carries the op id (short), the kind and the reason,
 //! and NOTHING of the note's text.
+
+mod common;
 
 use engramma_core::cell::ops::{self, OpKind, OpParts};
 use engramma_core::format::{Note, NoteType};
@@ -79,8 +82,8 @@ fn orphan_unsigned_put(body: &str) -> engramma_core::cell::ops::Op {
 #[tokio::test(flavor = "current_thread")]
 async fn an_unsendable_op_is_a_summary_row_and_an_event_without_note_text() {
     let bound = tokio::time::timeout(std::time::Duration::from_secs(120), async {
-        let dir_a = tempfile::tempdir().unwrap(/* t */);
-        let dir_b = tempfile::tempdir().unwrap(/* t */);
+        let dir_a = common::test_dir();
+        let dir_b = common::test_dir();
         std::fs::create_dir_all(dir_a.path().join("cells")).unwrap(/* t */);
         std::fs::create_dir_all(dir_b.path().join("cells")).unwrap(/* t */);
         let key_a = DeviceKey::load_or_create(dir_a.path()).unwrap(/* t */);
