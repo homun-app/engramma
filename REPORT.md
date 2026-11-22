@@ -11746,3 +11746,28 @@ finale. Fino ad allora Homun tiene la compattazione spenta.
   container: controllato con `pgrep` e `docker ps` a fine fase). I
   tre worktree di prova e le sonde delle misure, fuori dal repo, sono
   stati tolti.
+
+## La build sul tag
+
+`scripts/build-sha.sh` sul tag `fase-v0.6.12` (commit
+`3e7b7c614af4d95d2bd721fd84d2ff87b9586e9c`, albero pulito), i tre file
+dell'aggancio di Homun letti dal disco dopo la build:
+
+| file | byte | SHA256 |
+|---|---|---|
+| `engramma.darwin-arm64.node` | 50 784 728 | `d2119c270060d418fc5ed878fd33140a6120b52480928300fad6f7fd8fc6e376` |
+| `index.js` | 36 239 | `cd26043ecf56124be115f58a25368049dec67d48515109b31de588646280e311` |
+| `index.d.ts` | 27 109 | `dd80c0ac3be544f622b49ccb7b84796ac6c2270bc08c38932ca9105e5694854b` |
+
+`index.js` e `index.d.ts` hanno gli stessi SHA della v0.6.11: la
+superficie del binding non è cambiata in questa fase. L'addon è
+cambiato (50 784 728 B contro 50 766 728; `d2119c27…` contro
+`5cd74c36…`).
+
+**Riconto finale, dopo la build sul tag:** `target/` 25 G; `.tmp*` 8
+(le stesse otto vuote, non tolte); `engramma-test-*` 0;
+`engramma-node-*` 0; `engramma-cli-plain` e `engramma-cli-relay` al
+loro posto (le cache dei test del CLI); nessun processo acceso. In
+`$TMPDIR` ci sono anche un file `sonda-freddezza.log` e una cartella
+vuota `sonda-t-SmTu`, del 20 e del 21 novembre: precedenti a questa
+fase, non mie, non toccati.
