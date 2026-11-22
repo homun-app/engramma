@@ -19,7 +19,7 @@ use ulid::Ulid;
 /// note (…895) purged, then the local `put` of the same id the v0.6.8
 /// engine accepted — the phantom — and a living control note (…2).
 fn phantom_stage(name: &str) -> (tempfile::TempDir, Cell, Ulid, Ulid) {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/v068-put-after-purge.sqlite");
     let path = dir.path().join(name);
@@ -51,6 +51,16 @@ fn file_bytes(dir: &std::path::Path, name: &str) -> Vec<Vec<u8>> {
 /// irreversible, announced only by the `phantom_purged` field — a
 /// diagnosis must not destroy, and any future defect leaving a row on a
 /// purged id must ALARM, not silently lose the user's content.)
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn verify_touches_nothing_and_names_the_phantom() {
     let (dir, cell, phantom, _alive) = phantom_stage("verify-lettura.sqlite");
@@ -271,7 +281,7 @@ fn an_interrupted_resumable_repair_ends_clean() {
 /// becomes a function of the operations again.
 #[test]
 fn repair_settles_the_j1_leftover_of_an_old_cell() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("residuo.sqlite");
     let cell = Cell::create(&path, "residuo", "tester").unwrap(/* t */);
     let target = note(1, "la nota che il mondo vede");

@@ -615,7 +615,7 @@ fn the_bin_copy_appears_in_no_public_read() {
     }
 
     // the export: no file of the folder carries the copy
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let summary = engramma_core::port::export(&b, dir.path()).unwrap(/* t */);
     assert_eq!(
         summary.written, 1,
@@ -853,7 +853,7 @@ fn the_taken_copy_answers_every_read_like_a_living_note() {
     assert_eq!(resolved, copy);
 
     // the export: the copy's file is written
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let summary = engramma_core::port::export(&b, dir.path()).unwrap(/* t */);
     assert_eq!(
         summary.written, 2,

@@ -66,7 +66,7 @@ fn note_of(id: u16, body: &str) -> Note {
 /// it, accepted. The decide has closed the target and written the
 /// `supersedes` row.
 fn decided_stage(name: &str) -> (tempfile::TempDir, Cell, Ulid, Ulid) {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join(name), "p", "tester").unwrap(/* t */);
     let target = note_of(1, "la nota che il mondo vede");
     let mut proposal = note_of(2, "la rettifica che la corregge");
@@ -121,6 +121,16 @@ fn supersedes_rows(cell: &Cell, named: &Ulid) -> usize {
 /// replays NO half — the target is not closed by it anymore, the row does
 /// not come back, and the purge of the proposal reopens what the decide
 /// had closed.
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn the_target_half_of_a_decide_does_not_replay_over_the_purge_of_the_proposal_seed_14903() {
     let (_dir, cell, proposal, target) = decided_stage("decide-purga.sqlite");
@@ -260,7 +270,7 @@ fn the_proposal_half_of_a_decide_does_not_replay_over_the_purge_of_the_target() 
 /// censored body carried it); the per-operation rule takes it back.
 #[test]
 fn the_old_half_of_a_supersede_does_not_replay_over_the_purge_of_the_new() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("supersede-purga.sqlite"), "p", "tester")
         .unwrap(/* t */);
     let old = note_of(1, "la nota vecchia");
@@ -305,7 +315,7 @@ fn the_old_half_of_a_supersede_does_not_replay_over_the_purge_of_the_new() {
 /// is the hole this closes).
 #[test]
 fn a_link_arriving_after_the_purge_of_an_endpoint_does_not_recreate_the_edge() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let writer = Cell::create(&dir.path().join("scrittore.sqlite"), "p", "tester")
         .unwrap(/* t */);
     // the cited note: the edge's `note_id` — the note that declares it.
@@ -367,7 +377,7 @@ fn a_link_arriving_after_the_purge_of_an_endpoint_does_not_recreate_the_edge() {
 /// materialize again).
 #[test]
 fn an_unlink_of_an_edge_that_cited_a_purged_note_does_not_wait() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let writer = Cell::create(&dir.path().join("scollega-scr.sqlite"), "p", "tester")
         .unwrap(/* t */);
     let left = note_of(1, "un capo del legame che finisce");
@@ -443,7 +453,7 @@ fn an_unlink_of_an_edge_that_cited_a_purged_note_does_not_wait() {
 /// and no edge may name the purged target, whatever half replays.
 #[test]
 fn a_propose_for_a_purged_target_keeps_its_queue_row_and_names_nothing_purged() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("proposta-purga.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let target = note_of(1, "la nota che il mondo correggeva");

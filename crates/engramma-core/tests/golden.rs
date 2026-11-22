@@ -68,7 +68,7 @@ fn golden_now() -> OffsetDateTime {
 
 /// Build the golden cell from the vault files (deterministic order).
 fn golden_cell() -> (tempfile::TempDir, Cell) {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("famiglia.sqlite"), "famiglia", "golden")
         .unwrap(/* test-only */);
     let files = vault_files();
@@ -92,6 +92,16 @@ fn titles(hits: &[engramma_core::search::Hit]) -> Vec<String> {
     hits.iter()
         .map(|h| h.note.display_title().to_string())
         .collect()
+}
+
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
 }
 
 #[test]

@@ -59,7 +59,7 @@ impl std::ops::Deref for Kept {
 
 /// A fresh copy that ingests `ops` in the given order.
 fn copy_of(name: &str, ops: &[Op]) -> Kept {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::open_bare(&dir.path().join(format!("{name}.sqlite"))).unwrap(/* t */);
     for op in ops {
         assert!(cell.ingest_op(op).unwrap(/* t */));
@@ -85,10 +85,11 @@ fn union_of(cells: &[&Cell]) -> BTreeMap<String, Op> {
 /// purge, but its identity is the one it was born with: the patch's `base`
 /// resolves on both, the state is a function of the set, and no copy grows
 /// a phantom conflict copy.
+
 #[test]
 fn the_censored_supersede_keeps_its_identity_on_every_copy() {
     // A creates the cell and the original note
-    let dir_a = tempfile::tempdir().unwrap(/* t */);
+    let dir_a = test_dir();
     let a = Cell::create(&dir_a.path().join("a.sqlite"), "id", "device-a").unwrap(/* t */);
     let original = note(1, "la verità prima");
     let old_id = original.id;
@@ -278,7 +279,7 @@ impl Signer for FakeSigner {
 /// reviewer's exact scenario; this one sweeps the space.
 #[test]
 fn purge_compact_and_censorship_never_move_the_identity() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("p.sqlite"), "id", "device-a").unwrap(/* t */);
     cell.set_signer(std::sync::Arc::new(FakeSigner {
         device: "fakesigningdevice".into(),
@@ -458,6 +459,15 @@ fn body() -> impl Strategy<Value = String> {
     prop::collection::vec(word(), 1..4).prop_map(|parts| parts.join(" "))
 }
 
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -469,7 +479,7 @@ proptest! {
         bodies in prop::collection::vec(body(), 1..24),
         cut in 0.0f64..1.0,
     ) {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = test_dir();
         let cell = Cell::create(&dir.path().join("g.sqlite"), "gen", "device-a")
             .unwrap(/* t */);
         cell.set_signer(std::sync::Arc::new(FakeSigner {

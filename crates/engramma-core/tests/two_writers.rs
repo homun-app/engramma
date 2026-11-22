@@ -56,9 +56,19 @@ fn child(cell: &Cell) {
     }
 }
 
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn two_processes_share_one_cell_without_lost_writes_or_locks() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = test_dir();
     let path = dir.path().join("c.sqlite");
     if let Ok(child_path) = std::env::var("ENGRAMMA_TWO_WRITERS") {
         let cell = Cell::open(std::path::Path::new(&child_path)).unwrap(/* t */);

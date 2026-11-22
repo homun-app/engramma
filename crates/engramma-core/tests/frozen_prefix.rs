@@ -63,7 +63,7 @@ fn cut_at(cell: &Cell, cut: i64) {
 /// dichiarata sullo STATO, non sulla storia).
 #[test]
 fn purge_of_the_new_note_leaves_the_old_ones_history_whole() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cell = Cell::create(&dir.path().join("sonda.sqlite"), "p", "test")
         .unwrap(/* t */);
     let old = common::base_note(1, "la prima mano [[Roma]]");
@@ -123,7 +123,7 @@ fn purge_of_the_new_note_leaves_the_old_ones_history_whole() {
 /// sempre (`VersionNotFound`); deve riuscire, e la cella resta leggibile.
 #[test]
 fn compact_then_purge_of_the_new_note_succeeds() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cell = Cell::create(&dir.path().join("chirurgo.sqlite"), "p", "test")
         .unwrap(/* t */);
     let old = common::base_note(1, "la prima mano [[Roma]]");
@@ -174,7 +174,7 @@ fn compact_then_purge_of_the_new_note_succeeds() {
 /// vive (la riga che la nominava va), e la sua storia resta identica.
 #[test]
 fn purge_of_the_old_note_leaves_the_new_ones_history_whole() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cell = Cell::create(&dir.path().join("sup-volta.sqlite"), "p", "test")
         .unwrap(/* t */);
     let old = common::base_note(1, "la vecchia [[Roma]]");
@@ -211,7 +211,7 @@ fn purge_of_the_old_note_leaves_the_new_ones_history_whole() {
 /// proposta) e la sua storia resta identica.
 #[test]
 fn purge_of_the_proposal_leaves_the_targets_history_whole() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cell = Cell::create(&dir.path().join("dec-p.sqlite"), "p", "test")
         .unwrap(/* t */);
     cell.set_policy(serde_json::json!({ "write": "propose" }), "test")
@@ -277,7 +277,7 @@ fn purge_of_the_proposal_leaves_the_targets_history_whole() {
 /// accettata e attiva (contenuto suo) e la sua storia resta identica.
 #[test]
 fn purge_of_the_target_leaves_the_proposals_history_whole() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cell = Cell::create(&dir.path().join("dec-t.sqlite"), "p", "test")
         .unwrap(/* t */);
     cell.set_policy(serde_json::json!({ "write": "propose" }), "test")
@@ -328,7 +328,7 @@ fn purge_of_the_target_leaves_the_proposals_history_whole() {
 /// identica.
 #[test]
 fn purge_of_the_target_leaves_the_queued_proposal_whole() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cell = Cell::create(&dir.path().join("prop-t.sqlite"), "p", "test")
         .unwrap(/* t */);
     cell.set_policy(serde_json::json!({ "write": "propose" }), "test")
@@ -373,7 +373,7 @@ fn purge_of_the_target_leaves_the_queued_proposal_whole() {
 /// cambiano storia.
 #[test]
 fn purge_of_an_endpoint_leaves_the_other_notes_whole() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = common::test_dir();
     let cell = Cell::create(&dir.path().join("link.sqlite"), "p", "test")
         .unwrap(/* t */);
     let left = common::base_note(1, "l'estremo di sinistra [[Roma]]");

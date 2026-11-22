@@ -60,6 +60,16 @@ fn titles(hits: &[engramma_core::search::Hit]) -> Vec<String> {
         .collect()
 }
 
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn short_question_recall_on_the_golden_vault() {
     let raw = std::fs::read_to_string(golden_dir().join("queries-short.json")).unwrap(/* t */);
@@ -80,7 +90,7 @@ fn short_question_recall_on_the_golden_vault() {
     }
 
     // the golden cell, exactly as golden.rs builds it
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("famiglia.sqlite"), "famiglia", "golden")
         .unwrap(/* t */);
     let mut files: Vec<PathBuf> = Vec::new();

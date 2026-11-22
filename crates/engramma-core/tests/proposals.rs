@@ -42,7 +42,7 @@ fn note(body: &str) -> Note {
 }
 
 fn cell() -> (tempfile::TempDir, Cell) {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* t */);
     // v0.5 (P2): the default policy is closed (write: off); these tests
     // exercise the queue, so they open it
@@ -76,6 +76,16 @@ fn ids(cell: &Cell, text: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // the queue
 // ---------------------------------------------------------------------------
+
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
 
 #[test]
 fn a_proposal_is_born_in_quarantine_and_search_never_sees_it() {

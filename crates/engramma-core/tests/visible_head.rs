@@ -330,7 +330,7 @@ fn the_no_text_lost_judge_passes_the_r4_scenario() {
     };
     let mut saved = vec![Default::default(); 2];
     // the cells themselves, as the fleet would hold them
-    let dir_c = tempfile::tempdir().unwrap(/* t */);
+    let dir_c = common::test_dir();
     let c = engramma_core::Cell::open_bare(&dir_c.path().join("c.sqlite")).unwrap(/* t */);
     for op in b.ops().unwrap(/* t */).iter().chain(a.ops().unwrap(/* t */).iter()) {
         let _ = c.ingest_op(op);

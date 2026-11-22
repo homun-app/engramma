@@ -64,15 +64,25 @@ fn base_note(body: String, at: At) -> Note {
     }
 }
 
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(24))]
 
-    #[test]
+    
+#[test]
     fn proposal_sequences_keep_the_invariants(
         seed in any::<u64>(),
         steps in proptest::collection::vec(0u8..9, 12..48),
     ) {
-        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let dir = test_dir();
         let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* test-only */);
         cell.set_policy(serde_json::json!({ "write": "propose" }), "t")
             .unwrap(/* test-only */);

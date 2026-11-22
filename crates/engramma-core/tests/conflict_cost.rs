@@ -94,11 +94,21 @@ fn body_of(note_size: usize) -> String {
 
 /// Measure one copy's bytes: a quiet cell, then the same cell with `n`
 /// open copies, the difference over `n`.
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 #[ignore = "a measurement, not an assertion"]
 fn bytes_per_copy_1k_and_10k() {
     for (tag, note_size) in [("1 KB", 1_024_usize), ("10 KB", 10_240)] {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = test_dir();
         let (cell, wall) = bench_cell("m", dir.path());
         let body = body_of(note_size);
         let n = note(1, &body);
@@ -173,7 +183,7 @@ fn bytes_per_copy_1k_and_10k() {
 fn fleet_ten_thousand_notes_one_and_ten_percent() {
     let mut quiet_size = 0_u64;
     for (tag, conflicted) in [("0%", 0_u32), ("1%", 100), ("10%", 1000)] {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = test_dir();
         let (a, wall_a) = bench_cell("a", dir.path());
         let (b, wall_b) = bench_cell("b", dir.path());
         let mut ids: Vec<Ulid> = Vec::new();
@@ -280,7 +290,7 @@ fn fleet_ten_thousand_notes_one_and_ten_percent() {
 #[test]
 #[ignore = "a measurement, not an assertion"]
 fn rederivation_with_ten_open_copies_and_fifty_writes() {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = test_dir();
     let (cell, wall) = bench_cell("r", dir.path());
     let body = "prima riga\nil corpo condiviso della nota del banco\nterza riga";
     let n = note(41, body);
@@ -420,7 +430,7 @@ fn d5_the_copies_alone_table_by_table() {
     for (tag, note_size) in [("70 B", 70_usize), ("1 KB", 1_024), ("10 KB", 10_240)] {
         let body = body_of(note_size);
         // --- the conflicted fleet: put, then two concurrent patches
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = test_dir();
         let (a, wall_a) = bench_cell("a", dir.path());
         let (b, wall_b) = bench_cell("b", dir.path());
         let n = note(61, &body);
@@ -584,7 +594,7 @@ fn d6_ten_percent_conflicted_against_sequential() {
     let body = body_of(70);
     let mut sizes: Vec<(u64, f64)> = Vec::new();
     for sequential_flavor in [false, true] {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = test_dir();
         let (a, wall_a) = bench_cell("a", dir.path());
         let (b, wall_b) = bench_cell("b", dir.path());
         let mut ids: Vec<Ulid> = Vec::new();

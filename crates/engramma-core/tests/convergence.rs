@@ -69,7 +69,7 @@ impl std::ops::Deref for Kept {
 /// A fresh copy that ingests `ops` in the given order: a bare file, the
 /// shared `init` first, then the rest as it arrives.
 fn copy_of(name: &str, ops: &[Op]) -> Kept {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let cell = Cell::open_bare(&dir.path().join(format!("{name}.sqlite"))).unwrap(/* test-only */);
     for op in ops {
         assert!(
@@ -100,7 +100,7 @@ fn union_logs(a: &[Op], b: &[Op]) -> BTreeMap<String, Op> {
 #[test]
 fn concurrent_patches_converge_on_every_copy() {
     // A creates the cell and writes one note
-    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let dir_a = common::test_dir();
     let a = Cell::create(&dir_a.path().join("a.sqlite"), "conv", "device-a")
         .unwrap(/* test-only */);
     let note = base_note(1, "il corpo iniziale");
@@ -217,7 +217,7 @@ fn concurrent_patches_converge_on_every_copy() {
         .find(|o| o.kind.as_str() == "init")
         .cloned()
         .unwrap(/* test-only */);
-    let dir_z = tempfile::tempdir().unwrap(/* test-only */);
+    let dir_z = common::test_dir();
     let z = Cell::open_bare(&dir_z.path().join("z.sqlite")).unwrap(/* test-only */);
     z.ingest_op(&init).unwrap(/* test-only */);
     z.ingest_op(&patch_of("da A")).unwrap(/* test-only */);
@@ -245,7 +245,7 @@ fn concurrent_patches_converge_on_every_copy() {
 /// `conflitto` and an edge to the original, identical on every copy.
 #[test]
 fn the_losing_body_becomes_a_conflict_copy() {
-    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let dir_a = common::test_dir();
     let a = Cell::create(&dir_a.path().join("a.sqlite"), "conv", "device-a")
         .unwrap(/* test-only */);
     let note = base_note(7, "il corpo iniziale");
@@ -371,7 +371,7 @@ fn the_losing_body_becomes_a_conflict_copy() {
 /// reopens the note.
 #[test]
 fn a_tombstone_wins_over_an_unseen_modification() {
-    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let dir_a = common::test_dir();
     let a = Cell::create(&dir_a.path().join("a.sqlite"), "conv", "device-a")
         .unwrap(/* test-only */);
     let note = base_note(9, "il corpo iniziale");
@@ -451,7 +451,7 @@ fn a_tombstone_wins_over_an_unseen_modification() {
 /// that received the same set in opposite orders converge.
 #[test]
 fn the_purge_dominates_whatever_the_arrival_order() {
-    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let dir_a = common::test_dir();
     let a = Cell::create(&dir_a.path().join("a.sqlite"), "conv", "device-a")
         .unwrap(/* test-only */);
     let note = base_note(11, "il segreto da dimenticare");
@@ -555,7 +555,7 @@ fn dir_of(cell: &Cell) -> std::path::PathBuf {
 /// the cut reaches the head again.
 #[test]
 fn a_shared_cell_compacts_only_under_the_stable_frontier() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let cell = Cell::create(&dir.path().join("f.sqlite"), "conv", "device-a")
         .unwrap(/* test-only */);
     for i in 1..=3_u32 {
@@ -617,7 +617,7 @@ fn a_shared_cell_compacts_only_under_the_stable_frontier() {
 /// the root of exactly the set it holds.
 #[test]
 fn the_adopt_root_covers_the_unsigned_era_identically_on_every_copy() {
-    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let dir_a = common::test_dir();
     let a = Cell::create(&dir_a.path().join("a.sqlite"), "conv", "device-a")
         .unwrap(/* test-only */);
     for i in 1..=3_u32 {
@@ -1146,7 +1146,7 @@ proptest! {
         // reads the INJECTED wall, and a bare copy would read the real one
         // (the fleet base is months ahead of it)
         let reference = {
-            let dir = tempfile::tempdir().unwrap(/* test-only */);
+            let dir = common::test_dir();
             let cell = Cell::open_bare(&dir.path().join("ref.sqlite")).unwrap(/* test-only */);
             cell.inject_clock(engramma_core::hlc::HlcClock::new("ref00000000x", || FLEET_BASE_MS))
                 .unwrap(/* test-only */);
@@ -1235,7 +1235,7 @@ impl FleetRunner {
         // init's op id, salt and cell id come from the seed stream like every
         // other mint (a Cell::create would mint from the process CSPRNG and
         // break the reproduction)
-        let dir0 = tempfile::tempdir().unwrap(/* test-only */);
+        let dir0 = common::test_dir();
         let a = Cell::open_bare(&dir0.path().join("fleet0.sqlite")).unwrap(/* test-only */);
         let mut mint0 = SeedMint { seed, dev: 0, n: 0 };
         let (cell_id, _) = mint0.next();
@@ -1267,7 +1267,7 @@ impl FleetRunner {
         let mut cells = vec![a];
         let mut dirs = vec![dir0];
         for d in 1..n {
-            let dir = tempfile::tempdir().unwrap(/* test-only */);
+            let dir = common::test_dir();
             let cell = Cell::open_bare(&dir.path().join(format!("fleet{d}.sqlite")))
                 .unwrap(/* test-only */);
             dirs.push(dir);
@@ -1465,7 +1465,7 @@ fn a_local_write_rederives_the_conflict_set() {
     // a cell with a hand-set wall clock and a deterministic mint
     let cell_with = |name: &str| -> (Kept, Arc<AtomicU64>) {
         let wall = Arc::new(AtomicU64::new(K));
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = common::test_dir();
         let cell = Cell::open_bare(&dir.path().join(format!("{name}.sqlite"))).unwrap(/* t */);
         let w = Arc::clone(&wall);
         cell.inject_clock(engramma_core::hlc::HlcClock::new(
@@ -1735,7 +1735,7 @@ fn a_saved_seed_reproduces_the_same_op_set_byte_for_byte() {
 
 #[test]
 fn the_watermark_keeps_the_maximum_across_out_of_order_arrivals() {
-    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let dir_a = common::test_dir();
     let a = Cell::create(&dir_a.path().join("a.sqlite"), "conv", "device-a")
         .unwrap(/* test-only */);
     a.put_note(&base_note(21, "prima"), "device-a").unwrap(/* t */);
@@ -1762,7 +1762,7 @@ fn the_watermark_keeps_the_maximum_across_out_of_order_arrivals() {
 /// generous ceiling, a regression tripwire rather than a promise.
 #[test]
 fn rematerializing_a_hundred_version_note_stays_cheap() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = common::test_dir();
     let a = Cell::create(&dir.path().join("m.sqlite"), "conv", "device-a")
         .unwrap(/* test-only */);
     let note = base_note(31, "la nota dalle cento versioni");
@@ -1812,7 +1812,7 @@ fn concurrent_creates_of_the_same_note_converge() {
 }
 
 fn concurrent_creates_case(authors: u32) {
-    let dir0 = tempfile::tempdir().unwrap(/* t */);
+    let dir0 = common::test_dir();
     let seed = Cell::create(&dir0.path().join("seed.sqlite"), "conv", "device-0")
         .unwrap(/* t */);
     let note = base_note(41, "il corpo di 0");
@@ -1823,7 +1823,7 @@ fn concurrent_creates_case(authors: u32) {
     // the same base set
     let mut all: Vec<Op> = first.clone();
     for k in 1..=authors {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = common::test_dir();
         let cell = Cell::open_bare(&dir.path().join(format!("c{k}.sqlite")))
             .unwrap(/* t */);
         for op in &first {

@@ -114,9 +114,19 @@ fn supersedes_rows(cell: &Cell, named: &Ulid) -> usize {
 /// della vecchia non può toglierla. Vanno via la chiusura di A (A stessa)
 /// e la riga `supersedes` che la nominava. Nella v0.6.10 `get(N)`
 /// rispondeva `NoteNotFound` con `verify` verde.
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn the_new_note_of_a_supersede_survives_the_purge_of_the_old() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("nuova-vive.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let a = note_of(1, "il mio colore preferito è il rosso");
@@ -149,7 +159,7 @@ fn the_new_note_of_a_supersede_survives_the_purge_of_the_old() {
 /// P diventava `NoteNotFound` e anche la `patch` cadeva.
 #[test]
 fn the_accepted_correction_survives_the_purge_of_its_target() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("correzione-vive.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let a = note_of(1, "il mio colore preferito è il rosso");
@@ -215,7 +225,7 @@ fn the_accepted_correction_survives_the_purge_of_its_target() {
 /// regola dichiara, non un cambiamento di contenuto).
 #[test]
 fn the_old_note_reopens_unchanged_when_the_new_is_purged() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("vecchia-riapre.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let old = note_of(1, "la nota vecchia");
@@ -247,7 +257,7 @@ fn the_old_note_reopens_unchanged_when_the_new_is_purged() {
 /// accettata riapre il bersaglio. Il suo contenuto non cambia.
 #[test]
 fn the_target_reopens_unchanged_when_the_proposal_is_purged() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("bersaglio-riapre.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let target = note_of(1, "la nota che il mondo vede");
@@ -302,7 +312,7 @@ fn the_target_reopens_unchanged_when_the_proposal_is_purged() {
 /// tag, tipo, stato, versione.
 #[test]
 fn link_the_other_endpoint_and_the_declaring_note_stay_identical() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("arco-vive.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let left = note_of(1, "un capo del legame");
@@ -357,7 +367,7 @@ fn link_the_other_endpoint_and_the_declaring_note_stay_identical() {
 /// estremo resta identico.
 #[test]
 fn unlink_after_the_purge_leaves_the_other_endpoint_identical() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let writer = Cell::create(&dir.path().join("scollega-scr.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let left = note_of(1, "un capo del legame che finisce");
@@ -416,7 +426,7 @@ fn unlink_after_the_purge_leaves_the_other_endpoint_identical() {
 /// chiusura (non c'è più niente da chiudere).
 #[test]
 fn a_correction_of_a_purged_target_keeps_its_text_in_the_queue() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("proposta-vive.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let target = note_of(1, "la nota che il mondo correggeva");
@@ -483,7 +493,7 @@ fn a_correction_of_a_purged_target_keeps_its_text_in_the_queue() {
 /// più, e nessuna metà può chiuderlo).
 #[test]
 fn a_correction_of_a_purged_target_lands_as_a_new_note_when_accepted() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("proposta-atterra.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let target = note_of(1, "la nota che il mondo correggeva");
@@ -535,7 +545,7 @@ fn a_correction_of_a_purged_target_lands_as_a_new_note_when_accepted() {
 /// anche lì — il giudizio vale sul ricevente.
 #[test]
 fn the_new_note_survives_the_purge_arriving_by_sync() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let writer = Cell::create(&dir.path().join("scrittore.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let a = note_of(1, "il mio colore preferito è il rosso");
@@ -588,7 +598,7 @@ fn the_new_note_survives_the_purge_arriving_by_sync() {
 /// deve restare quella che il cancello del registro ammette.
 #[test]
 fn a_decide_accepted_over_a_purged_target_survives_the_purge_of_the_proposal() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("decide-censura.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let target = note_of(1, "la nota che il mondo correggeva");
@@ -641,7 +651,7 @@ fn a_decide_accepted_over_a_purged_target_survives_the_purge_of_the_proposal() {
 /// lo stato.
 #[test]
 fn purge_preview_names_the_reopenings_before_the_purge() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("anticipo.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let a = note_of(1, "il mio colore preferito è il rosso");

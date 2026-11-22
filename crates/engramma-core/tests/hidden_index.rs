@@ -82,9 +82,19 @@ fn term(word: &str) -> String {
 /// operation: the base index answers the default view with exactly the
 /// visible notes, the hidden index holds exactly the quarantined ones, and
 /// a tombstone lives in neither.
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn status_passages_move_the_row_inside_the_operation() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("p.sqlite"), "p", "t").unwrap(/* test-only */);
 
     let visible = note(1, "Fabio lavora a Milano");
@@ -143,7 +153,7 @@ fn status_passages_move_the_row_inside_the_operation() {
 /// notes only, and `verify` passes on the migrated file.
 #[test]
 fn a_v13_cell_migrates_its_hidden_rows() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("p.sqlite");
     let cell = Cell::create(&path, "p", "t").unwrap(/* test-only */);
     cell.put_note(&note(1, "Fabio lavora a Milano"), "t")
@@ -232,7 +242,7 @@ fn a_v13_cell_migrates_its_hidden_rows() {
 /// list, ordered deterministically.
 #[test]
 fn the_owners_view_searches_both_indices() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("p.sqlite"), "p", "t").unwrap(/* test-only */);
     cell.put_note(&note(1, "Fabio porta il tonno a casa"), "t")
         .unwrap(/* test-only */);
@@ -264,7 +274,7 @@ fn the_owners_view_searches_both_indices() {
 /// index (the note untouched) must fail the verification.
 #[test]
 fn verify_catches_a_rotten_hidden_index() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("p.sqlite");
     let cell = Cell::create(&path, "p", "t").unwrap(/* test-only */);
     cell.put_note(&hidden_note(1, "Zebedeo compra il tonno"), "t")

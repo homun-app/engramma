@@ -47,7 +47,7 @@ fn note(body: &str) -> Note {
 }
 
 fn cell() -> (tempfile::TempDir, Cell) {
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* t */);
     (dir, cell)
 }
@@ -117,6 +117,16 @@ fn auto_policy(cell: &Cell, extra: serde_json::Value) {
 // ---------------------------------------------------------------------------
 // the policy
 // ---------------------------------------------------------------------------
+
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
 
 #[test]
 fn without_a_policy_the_cell_refuses_proposals() {
@@ -850,7 +860,7 @@ fn reviewers_yaml_holds_env_names_never_keys() {
     );
     assert!(err.is_err(), "no shell, ever");
     // a missing file is no error: there simply are no reviewers
-    let dir = tempfile::tempdir().unwrap(/* t */);
+    let dir = test_dir();
     assert!(Reviewers::load(dir.path()).unwrap(/* t */).get("a").is_none());
 }
 

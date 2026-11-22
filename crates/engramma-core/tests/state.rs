@@ -38,7 +38,7 @@ fn note(id: u16, body: &str, confidence: Confidence, status: Status) -> Note {
 }
 
 fn cell() -> (tempfile::TempDir, Cell) {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* test-only */);
     (dir, cell)
 }
@@ -54,6 +54,16 @@ fn found(cell: &Cell, text: &str) -> Vec<String> {
 /// The dangerous rewrite of the point: a quarantined note rewritten with
 /// `stated` confidence stays quarantined, out of the search; asking for
 /// `active` explicitly is refused.
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn a_rewrite_preserves_quarantine() {
     let (_d, cell) = cell();

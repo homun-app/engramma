@@ -58,9 +58,19 @@ fn note_of(id: u16, body: &str) -> Note {
 /// The seed `1207186286826530307` reduced by hand: one note, one purge,
 /// one local `put` of the same id. The put must be refused, and the
 /// state must stay a function of the operations (`verify` green).
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn a_local_put_on_a_purged_id_is_refused_seed_1207() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("oblio-torno.sqlite");
     let cell = Cell::create(&path, "oblio", "tester").unwrap(/* test-only */);
     let secret = note_of(1, "quokkaviolaceo zibellinotremante");
@@ -92,7 +102,7 @@ fn a_local_put_on_a_purged_id_is_refused_seed_1207() {
 /// One stage for the per-operation walk: a cell with a purged id and a
 /// LIVING control note. The purged id is `1`, the living one is `2`.
 fn stage() -> (tempfile::TempDir, Cell, Ulid, Ulid) {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("stage.sqlite"), "p", "tester")
         .unwrap(/* test-only */);
     let secret = note_of(1, "quokkaviolaceo zibellinotremante");
@@ -329,7 +339,7 @@ fn the_revert_of_purged_content_keeps_its_own_answer() {
 /// keeps the historical fixture at the point that declared it).
 #[test]
 fn a_v068_cell_with_a_put_after_a_purge_signals_and_repairs_explicitly() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/v068-put-after-purge.sqlite");
     let path = dir.path().join("v068-fantasma.sqlite");
@@ -376,7 +386,7 @@ fn a_v068_cell_with_a_put_after_a_purge_signals_and_repairs_explicitly() {
 /// not about writing after a purge.
 #[test]
 fn a_new_note_after_a_purge_writes_normally() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("oblio-nuovo.sqlite");
     let cell = Cell::create(&path, "oblio", "tester").unwrap(/* test-only */);
     let secret = note_of(1, "quokkaviolaceo zibellinotremante");
@@ -402,7 +412,7 @@ fn a_new_note_after_a_purge_writes_normally() {
 /// and is re-imported after it.
 #[test]
 fn an_old_export_skips_the_purged_note_and_names_it() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("oblio-import.sqlite");
     let cell = Cell::create(&path, "oblio", "tester").unwrap(/* test-only */);
     let secret = note_of(1, "quokkaviolaceo zibellinotremante");
@@ -450,7 +460,7 @@ fn an_old_export_skips_the_purged_note_and_names_it() {
 /// a purged id is skipped and named, the others enter.
 #[test]
 fn an_obsidian_folder_skips_the_purged_note_and_names_it() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("oblio-obsidian.sqlite");
     let cell = Cell::create(&path, "oblio", "tester").unwrap(/* test-only */);
     let secret = note_of(1, "quokkaviolaceo zibellinotremante");

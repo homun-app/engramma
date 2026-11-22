@@ -44,6 +44,60 @@ pub fn base_note(id: u32, body: &str) -> Note {
     }
 }
 
+/// v0.6.12 (L3): a test folder with OUR name. A run killed mid-flight
+/// (Ctrl-C on a long hunt: SIGINT kills without unwinding, and the
+/// `TempDir` drops never run) leaves behind whatever folders were in
+/// flight — the three `.tmp*` of the 21st of November, with `a.sqlite`,
+/// `b.sqlite` and `c.sqlite` inside, were exactly that. With a name of
+/// our own the NEXT suite run can tell them from every other process's
+/// folders and sweep them once they are stale (below). A test that
+/// FAILS leaves nothing instead: the panic unwinds, the drops run.
+pub fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
+/// v0.6.12 (L3): sweep the STALE test folders a killed run left behind.
+/// Only `engramma-test-*` folders older than six hours go: ours by
+/// name, stale by age — a folder another test of THIS run holds is
+/// seconds old, and a folder that is not ours is never touched (the
+/// system's `$TMPDIR` is shared with every other process). Best effort
+/// by design: a folder that refuses to go waits for the next sweep.
+pub fn sweep_stale_test_dirs() -> usize {
+    let tmp = std::env::temp_dir();
+    let threshold = std::time::Duration::from_secs(6 * 3600);
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(&tmp) else {
+        return 0;
+    };
+    let mut swept = 0;
+    for e in entries.flatten() {
+        let p = e.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("engramma-test-") {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&p) else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(now);
+        if now.duration_since(modified).unwrap_or_default() <= threshold {
+            continue;
+        }
+        if std::fs::remove_dir_all(&p).is_ok() {
+            swept += 1;
+        }
+    }
+    swept
+}
+
 /// A copy and the folder that holds its file (the folder outlives the
 /// cell: fields drop in declaration order).
 pub struct Kept {
@@ -63,7 +117,7 @@ impl std::ops::Deref for Kept {
 /// case, not by the machine.
 pub fn cell_with(name: &str) -> (Kept, Arc<AtomicU64>) {
     let wall = Arc::new(AtomicU64::new(K));
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::open_bare(&dir.path().join(format!("{name}.sqlite"))).unwrap(/* t */);
     let w = Arc::clone(&wall);
     cell.inject_clock(engramma_core::hlc::HlcClock::new(

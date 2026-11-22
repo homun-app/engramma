@@ -11,9 +11,19 @@
 use engramma_core::cell::schema::SCHEMA_VERSION;
 use engramma_core::{Cell, CellError};
 
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn a_schema_newer_than_the_binary_refuses_to_open() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("c.sqlite");
     {
         let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);
@@ -55,7 +65,7 @@ fn a_schema_newer_than_the_binary_refuses_to_open() {
 /// current-schema cell reopens.
 #[test]
 fn the_own_schema_still_opens() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("c.sqlite");
     {
         let cell = Cell::create(&path, "t", "t").unwrap(/* test-only */);

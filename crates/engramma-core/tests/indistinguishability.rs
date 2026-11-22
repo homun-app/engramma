@@ -296,8 +296,18 @@ fn diff(a: &Snapshot, b: &Snapshot, what: &str) -> Option<String> {
     None
 }
 
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
+
     #[test]
     fn hidden_notes_leave_no_fingerprint(
         bodies in proptest::collection::vec(body(), 4..10).prop_map(|v| {
@@ -313,9 +323,9 @@ proptest! {
     ) {
         // base + hidden notes that MATCH the question (they must, to be a
         // fingerprint), in their own cell
-        let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+        let dir_a = test_dir();
         let cell_a = cell_of(dir_a.path(), &bodies);
-        let dir_b = tempfile::tempdir().unwrap(/* test-only */);
+        let dir_b = test_dir();
         let cell_b = cell_of(dir_b.path(), &bodies);
         let matching = format!("{question} {question}");
         for k in 0..n_quarantined {
@@ -387,9 +397,9 @@ fn the_zebedeo_tonno_case_is_bit_identical() {
         .collect();
     let mut bodies = vec![strong, thin];
     bodies.extend(fillers);
-    let dir_a = tempfile::tempdir().unwrap(/* test-only */);
+    let dir_a = test_dir();
     let cell_a = cell_of(dir_a.path(), &bodies);
-    let dir_b = tempfile::tempdir().unwrap(/* test-only */);
+    let dir_b = test_dir();
     let cell_b = cell_of(dir_b.path(), &bodies);
     // the hidden note: quarantined, external, matching BOTH terms — the
     // fingerprint carrier

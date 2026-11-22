@@ -32,10 +32,20 @@ fn nid(i: u32) -> Ulid {
     Ulid::from_string(&format!("01{}{:08}", "0".repeat(16), i)).unwrap(/* the golden's own ids */)
 }
 
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn the_golden_cell_opens_verifies_and_holds_its_facts() {
     for name in GOLDEN_CELLS {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = test_dir();
         let golden = golden_dir();
         // the live file and every snapshot beside it, under their own
         // names (the cell's rows name them so)

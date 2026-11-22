@@ -109,9 +109,19 @@ fn note_of(id: u16, body: &str) -> Note {
 /// P0.1: after a plain purge no root of the body survives in the cell file —
 /// the FTS5 `delete` alone leaves the stems in the old segments; only the
 /// `optimize` merge discards them.
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn purge_scrubs_the_stems_from_the_file() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("oblio.sqlite");
     let cell = Cell::create(&path, "oblio", "tester").unwrap(/* test-only */);
     let secret = note_of(1, "quokkaviolaceo zibellinotremante ovoviviparo");
@@ -142,7 +152,7 @@ fn purge_scrubs_the_stems_from_the_file() {
 /// note keeps the base index busy, so the two indexes part ways here.
 #[test]
 fn purge_of_a_quarantined_note_scrubs_the_hidden_index() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("oblio-nascosto.sqlite");
     let cell = Cell::create(&path, "oblio", "tester").unwrap(/* test-only */);
     let mut secret = note_of(1, "quokkaviolaceo zibellinotremante ovoviviparo");
@@ -178,7 +188,7 @@ fn purge_of_a_quarantined_note_scrubs_the_hidden_index() {
 /// them.
 #[test]
 fn purge_of_a_released_quarantined_note_scrubs_the_hidden_index() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("oblio-rilasciata.sqlite");
     let cell = Cell::create(&path, "oblio", "tester").unwrap(/* test-only */);
     let mut secret = note_of(1, "quokkaviolaceo zibellinotremante ovoviviparo");
@@ -210,7 +220,7 @@ fn purge_of_a_released_quarantined_note_scrubs_the_hidden_index() {
 /// purge time holds no hidden row at all. Both bodies must go.
 #[test]
 fn purge_after_a_quarantined_body_edit_scrubs_the_hidden_index() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("oblio-modificata.sqlite");
     let cell = Cell::create(&path, "oblio", "tester").unwrap(/* test-only */);
     let mut secret = note_of(1, "quokkaviolaceo zibellinotremante");
@@ -245,7 +255,7 @@ fn purge_after_a_quarantined_body_edit_scrubs_the_hidden_index() {
 /// and the scrub completes.
 #[test]
 fn purge_with_an_open_reader_completes_the_scrub_on_the_next_write() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("lettore.sqlite");
     let cell = Cell::create(&path, "lettore", "tester").unwrap(/* test-only */);
     let secret = note_of(1, "zibellinotremante quokkaviolaceo");
@@ -330,7 +340,7 @@ fn snapshots_of(cell: &Cell) -> Vec<SnapshotRow> {
 /// replay, purge included, reproduces the live state).
 #[test]
 fn compact_then_purge_scrubs_the_snapshot() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("istantanea.sqlite");
     let cell = Cell::create(&path, "istantanea", "tester").unwrap(/* test-only */);
     let secret = note_of(1, "zibellinotremante quokkaviolaceo");
@@ -393,7 +403,7 @@ fn compact_then_purge_scrubs_the_snapshot() {
 /// did — only then does the tail replay reproduce the live state.
 #[test]
 fn snapshot_purge_censors_the_supersede_inside_it() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("sopr.sqlite");
     let cell = Cell::create(&path, "t", "tester").unwrap(/* test-only */);
     let mut old = note_of(1, "la vecchia versione resta");
@@ -441,7 +451,7 @@ fn snapshot_purge_censors_the_supersede_inside_it() {
 /// v0.3.1 behavior stands (the snapshot is scrubbed, digest updated).
 #[test]
 fn purge_redacts_the_checkpoint_and_scrubs_the_file() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("redazione.sqlite");
     let cell = Cell::create(&path, "redazione", "tester").unwrap(/* test-only */);
     let secret = note_of(1, "zibellinotremante quokkaviolaceo");
@@ -526,7 +536,7 @@ fn purge_of(cell: &Cell) -> ulid::Ulid {
 /// head) a note row changed by hand.
 #[test]
 fn chain_only_catches_tampering_below_the_replay() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     // 1. a tampered DERIVED EDGE fails the coherence check
     let path = dir.path().join("archi.sqlite");
     let cell = Cell::create(&path, "archi", "tester").unwrap(/* test-only */);
@@ -614,7 +624,7 @@ fn chain_only_catches_tampering_below_the_replay() {
 /// stays: two compacts leave one row and one file.
 #[test]
 fn compact_makes_a_logical_snapshot_and_keeps_only_the_last() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("logica.sqlite");
     let cell = Cell::create(&path, "logica", "tester").unwrap(/* test-only */);
     for i in 1..=3_u16 {
@@ -718,7 +728,7 @@ fn compact_makes_a_logical_snapshot_and_keeps_only_the_last() {
 /// `ChainOnly` and passes, and a hand-tampered surviving payload fails it.
 #[test]
 fn compact_default_is_a_checkpoint_on_disk() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("punto.sqlite");
     let cell = Cell::create(&path, "punto", "tester").unwrap(/* test-only */);
     let secret = note_of(1, "zibellinotremante quokkaviolaceo");
@@ -800,7 +810,7 @@ fn compact_default_is_a_checkpoint_on_disk() {
 #[cfg(unix)]
 fn compact_fails_cleanly_when_the_old_file_cannot_go() {
     use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("ordine.sqlite");
     let cell = Cell::create(&path, "ordine", "tester").unwrap(/* test-only */);
     let secret = note_of(1, "zibellinotremante quokkaviolaceo");
@@ -883,7 +893,7 @@ fn compact_fails_cleanly_when_the_old_file_cannot_go() {
 /// without the flag turns it into a checkpoint and takes the file away.
 #[test]
 fn a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let path = dir.path().join("vecchia.sqlite");
     let cell = Cell::create(&path, "vecchia", "tester").unwrap(/* test-only */);
     for i in 1..=3_u16 {

@@ -192,7 +192,7 @@ proptest! {
     /// Replaying the log rebuilds exactly the same state.
     #[test]
     fn replay_equals_state(seed in any::<u64>()) {
-        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let dir = common::test_dir();
         let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* test-only */);
         run_random_ops(&cell, seed, ops_count(seed));
         let report = cell.verify().unwrap(/* test-only */);
@@ -204,7 +204,7 @@ proptest! {
     /// very digest, and after the extra ops verify passes from the snapshot.
     #[test]
     fn compaction_keeps_verify_and_state(seed in any::<u64>()) {
-        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let dir = common::test_dir();
         let path = dir.path().join("c.sqlite");
         let cell = Cell::create(&path, "p", "prop").unwrap(/* test-only */);
         run_random_ops(&cell, seed, ops_count(seed));
@@ -261,7 +261,7 @@ proptest! {
     /// the hidden-index leak of the verification lived.
     #[test]
     fn random_ops_compact_and_purge_leave_no_roots(seed in any::<u64>()) {
-        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let dir = common::test_dir();
         let path = dir.path().join("dimenticare.sqlite");
         let cell = Cell::create(&path, "p", "prop").unwrap(/* test-only */);
         let mut s = seed | 1;
@@ -467,7 +467,7 @@ proptest! {
 
     /// Export then import into a fresh cell gives the same notes and edges.    #[test]
     fn export_import_equality(seed in any::<u64>()) {
-        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let dir = common::test_dir();
         let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* test-only */);
         run_random_ops(&cell, seed, ops_count(seed));
         // close open-ended state: delete nothing, just export
@@ -1164,7 +1164,7 @@ fn frozen_prefix_body(seed: u64) {
     // --- the single-device form: one cell, the cut at head − 0/1/2, any
     // non-compact non-purge operation, then the purge exception
     {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = common::test_dir();
         let cell = Cell::create(&dir.path().join("gelo.sqlite"), "p", "prop")
             .unwrap(/* t */);
         run_random_ops(&cell, seed, ops_count(seed));
@@ -1618,7 +1618,7 @@ fn purge_takes_only_its_family_body(seed: u64) {
         // --- the single-device form: writes, supersede, proposals and
         // decisions, edges, conflict copies, one compaction in the middle
         {
-            let dir = tempfile::tempdir().unwrap(/* t */);
+            let dir = common::test_dir();
             let cell = Cell::create(&dir.path().join("meta.sqlite"), "p", "prop")
                 .unwrap(/* t */);
             run_random_ops(&cell, seed, ops_count(seed) / 2);
@@ -1667,6 +1667,64 @@ fn purge_family_open_defect_seeds_run_clean() {
     }
 }
 
+/// v0.6.12 (L3): the sweeper. A run KILLED mid-flight (a Ctrl-C on a
+/// long hunt) leaves behind whatever test folders were in flight — the
+/// three `.tmp*` of the 21st of November were exactly that, with
+/// `a.sqlite`, `b.sqlite` and `c.sqlite` inside (a test that merely
+/// FAILS leaves nothing: the panic unwinds and the drops run — proven
+/// on a proof branch). The folders now carry our name
+/// (`engramma-test-`), and the next suite run sweeps the stale ones:
+/// ours by name, older than six hours. A fresh folder survives (another
+/// test of this run may hold it), and a foreign folder — the `.tmp*` of
+/// any other process — is never touched.
+#[test]
+fn stale_test_dirs_are_swept_and_foreign_ones_untouched() {
+    let tmp = std::env::temp_dir();
+    // ours, STALE: the dir's own mtime set a week back
+    let stale = common::test_dir();
+    std::fs::write(stale.path().join("a.sqlite"), b"leftover").unwrap(/* t */);
+    let week_ago = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(7 * 24 * 3600);
+    std::fs::File::open(stale.path())
+        .unwrap(/* t */)
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(week_ago)
+                .set_accessed(week_ago),
+        )
+        .expect(/* t */ "the folder's clock is ours to set");
+    let stale_path = stale.keep();
+    // ours, FRESH: another test of this very run could hold it
+    let fresh = common::test_dir();
+    // FOREIGN, STALE: not ours — never touched, however old
+    let foreign = tempfile::Builder::new()
+        .prefix(".tmp")
+        .tempdir()
+        .unwrap(/* t */);
+    std::fs::File::open(foreign.path())
+        .unwrap(/* t */)
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(week_ago)
+                .set_accessed(week_ago),
+        )
+        .expect(/* t */ "the clock is settable");
+
+    let _swept = common::sweep_stale_test_dirs();
+
+    assert!(
+        !stale_path.exists(),
+        "the stale engramma-test folder must go"
+    );
+    assert!(fresh.path().exists(), "a fresh folder survives the sweep");
+    assert!(
+        foreign.path().exists(),
+        "a foreign folder is never touched"
+    );
+    drop(fresh);
+    drop(foreign);
+}
+
 /// v0.6.12 (L1, punto 5): the H2 second-layer seeds, deterministic —
 /// `compaction_keeps_verify_and_state` with the two seeds the v0.6.8
 /// declaration carried. They were ALREADY green on the v0.6.11 base
@@ -1678,7 +1736,7 @@ fn purge_family_open_defect_seeds_run_clean() {
 #[test]
 fn compaction_h2_second_layer_seeds_stay_green() {
     for seed in [11476711120049502961_u64, 10840318560449401940] {
-        let dir = tempfile::tempdir().unwrap(/* t */);
+        let dir = common::test_dir();
         let path = dir.path().join("c.sqlite");
         let cell = Cell::create(&path, "p", "prop").unwrap(/* t */);
         run_random_ops(&cell, seed, ops_count(seed));
@@ -2167,7 +2225,7 @@ fn random_ops_cover_every_kind() {
     // 20 times, so no branch of the generator silently rots.
     let mut totals = std::collections::HashMap::<OpKind, usize>::new();
     for seed in 0..256u64 {
-        let dir = tempfile::tempdir().unwrap(/* test-only */);
+        let dir = common::test_dir();
         let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* t */);
         cell.set_policy(serde_json::json!({ "write": "propose" }), "prop")
             .unwrap(/* t */);

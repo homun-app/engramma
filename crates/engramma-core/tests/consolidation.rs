@@ -41,9 +41,19 @@ fn note(id: u16, title: &str, body: &str) -> Note {
 }
 
 /// The contradictions work without any embedding model.
+
+/// v0.6.12 (L3): our own name, so a killed run's leftovers can be swept
+/// (see tests/common/mod.rs).
+fn test_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("engramma-test-")
+        .tempdir()
+        .expect(/* test-only */ "a fresh folder")
+}
+
 #[test]
 fn contradictions_on_a_hand_built_cell() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* t */);
     // one subject, one note, TWO lives_in with overlapping validity: the
     // open contradiction the golden vault models for Luca
@@ -90,7 +100,7 @@ fn contradictions_on_a_hand_built_cell() {
 /// No candidates on a quiet cell.
 #[test]
 fn quiet_cell_has_none() {
-    let dir = tempfile::tempdir().unwrap(/* test-only */);
+    let dir = test_dir();
     let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* t */);
     cell.put_note(&note(5, "una", "una nota su [[Milano]]"), "t")
         .unwrap(/* t */);
