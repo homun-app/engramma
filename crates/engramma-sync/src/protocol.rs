@@ -41,10 +41,17 @@ use crate::{Error, Result};
 /// same way the whole-log replay leaves it. Rules 7 against rules 8
 /// derive different states from the same operations, and must refuse
 /// each other.
-pub const ALPN: &[u8] = b"engramma/sync/8";
+///
+/// v0.6.14: the rules are 9 now — the `restore` brings the CONTENT of a
+/// version back and leaves the state (rules 8 wrote the state too), and
+/// the cut of a compaction only goes forward (the reconstruction above a
+/// cut that went back derived another state). Rules 8 against rules 9
+/// derive different states from the same operations, and must refuse
+/// each other.
+pub const ALPN: &[u8] = b"engramma/sync/9";
 /// The protocol version this build speaks (kept in the hello as a
 /// belt-and-braces check: the ALPN already gates the rules).
-pub const PROTOCOL_VERSION: u64 = 8;
+pub const PROTOCOL_VERSION: u64 = 9;
 /// A message is at most 1 MiB.
 pub const MAX_MESSAGE: usize = 1024 * 1024;
 

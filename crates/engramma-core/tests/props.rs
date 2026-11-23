@@ -2605,8 +2605,8 @@ fn last_quarantine_entry(cell: &Cell, id: &str) -> Option<(String, String)> {
 
 /// Does the LOG hold a legitimate EXIT from quarantine for this note,
 /// after its last entry — a decision to ACCEPT by a human, a `confirm`,
-/// a `set_status` to active or a `restore` (each a human's own act; the
-/// engine's own word on the classes is `classify_actor`)? A purge's
+/// a `set_status` to active (each a human's own act; the engine's own
+/// word on the classes is `classify_actor`)? A purge's
 /// reopening is NOT one: it returns a state the note HAD — if that
 /// state was the quarantine, the note lands back in it.
 fn has_a_legitimate_exit(cell: &Cell, id: &str, after: (&str, &str)) -> bool {
@@ -2643,18 +2643,19 @@ fn has_a_legitimate_exit(cell: &Cell, id: &str, after: (&str, &str)) -> bool {
     if accepted {
         return true;
     }
-    // the human acts of the other exits: confirm, set_status→active,
-    // restore (payload readable above the cut; below it the corner is
-    // declared — the hunt's judgment reads the seed by hand)
-    // the human acts of the other exits — `confirm`, `set_status`,
-    // `restore` — read by KIND and ACTOR (both survive the cut; the
+    // v0.6.14 (N2): the `restore` is NOT an exit any more — it brings
+    // the content back and leaves the state, so a quarantined note it
+    // restores stays quarantined (its seed of the v0.6.13 declaration,
+    // `11895058361907748327`, is a fixed case in this file)
+    // the human acts of the other exits — `confirm`, `set_status` — read
+    // by KIND and ACTOR (both survive the cut; the
     // payload's target is the declared corner: a `set_status` to
     // quarantine may pose as an exit, and the case is read by hand)
     cell.debug_column(&format!(
         "SELECT o.actor FROM ops o
          JOIN op_objects oo ON oo.op_id = o.op_id
          WHERE oo.object = 'note:{id}' AND {after_sql}
-           AND o.kind IN ('confirm', 'set_status', 'restore')"
+           AND o.kind IN ('confirm', 'set_status')"
     ))
     .unwrap_or_default()
     .into_iter()

@@ -23,6 +23,7 @@
 
 mod common;
 
+use engramma_core::cell::ops::{RESTORE_CONTENT_FIELDS, RESTORE_KEPT_FIELDS};
 use engramma_core::format::{At, Lang, Note, NoteType};
 use engramma_core::{Cell, Confidence, NotePatch, Status, Validity};
 use time::OffsetDateTime;
@@ -74,21 +75,38 @@ fn restore_of_an_active_version_on_a_closed_note_keeps_the_closing() {
     c.supersede(&a.id, &n, None, "user").unwrap(/* t */);
     let closed = c.get(&a.id).unwrap(/* t */);
     assert_eq!(closed.status, Status::Superseded);
-    let closing = closed.valid_to.expect(/* t */ "a closed note carries its closing");
+    let closing = closed
+        .valid_to
+        .expect(/* t */ "a closed note carries its closing");
 
     c.restore(&a.id, 1, "user").unwrap(/* t */);
 
     let after = c.get(&a.id).unwrap(/* t */);
-    assert_eq!(after.body, "la prima mano", "the content of version 1 comes back");
-    assert_eq!(after.status, Status::Superseded, "the state is the lifecycle's: still closed");
-    assert_eq!(after.valid_to, Some(closing), "the closing is the lifecycle's: it stays");
+    assert_eq!(
+        after.body, "la prima mano",
+        "the content of version 1 comes back"
+    );
+    assert_eq!(
+        after.status,
+        Status::Superseded,
+        "the state is the lifecycle's: still closed"
+    );
+    assert_eq!(
+        after.valid_to,
+        Some(closing),
+        "the closing is the lifecycle's: it stays"
+    );
     let rows = c
         .debug_column(&format!(
             "SELECT new_id || '→' || old_id FROM supersedes WHERE old_id = '{}'",
             a.id
         ))
         .unwrap(/* t */);
-    assert_eq!(rows, vec![format!("{}→{}", n.id, a.id)], "the closing row stays");
+    assert_eq!(
+        rows,
+        vec![format!("{}→{}", n.id, a.id)],
+        "the closing row stays"
+    );
     assert!(c.verify().unwrap(/* t */).ok(), "the cell verifies");
 }
 
@@ -109,8 +127,15 @@ fn restore_on_a_quarantined_note_stays_in_quarantine() {
     c.restore(&q.id, 1, "user").unwrap(/* t */);
 
     let after = c.get(&q.id).unwrap(/* t */);
-    assert_eq!(after.status, Status::Quarantined, "a restore is no exit from the quarantine");
-    assert_eq!(after.body, "letto sul web", "the content of version 1 comes back");
+    assert_eq!(
+        after.status,
+        Status::Quarantined,
+        "a restore is no exit from the quarantine"
+    );
+    assert_eq!(
+        after.body, "letto sul web",
+        "the content of version 1 comes back"
+    );
     assert!(c.verify().unwrap(/* t */).ok(), "the cell verifies");
 }
 
@@ -131,8 +156,15 @@ fn restore_does_not_demote_a_confirmed_external_note() {
 
     let after = c.get(&q.id).unwrap(/* t */);
     assert_eq!(after.status, Status::Active, "the user's confirm stands");
-    assert_eq!(after.body, "letto sul web", "the content of version 1 comes back");
-    assert_eq!(after.confidence, Confidence::External, "and the confidence is the lifecycle's");
+    assert_eq!(
+        after.body, "letto sul web",
+        "the content of version 1 comes back"
+    );
+    assert_eq!(
+        after.confidence,
+        Confidence::External,
+        "and the confidence is the lifecycle's"
+    );
     assert!(c.verify().unwrap(/* t */).ok(), "the cell verifies");
 }
 
@@ -155,8 +187,15 @@ fn restore_keeps_the_confidence() {
     c.restore(&s.id, 1, "user").unwrap(/* t */);
 
     let after = c.get(&s.id).unwrap(/* t */);
-    assert_eq!(after.confidence, Confidence::Inferred, "the confidence stays");
-    assert_eq!(after.title, None, "the content of version 1 comes back: no title");
+    assert_eq!(
+        after.confidence,
+        Confidence::Inferred,
+        "the confidence stays"
+    );
+    assert_eq!(
+        after.title, None,
+        "the content of version 1 comes back: no title"
+    );
     assert!(c.verify().unwrap(/* t */).ok(), "the cell verifies");
 }
 
@@ -170,7 +209,10 @@ fn restore_keeps_the_provenance_and_bring_back_the_content() {
     s.note_type = NoteType::Fact;
     s.valid_from = Validity::parse("2024-01-01").ok();
     s.valid_to = Validity::parse("2024-12-31").ok();
-    s.extensions = vec![("x-origine".into(), engramma_core::format::yaml::YamlValue::Str("a".into()))];
+    s.extensions = vec![(
+        "x-origine".into(),
+        engramma_core::format::yaml::YamlValue::Str("a".into()),
+    )];
     c.put_note(&s, "user").unwrap(/* t */);
     c.patch_note(
         &s.id,
@@ -197,29 +239,98 @@ fn restore_keeps_the_provenance_and_bring_back_the_content() {
     assert_eq!(after.title, None);
     assert_eq!(after.tags, vec!["casa/milano".to_string()]);
     assert_eq!(after.scope, None);
-    assert_eq!(after.valid_from.map(|v| v.to_db_string()), Some("2024-01-01".to_string()));
-    assert_eq!(after.valid_to.map(|v| v.to_db_string()), Some("2024-12-31".to_string()));
-    assert_eq!(after.extensions.len(), 1, "the extensions of version 1 come back");
+    assert_eq!(
+        after.valid_from.map(|v| v.to_db_string()),
+        Some("2024-01-01".to_string())
+    );
+    assert_eq!(
+        after.valid_to.map(|v| v.to_db_string()),
+        Some("2024-12-31".to_string())
+    );
+    assert_eq!(
+        after.extensions.len(),
+        1,
+        "the extensions of version 1 come back"
+    );
     // the provenance of the note
-    assert_eq!(after.source, "import:web", "the source is the note's provenance: it stays");
-    assert_eq!(after.created_at, at(0), "the birth date belongs to the note");
+    assert_eq!(
+        after.source, "import:web",
+        "the source is the note's provenance: it stays"
+    );
+    assert_eq!(
+        after.created_at,
+        at(0),
+        "the birth date belongs to the note"
+    );
     assert!(c.verify().unwrap(/* t */).ok(), "the cell verifies");
 }
 
 /// The two lists are the whole of `Note`: every field of the struct is in
 /// exactly one — the content the restore brings back, or the lifecycle
-/// and provenance it leaves — each with its reason (the same idea as
-/// `anchor_tables`: a hand-written list held honest by the thing it
-/// lists). On the base the lists do not exist: the test says so.
+/// and provenance it leaves — each with its reason. The lists are the
+/// engine's own constants (the single place they are written, beside the
+/// restore); the fields are read from the struct's DEFINITION, so a
+/// field `Note` gains is in neither until someone says which it is (the
+/// same idea as `anchor_tables`: a hand-written list held honest by the
+/// thing it lists).
 #[test]
 fn every_field_of_note_is_content_or_lifecycle() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let ops_src = std::fs::read_to_string(root.join("src/cell/ops.rs")).unwrap(/* t */);
-    for name in ["RESTORE_CONTENT_FIELDS", "RESTORE_KEPT_FIELDS"] {
+    let format_src = std::fs::read_to_string(root.join("src/format/mod.rs")).unwrap(/* t */);
+    // the fields of `pub struct Note { ... }`
+    let start = format_src
+        .find("pub struct Note {")
+        .expect(/* t */ "Note is defined in format/mod.rs");
+    // the fields begin on the line after the opening one
+    let body_start = format_src[start..]
+        .find('\n')
+        .expect(/* t */ "the struct opens")
+        + start;
+    let end = format_src[body_start..]
+        .find("\n}")
+        .expect(/* t */ "the struct closes")
+        + body_start;
+    let fields: Vec<String> = format_src[body_start..end]
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("pub "))
+        .filter_map(|l| l.split(':').next())
+        .map(str::to_string)
+        .collect();
+    assert!(
+        fields.len() >= 16,
+        "the walk reads the struct's fields: {fields:?}"
+    );
+    let content: Vec<&str> = RESTORE_CONTENT_FIELDS.iter().map(|(f, _)| *f).collect();
+    let kept: Vec<&str> = RESTORE_KEPT_FIELDS.iter().map(|(f, _)| *f).collect();
+    for (name, list) in [
+        ("RESTORE_CONTENT_FIELDS", &content),
+        ("RESTORE_KEPT_FIELDS", &kept),
+    ] {
+        for f in list.iter() {
+            assert!(
+                fields.iter().any(|x| x == f),
+                "{name} names `{f}`, which Note does not have"
+            );
+        }
+    }
+    for f in &content {
+        assert!(!kept.contains(f), "`{f}` is in both lists");
+    }
+    let unlisted: Vec<&String> = fields
+        .iter()
+        .filter(|f| !content.contains(&f.as_str()) && !kept.contains(&f.as_str()))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "fields of Note in neither list — the restore would not know what to do with them: \
+         {unlisted:?} (add each to RESTORE_CONTENT_FIELDS or RESTORE_KEPT_FIELDS in ops.rs, \
+         with its reason)"
+    );
+    // each entry carries its reason
+    for (f, reason) in RESTORE_CONTENT_FIELDS.iter().chain(RESTORE_KEPT_FIELDS) {
         assert!(
-            ops_src.contains(&format!("pub const {name}:")),
-            "`{name}` is not in cell/ops.rs: the restore has no list of the fields it \
-             brings back or leaves"
+            reason.len() >= 12,
+            "`{f}` has no reason worth the name: {reason:?}"
         );
     }
 }

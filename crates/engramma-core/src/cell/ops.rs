@@ -1403,7 +1403,8 @@ pub(crate) fn restore_derived_anchor(
 /// Write a note row (insert or full update), bumping the version; returns the
 /// rowid and the new version. `allow_external_active` is set only by
 /// `confirm`, the single operation that can bring an `external` note to
-/// `active`.
+/// `active` — and (v0.6.14) by a `restore` over a note that is already
+/// active and external: it preserves the state, it promotes nothing.
 fn write_note(
     tx: &Transaction<'_>,
     note: &Note,
@@ -1819,8 +1820,9 @@ fn apply_put(tx: &Transaction<'_>, op: &Op, note: &Note) -> Result<(), CellError
     let mut note = note.clone();
     if let Some(row) = &old {
         // v0.4.1 (P0.1): a rewrite PRESERVES the note's state — the state
-        // changes only through `set_status`, `confirm`, `delete` (and
-        // `restore`). The one exception is the quarantine: a new version
+        // changes only through `set_status`, `confirm`, `delete` (and the
+        // other operations of the lifecycle: since v0.6.14 the `restore`
+        // brings the content back and leaves it). The one exception is the quarantine: a new version
         // with `external` confidence brings an active note to quarantine,
         // never the opposite. Every caller builds the note it wants; this
         // is the single place that decides, so the CLI, the vault sync and
@@ -1883,7 +1885,9 @@ fn apply_patch(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     // wins. A tombstone has no FTS row (the index's discipline), so the
     // reindex below must not try to delete one: the note re-enters the
     // index as if new. A full REWRITE (`put`) of a tombstone stays a usage
-    // error — `restore` is the tool for that, and the JS contract says so.
+    // error — the way back is `setStatus` (or this patch, with the lapide
+    // as its base). v0.6.14 (N2): no longer `restore`, which brings the
+    // content back and leaves the state.
     let mut reopened = false;
     let old = if old.note.status == Status::Deleted {
         reopened = true;
@@ -2130,6 +2134,96 @@ fn apply_delete(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     Ok(())
 }
 
+/// v0.6.14 (N2): the fields of [`Note`] the `restore` brings back — the
+/// CONTENT of the version, the text and what the text declares. This and
+/// [`RESTORE_KEPT_FIELDS`] are the ONE list of the fields, written here,
+/// beside the operation that reads it; the test `restore_content.rs`
+/// holds them against the struct: a field of `Note` in neither fails it.
+pub const RESTORE_CONTENT_FIELDS: &[(&str, &str)] = &[
+    (
+        "note_type",
+        "what the note is — a fact, a person, a place: the text says it",
+    ),
+    ("title", "the title the text carries in its frontmatter"),
+    ("body", "the text itself"),
+    (
+        "tags",
+        "the classification the text carries in its frontmatter",
+    ),
+    ("scope", "who the text is for: a field of the content"),
+    (
+        "lang",
+        "the language the text is written in (the override of the stemmer)",
+    ),
+    ("valid_from", "the validity the content declares"),
+    (
+        "valid_to",
+        "the validity the content declares — EXCEPT on a closed note, where \
+         the field is the CLOSING and stays: the lifecycle's, as `apply_put` \
+         keeps it",
+    ),
+    ("extensions", "the `x-*` frontmatter, in file order"),
+];
+
+/// v0.6.14 (N2): the fields the `restore` LEAVES — the lifecycle and the
+/// provenance. The lifecycle is a state machine and only the operations
+/// made for it move it (`supersede`, `decide`, `revert_decision`,
+/// `set_status`, `confirm`, `delete`, `purge`); a restore that copied the
+/// state produced what no lifecycle operation makes — a note closed with
+/// no closing row, a quarantined note read as active — and every rule on
+/// the closings had to guess (the v0.6.13 declaration, seed
+/// `11895058361907748327`).
+pub const RESTORE_KEPT_FIELDS: &[(&str, &str)] = &[
+    (
+        "id",
+        "the note's identity: a restore is of the note, never of another",
+    ),
+    ("status", "the lifecycle's state"),
+    (
+        "confidence",
+        "how the cell came to hold the text (stated, inferred, external): it \
+         decides the visibility together with the status, and is the \
+         lifecycle's",
+    ),
+    (
+        "supersedes",
+        "the closing relation: the work of the supersede that made the note",
+    ),
+    (
+        "source",
+        "PROVENANCE: who or what the note comes from — the proposer stamps it, \
+         the import stamps the path. A property of the note's existence, set \
+         at birth, which no rule reads as version content",
+    ),
+    (
+        "created_at",
+        "the birth date belongs to the NOTE, not to the version (the rule of \
+         `apply_put`)",
+    ),
+    (
+        "updated_at",
+        "the restore's own stamp, like every operation that writes",
+    ),
+];
+
+/// v0.6.14 (N2): the content of `version` onto `note` — and nothing else.
+/// The restore is the `git revert` of a file: the text comes back, the
+/// branches stay.
+fn apply_restored_content(note: &mut Note, version: &Note) {
+    note.note_type = version.note_type;
+    note.title = version.title.clone();
+    note.body = version.body.clone();
+    note.tags = version.tags.clone();
+    note.scope = version.scope.clone();
+    note.lang = version.lang;
+    note.valid_from = version.valid_from;
+    // a closed note keeps its CLOSING: there `valid_to` is the lifecycle's
+    if note.status != Status::Superseded {
+        note.valid_to = version.valid_to;
+    }
+    note.extensions = version.extensions.clone();
+}
+
 fn apply_restore(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
     let id = Ulid::from_string(&body_str(op, "id")?)
         .map_err(|_| CellError::Invalid(format!("op {}: bad id", op.op_id)))?;
@@ -2157,9 +2251,18 @@ fn apply_restore(tx: &Transaction<'_>, op: &Op) -> Result<(), CellError> {
         return Err(CellError::NoteNotFound(id.to_string()));
     };
     snapshot(tx, &id, old.version, &op.op_id)?;
-    let mut note = restored;
+    // v0.6.14 (N2): the CONTENT of the version comes back over the note
+    // as it stands; its state, its confidence, its provenance stay. The
+    // old rule wrote the whole photograph and produced states no
+    // lifecycle operation makes (a note closed with no closing row).
+    let mut note = old.note.clone();
+    apply_restored_content(&mut note, &restored);
     note.updated_at = updated_at;
-    write_note(tx, &note, true, false)?;
+    // a note `confirm` already promoted is active AND external: the
+    // restore preserves that state — it does not promote anything
+    let promoted = old.note.status == Status::Active
+        && old.note.confidence == crate::format::Confidence::External;
+    write_note(tx, &note, true, promoted)?;
     reindex_note(tx, &id, Some(&old))?;
     Ok(())
 }

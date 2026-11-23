@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The blind mailbox OVER THE WIRE (v0.6.1, P4): ALPN
-//! `engramma/mailbox/8` (the rules version, riding with the sync one, D4). The node holds sealed envelopes for the device
+//! `engramma/mailbox/9` (the rules version, riding with the sync one, D4). The node holds sealed envelopes for the device
 //! lists it knows, indexed by OPAQUE id and nothing else, and hosts the
 //! short-code meeting point. It never holds a cell key: what it stores is
 //! ciphertext; what it relays after the PAKE is ciphertext too.
@@ -30,7 +30,7 @@ use crate::{Error, Result};
 
 /// The mailbox protocol's ALPN — the rules version rides with the sync
 /// one (D4: a v0.6.5 device must refuse a v0.6.4 mailbox too).
-pub const MAILBOX_NET_ALPN: &[u8] = b"engramma/mailbox/8";
+pub const MAILBOX_NET_ALPN: &[u8] = b"engramma/mailbox/9";
 /// The mailbox protocol's version.
 pub const MAILBOX_VERSION: u64 = 1;
 /// A frame is at most 1 MiB.

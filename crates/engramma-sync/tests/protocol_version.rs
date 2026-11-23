@@ -21,18 +21,25 @@
 //! and a shared cell refuses an arrival that falls inside the frozen
 //! prefix. Rules 7 against rules 8 derive different states from the
 //! same operations, and must refuse each other.
+//!
+//! v0.6.14 (N1, N2): the rules are 9 now — the `restore` brings the
+//! CONTENT of a version back and leaves the state (rules 8 wrote the
+//! state too: a note closed with no closing row), and a compaction cut
+//! only goes forward (above a cut that went back, the reconstruction
+//! derived another state). Rules 8 against rules 9 derive different
+//! states from the same operations, and must refuse each other.
 
 use engramma_sync::device::DeviceKey;
 use engramma_sync::protocol::{self, PROTOCOL_VERSION, connect};
 use engramma_sync::relay::RelayChoice;
 use engramma_sync::serve::PeerAddr;
 
-/// The old rules' ALPN — what a v0.6.12 device still speaks (its
-/// rematerialization deleted the queue row, the registry rows and the
-/// new side's `supersedes` rows without looking at the cut: rules 7
-/// against rules 8 derive different states from the same operations,
-/// and must refuse each other).
-const V7_ALPN: &[u8] = b"engramma/sync/7";
+/// The old rules' ALPN — what a v0.6.13 device still speaks (its
+/// `restore` wrote the state of the version, and its compaction accepted
+/// a cut below the one already made: rules 8 against rules 9 derive
+/// different states from the same operations, and must refuse each
+/// other).
+const V8_ALPN: &[u8] = b"engramma/sync/8";
 
 fn unhex32(s: &str) -> [u8; 32] {
     let mut out = [0_u8; 32];
@@ -44,17 +51,17 @@ fn unhex32(s: &str) -> [u8; 32] {
     out
 }
 
-/// Two endpoints on loopback, one per rules version: the v8 dialer
-/// against a v7 answerer. The handshake dies at the ALPN, the error is
+/// Two endpoints on loopback, one per rules version: the v9 dialer
+/// against a v8 answerer. The handshake dies at the ALPN, the error is
 /// `PeerOutdated` naming the device, and not one frame moved.
 #[tokio::test]
 async fn a_peer_of_the_old_rules_is_refused_before_any_exchange() {
     assert_eq!(
         protocol::ALPN,
-        b"engramma/sync/8",
-        "this build speaks rules 8"
+        b"engramma/sync/9",
+        "this build speaks rules 9"
     );
-    assert_eq!(PROTOCOL_VERSION, 8);
+    assert_eq!(PROTOCOL_VERSION, 9);
 
     let key_old = DeviceKey::from_seed([7_u8; 32]);
     let key_new = DeviceKey::from_seed([9_u8; 32]);
@@ -62,7 +69,7 @@ async fn a_peer_of_the_old_rules_is_refused_before_any_exchange() {
     let ep_old = engramma_sync::relay::bind(
         &key_old,
         "127.0.0.1:0",
-        V7_ALPN,
+        V8_ALPN,
         &RelayChoice::Disabled,
     )
     .await
@@ -92,7 +99,7 @@ async fn a_peer_of_the_old_rules_is_refused_before_any_exchange() {
 
     // the protocol's own connect: the handshake dies at the ALPN
     let refused = connect(&ep_new, old_addr.clone()).await;
-    assert!(refused.is_err(), "a v7 answerer refuses a v8 dialer");
+    assert!(refused.is_err(), "a v8 answerer refuses a v9 dialer");
 
     // the service's dial says WHO: PeerOutdated names the device
     let peer = PeerAddr {
