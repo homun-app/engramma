@@ -433,10 +433,25 @@ pub struct VerifyView {
     /// explicit step that moves each phantom's content to a new id.
     /// Empty on a healthy cell.
     pub phantom_purged: Vec<String>,
+    /// v0.6.14 (N1.3): the DECLARED CORNERS this cell carries — prose,
+    /// never a failure (`ok` does not look at it). Today one kind: the cut
+    /// of a compaction went back under the v0.6.13 engine and the
+    /// migration had no copy file to rebuild some objects from. Empty on
+    /// every other cell.
+    pub declared_corners: Vec<String>,
 }
 
+/// What one `compact()` did. v0.6.14 (N1): the cut only goes forward — a
+/// call asking a cut BELOW the one already made does nothing (it is not
+/// an error: Homun's automatic call must not fail when `keepLast` grows)
+/// and answers `compacted: false` with the TRUE cut in `cutSeq`.
 #[napi(object)]
 pub struct CompactView {
+    /// Did THIS call compact? `false`: the cut asked was below the one
+    /// already made, and nothing moved (v0.6.14).
+    pub compacted: bool,
+    /// The cut in force after the call (the true cut, also when nothing
+    /// moved).
     pub cut_seq: i64,
     pub head_seq: i64,
     pub head_hash: String,
@@ -2985,6 +3000,7 @@ impl Task for VerifyTask {
             ok: r.ok(),
             mismatch: r.mismatch,
             phantom_purged: r.phantom_purged,
+            declared_corners: r.declared_corners,
             coverage: r
                 .coverage
                 .into_iter()
@@ -3071,6 +3087,7 @@ impl Task for CompactTask {
 
     fn resolve(&mut self, _env: Env, r: engramma_core::cell::CompactReport) -> Result<CompactView> {
         Ok(CompactView {
+            compacted: r.compacted,
             cut_seq: r.cut_seq,
             head_seq: r.head_seq,
             head_hash: r.head_hash,
@@ -3397,6 +3414,13 @@ impl Cell {
 
     /// Forget the payloads of the oldest operations, keeping the last
     /// `keepLast` replayable.
+    ///
+    /// v0.6.14 (N1): **the cut only goes forward.** A `keepLast` so large
+    /// that the cut would fall BELOW the one already made changes
+    /// nothing: the call answers `compacted: false` with the true cut.
+    /// Raising `keepLast` does no harm — the cut never goes back (before
+    /// this version it did, and the first reconstruction above it lost
+    /// the queue row of an accepted proposal).
     #[napi(ts_return_type = "Promise<CompactView>")]
     pub fn compact(
         &self,

@@ -188,6 +188,85 @@ test('propose() then decide() then compact() then purge(): the queue row survive
   }
 });
 
+// v0.6.14 (N1): the cut only goes forward, in the contract Homun leans
+// on. Homun compacts with `compact(keepLast)` on its own; when it RAISES
+// `keepLast`, `head − keepLast` falls below the cut of the day before.
+// On every engine before this one that moved the cut BACK under payloads
+// already gone, and the first write above it lost the user's decision:
+// the accepted proposal came back `pending`, its registry row went. Here
+// the second call does nothing and says so (`compacted: false`, the true
+// cut), and the write above the cut finds the queue whole. Its Rust twin
+// (`cut_goes_back_*` in cut_monotone.rs) was red on the base.
+test('compact() with a larger keepLast does not drag the cut back: the accepted proposal stays accepted', async () => {
+  const cli = engrammaBin();
+  if (!cli) return; // no binary around: the per-test assertion below says so
+  const run = (args) => {
+    const r = require('node:child_process').spawnSync(cli, args, { encoding: 'utf8' });
+    assert.equal(r.status, 0, `${args.join(' ')}\n${r.stdout}${r.stderr}`);
+    return r;
+  };
+  const rootDir = root();
+  const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
+  try {
+    const cell = await e.cell('taglio-avanti');
+    await cell.put({
+      body: 'una nota qualunque [[Milano]]',
+      source: 'homun:test',
+      confidence: 'stated',
+    });
+    run(['--root', rootDir, '--cell', 'taglio-avanti', 'policy', 'set', 'write=propose']);
+
+    // 1. the agent's proposal, 2. the user's accept
+    const out = await cell.propose({
+      note: {
+        body: 'il mio colore preferito è il nero [[Roma]]',
+        source: 'homun:test',
+        confidence: 'stated',
+      },
+      mode: 'new',
+      reason: "l'utente l'ha detto",
+    });
+    assert.equal(out.status, 'pending', 'the proposal waits in the queue');
+    await cell.decide(out.id, { action: 'accept' });
+    let row = (await cell.proposals()).find((r) => r.id === out.id);
+    assert.ok(row, 'the row is in the queue');
+    assert.equal(row.state, 'accepted', 'the user accepted it');
+
+    // 3. the compaction with a small keepLast: the cut sits ON the decision
+    const small = await cell.compact(0);
+    assert.equal(small.compacted, true, 'the first call compacted');
+    assert.equal(small.cutSeq, small.headSeq, 'the cut sits on the head: the decision is below it');
+
+    // 4. a larger keepLast: the cut does not go back
+    const large = await cell.compact(10);
+    assert.equal(large.compacted, false, 'a cut below the one already made does nothing');
+    assert.equal(large.cutSeq, small.cutSeq, 'the report answers the true cut');
+    assert.equal(large.headSeq, small.headSeq, 'the head is the same');
+
+    // 5. a write above the cut, on the proposal
+    await cell.patch(out.id, { title: 'ritoccata sopra il taglio' });
+    row = (await cell.proposals()).find((r) => r.id === out.id);
+    assert.ok(row, 'the row is still in the queue');
+    assert.equal(
+      row.state,
+      'accepted',
+      "the user's decision stands: the cut did not replay it as nothing",
+    );
+    const after = await cell.get(out.id);
+    assert.equal(after.status, 'active', 'the accepted text stands');
+    assert.equal(after.title, 'ritoccata sopra il taglio', 'the write above the cut landed');
+    const verified = await cell.verify();
+    assert.equal(verified.ok, true, `verify after the write: ${verified.mismatch}`);
+    assert.deepEqual(
+      verified.declaredCorners,
+      [],
+      'a cell whose cut never went back has no corner',
+    );
+  } finally {
+    await e.close();
+  }
+});
+
 test('purgePreview() names the note that would reopen, and moves nothing', async () => {
   const cli = engrammaBin();
   if (!cli) return; // no binary around: the per-test assertion below says so
