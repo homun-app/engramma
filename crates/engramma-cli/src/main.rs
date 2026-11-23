@@ -1565,6 +1565,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "fts_ok": report.fts_ok,
                     "mismatch": report.mismatch,
                     "phantom_purged": report.phantom_purged,
+                    "declared_corners": report.declared_corners,
                     "coverage": coverage,
                     "ok": report.ok(),
                 }));
@@ -1621,6 +1622,10 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                         c.covered,
                         c.living
                     );
+                }
+                // v0.6.14 (N1.3): the declared corners — said, never judged
+                for corner in &report.declared_corners {
+                    println!("{corner}");
                 }
             } else {
                 return Err(CliError::internal(format!(

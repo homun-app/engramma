@@ -99,10 +99,10 @@ Un estraneo che si finge un dispositivo: la connessione si chiude **prima di qua
 
 **Quello che il dispositivo aveva già lo tiene**: la revoca non cancella i dischi altrui. Le sei cifre e il biglietto monouso sono le difese dell'**abbinamento**; la rotazione è la difesa del **dopo**.
 
-## La versione delle regole (v0.6.5; la 4 in v0.6.7; la 5 in v0.6.10; la 6 in v0.6.11; la 7 in v0.6.12)
+## La versione delle regole (v0.6.5; la 4 in v0.6.7; la 5 in v0.6.10; la 6 in v0.6.11; la 7 in v0.6.12; la 8 in v0.6.13; la 9 in v0.6.14)
 
 L'ALPN **è** la versione delle regole di materializzazione:
-`engramma/sync/8` (e `engramma/mailbox/8` per la casella postale).
+`engramma/sync/9` (e `engramma/mailbox/9` per la casella postale).
 La v0.6.12 porta la `7`: **il prefisso congelato è immutabile** — le
 righe di versione nate a o sotto il taglio di compattazione non si
 toccano, le metà dominate dalla purga (e le scritture battute dalla
@@ -130,7 +130,17 @@ CONTENUTO PROPRIO dell'altro oggetto — la nota nuova di un `supersede`
 spariva quando si purgava la vecchia — e la regola nuova la divide per
 metà: il contenuto proprio resta, i riferimenti al purgato vanno (con
 le riaperture dichiarate); regole 5 e 6 derivano stati diversi dallo
-stesso insieme, e devono rifiutarsi a vicenda.
+stesso insieme, e devono rifiutarsi a vicenda. La v0.6.13 porta la
+`8` (l'ancora della rimaterializzazione è l'oggetto intero: coda,
+registro e righe `supersedes` tornano allo stato al taglio prima che la
+coda rigiochi). **La v0.6.14 porta la `9`** per due cambi della
+derivazione: il `restore` riporta il contenuto di una versione e lascia
+lo stato (le regole 8 scrivevano anche lo stato: una nota chiusa senza
+la riga di chi l'ha chiusa), e il taglio di compattazione va solo avanti
+(sopra un taglio tornato indietro, com'era possibile prima, la
+ricostruzione derivava un altro stato). Il test `protocol_version`
+parla di 9 contro 8: l'handshake muore sull'ALPN, `PEER_OUTDATED` nomina
+il dispositivo, e non uno scambio si muove.
 
 ## I conflitti
 

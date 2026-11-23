@@ -3,11 +3,20 @@
 # La caccia (scripts/caccia.sh) gira queste proprietà COMUNQUE — un difetto
 # noto non è un motivo per non giudicare il resto — e il giudizio («è il
 # difetto dichiarato o uno nuovo?»), con la riproduzione del seme, sta nel
-# REPORT, scritto a mano. Il difetto purge_takes_only_its_family della
-# v0.6.12 (semi 8394…, 9848…) è CHIUSO dalla v0.6.13 M1: i suoi semi
-# girano nel test deterministico purge_family_defect_seeds_of_v0613_run_clean. I semi qui NON stanno nei file delle regressioni
-# (il test open_defect_seeds_stay_out_of_the_regression_files lo controlla):
-# una suite che parte già rossa non misura niente.
+# REPORT, scritto a mano. Un rosso del cancello o della notte ha 30 minuti
+# per tre passi (docs/caccia.md): la riproduzione del seme, lo stesso seme
+# sul tag precedente (scripts/seme-sul-tag.sh), il giudizio — nasce da
+# questa fase si corregge, c'era già si dichiara qui e si va avanti.
+# Il difetto purge_takes_only_its_family della v0.6.12 (semi 8394…, 9848…)
+# è CHIUSO dalla v0.6.13 M1, e i due della v0.6.13 — il restore che scrive
+# lo stato (purge_takes_only_its_family, seme 11895058361907748327) e il
+# taglio che torna indietro (quarantine_exits_only_by_decision, seme
+# 11558843446952054066) — sono CHIUSI dalla v0.6.14 (N2 e N1): i loro semi
+# girano nei test deterministici di props.rs
+# (purge_family_defect_seeds_of_v0613_run_clean,
+# purge_family_restore_seed_of_v0613_runs_clean,
+# quarantine_defect_seed_of_v0613_runs_clean). I semi qui NON stanno nei
+# file delle regressioni (il test
+# open_defect_seeds_stay_out_of_the_regression_files lo controlla): una
+# suite che parte già rossa non misura niente.
 crates/engramma-core/tests/convergence.rs no_body_text_is_lost 6467221993839934612,9368190224066329310 # REPORT.md, v0.6.8 «Difetti nuovi» 2: la perdita di testo esposta dal cestino
-crates/engramma-core/tests/props.rs purge_takes_only_its_family 11895058361907748327 # REPORT.md, v0.6.13 «Difetti nuovi»: l'oracolo della purga allargato all'oggetto intero. Una nota chiusa da una decide accettata, poi annullata, poi RIAPERTA da un restore dell'utente (stato superseded SENZA riga, legittimo), torna Active dopo la purga di una nota qualunque: la rimaterializzazione che la purga forza riordina le versioni e il restore nomina un numero che nel rigioco tiene un'altra fotografia
-crates/engramma-core/tests/props.rs quarantine_exits_only_by_decision 11558843446952054066 # REPORT.md, v0.6.13 «Difetti nuovi»: la proprietà nuova. Una proposta d'agente in modo new, accettata dall'utente, poi chiusa da un supersede dell'utente: alla fine la coda dice PENDING e lo stato superseded — contenuto in quarantena reso visibile senza decisione in piedi (l'ancora dell'oggetto intero o la semantica della coda: la riga di coda non racconta più la nota)

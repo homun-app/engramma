@@ -100,6 +100,14 @@ explain fields.
 ### `history ID` / `restore ID VERSION`
 `history` JSON: `{id, versions: [{version, op_id, note}]}`. `restore` is
 itself an operation in the log. JSON: `{"ok": "<id>"}`.
+**(v0.6.14, N2) `restore` brings back the CONTENT of the version, not its
+state**: body, title, tags, type, scope, language, validity and
+extensions come back; status, confidence, `supersedes`, source and the
+birth date stay as the operations of the lifecycle left them (DESIGN §
+4.4 has the two lists). A closed note stays closed — keeping its closing
+date — a note in quarantine stays there, a note the user confirmed is
+not demoted. The way back from a tombstone is `status` (or a patch whose
+base is the tombstone), no longer `restore`.
 
 ### `import DIR [--obsidian]`
 Engramma folder (with `engramma.json`) or, with `--obsidian`, any Markdown
@@ -126,8 +134,16 @@ compaction), `from_snapshot` (the tail replays on the snapshot file) or
 chain, every surviving payload's digest, the derived indexes (the `d…`
 edges re-derived from the notes, no vector for a note that no longer lives)
 and the state digest while the head has not moved past the checkpoint.
+**(v0.6.14, N1.2)** verify also checks the compaction threshold: every
+operation whose payload the cut removed sits at or below the registered
+cut — one above it is a broken cell (a cut that went back, as engines
+before v0.6.14 accepted), and `mismatch` names it.
 JSON: `{ops, replay, hash_chain_ok, replay_ok, fts_ok, mismatch,
-phantom_purged, coverage, ok}` — `coverage` lists the vector coverage per
+phantom_purged, declared_corners, coverage, ok}` — `declared_corners`
+(v0.6.14, N1.3) is prose, never a failure: the corners a migration
+declared (today one kind: a cut that went back under the v0.6.13 engine,
+with no copy file to rebuild some objects from); the human output prints
+one line each — `coverage` lists the vector coverage per
 model (`{model, state, covered, living}`; embeddings are derived data,
 their absence is never a verification failure). The human output prints one
 `copertura vettori` line per model. **(v0.6.10, J2) verify is read-only**:
@@ -298,6 +314,15 @@ deletes the file of the previous one. A later `purge` scrubs a snapshot
 file (its row records the redacted digest with `redacted_by` naming the
 purge, spec §6.4) and **nulls a checkpoint's digest** (it described a
 state that contained the purged note).
+
+**(v0.6.14, N1) The cut only goes forward.** A compaction asking a cut
+BELOW the one already made does nothing: it prints
+`nessun taglio nuovo: il taglio resta a seq N` (JSON `"compacted": false`
+with the true `cut_seq`) — not an error, so an automatic caller that
+raises `keep-last` never fails. The same cut asked again keeps the
+behavior it always had: the restart point is registered again, in the
+form asked (a file snapshot becomes a checkpoint, and the other way
+round).
 
 `--json` carries `cut_seq`, `head_seq`, `head_hash`, `state_digest`,
 `snapshot` (null for a checkpoint), `bytes_before`/`bytes_after` — the
