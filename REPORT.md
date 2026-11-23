@@ -12158,7 +12158,17 @@ lasciato acceso. Le cache `engramma-cli-*` e il volume Docker
 
 ## La build sul tag
 
-(COMPILAZIONE-DOPO-IL-TAG)
+`scripts/build-sha.sh` col repo sul tag `fase-v0.6.13` (`cc63772d`),
+albero pulito:
+
+- costruzione sul commit `cc63772d` (il tag; costruito altrove dà un
+  altro SHA — il binario porta il commit);
+- `engramma.darwin-arm64.node` **51 200 584 B**, SHA256
+  `e33beb8ec992319a035aa7d7c92d7a79cfef7e4dd8ede3e2117b9f6c2d69b3b3`;
+- `index.js` 36 239 B, SHA256
+  `cd26043ecf56124be115f58a25368049dec67d48515109b31de588646280e311`;
+- `index.d.ts` 30 518 B, SHA256
+  `72b1c139b7ca6404d007b5399033e8efdcc52ac0e30619e1ac17bd20de19330f`.
 
 ## Verifica v0.6.12 (revisore, 2026-11-22)
 
