@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  v0.6.14 (N3): il launchd di ESEMPIO della caccia notturna (il livello 3,
+  docs/caccia.md). NON È INSTALLATO: l'installazione è dell'utente — far
+  girare qualcosa ogni notte sulla macchina è una sua decisione.
+
+  Per installarlo (solo se lo vuoi):
+    1. sostituisci /PERCORSO/DEL/repo/engramma con il percorso del repo e
+       TUO-UTENTE col tuo nome utente (la PATH deve trovare `cargo`);
+    2. mkdir -p ~/Library/LaunchAgents
+       cp scripts/it.engramma.caccia-notte.plist ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/it.engramma.caccia-notte.plist
+  Per toglierlo:
+       launchctl unload ~/Library/LaunchAgents/it.engramma.caccia-notte.plist
+       rm ~/Library/LaunchAgents/it.engramma.caccia-notte.plist
+
+  Lo script gira da solo nella sua finestra (01:00–07:00), a priorità
+  minima, e si ferma da solo. Se il Mac dorme all'una, launchd lo lancia
+  al risveglio e lo script calcola quanto resta della finestra. Lo script
+  non committa niente e non tocca il repo: scrive solo sotto target/.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>it.engramma.caccia-notte</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/PERCORSO/DEL/repo/engramma/scripts/caccia-notte.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/PERCORSO/DEL/repo/engramma</string>
+
+  <!-- l'una di notte, ogni giorno -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>1</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <!-- in background, a priorità minima: la notte è di chi dorme -->
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>19</integer>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- `cargo` sta in ~/.cargo/bin: la PATH di launchd non lo sa -->
+    <key>PATH</key>
+    <string>/Users/TUO-UTENTE/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/PERCORSO/DEL/repo/engramma/target/caccia-notte/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/PERCORSO/DEL/repo/engramma/target/caccia-notte/launchd.err.log</string>
+</dict>
+</plist>
