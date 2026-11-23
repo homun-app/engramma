@@ -102,7 +102,7 @@ Un estraneo che si finge un dispositivo: la connessione si chiude **prima di qua
 ## La versione delle regole (v0.6.5; la 4 in v0.6.7; la 5 in v0.6.10; la 6 in v0.6.11; la 7 in v0.6.12)
 
 L'ALPN **è** la versione delle regole di materializzazione:
-`engramma/sync/7` (e `engramma/mailbox/7` per la casella postale).
+`engramma/sync/8` (e `engramma/mailbox/8` per la casella postale).
 La v0.6.12 porta la `7`: **il prefisso congelato è immutabile** — le
 righe di versione nate a o sotto il taglio di compattazione non si
 toccano, le metà dominate dalla purga (e le scritture battute dalla
