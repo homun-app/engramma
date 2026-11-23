@@ -321,6 +321,12 @@ pub struct VerifyReport {
     /// the forgetting rule to the old one. The list is empty on a
     /// healthy cell.
     pub phantom_purged: Vec<String>,
+    /// v0.6.14 (N1.3): the DECLARED CORNERS this cell carries — lines of
+    /// prose, never a failure. Today one kind: the cut went back under the
+    /// v0.6.13 engine and the migration had no copy file to rebuild some
+    /// objects from (their rows stay as the migration found them). Empty
+    /// on every other cell; `ok()` does not look at it.
+    pub declared_corners: Vec<String>,
 }
 
 impl VerifyReport {
@@ -334,6 +340,45 @@ impl VerifyReport {
             && self.snapshot_ok
             && self.phantom_purged.is_empty()
     }
+}
+
+/// v0.6.14 (N1.3): the declared corners of the cell, as prose. The
+/// migration that repairs a cut gone back writes the objects it could not
+/// rebuild (no copy file, no photograph above the true cut) in the LOCAL
+/// `meta` key `cut_repair_corner`; the rows stay as they were found —
+/// nothing is invented — and this is where the cell says so.
+fn declared_corners(conn: &Connection) -> Result<Vec<String>, CellError> {
+    let marker: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'cut_repair_corner'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(marker) = marker else {
+        return Ok(Vec::new());
+    };
+    let value: serde_json::Value = serde_json::from_str(&marker)
+        .map_err(|e| CellError::Db(format!("corrupt cut_repair_corner: {e}")))?;
+    let from = value.get("from").and_then(serde_json::Value::as_i64);
+    let to = value.get("to").and_then(serde_json::Value::as_i64);
+    let unserved: Vec<String> = value
+        .get("unserved")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(vec![format!(
+        "angolo dichiarato: il taglio di compattazione tornò indietro (da {from:?} a {to:?}) \
+         con un motore prima della v0.6.14, e senza file di copia la migrazione non ha \
+         potuto ricostruire {} oggetto/i dalla coda in su: {} — le righe restano come le ha \
+         trovate",
+        unserved.len(),
+        unserved.join(", ")
+    )])
 }
 
 /// v0.6.10 (J2): the «phantom» ids — a living notes row on an id the set
@@ -3482,7 +3527,7 @@ impl Cell {
                     tx.execute_batch(
                         "INSERT INTO notes_fts(notes_fts) VALUES('delete-all');
                          INSERT INTO notes_fts_hidden(notes_fts_hidden) VALUES('delete-all');
-                         DELETE FROM meta WHERE key = 'fts_hidden_dirty';",
+                         DELETE FROM meta WHERE key IN ('fts_hidden_dirty', 'cut_repair_corner');",
                     )?;
                     tx.commit()?;
                 }
@@ -3865,6 +3910,9 @@ impl Cell {
             .transaction_with_behavior(TransactionBehavior::Deferred)?;
         let phantom_purged: Vec<String> =
             phantom_ids(&audit)?.iter().map(|i| i.to_string()).collect();
+        // v0.6.14 (N1.3): the corners the migration DECLARED (local
+        // bookkeeping, `meta.cut_repair_corner`) — reported, never judged
+        let declared_corners: Vec<String> = declared_corners(&audit)?;
         let source_ops = match ops::read_ops(&audit) {
             Ok(ops) => ops,
             Err(e) => {
@@ -3878,6 +3926,7 @@ impl Cell {
                     mismatch: Some(format!("unreadable log: {e}")),
                     coverage: Vec::new(),
                     phantom_purged,
+                    declared_corners: declared_corners.clone(),
                 });
             }
         };
@@ -4167,6 +4216,7 @@ impl Cell {
                 mismatch: Some(mismatch.unwrap_or_else(|| format!("replay failed: {e}"))),
                 coverage: Vec::new(),
                 phantom_purged,
+                declared_corners: declared_corners.clone(),
             });
         }
         if chain_only {
@@ -4209,6 +4259,7 @@ impl Cell {
             mismatch,
             coverage,
             phantom_purged,
+            declared_corners,
         })
     }
 
@@ -4800,11 +4851,13 @@ fn state_dump_tables(replicated: bool) -> Vec<(&'static str, &'static str)> {
     let meta_sql = if replicated {
         "SELECT key, value FROM meta
          WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13', 'hlc',
-                           'sync_shared', 'fts_hidden_dirty') ORDER BY key"
+                           'sync_shared', 'fts_hidden_dirty', 'cut_repair_corner')
+         ORDER BY key"
     } else {
         "SELECT key, value FROM meta
          WHERE key NOT IN ('log_v1_head', 'log_v2_from_seq', 'dump_v13',
-                           'sync_shared', 'fts_hidden_dirty') ORDER BY key"
+                           'sync_shared', 'fts_hidden_dirty', 'cut_repair_corner')
+         ORDER BY key"
     };
     vec![
         (

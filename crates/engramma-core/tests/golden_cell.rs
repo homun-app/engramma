@@ -26,7 +26,7 @@ fn golden_dir() -> PathBuf {
 /// schema change — the whole-object anchor migration opens it). A new
 /// golden lands here by NAME, and this list growing is the visible part
 /// of the rule.
-const GOLDEN_CELLS: &[&str] = &["v068", "v0612", "v0613"];
+const GOLDEN_CELLS: &[&str] = &["v068", "v0612", "v0613", "v0613-indietro"];
 
 /// The deterministic note id of the golden's note `i`
 /// (`01` + sixteen zeros + eight hex digits).
@@ -85,6 +85,7 @@ fn the_golden_cell_opens_verifies_and_holds_its_facts() {
             "v068" => v068_facts(&cell),
             "v0612" => v0612_facts(&cell),
             "v0613" => v0613_facts(&cell),
+            "v0613-indietro" => v0613_indietro_facts(&cell),
             other => panic!("a golden with no facts to check: {other}"),
         }
     }
@@ -298,5 +299,106 @@ fn v0613_facts(cell: &Cell) {
     assert!(
         cell.verify().unwrap(/* t */).ok(),
         "the v0613 golden verifies after the purge"
+    );
+}
+
+/// v0.6.14 (N1): the golden the v0.6.13 engine damaged and froze. Its
+/// story: an agent's `new` proposal, the user's accept, a compaction WITH
+/// its copy file at the head (seq 4), a second compaction one step BELOW
+/// it (registered 3), and the user's supersede of the proposal above the
+/// cut. The base left the queue `pending` with no registry row — the
+/// `decide` that accepted sat above the registered cut with its payload
+/// gone — and called the cell green. The v24 migration must open it, take
+/// the record back to the true cut, rebuild the proposal from the copy
+/// file, and `verify` must be green with the queue whole; a write above
+/// the cut keeps it whole.
+fn v0613_indietro_facts(cell: &Cell) {
+    let pid = nid(3);
+    // the record is back where the payloads are gone
+    let cut: Vec<String> = cell
+        .debug_column("SELECT CAST(seq AS TEXT) FROM snapshots")
+        .unwrap(/* t */);
+    assert_eq!(
+        cut,
+        vec!["4".to_string()],
+        "the registered cut is the true one"
+    );
+    let above: Vec<String> = cell
+        .debug_column(
+            "SELECT op_id FROM ops WHERE payload_state = 'redacted' AND seq > 4",
+        )
+        .unwrap(/* t */);
+    assert!(above.is_empty(), "no payload is removed above the cut");
+    // the user's decision, whole again
+    let queue: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT mode || ' ' || state FROM proposals WHERE note_id = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        queue,
+        vec!["new accepted".to_string()],
+        "the queue says the user accepted it"
+    );
+    let registry: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT decision || ' ' || actor FROM decisions WHERE proposal = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        registry,
+        vec!["accept user:golden".to_string()],
+        "the registry holds it"
+    );
+    // and the user's supersede above the cut stands
+    assert_eq!(cell.get(&pid).unwrap(/* t */).status, Status::Superseded);
+    let closes: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT new_id || '→' || old_id FROM supersedes WHERE old_id = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        closes,
+        vec![format!("{}→{pid}", nid(5))],
+        "the supersede's row is there"
+    );
+    // a further write above the cut: the reconstruction keeps the queue
+    cell.patch_note(
+        &pid,
+        &engramma_core::NotePatch {
+            title: Some(Some("ritoccata sopra il taglio".into())),
+            ..Default::default()
+        },
+        "user:golden",
+    )
+    .expect(/* t */ "the write above the cut lands");
+    let queue: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT mode || ' ' || state FROM proposals WHERE note_id = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        queue,
+        vec!["new accepted".to_string()],
+        "the queue stays whole"
+    );
+    let report = cell.verify().unwrap(/* t */);
+    assert!(
+        report.ok(),
+        "the golden verifies after the write: {:?}",
+        report.mismatch
+    );
+    assert!(
+        matches!(
+            report.replay,
+            engramma_core::cell::Replay::FromSnapshot { seq: 4 }
+        ),
+        "the replay starts from the copy file at the true cut: {:?}",
+        report.replay
+    );
+    assert!(
+        report.declared_corners.is_empty(),
+        "a cell with its copy file has no corner: {:?}",
+        report.declared_corners
     );
 }

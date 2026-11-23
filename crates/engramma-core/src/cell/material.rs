@@ -71,6 +71,18 @@ pub(crate) fn ops_concerning(
     object: &str,
 ) -> Result<Vec<Op>, CellError> {
     let cut = cut_seq(tx)?;
+    ops_concerning_since(tx, object, cut)
+}
+
+/// The same walk above an EXPLICIT seq (v0.6.14, N1.3: a reconstruction
+/// that starts from the copy file replays the operations above the FILE's
+/// head — its rows already hold everything at or below it).
+pub(crate) fn ops_concerning_since(
+    tx: &rusqlite::Transaction<'_>,
+    object: &str,
+    above: i64,
+) -> Result<Vec<Op>, CellError> {
+    let cut = above;
     let mut stmt = tx.prepare(
         "SELECT o.seq, o.op_id, o.hlc, o.actor, o.kind, o.note_id, o.base, o.content_hash,
                 o.payload_digest, o.payload_state, p.salt, p.body, o.prev_hash, o.hash, o.device, o.sig
@@ -438,6 +450,92 @@ pub(crate) fn materialize(tx: &rusqlite::Transaction<'_>, object: &str) -> Resul
     }
 }
 
+/// v0.6.14 (N1.3): copy the rows of one object from another connection —
+/// the copy file — into `tx`. Generic over the table's columns, read from
+/// the file's own schema: no hand-written column list can age. The table
+/// and the key column are the engine's own words; `ignore` makes the
+/// insert `OR IGNORE` (the photographs: a row already there stays).
+pub(crate) fn copy_rows_from(
+    from: &rusqlite::Connection,
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    key_column: &str,
+    key: &str,
+    ignore: bool,
+) -> Result<usize, CellError> {
+    let cols: Vec<String> = {
+        let mut stmt = from.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if cols.is_empty() {
+        return Ok(0); // the file's schema has no such table (an older engine wrote it)
+    }
+    let mut stmt = from.prepare(&format!("SELECT * FROM {table} WHERE {key_column} = ?1"))?;
+    let ncols = stmt.column_count();
+    let mut rows = stmt.query([key])?;
+    let mut copied = 0;
+    while let Some(row) = rows.next()? {
+        let values: Vec<rusqlite::types::Value> = (0..ncols)
+            .map(|i| row.get(i))
+            .collect::<Result<Vec<_>, _>>()?;
+        let placeholders = vec!["?"; cols.len()].join(", ");
+        let sql = format!(
+            "INSERT {}INTO {table} ({}) VALUES ({placeholders})",
+            if ignore { "OR IGNORE " } else { "" },
+            cols.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> =
+            values.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+        copied += tx.execute(&sql, params.as_slice())?;
+    }
+    Ok(copied)
+}
+
+/// v0.6.14 (N1.3): rebuild one object from the COPY FILE — the migration's
+/// repair of a cut that went back. The file is a full copy the compaction
+/// itself took: its rows of the object are the state at the file's head,
+/// and the object's operations above that head replay over them (the
+/// engine's own reconstruction, anchored on the file instead of on a
+/// photograph). The version photographs and the object anchors the
+/// wrong-cut reconstruction deleted come back first: they are immutable
+/// history, and a row already there stays. An object the file does not
+/// hold was born after the compaction — nothing above the true cut was
+/// ever frozen for it, and nothing is said.
+pub(crate) fn rebuild_from_file(
+    tx: &rusqlite::Transaction<'_>,
+    object: &str,
+    file: &rusqlite::Connection,
+    above: i64,
+) -> Result<(), CellError> {
+    if let Some(id) = object.strip_prefix("note:") {
+        let id = Ulid::from_string(id)
+            .map_err(|_| CellError::Invalid(format!("bad object key `{object}`")))?;
+        let Some(row) = ops::read_note_row(file, &id)? else {
+            return Ok(());
+        };
+        let key = id.to_string();
+        copy_rows_from(file, tx, "note_versions", "note_id", &key, true)?;
+        copy_rows_from(file, tx, "object_anchors", "note_id", &key, true)?;
+        let derived = ops::derived_anchor_json(file, &id)?;
+        materialize_note_with(
+            tx,
+            &id,
+            object,
+            Some(FileAnchor {
+                note: row.note,
+                version: row.version,
+                derived,
+                above,
+            }),
+        )
+    } else if let Some(edge_id) = object.strip_prefix("edge:") {
+        materialize_edge_with(tx, edge_id, object, Some((file, above)))
+    } else {
+        Ok(())
+    }
+}
+
 /// Does this operation CREATE the note `id` (so the object materializes even
 /// while the row is absent)?
 fn op_creates_note(op: &Op, id: &Ulid) -> bool {
@@ -479,16 +577,53 @@ fn materialize_note(
     id: &Ulid,
     object: &str,
 ) -> Result<(), CellError> {
-    let all = ops_concerning(tx, object)?;
+    materialize_note_with(tx, id, object, None)
+}
+
+/// v0.6.14 (N1.3): an anchor the photographs cannot give. A cell whose cut
+/// went back (the v0.6.13 engine) lost derived rows in its first
+/// reconstruction above the wrong cut — the queue row, the registry rows,
+/// the `supersedes` rows, the version photographs born between the two
+/// cuts, a manual edge — and for an object with no photograph above the
+/// TRUE cut nothing in the cell still says what the state at the cut was.
+/// The copy file does: it is a full copy the compaction itself took. Its
+/// rows of one object are the state at the FILE's head; the operations of
+/// the object above that head replay over them. Only the migration builds
+/// one — the live engine never needs it.
+pub(crate) struct FileAnchor {
+    /// The note row as the file holds it.
+    pub note: crate::format::Note,
+    /// Its version there.
+    pub version: i64,
+    /// The derived rows of its object, in the anchor's own JSON shape.
+    pub derived: String,
+    /// The file's head: the object's operations ABOVE it replay.
+    pub above: i64,
+}
+
+fn materialize_note_with(
+    tx: &rusqlite::Transaction<'_>,
+    id: &Ulid,
+    object: &str,
+    forced: Option<FileAnchor>,
+) -> Result<(), CellError> {
+    let all = match &forced {
+        Some(f) => ops_concerning_since(tx, object, f.above)?,
+        None => ops_concerning(tx, object)?,
+    };
     // a pure conflict copy has no operations of its own: its whole state is
     // the derivation (a copy the user edited has ops, and replays them over
     // the derived base below)
     if all.is_empty() {
         if let Some((original, note)) = conflict_copy_state(tx, id)? {
             restore_conflict_copy(tx, id, &original, &note)?;
+            clear_pending(tx, object)?;
+            return Ok(());
         }
-        clear_pending(tx, object)?;
-        return Ok(());
+        if forced.is_none() {
+            clear_pending(tx, object)?;
+            return Ok(());
+        }
     }
     let cut = cut_seq(tx)?;
     let watermark: Option<String> = tx
@@ -525,8 +660,14 @@ fn materialize_note(
     // derived rows stand in — read here, before the delete step below
     // takes them away.
     let mut derived_anchor: Option<String> = None;
-    let cut_state: Option<(crate::format::Note, i64)> =
-        if cut > 0 && note_exists_at(tx, object, cut)? {
+    // v0.6.14 (N1.3): a FORCED anchor replaces the whole search — the
+    // state comes from the copy file, and no live row stands in
+    let cut_state: Option<(crate::format::Note, i64)> = match &forced {
+        Some(f) => {
+            derived_anchor = Some(f.derived.clone());
+            Some((f.note.clone(), f.version))
+        }
+        None if cut > 0 && note_exists_at(tx, object, cut)? => {
             let mut stmt = tx.prepare(
                 "SELECT o.op_id FROM ops o
              JOIN op_objects oo ON oo.op_id = o.op_id
@@ -572,9 +713,9 @@ fn materialize_note(
                     Some((note, version))
                 }
             }
-        } else {
-            None
-        };
+        }
+        None => None,
+    };
 
     // v0.6.12 (L1): the LIVE ROW before the delete step. When the note
     // existed at the cut but NO above-cut operation ever photographed it,
@@ -585,7 +726,7 @@ fn materialize_note(
     // the replay started from zero and the note DIED instead of keeping
     // the frozen state (found by the oracle, seed 765420891842479779).
     let live_row: Option<(crate::format::Note, i64)> =
-        if cut > 0 && note_exists_at(tx, object, cut)? {
+        if forced.is_none() && cut > 0 && note_exists_at(tx, object, cut)? {
             ops::read_note_row(tx, id)?.map(|r| (r.note, r.version))
         } else {
             None
@@ -606,7 +747,7 @@ fn materialize_note(
     // photograph the older engine never took (v0.6.13, M1 — the
     // migration back-fills what it can; what it cannot, the live rows
     // hold, and the idempotent replay of the tail converges over them)
-    let derived_live = if cut > 0 && note_exists_at(tx, object, cut)? {
+    let derived_live = if forced.is_none() && cut > 0 && note_exists_at(tx, object, cut)? {
         Some(ops::derived_anchor_json(tx, id)?)
     } else {
         None
@@ -1920,11 +2061,30 @@ fn materialize_edge(
     edge_id: &str,
     object: &str,
 ) -> Result<(), CellError> {
-    let all = ops_concerning(tx, object)?;
+    materialize_edge_with(tx, edge_id, object, None)
+}
+
+/// v0.6.14 (N1.3): the edge's reconstruction, from the copy file when the
+/// migration has one: the row comes back as the file holds it, and the
+/// operations above the FILE's head replay over it (an `unlink` written
+/// after the compaction still takes the edge away).
+fn materialize_edge_with(
+    tx: &rusqlite::Transaction<'_>,
+    edge_id: &str,
+    object: &str,
+    file: Option<(&rusqlite::Connection, i64)>,
+) -> Result<(), CellError> {
+    let all = match file {
+        Some((_, above)) => ops_concerning_since(tx, object, above)?,
+        None => ops_concerning(tx, object)?,
+    };
     let watermark: Option<String> = tx
         .query_row("SELECT value FROM meta WHERE key = 'hlc'", [], |r| r.get(0))
         .optional()?;
     tx.execute("DELETE FROM edges WHERE id = ?1", [edge_id])?;
+    if let Some((file, _)) = file {
+        copy_rows_from(file, tx, "edges", "id", edge_id, false)?;
+    }
     let mut pending_since: Option<String> = None;
     for op in &all {
         // v0.6.11 (K1): the purge dominates per half here too — the

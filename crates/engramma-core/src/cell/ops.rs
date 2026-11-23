@@ -1008,13 +1008,13 @@ pub(crate) struct NoteRow {
     pub(crate) tags_text: String,
 }
 
-pub(crate) fn read_note_row(tx: &Transaction<'_>, id: &Ulid) -> Result<Option<NoteRow>, CellError> {
-    read_note(tx, id)
+pub(crate) fn read_note_row(conn: &Connection, id: &Ulid) -> Result<Option<NoteRow>, CellError> {
+    read_note(conn, id)
 }
 
-fn read_note(tx: &Transaction<'_>, id: &Ulid) -> Result<Option<NoteRow>, CellError> {
+fn read_note(conn: &Connection, id: &Ulid) -> Result<Option<NoteRow>, CellError> {
     let sql = format!("SELECT rowid, {NOTE_COLS} FROM notes WHERE id = ?1");
-    let mut stmt = tx.prepare_cached(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query([id.to_string()])?;
     let Some(row) = rows.next().map_err(CellError::from)? else {
         return Ok(None);
@@ -1232,9 +1232,9 @@ pub(crate) fn has_derived_rows(tx: &Transaction<'_>, id: &Ulid) -> Result<bool, 
 /// photograph — the queue row, the registry rows, the `supersedes` rows
 /// of the new side. Read as JSON so the writer (`snapshot_object`) and
 /// the reader (`materialize_note`'s restore step) share one shape.
-pub(crate) fn derived_anchor_json(tx: &Transaction<'_>, id: &Ulid) -> Result<String, CellError> {
+pub(crate) fn derived_anchor_json(conn: &Connection, id: &Ulid) -> Result<String, CellError> {
     let mut anchor = serde_json::Map::new();
-    let proposal: Option<String> = tx
+    let proposal: Option<String> = conn
         .query_row(
             "SELECT json_object(
                      'mode', mode, 'target', target, 'proposer', proposer, 'client', client,
@@ -1251,7 +1251,7 @@ pub(crate) fn derived_anchor_json(tx: &Transaction<'_>, id: &Ulid) -> Result<Str
         "proposals".into(),
         proposal.map_or(Value::Null, Value::String),
     );
-    let mut stmt = tx.prepare(
+    let mut stmt = conn.prepare(
         "SELECT json_array(op_id, proposal, decision, actor, decided_at, reason,
                            review_json, reverted_by)
          FROM decisions WHERE proposal = ?1 ORDER BY op_id",
@@ -1270,7 +1270,7 @@ pub(crate) fn derived_anchor_json(tx: &Transaction<'_>, id: &Ulid) -> Result<Str
                 .collect(),
         ),
     );
-    let mut stmt = tx.prepare(
+    let mut stmt = conn.prepare(
         "SELECT json_array(new_id, old_id) FROM supersedes WHERE new_id = ?1 ORDER BY old_id",
     )?;
     let supersedes: Vec<String> = stmt

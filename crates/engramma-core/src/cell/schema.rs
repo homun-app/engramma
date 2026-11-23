@@ -8,7 +8,7 @@
 //! instead of merely deduced from the replay.
 
 /// Current schema version (number of entries in [`MIGRATIONS`]).
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// v0.6.13 (M1/M2): the tables of one note's ANCHOR — the derived rows
 /// a reconstruction DELETES and the whole-object photograph restores.
@@ -89,7 +89,7 @@ pub const NON_ANCHOR_NOTE_TABLES: &[(&str, &str)] = &[
 
 /// Ordered migrations; `MIGRATIONS[i]` brings a cell to version i + 1.
 /// (`meta` is created by the bootstrap in [`migrate`], not by a migration.)
-pub const MIGRATIONS: [&str; 23] = [
+pub const MIGRATIONS: [&str; 24] = [
     r#"
 CREATE TABLE notes     (id TEXT PRIMARY KEY, type TEXT, title TEXT, body TEXT,
                         frontmatter_json TEXT,
@@ -471,6 +471,30 @@ CREATE TABLE object_anchors (note_id TEXT NOT NULL,
                              anchor_json TEXT NOT NULL,
                              PRIMARY KEY (note_id, op_id));
 "#,
+    r#"
+-- v24 (v0.6.14, N1.3 and N2.4): no table, no column — a REPAIR of what the
+-- engines before this phase left in the derived state, so that the live
+-- cell and its replay agree again. Two steps, in this order (the Rust
+-- side is migrate_v24):
+-- 1. the cut that went back. The v0.6.13 engine accepted a compaction
+--    BELOW the cut already made: the registered cut said less than the
+--    payloads actually gone, and the first reconstruction above it
+--    replayed operations with no payload — the queue row of an accepted
+--    proposal came back pending, its registry row went, and so did the
+--    version photographs born between the two cuts. The record goes back
+--    to the highest operation whose payload the cut removed, and every
+--    object a wrong-cut reconstruction could have touched is rebuilt:
+--    from the copy file when the cell has one (the state the compaction
+--    itself froze), otherwise from the photographs; what neither can
+--    serve is the declared corner, named in meta (cut_repair_corner) for
+--    verify to report — never invented.
+-- 2. the restore that wrote the state (N2). A restore used to copy the
+--    WHOLE version photograph, status and confidence included: a note
+--    closed without its closing row. The notes holding a replayable
+--    restore in their log rematerialize under the new rule.
+-- The marker of the corner is LOCAL bookkeeping, like sync_shared: it
+-- never enters a digest.
+"#,
 ];
 
 /// Rust-side migration steps, run right after the SQL of version `v`.
@@ -517,6 +541,284 @@ fn migrate_rust(tx: &rusqlite::Transaction<'_>, v: i64) -> Result<(), crate::err
     }
     if v == 23 {
         migrate_anchors_v23(tx)?;
+    }
+    if v == 24 {
+        migrate_v24(tx)?;
+    }
+    Ok(())
+}
+
+/// The Rust side of migration v24 (v0.6.14): the repair of a cut that
+/// went back (N1.3), then the rematerialization of the notes a `restore`
+/// wrote the state of (N2.4).
+fn migrate_v24(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
+    repair_backward_cut_v24(tx)?;
+    rematerialize_restored_v24(tx)?;
+    Ok(())
+}
+
+/// v0.6.14 (N1.3): the highest operation whose payload the CUT removed.
+/// An operation of a note the set purged is the purge's work, at any seq,
+/// and does not count; a `purge` op itself is only ever forgotten by the
+/// cut.
+fn real_cut_v24(tx: &rusqlite::Transaction<'_>) -> Result<i64, crate::error::CellError> {
+    let real: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(o.seq), 0) FROM ops o
+         WHERE o.payload_state = 'redacted'
+           AND NOT (o.kind != 'purge'
+                    AND o.note_id IN (SELECT note_id FROM ops WHERE kind = 'purge'))",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(real)
+}
+
+/// v0.6.14 (N1.3): repair a cell the v0.6.13 engine compacted with a cut
+/// BELOW the one already made.
+/// - the record goes back to the true cut (the payloads are gone there);
+/// - every object with an operation above the WRONG cut — the only ones a
+///   reconstruction under it could have touched — is rebuilt FROM THE COPY
+///   FILE when the cell has one: its rows are the state the compaction
+///   froze, and the operations above the file's head replay over them.
+/// - without a copy file NOTHING is rebuilt. The photographs are no
+///   repair here: a reconstruction under the wrong cut re-recorded them
+///   over the damaged state itself (found staging the damage by hand — the
+///   supersede's photograph of the proposal came back with the queue
+///   `pending`, and the anchor's write-back covered it). What the
+///   skeletons of the log PROVE lost — an operation whose payload the cut
+///   took and whose derived row is not there — is the DECLARED CORNER: the
+///   rows stay as the migration found them, the corner is written in
+///   `meta.cut_repair_corner`, and `verify` reports it as a known corner.
+///   Nothing is ever invented: a decision the registry no longer holds is
+///   not rebuilt.
+fn repair_backward_cut_v24(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
+    use rusqlite::OptionalExtension;
+    let old = super::registered_cut(tx)?;
+    if old == 0 {
+        return Ok(()); // never compacted: no cut could go back
+    }
+    let real = real_cut_v24(tx)?;
+    if real <= old {
+        return Ok(()); // the cut never went back: nothing to repair
+    }
+    tx.execute(
+        "UPDATE snapshots SET seq = ?2 WHERE seq = ?1",
+        rusqlite::params![old, real],
+    )?;
+    // the copy file of the record, when there is one and it opens
+    let (snap, file_head): (Option<rusqlite::Connection>, i64) = {
+        let file: Option<String> = tx
+            .query_row("SELECT file FROM snapshots WHERE seq = ?1", [real], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten();
+        let dir: Option<std::path::PathBuf> = {
+            let mut stmt = tx.prepare("PRAGMA database_list")?;
+            let rows: Vec<(i64, String, String)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .flatten()
+                .collect();
+            drop(stmt);
+            rows.into_iter()
+                .find(|(n, _, _)| *n == 0)
+                .and_then(|(_, _, path)| {
+                    std::path::PathBuf::from(path)
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                })
+        };
+        match (file, dir) {
+            (Some(file), Some(dir)) => {
+                let path = dir.join(file);
+                match rusqlite::Connection::open_with_flags(
+                    &path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                ) {
+                    Ok(conn) => {
+                        let head: i64 = conn
+                            .query_row("SELECT COALESCE(MAX(seq), 0) FROM ops", [], |r| r.get(0))
+                            .unwrap_or(0);
+                        (Some(conn), head)
+                    }
+                    Err(_) => (None, 0),
+                }
+            }
+            _ => (None, 0),
+        }
+    };
+    let objects: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT oo.object FROM op_objects oo
+             JOIN ops o ON o.op_id = oo.op_id
+             WHERE o.seq > ?1",
+        )?;
+        let rows = stmt.query_map([old], |r| r.get::<_, String>(0))?;
+        rows.flatten().collect()
+    };
+    let mut corner: Vec<String> = Vec::new();
+    for object in objects {
+        // a purged note keeps nothing: its rows are the purge's word
+        if let Some(id) = object.strip_prefix("note:")
+            && let Ok(id) = ulid::Ulid::from_string(id)
+            && super::material::note_purged_in_set(tx, &id)?
+        {
+            continue;
+        }
+        match &snap {
+            Some(file) => super::material::rebuild_from_file(tx, &object, file, file_head)?,
+            None => {
+                for what in lost_rows_v24(tx, &object, real)? {
+                    corner.push(format!("{object}: {what}"));
+                }
+            }
+        }
+    }
+    if !corner.is_empty() {
+        let marker = serde_json::json!({ "from": old, "to": real, "unserved": corner });
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('cut_repair_corner', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            [marker.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+/// v0.6.14 (N1.3): what the SKELETONS of the log prove lost for one
+/// object of a cell without a copy file. The skeletons survive the cut
+/// (kind, ids, the object index); the derived rows are what a
+/// reconstruction under the wrong cut took: the queue row of a proposal
+/// whose `propose` the cut forgot, the registry row of a decision whose
+/// `decide` the cut forgot, the `supersedes` row of a closing the cut
+/// forgot, the row of a manual edge whose `link` the cut forgot and that
+/// nothing closed. Each is read as «the operation is there, its payload
+/// is gone, its row is not» — proof, never a guess.
+fn lost_rows_v24(
+    tx: &rusqlite::Transaction<'_>,
+    object: &str,
+    real: i64,
+) -> Result<Vec<&'static str>, crate::error::CellError> {
+    let mut lost: Vec<&'static str> = Vec::new();
+    // the operations of the object whose payload the CUT took (a purge's
+    // own removals are explained by the purged note, and skipped with it)
+    let forgotten = |kind: &str| -> Result<i64, crate::error::CellError> {
+        Ok(tx.query_row(
+            "SELECT COUNT(*) FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = ?1 AND o.kind = ?2 AND o.payload_state = 'redacted' AND o.seq <= ?3",
+            rusqlite::params![object, kind, real],
+            |r| r.get(0),
+        )?)
+    };
+    if let Some(id) = object.strip_prefix("note:") {
+        let row: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM proposals WHERE note_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if row == 0 && forgotten("propose")? > 0 {
+            lost.push("la riga di coda");
+        }
+        let orphan: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM ops o
+             WHERE o.note_id = ?1 AND o.kind = 'decide' AND o.payload_state = 'redacted'
+               AND o.seq <= ?2
+               AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.op_id = o.op_id)",
+            rusqlite::params![id, real],
+            |r| r.get(0),
+        )?;
+        if orphan > 0 {
+            lost.push("la riga del registro");
+        }
+        // the note as the NEW side of a supersede the cut forgot: the old
+        // side is the operation's own note (the index keeps both)
+        let closings: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT o.note_id FROM ops o
+                 JOIN op_objects oo ON oo.op_id = o.op_id
+                 WHERE oo.object = ?1 AND o.kind = 'supersede'
+                   AND o.payload_state = 'redacted' AND o.seq <= ?2 AND o.note_id != ?3",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![object, real, id], |r| {
+                r.get::<_, String>(0)
+            })?;
+            rows.flatten().collect()
+        };
+        for old_id in closings {
+            let purged: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM ops WHERE kind = 'purge' AND note_id = ?1",
+                [&old_id],
+                |r| r.get(0),
+            )?;
+            let row: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM supersedes WHERE new_id = ?1 AND old_id = ?2",
+                rusqlite::params![id, old_id],
+                |r| r.get(0),
+            )?;
+            if purged == 0 && row == 0 {
+                lost.push("la riga supersedes");
+                break;
+            }
+        }
+        // the queue row is there but a decision the cut forgot has no
+        // registry row: the row's state is the wrong cut's word
+        if row > 0 && orphan > 0 {
+            lost.push("lo stato della riga di coda");
+        }
+    } else if let Some(edge_id) = object.strip_prefix("edge:") {
+        // a link the cut forgot, closed by nothing above it
+        let newest_is_link: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM ops o
+             JOIN op_objects oo ON oo.op_id = o.op_id
+             WHERE oo.object = ?1 AND o.kind = 'link' AND o.payload_state = 'redacted'
+               AND o.seq <= ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM ops u JOIN op_objects ou ON ou.op_id = u.op_id
+                   WHERE ou.object = ?1 AND u.kind = 'unlink'
+                     AND (u.hlc > o.hlc OR (u.hlc = o.hlc AND u.op_id > o.op_id)))",
+            rusqlite::params![object, real],
+            |r| r.get(0),
+        )?;
+        let row: i64 =
+            tx.query_row("SELECT COUNT(*) FROM edges WHERE id = ?1", [edge_id], |r| {
+                r.get(0)
+            })?;
+        if newest_is_link > 0 && row == 0 {
+            lost.push("la riga dell'arco");
+        }
+    }
+    Ok(lost)
+}
+
+/// v0.6.14 (N2.4): the notes whose log holds a `restore` the cell can
+/// still replay (above the cut, or anywhere in a cell without one) — the
+/// old rule wrote the WHOLE version photograph, the new one the content
+/// alone, so their derived state changes here: they rematerialize, and
+/// the live cell agrees with its replay again. A restore frozen under the
+/// cut has no payload left: its effect is part of the frozen state, and
+/// stays as the engine of then wrote it.
+fn rematerialize_restored_v24(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<(), crate::error::CellError> {
+    let cut = super::registered_cut(tx)?;
+    let objects: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT DISTINCT oo.object FROM op_objects oo
+             JOIN ops o ON o.op_id = oo.op_id
+             WHERE o.kind = 'restore' AND o.seq > ?1 AND oo.object LIKE 'note:%'",
+        )?;
+        let rows = stmt.query_map([cut], |r| r.get::<_, String>(0))?;
+        rows.flatten().collect()
+    };
+    for object in objects {
+        if let Some(id) = object.strip_prefix("note:")
+            && let Ok(id) = ulid::Ulid::from_string(id)
+            && super::material::note_purged_in_set(tx, &id)?
+        {
+            continue;
+        }
+        super::material::materialize(tx, &object)?;
     }
     Ok(())
 }

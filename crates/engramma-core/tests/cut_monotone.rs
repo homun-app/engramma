@@ -416,3 +416,223 @@ fn the_frontier_that_goes_down_changes_nothing() {
     );
     assert!(cell.verify().unwrap(/* t */).ok(), "the cell verifies");
 }
+
+// ---------------------------------------------------------------------------
+// v0.6.14 (N1.3): the migration that repairs a cell the v0.6.13 engine
+// damaged. The damage is STAGED BY HAND — the engine of this phase refuses
+// the backward cut, by construction — with the same three moves the old
+// engine made: a compaction at the head, the record pushed one step back
+// under the same log, and a reconstruction above it (the supersede). The
+// cell then closes as the schema-23 cell it would have been, and the next
+// open runs the v24 repair. The real artifact is the golden
+// `v0613-indietro`, written by the v0.6.13 engine itself.
+// ---------------------------------------------------------------------------
+
+struct Damaged {
+    /// the folder lives as long as the test reads the cell
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+    pid: Ulid,
+}
+
+/// `keep_file`: the compaction keeps its copy file.
+fn damaged_cell(prefix: &str, keep_file: bool) -> Damaged {
+    let s = accepted_proposal(prefix);
+    let path = s.dir.path().join(format!("{prefix}.sqlite"));
+    let h = head(&s.cell);
+    s.cell
+        .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: keep_file })
+        .unwrap(/* t */);
+    // the record says one step less than the payloads the cut took
+    let raw = rusqlite::Connection::open(&path).unwrap(/* t */);
+    raw.execute("UPDATE snapshots SET seq = seq - 1", []).unwrap(/* t */);
+    drop(raw);
+    // the reconstruction under the wrong cut: the decide replays as nothing
+    supersede_above(&s.cell, &s.pid);
+    assert_eq!(
+        queue(&s.cell, &s.pid),
+        vec!["new pending".to_string()],
+        "the damage is staged: the queue lost the user's decision"
+    );
+    assert!(
+        registry(&s.cell, &s.pid).is_empty(),
+        "the damage is staged: the registry is empty"
+    );
+    let pid = s.pid;
+    drop(s.cell);
+    // the cell closes as the v0.6.13 engine left it
+    let raw = rusqlite::Connection::open(&path).unwrap(/* t */);
+    raw.execute(
+        "UPDATE meta SET value = '23' WHERE key = 'schema_version'",
+        [],
+    )
+    .unwrap(/* t */);
+    drop(raw);
+    Damaged {
+        _dir: s.dir,
+        path,
+        pid,
+    }
+}
+
+fn assert_repaired(cell: &Cell, pid: &Ulid, ctx: &str) {
+    assert_eq!(
+        queue(cell, pid),
+        vec!["new accepted".to_string()],
+        "{ctx}: the queue"
+    );
+    assert_eq!(
+        registry(cell, pid),
+        vec!["accept user".to_string()],
+        "{ctx}: the registry"
+    );
+    assert_eq!(
+        cell.get(pid).unwrap(/* t */).status,
+        Status::Superseded,
+        "{ctx}: the note"
+    );
+    let report = cell.verify().unwrap(/* t */);
+    assert!(report.ok(), "{ctx}: verify is green: {:?}", report.mismatch);
+    assert!(
+        report.declared_corners.is_empty(),
+        "{ctx}: no corner: {:?}",
+        report.declared_corners
+    );
+}
+
+/// With the copy file the object is rebuilt from the file: its rows are
+/// the state the compaction froze, and the supersede replays over them.
+#[test]
+fn the_migration_rebuilds_from_the_copy_file() {
+    let d = damaged_cell("ripara-copia", true);
+    let cell = Cell::open(&d.path).unwrap(/* t */);
+    assert_eq!(
+        registered_cut(&cell),
+        5,
+        "the record is back at the true cut"
+    );
+    assert_repaired(&cell, &d.pid, "from the copy file");
+    assert!(
+        matches!(
+            cell.verify().unwrap(/* t */).replay,
+            engramma_core::cell::Replay::FromSnapshot { seq: 5 }
+        ),
+        "the replay starts from the file"
+    );
+}
+
+/// Without a copy file NOTHING is rebuilt — not from the photographs: a
+/// reconstruction under the wrong cut re-recorded them over the damaged
+/// state. What the skeletons PROVE lost is the DECLARED CORNER: the rows
+/// stay as the migration found them, the record still goes back to the
+/// true cut, and `verify` is green (nothing is broken) while naming what
+/// is lost.
+#[test]
+fn without_the_copy_file_the_corner_is_declared() {
+    let d = damaged_cell("ripara-angolo", false);
+    let cell = Cell::open(&d.path).unwrap(/* t */);
+    assert_eq!(
+        registered_cut(&cell),
+        5,
+        "the record is back at the true cut all the same"
+    );
+    assert_eq!(
+        queue(&cell, &d.pid),
+        vec!["new pending".to_string()],
+        "the queue stays as the migration found it: nothing is invented"
+    );
+    assert!(registry(&cell, &d.pid).is_empty(), "the registry too");
+    let report = cell.verify().unwrap(/* t */);
+    assert!(
+        report.ok(),
+        "a declared corner is not a break: {:?}",
+        report.mismatch
+    );
+    assert_eq!(
+        report.declared_corners.len(),
+        1,
+        "one corner: {:?}",
+        report.declared_corners
+    );
+    let corner = &report.declared_corners[0];
+    assert!(
+        corner.contains(&d.pid.to_string()),
+        "the corner names the object: {corner}"
+    );
+    assert!(corner.contains("registro"), "and what is lost: {corner}");
+    assert!(
+        corner.contains("da Some(4) a Some(5)"),
+        "and the two cuts: {corner}"
+    );
+}
+
+/// The same damaged cell, with the copy file: there is no corner — the
+/// file says what the state at the cut was.
+#[test]
+fn with_the_copy_file_the_corner_is_not() {
+    let d = damaged_cell("ripara-angolo-copia", true);
+    let cell = Cell::open(&d.path).unwrap(/* t */);
+    assert_eq!(registered_cut(&cell), 5);
+    assert_repaired(&cell, &d.pid, "from the copy file");
+}
+
+/// The cut went back and NOTHING was written above it: the live rows are
+/// the truth, there is nothing to rebuild, and no corner is declared.
+#[test]
+fn a_backward_cut_nobody_wrote_over_declares_no_corner() {
+    let s = accepted_proposal("ripara-fermo");
+    let path = s.dir.path().join("ripara-fermo.sqlite");
+    let h = head(&s.cell);
+    s.cell
+        .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: false })
+        .unwrap(/* t */);
+    let raw = rusqlite::Connection::open(&path).unwrap(/* t */);
+    raw.execute("UPDATE snapshots SET seq = seq - 1", []).unwrap(/* t */);
+    raw.execute("UPDATE meta SET value = '23' WHERE key = 'schema_version'", []).unwrap(/* t */);
+    drop(raw);
+    let pid = s.pid;
+    drop(s.cell);
+    let cell = Cell::open(&path).unwrap(/* t */);
+    assert_eq!(
+        registered_cut(&cell),
+        h,
+        "the record is back at the true cut"
+    );
+    assert_the_queue_stands(
+        &cell,
+        &pid,
+        Status::Active,
+        "nothing was written over the wrong cut",
+    );
+    assert!(
+        cell.verify().unwrap(/* t */).declared_corners.is_empty(),
+        "no corner"
+    );
+    // and the write that comes now rebuilds nothing wrong
+    supersede_above(&cell, &pid);
+    assert_the_queue_stands(&cell, &pid, Status::Superseded, "the write above the cut");
+}
+
+/// A healthy cell is not touched: the record stays, no corner is written,
+/// and `verify` says nothing about corners.
+#[test]
+fn a_cell_whose_cut_never_went_back_is_left_alone() {
+    let s = accepted_proposal("ripara-sana");
+    let h = head(&s.cell);
+    s.cell
+        .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: false })
+        .unwrap(/* t */);
+    let path = s.dir.path().join("ripara-sana.sqlite");
+    let pid = s.pid;
+    drop(s.cell);
+    let raw = rusqlite::Connection::open(&path).unwrap(/* t */);
+    raw.execute("UPDATE meta SET value = '23' WHERE key = 'schema_version'", []).unwrap(/* t */);
+    drop(raw);
+    let cell = Cell::open(&path).unwrap(/* t */);
+    assert_eq!(registered_cut(&cell), h, "the record did not move");
+    let marker: Vec<String> = cell
+        .debug_column("SELECT value FROM meta WHERE key = 'cut_repair_corner'")
+        .unwrap(/* t */);
+    assert!(marker.is_empty(), "no corner on a healthy cell");
+    assert_the_queue_stands(&cell, &pid, Status::Active, "the healthy cell");
+}
