@@ -118,6 +118,18 @@ fn proposal_sequences_keep_the_invariants_body(
         .new_tree(&mut runner)
         .expect(/* t */ "the strategy builds its tree")
         .current();
+    proposal_sequences_keep_the_invariants_with(seed, steps)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY — the shape
+/// it drew until this phase, the one in which its persisted counterexamples
+/// and its declared defect were written down. The body above derives the
+/// inputs from one seed (so a failing seed replays in one case); this takes
+/// them as they are, for the cases history recorded.
+fn proposal_sequences_keep_the_invariants_with(
+    seed: u64,
+    steps: Vec<u8>,
+) -> Result<(), proptest::test_runner::TestCaseError> {
     let dir = test_dir();
     let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* test-only */);
     cell.set_policy(serde_json::json!({ "write": "propose" }), "t")

@@ -2536,6 +2536,15 @@ fn format_round_trip_body(seed: u64) -> Result<(), proptest::test_runner::TestCa
         .new_tree(&mut runner)
         .expect(/* t */ "the strategy builds its tree")
         .current();
+    format_round_trip_with(note)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY — the shape
+/// it drew until this phase, the one in which its persisted counterexamples
+/// and its declared defect were written down. The body above derives the
+/// inputs from one seed (so a failing seed replays in one case); this takes
+/// them as they are, for the cases history recorded.
+fn format_round_trip_with(note: Note) -> Result<(), proptest::test_runner::TestCaseError> {
     let text = note.serialize().unwrap(/* strategy keeps fields valid */);
     let parsed = engramma_core::format::parse(&text, ParseMode::Strict).unwrap(/* serialized notes are valid */);
     prop_assert_eq!(parsed.note, note.clone());
@@ -2917,6 +2926,17 @@ fn hlc_monotonic_body(seed: u64) -> Result<(), proptest::test_runner::TestCaseEr
         .new_tree(&mut runner)
         .expect(/* t */ "the strategy builds its tree")
         .current();
+    hlc_monotonic_with(clock_readings)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY — the shape
+/// it drew until this phase, the one in which its persisted counterexamples
+/// and its declared defect were written down. The body above derives the
+/// inputs from one seed (so a failing seed replays in one case); this takes
+/// them as they are, for the cases history recorded.
+fn hlc_monotonic_with(
+    clock_readings: Vec<u64>,
+) -> Result<(), proptest::test_runner::TestCaseError> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     let t = Arc::new(AtomicU64::new(0));
@@ -3292,4 +3312,72 @@ fn frozen_prefix_is_immutable_body(seed: u64) -> Result<(), proptest::test_runne
         .current();
     frozen_prefix_body(seed);
     Ok(())
+}
+
+/// v0.6.14 (N3): the counterexamples proptest persisted while
+/// `format_round_trip` drew a whole `Note` (`props.proptest-regressions`,
+/// whose three `note = …` lines left with the structured shape: a single
+/// seed would decode them into cases that never happened). Written out,
+/// replayed: the empty body with a tag, and the apostrophe title, round
+/// trip as they always did. The third — an `x-` map with a REPEATED key —
+/// is not a note the round trip can take: the serialiser writes what it
+/// is given and a YAML mapping with duplicate keys is not a valid note
+/// (the strict parser refuses it). That is exactly why the generator
+/// deduplicates (`dedup_ext`): the case stays here as the rule it taught.
+#[test]
+fn the_regressions_of_the_structured_era_stay_green() {
+    let base = |n: u128, title: Option<&str>, tags: Vec<&str>, source: &str| Note {
+        id: ulid::Ulid::from(n),
+        note_type: NoteType::Fact,
+        title: title.map(str::to_string),
+        body: String::new(),
+        tags: tags.into_iter().map(str::to_string).collect(),
+        scope: None,
+        lang: None,
+        source: source.to_string(),
+        confidence: Confidence::Stated,
+        status: Status::Active,
+        valid_from: None,
+        valid_to: None,
+        supersedes: vec![ulid::Ulid::from(n)],
+        created_at: ts(1000),
+        updated_at: ts(1000),
+        extensions: vec![],
+    };
+    for note in [
+        base(
+            2_243_072_242_887_045_535_525_174_414_223_081_472,
+            None,
+            vec!["0o0"],
+            "0",
+        ),
+        base(
+            2_243_072_242_887_045_535_525_174_414_223_081_472,
+            Some("'"),
+            vec![],
+            "_",
+        ),
+    ] {
+        format_round_trip_with(note.clone()).unwrap_or_else(|e| panic!("{note:?}: {e:?}"));
+    }
+    let mut with_map = base(
+        1_329_227_995_784_915_872_903_807_060_280_344_576,
+        None,
+        vec![],
+        "a",
+    );
+    with_map.extensions = vec![(
+        "x-a".to_string(),
+        YamlValue::Map(vec![
+            ("x-z".to_string(), YamlValue::Null),
+            ("x-z".to_string(), YamlValue::Null),
+        ]),
+    )];
+    let text = with_map
+        .serialize()
+        .expect(/* t */ "the serialiser writes what it is given");
+    assert!(
+        engramma_core::format::parse(&text, ParseMode::Strict).is_err(),
+        "the strict parser refuses a mapping with a repeated key"
+    );
 }

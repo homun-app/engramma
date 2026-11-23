@@ -26,7 +26,7 @@ fn golden_dir() -> PathBuf {
 /// schema change — the whole-object anchor migration opens it). A new
 /// golden lands here by NAME, and this list growing is the visible part
 /// of the rule.
-const GOLDEN_CELLS: &[&str] = &["v068", "v0612", "v0613", "v0613-indietro"];
+const GOLDEN_CELLS: &[&str] = &["v068", "v0612", "v0613", "v0613-indietro", "v0614"];
 
 /// The deterministic note id of the golden's note `i`
 /// (`01` + sixteen zeros + eight hex digits).
@@ -86,6 +86,7 @@ fn the_golden_cell_opens_verifies_and_holds_its_facts() {
             "v0612" => v0612_facts(&cell),
             "v0613" => v0613_facts(&cell),
             "v0613-indietro" => v0613_indietro_facts(&cell),
+            "v0614" => v0614_facts(&cell),
             other => panic!("a golden with no facts to check: {other}"),
         }
     }
@@ -401,4 +402,146 @@ fn v0613_indietro_facts(cell: &Cell) {
         "a cell with its copy file has no corner: {:?}",
         report.declared_corners
     );
+}
+
+/// v0.6.14: this phase's golden, written by THIS engine (schema 24) — the
+/// shapes the phase fixed, frozen so every later version keeps them: the
+/// restore that brings the content back and leaves the state, the cut
+/// that does not go back, the user's decision that survives the
+/// reconstruction over the cut.
+fn v0614_facts(cell: &Cell) {
+    // the restore brings the CONTENT back and leaves the state
+    let closed = cell.get(&nid(2)).expect(/* t */ "the closed note");
+    assert_eq!(
+        closed.status,
+        Status::Superseded,
+        "a restore does not reopen a closed note"
+    );
+    assert_eq!(
+        closed.body, "la prima mano [[Roma]]",
+        "and the content of version 1 comes back"
+    );
+    assert!(closed.valid_to.is_some(), "the closing stays");
+    let hidden = cell.get(&nid(4)).expect(/* t */ "the external note");
+    assert_eq!(
+        hidden.status,
+        Status::Quarantined,
+        "the restore is no exit from the quarantine"
+    );
+    assert_eq!(
+        hidden.body, "letto sul web [[Milano]]",
+        "the content of version 2 comes back"
+    );
+    assert_eq!(
+        hidden.confidence,
+        engramma_core::Confidence::External,
+        "the confidence is the lifecycle's"
+    );
+    let restores = cell
+        .debug_column("SELECT CAST(COUNT(*) AS TEXT) FROM ops WHERE kind = 'restore'")
+        .unwrap(/* t */);
+    assert_eq!(
+        restores,
+        vec!["2".to_string()],
+        "the two restores are in the log"
+    );
+
+    // the cut sits where the first compaction put it, and nothing above
+    // it is removed
+    let cut: i64 = cell.debug_column("SELECT CAST(seq AS TEXT) FROM snapshots").unwrap(/* t */)[0]
+        .parse()
+        .unwrap(/* t */);
+    let above = cell
+        .debug_column(&format!(
+            "SELECT op_id FROM ops WHERE payload_state = 'redacted' AND seq > {cut}"
+        ))
+        .unwrap(/* t */);
+    assert!(above.is_empty(), "no payload is removed above the cut");
+    let again = cell
+        .compact(
+            cut - 1,
+            &engramma_core::cell::CompactOptions {
+                keep_snapshot: true,
+            },
+        )
+        .expect(/* t */ "the call lands");
+    assert!(
+        !again.compacted && again.cut_seq == cut,
+        "the cut does not go back on this cell either: {:?}",
+        (again.compacted, again.cut_seq)
+    );
+
+    // the user's decision, whole after the supersede above the cut
+    let pid = nid(5);
+    let queue = |cell: &Cell| -> Vec<String> {
+        cell.debug_column(&format!(
+            "SELECT mode || ' ' || state FROM proposals WHERE note_id = '{pid}'"
+        ))
+        .unwrap(/* t */)
+    };
+    assert_eq!(queue(cell), vec!["new accepted".to_string()], "the queue");
+    let registry = cell
+        .debug_column(&format!(
+            "SELECT decision || ' ' || actor FROM decisions WHERE proposal = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        registry,
+        vec!["accept user:golden".to_string()],
+        "the registry"
+    );
+    assert_eq!(
+        cell.get(&pid).expect(/* t */ "the proposal").status,
+        Status::Superseded
+    );
+    let closes = cell
+        .debug_column(&format!(
+            "SELECT new_id || '→' || old_id FROM supersedes WHERE old_id = '{pid}'"
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        closes,
+        vec![format!("{}→{pid}", nid(6))],
+        "the supersede's row"
+    );
+    let six = cell
+        .get(&nid(6))
+        .expect(/* t */ "the note that closes the proposal");
+    assert_eq!(
+        six.title.as_deref(),
+        Some("il blu, ritoccato sopra il taglio"),
+        "the write above the cut stands"
+    );
+    assert_eq!(six.status, Status::Active);
+
+    // a further write above the cut: the reconstruction keeps the queue
+    cell.patch_note(
+        &pid,
+        &engramma_core::NotePatch {
+            title: Some(Some("ritoccata sopra il taglio".into())),
+            ..Default::default()
+        },
+        "user:golden",
+    )
+    .expect(/* t */ "the write above the cut lands");
+    assert_eq!(
+        queue(cell),
+        vec!["new accepted".to_string()],
+        "the queue stays whole"
+    );
+    let report = cell.verify().unwrap(/* t */);
+    assert!(
+        report.ok(),
+        "the golden verifies after the write: {:?}",
+        report.mismatch
+    );
+    assert!(
+        matches!(
+            report.replay,
+            engramma_core::cell::Replay::FromSnapshot { seq } if seq == cut
+        ),
+        "the replay starts from the copy file at the cut: {:?}",
+        report.replay
+    );
+    assert!(report.declared_corners.is_empty(), "no corner on this cell");
 }

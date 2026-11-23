@@ -4,39 +4,8 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 87b8b8e0bc2ae2fdcaf9fff8dade945b8ce3fcaff8cd00bcfb46c56265a591fe # shrinks to seed = 1036082753074772072, devices = 2, rounds = 12
-cc 4fd9b24914d506f7e4d2cd4f41c07091fcff45732ed6c7b2078136cf60db30e0 # shrinks to seed = 11109694715156990406, devices = 2, rounds = 22
-cc bc9b90c3bfc970d68ce8444425ea755f2a8c05825e20bbc891cd7dbad87e7619 # shrinks to seed = 7136779684692326282, devices = 2, rounds = 18
-cc 7c3b4c58d632b70823d19b3e12602327b1fb3fae4304ce97833f30c2b90f7ef0 # shrinks to seed = 6576849743356389508, devices = 3, rounds = 24
-cc a3dceb4932e2aaf147d971c7ba35501144d7c1aa30f4c4c12fb3559d91a2417a # shrinks to seed = 4534801786712046430, devices = 3, rounds = 22
-cc e584f8385cabfd8a1fa9d0b40d069115ee6676ed4a30212f5f4c73d78e3decec # shrinks to seed = 13869188100963222214, devices = 2, rounds = 18
-cc d1abcb238a73b5d8ae8080bf70fe25989c6b594cedb823086ac3ddc0dc2e936c # shrinks to seed = 14335429117429864748, devices = 2, rounds = 21
-cc 35344dc9dd0d787b8d992e96b9ab17bdbea94abb3afc66fc5b11b54e13a2de04 # shrinks to seed = 12313477229222461014, devices = 2, rounds = 28
-cc c542b31d67dfc40ef4582bbd18011b238e0a4e129786b68e6661264d8e692e10 # shrinks to seed = 14236341178258306056, devices = 2, rounds = 22
-cc aa12c4a37e71b086b3e7bb512b1d149d63b03a2c69906e449be6b15fe7557dab # shrinks to seed = 6463025515774629240, devices = 2, rounds = 16
-cc b8033d13d3c4b08473e3032a64f8a97aa8a6e13531407969acb23cc2a7542fb0 # shrinks to seed = 17094079269045823814, devices = 3, rounds = 27
-cc e0909f86d803ba4dab40870d055c50c07d46d04972bfac1645bfa61bdab22409 # shrinks to seed = 16888028934669089344, devices = 2, rounds = 19
-cc 148e10f6336e28698d51d753e060f5d465321b2179a142c4775147483239bf6b # shrinks to seed = 8354786356070561648, devices = 3, rounds = 16
-cc d8af6fa598dfe685fbce9e7ea56b74dce3ed1d3d0c19c03f551ee3eb851f7cbc # shrinks to seed = 8148618087815055854, devices = 2, rounds = 14
-cc cc38ffc1dd49a34d846f2623bf17120ad490a643b47abcdcfbc798d1478b3298 # shrinks to seed = 1631101431298205084, devices = 2, rounds = 24
-cc 965913c5dd5acff9c0634a422f19a6cb1b893ebafed9bd05754bc1ec432f578f # shrinks to seed = 1181958738532265110, devices = 3, rounds = 23
-cc 2ccc9b09dd7138a4697effb27bfa7371909dac0ce60ae33ed0669f5d6fb4ad8d # shrinks to seed = 3808346592130930526, devices = 3, rounds = 16
-cc 7195e8ae6d12556ef7bcb82e69b164c9393d381fe34498f501772ed061525622 # shrinks to seed = 10782023552461549766, devices = 3, rounds = 23
-cc bad3dc7b8c6dcf170dd7b2e43aa946cffda07985898a0b75f8f16f576c19ef5f # shrinks to seed = 12328535914020248362, devices = 4, rounds = 25
-cc b684886435c6aa86705ae2847e5b5685068440dd3439bfb8d141d8b7d9212902 # shrinks to seed = 1421488054822918858, devices = 4, rounds = 17
-cc 2262e5d4060df0c396faa3860da7882f9ead29958a80b9c399a5b990bba13629 # shrinks to seed = 15192944291106605994, devices = 4, rounds = 23
-cc 9c556b327f624628772854ee99e0a53d2d6bdb60900dadff3898cb4567b9bcd0 # shrinks to seed = 3806138527623646080, devices = 3, rounds = 21
-cc 300999a16582a85a06845c202dfc72f5ce9dcef0402a355c9c38dcae94f9661b # shrinks to seed = 4946564889653177402, devices = 3, rounds = 26
-cc af2c008770618f886d625cf96229f252a67611e0d77e5417061eb000a528494e # shrinks to seed = 9942741803736828218, devices = 4, rounds = 24
-cc 1c6243ed264e9b12bb674af4599dfec28c09068a2ad9a6f86218779fc193a921 # shrinks to seed = 15949736314113672176, devices = 3, rounds = 21
-cc e2a608a518ae894eca9f41019bba8255a4e6813ba5ed5a6c457552aec4399db4 # shrinks to seed = 3142143418041393536, devices = 3, rounds = 12
-cc c58652b2f3cae36fafa703ac621fb97b1993b21210b0d92878566f4f6250876d # shrinks to seed = 18395765411331687066, devices = 4, rounds = 14
-cc d81cc2815b6422de2bd259c5948bf961c71989651def81fcc9c3638212e920fe # shrinks to seed = 704511004447704616, devices = 2, rounds = 13
-cc aa1fd0edfbce9726b21dadb617630d861c77da8a23e4a21b2db57dc26fe7bbdd # shrinks to seed = 3753902730771729170, devices = 4, rounds = 20
-cc 497f14fcf307c61b1fa9afd8b12bc4aabf2f6df7293c29c12369173083cfca62 # shrinks to seed = 11196124333436581516, devices = 3, rounds = 20
-cc fe9385b7bc17b1914c752204e4b5c4e378660143954ec9c7685aaa9107f6bc01 # shrinks to seed = 2788425701518801064, devices = 4, rounds = 24
-cc 60dc1b9d7e2a52cddab5081d841de2e7db71e54e33abce2399994da77e983d7c # shrinks to seed = 6770163031176974400, devices = 3, rounds = 13
-cc e44c91c6cbd9ecd8d84ddd4643c22d110d7f6699580ec9dcd6930a4b29881274 # shrinks to seed = 3695505122594015908, devices = 2, rounds = 27
-cc c1004e1144b04b7bd35ccf9d7a6f4571f5021f6cd9badf69b74db57806861226 # shrinks to seed = 9683753651273141986, devices = 4, rounds = 21
-cc 949f0d834a764d4f4b6718a8782eaf80b30a548bfdcfb5a9e78058d67327dcf3 # shrinks to seed = 16743842670308237750, devices = 2, rounds = 21
-cc fa324830ae58645c716788ce3ded46d52b23fa8cb5441dd06d01e827ed3f955b # shrinks to seed = 16078125341432563140, devices = 3, rounds = 22
+# v0.6.14 (N3): le 36 righe `cc` di questo file erano i controesempi minimi di
+# quando le quattro proprietà della flotta pescavano (seed, dispositivi, giri)
+# separatamente. Con il corpo a seme unico si decodificherebbero in casi mai
+# successi: le terne stanno scritte in convergence.rs, nel test deterministico
+# the_regressions_of_the_tuple_era_stay_green, e si rigiocano da lì.

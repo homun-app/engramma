@@ -4,4 +4,7 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 0d299c4e581485e85f006c08d10b9493b4af0e8c00c8e0250a871f24b6603b9d # shrinks to steps = [Patch(0)], bodies = ["a"], cut = 0.0
+# v0.6.14 (N3): la riga `cc` di questo file era il controesempio minimo di quando
+# la proprietà pescava (passi, corpi, taglio) separatamente. Con il corpo a seme
+# unico si decodificherebbe in un caso mai successo: i valori stanno in identity.rs,
+# nel test the_regression_of_the_tuple_era_stays_green.

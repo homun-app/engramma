@@ -2035,6 +2035,19 @@ fn the_fleet_converges_body(seed: u64) -> Result<(), proptest::test_runner::Test
         .new_tree(&mut runner)
         .expect(/* t */ "the strategy builds its tree")
         .current();
+    the_fleet_converges_with(seed, devices, rounds)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY — the shape
+/// it drew until this phase, the one in which its persisted counterexamples
+/// and its declared defect were written down. The body above derives the
+/// inputs from one seed (so a failing seed replays in one case); this takes
+/// them as they are, for the cases history recorded.
+fn the_fleet_converges_with(
+    seed: u64,
+    devices: u32,
+    rounds: u32,
+) -> Result<(), proptest::test_runner::TestCaseError> {
     let fleet = fleet_run(seed, devices, rounds);
     // every copy holds the same replicated state…
     let digests: Vec<String> = fleet
@@ -2096,6 +2109,19 @@ fn every_copy_equals_its_reconstruction_body(
         .new_tree(&mut runner)
         .expect(/* t */ "the strategy builds its tree")
         .current();
+    every_copy_equals_its_reconstruction_with(seed, devices, rounds)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY — the shape
+/// it drew until this phase, the one in which its persisted counterexamples
+/// and its declared defect were written down. The body above derives the
+/// inputs from one seed (so a failing seed replays in one case); this takes
+/// them as they are, for the cases history recorded.
+fn every_copy_equals_its_reconstruction_with(
+    seed: u64,
+    devices: u32,
+    rounds: u32,
+) -> Result<(), proptest::test_runner::TestCaseError> {
     let fleet = fleet_run(seed, devices, rounds);
     for cell in &fleet.cells {
         let live = cell.replicated_digest().unwrap(/* test-only */);
@@ -2125,6 +2151,19 @@ fn no_body_text_is_lost_body(seed: u64) -> Result<(), proptest::test_runner::Tes
         .new_tree(&mut runner)
         .expect(/* t */ "the strategy builds its tree")
         .current();
+    no_body_text_is_lost_with(seed, devices, rounds)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY — the shape
+/// it drew until this phase, the one in which its persisted counterexamples
+/// and its declared defect were written down. The body above derives the
+/// inputs from one seed (so a failing seed replays in one case); this takes
+/// them as they are, for the cases history recorded.
+fn no_body_text_is_lost_with(
+    seed: u64,
+    devices: u32,
+    rounds: u32,
+) -> Result<(), proptest::test_runner::TestCaseError> {
     let mut runner = FleetRunner::new(seed, devices);
     let mut saved: Vec<std::collections::HashSet<String>> = runner
         .fleet
@@ -2169,6 +2208,19 @@ fn no_copy_closes_without_a_witness_body(
         .new_tree(&mut runner)
         .expect(/* t */ "the strategy builds its tree")
         .current();
+    no_copy_closes_without_a_witness_with(seed, devices, rounds)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY — the shape
+/// it drew until this phase, the one in which its persisted counterexamples
+/// and its declared defect were written down. The body above derives the
+/// inputs from one seed (so a failing seed replays in one case); this takes
+/// them as they are, for the cases history recorded.
+fn no_copy_closes_without_a_witness_with(
+    seed: u64,
+    devices: u32,
+    rounds: u32,
+) -> Result<(), proptest::test_runner::TestCaseError> {
     let mut runner = FleetRunner::new(seed, devices);
     let mut prev: Vec<Vec<(Ulid, Ulid, Ulid)>> = runner
         .fleet
@@ -2306,4 +2358,93 @@ fn no_copy_closes_without_a_witness_body(
         }
     }
     Ok(())
+}
+
+/// v0.6.14 (N3): the counterexamples proptest persisted while the fleet
+/// properties drew `(seed, devices, rounds)` separately. Their `cc` lines
+/// left `convergence.proptest-regressions` — a single seed would decode
+/// them into cases that never happened — and stay here instead, written
+/// out, replayed through the four bodies: the same memory, readable. (The
+/// declared open defect is NOT among them: its seeds never entered the
+/// file — see `the_declared_defect_of_the_bin`, ignored, below.)
+#[test]
+fn the_regressions_of_the_tuple_era_stay_green() {
+    let cases: [(u64, u32, u32); 36] = [
+        (1036082753074772072, 2, 12),
+        (11109694715156990406, 2, 22),
+        (7136779684692326282, 2, 18),
+        (6576849743356389508, 3, 24),
+        (4534801786712046430, 3, 22),
+        (13869188100963222214, 2, 18),
+        (14335429117429864748, 2, 21),
+        (12313477229222461014, 2, 28),
+        (14236341178258306056, 2, 22),
+        (6463025515774629240, 2, 16),
+        (17094079269045823814, 3, 27),
+        (16888028934669089344, 2, 19),
+        (8354786356070561648, 3, 16),
+        (8148618087815055854, 2, 14),
+        (1631101431298205084, 2, 24),
+        (1181958738532265110, 3, 23),
+        (3808346592130930526, 3, 16),
+        (10782023552461549766, 3, 23),
+        (12328535914020248362, 4, 25),
+        (1421488054822918858, 4, 17),
+        (15192944291106605994, 4, 23),
+        (3806138527623646080, 3, 21),
+        (4946564889653177402, 3, 26),
+        (9942741803736828218, 4, 24),
+        (15949736314113672176, 3, 21),
+        (3142143418041393536, 3, 12),
+        (18395765411331687066, 4, 14),
+        (704511004447704616, 2, 13),
+        (3753902730771729170, 4, 20),
+        (11196124333436581516, 3, 20),
+        (2788425701518801064, 4, 24),
+        (6770163031176974400, 3, 13),
+        (3695505122594015908, 2, 27),
+        (9683753651273141986, 4, 21),
+        (16743842670308237750, 2, 21),
+        (16078125341432563140, 3, 22),
+    ];
+    for (seed, devices, rounds) in cases {
+        the_fleet_converges_with(seed, devices, rounds)
+            .unwrap_or_else(|e| panic!("the_fleet_converges ({seed}, {devices}, {rounds}): {e:?}"));
+        every_copy_equals_its_reconstruction_with(seed, devices, rounds)
+            .unwrap_or_else(|e| panic!("every_copy… ({seed}, {devices}, {rounds}): {e:?}"));
+        no_copy_closes_without_a_witness_with(seed, devices, rounds)
+            .unwrap_or_else(|e| panic!("no_copy… ({seed}, {devices}, {rounds}): {e:?}"));
+        no_body_text_is_lost_with(seed, devices, rounds)
+            .unwrap_or_else(|e| panic!("no_body_text… ({seed}, {devices}, {rounds}): {e:?}"));
+    }
+}
+
+/// v0.6.14 (N3): the defect the suite declared OPEN since the v0.6.8 — «una
+/// perdita di testo esposta dal cestino» — is CLOSED, and nobody had
+/// noticed for five phases: the recorded case was never replayed. With
+/// the bodies taking one seed, the declared seeds (which were the first
+/// element of a `(seed, devices, rounds)` triple) stopped meaning
+/// anything on their own — so the triples were recovered on the tag of
+/// the declaration and replayed tag by tag (`_with`, the explicit twin
+/// of the body):
+///
+/// | tag | `6467221993839934612` (3 dispositivi, 18 giri) | `9368190224066329310` (2 dispositivi, 28 giri) |
+/// |---|---|---|
+/// | fase-v0.6.8 | CADE | CADE |
+/// | fase-v0.6.9 … fase-v0.6.13 | passa | passa |
+///
+/// It stopped falling with the v0.6.9 and stayed «declared» because the
+/// hunts never met it again (five at 20 000 cases) and nothing replayed
+/// the record. The cause was not diagnosed here: closing it is not this
+/// phase's work. The two cases are a fixed regression, as the seeds of
+/// the v0.6.12 became with the v0.6.13; `open-defects.txt` is gone with
+/// the last row, as its gate prescribed.
+#[test]
+fn the_declared_defect_of_v068_stays_closed() {
+    no_body_text_is_lost_with(6_467_221_993_839_934_612, 3, 18).expect(
+        /* t */ "«la perdita di testo esposta dal cestino» resta chiusa (v0.6.9)",
+    );
+    no_body_text_is_lost_with(9_368_190_224_066_329_310, 2, 28).expect(
+        /* t */ "«la perdita di testo esposta dal cestino» resta chiusa (v0.6.9)",
+    );
 }

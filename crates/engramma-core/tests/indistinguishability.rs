@@ -419,6 +419,20 @@ fn hidden_notes_leave_no_fingerprint_body(
         .new_tree(&mut runner)
         .expect(/* t */ "the strategy builds its tree")
         .current();
+    hidden_notes_leave_no_fingerprint_with(bodies, question, n_quarantined, n_tombstones)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY — the shape
+/// it drew until this phase, the one in which its persisted counterexamples
+/// and its declared defect were written down. The body above derives the
+/// inputs from one seed (so a failing seed replays in one case); this takes
+/// them as they are, for the cases history recorded.
+fn hidden_notes_leave_no_fingerprint_with(
+    bodies: Vec<String>,
+    question: String,
+    n_quarantined: u32,
+    n_tombstones: u32,
+) -> Result<(), proptest::test_runner::TestCaseError> {
     // base + hidden notes that MATCH the question (they must, to be a
     // fingerprint), in their own cell
     let dir_a = test_dir();
@@ -470,4 +484,67 @@ fn hidden_notes_leave_no_fingerprint_body(
         }
     }
     Ok(())
+}
+
+/// v0.6.14 (N3): the counterexamples proptest persisted while the property
+/// drew `(bodies, question, n_quarantined, n_tombstones)` separately
+/// (`indistinguishability.proptest-regressions`, whose `cc` lines left
+/// with the tuple shape). Written out, replayed.
+#[test]
+fn the_regressions_of_the_tuple_era_stay_green() {
+    let cases: Vec<(Vec<&str>, &str, u32, u32)> = vec![
+        (vec!["ritratto gatto", "gatto gatto"], "ritratto", 1, 0),
+        (
+            vec!["gatto gatto", "gatto tonno con [[Gaa]]"],
+            "gatto",
+            1,
+            0,
+        ),
+        (vec!["corsa gatto", "treno martedì"], "corsa treno", 1, 0),
+        (
+            vec![
+                "gatto studio",
+                "gatto gatto",
+                "gatto gatto gatto lavoro",
+                "tavolo gatti",
+            ],
+            "tavolo lavoro",
+            1,
+            0,
+        ),
+        (
+            vec![
+                "moneta cucina",
+                "gatto gatto",
+                "gatto gatto con [[Aaa]]",
+                "moneta ritratto",
+                "gatto gatto con [[Gaa]]",
+            ],
+            "moneta",
+            2,
+            0,
+        ),
+        (
+            vec![
+                "gatto gatto",
+                "gatto gatti",
+                "ombrello gatto gatto con [[Aaa]]",
+                "gatto tonno",
+                "gatto sedia con [[Gaa]]",
+                "sedia gatto",
+            ],
+            "ombrello sedia sedia",
+            0,
+            0,
+        ),
+    ];
+    for (bodies, question, n_quarantined, n_tombstones) in cases {
+        hidden_notes_leave_no_fingerprint_with(
+            bodies.into_iter().map(str::to_string).collect(),
+            question.to_string(),
+            n_quarantined,
+            n_tombstones,
+        )
+        .unwrap_or_else(|e| panic!("«{question}» ({n_quarantined}, {n_tombstones}): {e:?}"));
+    }
 }

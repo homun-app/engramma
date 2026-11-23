@@ -296,6 +296,19 @@ fn the_new_diff3_decides_as_the_v064_one_body(
         .new_tree(&mut runner)
         .expect(/* t */ "the strategy builds its tree")
         .current();
+    the_new_diff3_decides_as_the_v064_one_with(base, a, b)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY — the shape
+/// it drew until this phase, the one in which its persisted counterexamples
+/// and its declared defect were written down. The body above derives the
+/// inputs from one seed (so a failing seed replays in one case); this takes
+/// them as they are, for the cases history recorded.
+fn the_new_diff3_decides_as_the_v064_one_with(
+    base: String,
+    a: String,
+    b: String,
+) -> Result<(), proptest::test_runner::TestCaseError> {
     let mine = diff3_merge(&base, &a, &b);
     let theirs = diff3_merge_v064(&base, &a, &b);
     prop_assert_eq!(
@@ -321,6 +334,19 @@ fn the_long_alignment_is_still_a_lcs_body(
         .new_tree(&mut runner)
         .expect(/* t */ "the strategy builds its tree")
         .current();
+    the_long_alignment_is_still_a_lcs_with(seed, n, edits)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY — the shape
+/// it drew until this phase, the one in which its persisted counterexamples
+/// and its declared defect were written down. The body above derives the
+/// inputs from one seed (so a failing seed replays in one case); this takes
+/// them as they are, for the cases history recorded.
+fn the_long_alignment_is_still_a_lcs_with(
+    seed: u64,
+    n: usize,
+    edits: u32,
+) -> Result<(), proptest::test_runner::TestCaseError> {
     // a seeded scramble of a shared spine, with repeats
     let mut rng = seed;
     let mut next = move || {
@@ -388,4 +414,17 @@ fn the_long_alignment_is_still_a_lcs_body(
     // and maximal: as long as the table's own LCS
     prop_assert_eq!(pairs.len(), reference_len);
     Ok(())
+}
+
+/// v0.6.14 (N3): the counterexample proptest persisted while the property
+/// drew `(base, a, b)` separately (`diff3_linear.proptest-regressions`,
+/// whose `cc` line left with the tuple shape). Written out, replayed.
+#[test]
+fn the_regression_of_the_tuple_era_stays_green() {
+    the_new_diff3_decides_as_the_v064_one_with(
+        "\n\n\n".into(),
+        "\n\nA\n\n\nx\nx\n\na\n".into(),
+        "\n\n\n\n\n".into(),
+    )
+    .expect(/* t */ "the case history recorded");
 }

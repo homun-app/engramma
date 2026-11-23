@@ -4,4 +4,7 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 556c57aed234c33604f23da3e74734a0a35a7fbea0e2fe5dc97726be83830a08 # shrinks to base = "\n\n\n", a = "\n\nA\n\n\nx\nx\n\na\n", b = "\n\n\n\n"
+# v0.6.14 (N3): la riga `cc` di questo file era il controesempio minimo di quando
+# la proprietà pescava (base, a, b) separatamente. Con il corpo a seme unico si
+# decodificherebbe in un caso mai successo: i valori stanno in diff3_linear.rs,
+# nel test the_regression_of_the_tuple_era_stays_green.

@@ -4,9 +4,7 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 63ad6095299b84000728c4828a7534ec0747ea2138a77a36adf66234ee28da4b # shrinks to bodies = ["ritratto gatto", "gatto gatto"], question = "ritratto", n_quarantined = 1, n_tombstones = 0
-cc 32a9f17de60aa892e4e88a69295b97480c9ba8651ba3059289e4a3de235cc6c4 # shrinks to bodies = ["gatto gatto", "gatto tonno con [[Gaa]]"], question = "gatto", n_quarantined = 1, n_tombstones = 0
-cc 7b5b1f3b3fa9aa30e47deecf650f12e4e7806f041102808bcaea3bb3505a2ffa # shrinks to bodies = ["corsa gatto", "treno martedì"], question = "corsa treno", n_quarantined = 1, n_tombstones = 0
-cc 71df85b80fe00ac67431be27d930edf90c65079ad2bcaee4d058e00a7b79ca03 # shrinks to bodies = ["gatto studio", "gatto gatto", "gatto gatto gatto lavoro", "tavolo gatti"], question = "tavolo lavoro", n_quarantined = 1, n_tombstones = 0
-cc 0fd791d854956679265adf590c71c70426a147fa8f3fda9f5906127a68de2320 # shrinks to bodies = ["moneta cucina", "gatto gatto", "gatto gatto con [[Aaa]]", "moneta ritratto", "gatto gatto con [[Gaa]]"], question = "moneta", n_quarantined = 2, n_tombstones = 0
-cc 1006c67fd014c01a6e12c01d28dcae01a45cb7a592702dace5eda95d12f1dc05 # shrinks to bodies = ["gatto gatto", "gatto gatti", "ombrello gatto gatto con [[Aaa]]", "gatto tonno", "gatto sedia con [[Gaa]]", "sedia gatto"], question = "ombrello sedia sedia", n_quarantined = 0, n_tombstones = 0
+# v0.6.14 (N3): le sei righe `cc` di questo file erano i controesempi minimi di
+# quando la proprietà pescava (corpi, domanda, nascoste, lapidi) separatamente.
+# Con il corpo a seme unico si decodificherebbero in casi mai successi: i valori
+# stanno in indistinguishability.rs, in the_regressions_of_the_tuple_era_stay_green.

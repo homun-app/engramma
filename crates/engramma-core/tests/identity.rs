@@ -518,6 +518,19 @@ fn the_identity_never_moves_on_generated_histories_body(
         .new_tree(&mut runner)
         .expect(/* t */ "the strategy builds its tree")
         .current();
+    the_identity_never_moves_on_generated_histories_with(steps, bodies, cut)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY — the shape
+/// it drew until this phase, the one in which its persisted counterexamples
+/// and its declared defect were written down. The body above derives the
+/// inputs from one seed (so a failing seed replays in one case); this takes
+/// them as they are, for the cases history recorded.
+fn the_identity_never_moves_on_generated_histories_with(
+    steps: Vec<Step>,
+    bodies: Vec<String>,
+    cut: f64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
     let dir = test_dir();
     let cell = Cell::create(&dir.path().join("g.sqlite"), "gen", "device-a")
         .unwrap(/* t */);
@@ -635,4 +648,17 @@ fn the_identity_never_moves_on_generated_histories_body(
     }
     prop_assert!(cell.verify().unwrap(/* t */).ok());
     Ok(())
+}
+
+/// v0.6.14 (N3): the counterexample proptest persisted while the property
+/// drew `(steps, bodies, cut)` separately (`identity.proptest-regressions`,
+/// whose `cc` line left with the tuple shape). Written out, replayed.
+#[test]
+fn the_regression_of_the_tuple_era_stays_green() {
+    the_identity_never_moves_on_generated_histories_with(
+        vec![Step::Patch(0)],
+        vec!["a".into()],
+        0.0,
+    )
+    .expect(/* t */ "the case history recorded");
 }
