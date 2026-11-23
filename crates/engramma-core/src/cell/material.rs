@@ -1271,8 +1271,12 @@ pub(crate) fn newest_closing_of(
     // (op_id, closer object, dominated?)
     let row: Option<(String, String)> = tx
         .query_row(
+            // the closer in the OBJECT form (`note:<ulid>`), both branches:
+            // the supersede's other object comes indexed with the prefix,
+            // the decide's `note_id` column does not
             "SELECT o.op_id,
-                    CASE WHEN o.note_id = ?1 THEN oo2.object ELSE o.note_id END
+                    CASE WHEN o.note_id = ?1 THEN oo2.object
+                         ELSE 'note:' || o.note_id END
              FROM ops o
              JOIN op_objects oo1 ON oo1.op_id = o.op_id AND oo1.object = ?2
              JOIN op_objects oo2 ON oo2.op_id = o.op_id
