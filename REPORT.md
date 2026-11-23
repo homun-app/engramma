@@ -12286,3 +12286,171 @@ dall'utente diventa attiva.
 - le proprietà la fotografano tutta;
 - un invariante di sicurezza: «una nota esce dalla quarantena solo per una
   decisione dell'utente».
+
+## Verifica v0.6.13 (revisore, 2026-11-23)
+
+Consegnata **per lo sviluppo**. M1–M4 reggono, e i due difetti della
+v0.6.12 sono chiusi davvero. Dei due difetti dichiarati aperti, uno ha
+la diagnosi giusta, l'altro no: la sua causa è una regola che manca
+alla compattazione. Nessuno dei due nasce da questa fase. La release
+locale resta non pronta, con la compattazione spenta: il verdetto della
+fase è giusto.
+
+### Cosa regge
+
+- **Le sonde del revisore**, rigiocate sul commit della fase. La
+  correzione annullata, con il taglio e la purga del bersaglio, resta
+  `Quarantined` con la coda `reverted`, uguale al caso senza taglio. La
+  pendente resta `Quarantined` con la coda `pending`. `verify` è verde
+  in tutti e quattro i casi.
+- **Il sospetto `supersedes` era fondato** e il test lo prova. La regola
+  della caccia sul commit finale è stata rispettata: il fix
+  `24ba5ab` tocca `material.rs`, e la caccia è stata rifatta intera.
+- **I denti** di M2 e M3 sono provati sul ramo e cadono sulla causa
+  (la riga), non sullo stato. Il test `anchor_tables` lega le due liste
+  a `sqlite_master`.
+- **M4**: il meta-test cammina i sorgenti di tutte le crate. Le otto
+  `.tmp*` del 22 novembre restano dove sono.
+- **Le prove sul tag** (repo su `fase-v0.6.13`, `nice -n 19`, 2 fili):
+  tutti verdi in release (`anchor_object` 9/9, `anchor_tables` 1/1, `golden_cell` 1/1, `frozen_prefix` 9/9, `purge_own_content` 11/11, `properties_inventory` 3/3, `test_folder_names` 1/1, `props` 16/16). La build: `scripts/build-sha.sh` col repo sul tag riproduce gli SHA del REPORT (`.node` 51 200 584 B `e33beb8e…`, `index.js` `cd26043e…`, `index.d.ts` 30 518 B `72b1c139…`). Il contratto JS: 64/64 in Node e 64/64 in Electron.
+
+### I due difetti aperti, pesati
+
+**Seme `11895058361907748327` (il `restore`): la diagnosi è giusta, ed è
+pre-esistente.** Il revisore ha rigiocato lo stesso corpo della
+proprietà sul tag `fase-v0.6.12`. Il generatore è identico fra i due tag,
+e il seme cade allo stesso modo: `01P4962…`, prima `Superseded`, dopo
+`Active`. La storia del seme:
+1. una decisione accetta la correzione e chiude la nota;
+2. l'annullamento la riapre;
+3. un `restore` dell'utente la rimette `superseded`, senza una riga
+   `supersedes`;
+4. la decisione viene riaccettata;
+5. si purga il chiudente.
+
+Il problema vero sta nel passo 3. Un `restore` che riporta il **campo
+di stato** di una versione vecchia crea uno stato che nessuna
+operazione del ciclo di vita produce: chiusa senza chiudente. Ogni
+regola che lavora sulle chiusure (la riapertura della purga, il rigioco)
+deve poi indovinare cosa vuol dire. Lo stato dell'arte è rendere
+impossibile lo stato illegale alla fonte, non insegnare al rigioco a
+conviverci. Il `restore` riporta il **contenuto** della versione (corpo,
+titolo, tag, campi). Lo **stato** resta delle operazioni del ciclo di
+vita: `supersede`, `decide`, `set_status`, `confirm`, `purge`. Se la
+regola cambia lo stato derivato, l'ALPN sale.
+
+**Seme `11558843446952054066` (la coda `pending` con lo stato
+`superseded`): la diagnosi del REPORT è sbagliata.** Non è «l'ancora
+dell'oggetto intero o la semantica della coda». Il revisore ha tracciato
+il seme fino in fondo. La storia ha **due compattazioni**: la prima col
+taglio a 15, dove cade la `decide` che accetta, e la seconda col taglio
+a **14**, più in basso, con il file di copia. `compact` accetta un
+taglio più basso di quello già fatto (`cell/mod.rs`, circa riga 3329:
+controlla solo `1..=head` e la frontiera stabile). Dopo:
+- la `decide` a 15 ha il payload già tolto;
+- ma per il taglio nuovo sta **sopra**, quindi va rigiocata;
+- e un rigioco senza payload non rifà niente.
+
+Alla prima ricostruzione della nota, che qui è un `supersede` dell'utente
+sopra il taglio, la coda torna a `pending` e la riga del registro
+sparisce.
+
+La sonda deterministica (`zz_review_v0613.rs` nello scratchpad del
+revisore) è minima:
+1. proposta `new`;
+2. `decide` accetta;
+3. `compact(head)`, poi `compact(head − 1)`;
+4. `supersede` della proposta.
+
+Gli esiti:
+- con o senza file di copia: coda `new pending`, registro vuoto,
+  `verify` **verde**;
+- con lo stesso taglio ripetuto: corretto;
+- sul tag `fase-v0.6.12`, la stessa sonda perde la riga di coda
+  **intera** (coda vuota, registro vuoto, `verify` verde).
+
+Quindi è pre-esistente, la v0.6.13 lo rende meno grave, e `verify` non
+lo vede.
+
+**Perché conta più di quanto dica il REPORT.** Un taglio che torna
+indietro non è un caso da generatore. Succede nella vita normale:
+- Homun alza `keepLast`, quindi `head − keepLast` scende sotto il taglio
+  di ieri;
+- in una cella condivisa, `compact` stringe il taglio alla **frontiera
+  stabile**, cioè il minimo confermato dai dispositivi vivi. La
+  frontiera scende quando entra un dispositivo nuovo, e allora la
+  compattazione automatica successiva taglia più in basso.
+
+L'effetto è una decisione dell'utente che sparisce dal registro, e una
+nota già accettata che torna in coda come da decidere.
+
+**La regola, lo stato dell'arte**: il taglio è una soglia che **va solo
+avanti**. È l'indice dell'istantanea di Raft (un'istantanea più vecchia
+della propria si ignora) e il `log start offset` di Kafka, che sale e
+basta. Quindi:
+- `compact` con un taglio sotto quello già fatto non fa niente e
+  restituisce il taglio vero. Non è un errore: la chiamata automatica di
+  Homun non deve fallire;
+- `verify` controlla che ogni operazione col payload tolto stia a o
+  sotto il taglio registrato. Oggi è cieco proprio qui;
+- una cella già toccata da un taglio all'indietro va riparata dalla
+  migrazione: il taglio registrato torna al massimo dei payload tolti, e
+  le righe derivate perse si ricostruiscono dal file di copia quando
+  c'è, con l'angolo dichiarato quando non c'è.
+
+### Altre note
+
+- **Le cartelle temporanee.** In `$TMPDIR` le `engramma-test-*` e le
+  `engramma-node-*` sono a zero. Le `.tmp*` invece sono **46**: le otto
+  del 22 novembre più **38 nuove**, vuote, create il 23 novembre fra
+  le 09:39 e le 09:47. In quella finestra la caccia faceva girare
+  `proposal_sequences_keep_the_invariants`, che però usa il prefisso
+  `engramma-test-`. Il nucleo non usa `tempfile` fuori dai test, e il
+  meta-test di M4 copre tutte le crate. Nello stesso secondo della
+  prima `.tmp*` (09:39:53) nasce in `$TMPDIR` una sessione di un altro
+  programma (`codex-artifact-session-*`, 09:39:56). Il revisore le
+  giudica **non di Engramma** e non le tocca: la decisione è
+  dell'utente. Il prefisso di M4 ha fatto il suo lavoro, cioè permette
+  di dire «non sono nostre».
+
+- **Il giudice della proprietà nuova** è cambiato dopo la caccia buona
+  (`5034ff8`, il confronto per ordine totale). La regola di questa fase
+  obbligava a rifare la caccia solo per `crates/*/src`, quindi la fase è
+  in regola. Ma la proprietà, col giudice corretto, non ha mai girato a
+  20 000 casi. La regola si estende: **un cambio di oracolo obbliga a
+  rifare la caccia di quella proprietà**.
+- **La quarantena, la clausola dell'attore.** L'invariante chiede che la
+  decisione venga da un attore non-agente. Ma il generatore decide
+  sempre come `user@prop`, e il motore non rifiuta una `decide` d'agente,
+  quindi la clausola oggi non ha denti. È coerente col piano: i permessi
+  per attore arrivano nella v0.7.0, e lì la proprietà dovrà generare
+  anche decisioni d'agente e pretendere il rifiuto.
+- **Il binding si è esteso** con `propose()`, `decide()` e
+  `proposals()`. La spec lo permetteva («si estende e non si rompe»), ma
+  è superficie nuova per Homun. `decide()` usa l'attore della maniglia:
+  Homun deve chiamarla solo da un gesto dell'utente, mai dal giro
+  dell'agente.
+- **Le misure.** Contro la v0.6.3, l'inserimento è a −6,7% e la ricerca
+  p50 a +6,2%: tutte e due fuori dal cancello del 5%. Il prezzo di
+  questa fase da sola è piccolo (−0,8%), e il REPORT lo legge
+  onestamente. Ma il cancello contro un riferimento fisso ormai si
+  supera da solo, una fase dopo l'altra. La proposta è un **doppio
+  cancello**:
+  - uno per fase contro il tag precedente (+2%);
+  - un tetto assoluto contro un riferimento che decide l'utente.
+
+  Superare il tetto diventa una decisione scritta, non una nota a
+  margine.
+
+### Verdetto
+
+M1–M4 consegnati. I due difetti della v0.6.12 sono chiusi. Il verdetto
+«release locale non pronta, compattazione spenta per Homun» è giusto,
+con una correzione alla diagnosi: dei due difetti aperti, uno è il
+`restore` che scrive lo stato (pre-esistente), l'altro è il **taglio che
+torna indietro** (pre-esistente, raggiungibile da `keepLast` e dalla
+frontiera stabile). La prossima fase li chiude tutti e due alla radice:
+- il taglio va solo avanti, e `verify` lo controlla;
+- il `restore` riporta il contenuto, non lo stato.
+
+Poi la caccia, intera, anche sulla proprietà della quarantena.
