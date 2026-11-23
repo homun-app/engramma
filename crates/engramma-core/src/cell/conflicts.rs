@@ -1319,9 +1319,7 @@ fn needs_replay(
             return Ok(true);
         }
     }
-    let cut: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
-        r.get(0)
-    })?;
+    let cut = super::registered_cut(tx)?;
     let heavy: i64 = tx.query_row(
         "SELECT COUNT(*) FROM ops o
          JOIN op_objects oo ON oo.op_id = o.op_id

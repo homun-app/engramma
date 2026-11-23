@@ -1479,6 +1479,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 )?;
                 if cli.json {
                     print_json(&serde_json::json!({
+                        "compacted": report.compacted,
                         "cut_seq": report.cut_seq,
                         "head_seq": report.head_seq,
                         "head_hash": report.head_hash,
@@ -1488,6 +1489,13 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                         "bytes_before": report.bytes_before,
                         "bytes_after": report.bytes_after,
                     }));
+                } else if !report.compacted {
+                    // v0.6.14 (N1): the cut only goes forward
+                    println!(
+                        "nessun taglio nuovo: il taglio resta a seq {} (testa {}) — \
+                         la compattazione va solo avanti (cella+WAL+istantanee: {} byte)",
+                        report.cut_seq, report.head_seq, report.bytes_after
+                    );
                 } else if let Some(snap) = &report.snapshot {
                     println!(
                         "compattata fino a seq {} (testa {}): {} \

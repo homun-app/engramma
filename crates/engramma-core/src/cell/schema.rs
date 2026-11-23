@@ -546,9 +546,7 @@ fn migrate_rust(tx: &rusqlite::Transaction<'_>, v: i64) -> Result<(), crate::err
 /// already exists stays.
 fn migrate_anchors_v23(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::CellError> {
     use rusqlite::OptionalExtension;
-    let cut: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
-        r.get(0)
-    })?;
+    let cut = super::registered_cut(tx)?;
     if cut == 0 {
         return Ok(()); // no prefix: every reconstruction replays from zero
     }

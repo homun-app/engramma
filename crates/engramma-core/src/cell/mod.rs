@@ -243,15 +243,28 @@ pub struct CompactOptions {
 /// What one compaction did (v0.3.2, P0.1).
 #[derive(Debug, Clone)]
 pub struct CompactReport {
-    /// The cut: payloads of ops up to this seq are forgotten.
+    /// v0.6.14 (N1): did THIS call compact? The cut is a monotone
+    /// threshold — a call asking a cut BELOW the one already made does
+    /// nothing (it is not an error: Homun's automatic call must not fail
+    /// when `keepLast` grows), and answers `false` with the TRUE cut in
+    /// [`Self::cut_seq`]. A call the stable frontier pulled back under the
+    /// cut already made answers `false` the same way.
+    pub compacted: bool,
+    /// The cut in force after the call: payloads of ops up to this seq
+    /// are forgotten. For a call that did not compact, the cut already
+    /// made.
     pub cut_seq: i64,
     /// The head at compaction time.
     pub head_seq: i64,
     /// The hash chain's head at `head_seq`.
     pub head_hash: String,
-    /// Digest of the logical state at the head, after the cut.
+    /// Digest of the logical state at the head, after the cut. For a call
+    /// that did not compact (v0.6.14): the digest the registered
+    /// checkpoint recorded — the last real compaction's; when a purge
+    /// blanked it, the live state's.
     pub state_digest: String,
-    /// The snapshot file, when `keep_snapshot` was set.
+    /// The snapshot file, when `keep_snapshot` was set. For a call that
+    /// did not compact: the file the registered checkpoint names, if any.
     pub snapshot: Option<PathBuf>,
     /// Cell + WAL + snapshot files, bytes on disk, before and after.
     pub bytes_before: u64,
@@ -288,7 +301,10 @@ pub struct VerifyReport {
     /// The FTS index matches its content table (integrity-check).
     pub fts_ok: bool,
     /// The compaction snapshot (when any) matched its recorded head hash and
-    /// state digest (v0.3).
+    /// state digest (v0.3). v0.6.14 (N1.2): also that the cut never went
+    /// back — no operation has its payload removed ABOVE the registered
+    /// cut (the purge's own removals excepted); when it did, `mismatch`
+    /// names the operation.
     pub snapshot_ok: bool,
     /// First mismatch, when something failed.
     pub mismatch: Option<String>,
@@ -1282,10 +1298,7 @@ impl Cell {
         // offline shape of `shared_verify.rs`) sorts above the cut and
         // passes untouched.
         {
-            let cut: i64 =
-                tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
-                    r.get(0)
-                })?;
+            let cut = registered_cut(&tx)?;
             if cut > 0 {
                 let shared: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM meta WHERE key = 'sync_shared' AND value = '1'",
@@ -2640,12 +2653,7 @@ impl Cell {
     /// SQL failure.
     pub fn rematerialize_for_test(&self) -> Result<(String, String), CellError> {
         let inner = self.lock()?;
-        let cut: i64 =
-            inner
-                .conn
-                .query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
-                    r.get(0)
-                })?;
+        let cut = registered_cut(&inner.conn)?;
         if cut > 0 {
             return Err(CellError::Invalid(
                 "the oracle covers cells without a compaction cut".into(),
@@ -3142,18 +3150,12 @@ impl Cell {
 
     /// The latest compaction row's cut, when any (the row may be a
     /// checkpoint without a file — the payloads below the cut are gone
-    /// either way).
+    /// either way). Read through [`registered_cut`], like every other
+    /// reader (v0.6.14, N1.4).
     fn last_cut_seq(&self) -> Result<Option<i64>, CellError> {
         let inner = self.lock()?;
-        inner
-            .conn
-            .query_row(
-                "SELECT seq FROM snapshots ORDER BY seq DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(CellError::from)
+        let cut = registered_cut(&inner.conn)?;
+        Ok((cut > 0).then_some(cut))
     }
 
     /// Bytes on disk of the cell, its WAL and every snapshot file (v0.3.2:
@@ -3185,23 +3187,6 @@ impl Cell {
         total
     }
 
-    /// Compact the log (DESIGN §4.3, v0.3): forget the payloads of every op
-    /// up to `up_to_seq` (must be within the live log); the skeletons and
-    /// the chain stay whole. v0.3.2 (P0.1): by default the compaction
-    /// registers a **checkpoint** — head hash and [`state_digest`] of the
-    /// logical state at the head, no file (a second copy of the cell served
-    /// only the full audit, and the logical state *is* almost the whole
-    /// cell). With `keep_snapshot` the v0.3.1 behavior: `VACUUM INTO` a
-    /// snapshot of the cell **exactly as it stands**, stripped to its
-    /// logical state (payloads up to the cut, vectors, model registry,
-    /// markdown-view bindings and FTS content go), registered with its head
-    /// hash and digest. Only the LAST row stays, with or without a file:
-    /// the latest compaction replaces the previous one.
-    ///
-    /// # Errors
-    /// [`CellError::Invalid`] when `up_to_seq` is outside the live log;
-    /// [`CellError::Db`] on SQL or I/O failures (a failed compaction leaves
-    /// the previous row and its file alone).
     /// The stable frontier of this cell (v0.6, P1.5): the deepest seq every
     /// live device has confirmed holding — everything at or below it is
     /// causally stable, and only there may a compaction forget payloads. An
@@ -3312,6 +3297,43 @@ impl Cell {
         Ok(())
     }
 
+    /// Compact the log (DESIGN §4.3, v0.3): forget the payloads of every op
+    /// up to `up_to_seq` (must be within the live log); the skeletons and
+    /// the chain stay whole. v0.3.2 (P0.1): by default the compaction
+    /// registers a **checkpoint** — head hash and [`state_digest`] of the
+    /// logical state at the head, no file (a second copy of the cell served
+    /// only the full audit, and the logical state *is* almost the whole
+    /// cell). With `keep_snapshot` the v0.3.1 behavior: `VACUUM INTO` a
+    /// snapshot of the cell **exactly as it stands**, stripped to its
+    /// logical state (payloads up to the cut, vectors, model registry,
+    /// markdown-view bindings and FTS content go), registered with its head
+    /// hash and digest. Only the LAST row stays, with or without a file:
+    /// the latest compaction replaces the previous one.
+    ///
+    /// **The cut only goes forward** (v0.6.14, N1). The cut is a monotone
+    /// threshold — Raft's snapshot index, Kafka's log start offset. A cut
+    /// BELOW the one already made does NOTHING: the payloads between the
+    /// two cuts are already gone, and a registered cut below them made the
+    /// first reconstruction above it replay operations with no payload
+    /// (the v0.6.13 verification, seed `11558843446952054066`: a `decide`
+    /// that accepted a proposal landed as nothing — the queue `pending`,
+    /// the registry empty, `verify` green). It is not an error: Homun's
+    /// automatic call must not fail when `keepLast` grows and `head −
+    /// keepLast` falls below yesterday's cut. The report answers
+    /// `compacted: false` with the true cut. The same holds when the
+    /// stable frontier pulls the asked cut back under the one already
+    /// made.
+    ///
+    /// The SAME cut is not back: it keeps the behavior it always had
+    /// (v0.3.2) — the restart point is registered again at the head of
+    /// now, in the form asked (a file snapshot becomes a checkpoint and
+    /// the other way round), and no payload is forgotten twice.
+    ///
+    /// # Errors
+    /// [`CellError::Invalid`] when `up_to_seq` is outside the live log, or
+    /// when nothing is stable yet in a cell that never compacted;
+    /// [`CellError::Db`] on SQL or I/O failures (a failed compaction leaves
+    /// the previous row and its file alone).
     pub fn compact(
         &self,
         up_to_seq: i64,
@@ -3340,6 +3362,54 @@ impl Cell {
         if up_to_seq > frontier {
             up_to_seq = frontier;
         }
+        let parent = self
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        // v0.6.14 (N1): **the cut only goes forward.** A cut BELOW the one
+        // already made — asked so, or pulled back under it by the frontier
+        // — does nothing: the payloads up to the made cut are gone, and
+        // registering a lower cut made the first reconstruction above it
+        // replay operations with no payload (a `decide` that landed as
+        // nothing: the queue `pending`, the registry empty). Not an error:
+        // the automatic call must not fail when `keepLast` grows. The
+        // report answers the TRUE cut and `compacted: false`. The SAME cut
+        // is not back: it re-registers the restart point as it always did.
+        let made = registered_cut(&inner.conn)?;
+        if up_to_seq < made {
+            let (digest, file): (Option<String>, Option<String>) = inner
+                .conn
+                .query_row(
+                    "SELECT state_digest, file FROM snapshots ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+                .unwrap_or_default();
+            let head_hash: String = inner
+                .conn
+                .query_row("SELECT hash FROM ops WHERE seq = ?1", [head_seq], |r| {
+                    r.get(0)
+                })
+                .unwrap_or_default();
+            let bytes = self.dir_footprint();
+            return Ok(CompactReport {
+                compacted: false,
+                cut_seq: made,
+                head_seq,
+                head_hash,
+                // a purge blanks the digest of a checkpoint that described
+                // a state holding the purged note: the live state's stands in
+                state_digest: match digest {
+                    Some(d) if !d.is_empty() => d,
+                    _ => state_digest(&inner.conn)?,
+                },
+                snapshot: file.map(|f| parent.join(f)),
+                bytes_before: bytes,
+                bytes_after: bytes,
+            });
+        }
         if up_to_seq < 1 {
             return Err(CellError::Invalid(
                 "nothing is stable yet: no device has confirmed any operation".into(),
@@ -3360,11 +3430,6 @@ impl Cell {
                 .unwrap_or_else(|| "cell".into())
                 .trim_end_matches(".sqlite")
         );
-        let parent = self
-            .path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
         // The file snapshot, when asked for: written and stripped BEFORE the
         // transaction, so a failure here leaves the cell untouched.
         let file_snapshot: Option<(PathBuf, String)> = if opts.keep_snapshot {
@@ -3530,6 +3595,7 @@ impl Cell {
             .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
         let bytes_after = self.dir_footprint();
         Ok(CompactReport {
+            compacted: true,
             cut_seq: up_to_seq,
             head_seq,
             head_hash,
@@ -4038,8 +4104,44 @@ impl Cell {
                 tx.commit()?;
             }
         }
-        let mut mismatch: Option<String> =
-            (!snapshot_ok).then(|| "the compaction snapshot does not match its record".to_string());
+        // v0.6.14 (N1.2): **the threshold.** Every operation whose payload
+        // the CUT removed sits at or below the registered cut: a cut that
+        // went back leaves payloads removed above it, and the first
+        // reconstruction replays those operations as nothing. An operation
+        // removed above the cut is a broken cell, and the message names
+        // it. The PURGE's own removals are not the cut's: the purge forgets
+        // the payloads of the purged note's operations at any seq (and
+        // censors the closings, which keep a payload), above the cut
+        // included — an operation of a note the set purged is explained.
+        let cut_went_back: Option<String> =
+            {
+                let cut = registered_cut(&audit)?;
+                audit
+                .query_row(
+                    "SELECT o.seq, o.op_id, o.kind FROM ops o
+                     WHERE o.payload_state = 'redacted' AND o.seq > ?1
+                       AND NOT (o.kind != 'purge'
+                                AND o.note_id IN (SELECT note_id FROM ops
+                                                  WHERE kind = 'purge'))
+                     ORDER BY o.seq LIMIT 1",
+                    [cut],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+                )
+                .optional()?
+                .map(|(seq, op_id, kind)| {
+                    format!(
+                        "the compaction cut went back: operation {op_id} ({kind}, seq {seq}) has \
+                         its payload removed ABOVE the registered cut ({cut}) — the cut only \
+                         goes forward"
+                    )
+                })
+            };
+        if cut_went_back.is_some() {
+            snapshot_ok = false;
+        }
+        let mut mismatch: Option<String> = cut_went_back.or_else(|| {
+            (!snapshot_ok).then(|| "the compaction snapshot does not match its record".to_string())
+        });
         // Replay: the tail on the snapshot, or everything from zero.
         let mut replay_err: Option<String> = None;
         if !chain_only {
@@ -4782,6 +4884,22 @@ pub fn state_digest(conn: &Connection) -> Result<String, CellError> {
     Ok(blake3::hash(state_dump(conn)?.as_bytes())
         .to_hex()
         .to_string())
+}
+
+/// v0.6.14 (N1.4): **the registered cut** — the one place the compaction
+/// cut lives. It is the `seq` of the newest row of `snapshots`, the
+/// compaction's record (head hash, state digest, file, `redacted_by`); 0
+/// when the cell never compacted. Until this phase the cut was registered
+/// there already but READ by eight hand-written queries in four files;
+/// every reader goes through this function now — the materializer, the
+/// arrival guard of a shared cell, the photograph's guard, `verify`, the
+/// migrations — so «where is the cut» has one answer, and the monotone
+/// rule of [`Cell::compact`] is the only writer.
+pub(crate) fn registered_cut(conn: &Connection) -> Result<i64, CellError> {
+    let cut: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
+        r.get(0)
+    })?;
+    Ok(cut)
 }
 
 /// The stable frontier (v0.6, P1.5): the minimum ack over the live devices

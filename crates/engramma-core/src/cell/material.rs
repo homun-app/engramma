@@ -26,11 +26,10 @@ use super::ops::{self, Op, OpKind, Scope};
 /// compacted). Below the cut the payloads are gone — the state there is
 /// frozen and stable (P1.6 will make it the frontier), so materialization
 /// only ever replays ABOVE it, starting from the state the cut left.
+/// Read through [`super::registered_cut`] (v0.6.14, N1.4): the cut has one
+/// reader, like it has one writer.
 fn cut_seq(tx: &rusqlite::Transaction<'_>) -> Result<i64, CellError> {
-    let cut: i64 = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
-        r.get(0)
-    })?;
-    Ok(cut)
+    super::registered_cut(tx)
 }
 
 /// A held half — purge-dominated, or beaten by a lapide — still consumes

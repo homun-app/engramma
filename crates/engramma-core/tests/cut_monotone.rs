@@ -15,6 +15,11 @@
 //! keepLast` falls below yesterday's cut; a shared cell clamps the cut to
 //! the stable frontier, and the frontier is a minimum.
 //!
+//! The SAME cut is not back: it keeps the behavior of v0.3.2 — the
+//! restart point is registered again, in the form asked (the test
+//! `the_same_cut_registers_the_restart_point_again`; the v0.3.1 upgrade
+//! in `forgetting.rs` leans on it).
+//!
 //! These tests were RED on the v0.6.13 base (commit of the red tests in
 //! the REPORT): the queue came back `pending` with no registry row, the
 //! registered cut went back, and `verify` stayed green on a cell whose
@@ -22,7 +27,9 @@
 
 mod common;
 
-use engramma_core::cell::proposals::{DecisionAction, DecisionInput, ProposalInput, ProposalMode, ProposeContext};
+use engramma_core::cell::proposals::{
+    DecisionAction, DecisionInput, ProposalInput, ProposalMode, ProposeContext,
+};
 use engramma_core::format::{At, Lang, Note, NoteType};
 use engramma_core::{Cell, Confidence, Status};
 use time::OffsetDateTime;
@@ -91,7 +98,8 @@ struct Stage {
 
 fn accepted_proposal(prefix: &str) -> Stage {
     let dir = common::test_dir();
-    let cell = Cell::create(&dir.path().join(&format!("{prefix}.sqlite")), "p", "n1").unwrap(/* t */);
+    let cell =
+        Cell::create(&dir.path().join(format!("{prefix}.sqlite")), "p", "n1").unwrap(/* t */);
     cell.put_note(&note_of(1, "nota qualunque"), "user").unwrap(/* t */);
     cell.set_policy(serde_json::json!({ "write": "propose" }), "cli").unwrap(/* t */);
     let out = cell
@@ -118,6 +126,23 @@ fn accepted_proposal(prefix: &str) -> Stage {
 
 /// The user closes the accepted proposal with a supersede written ABOVE
 /// the cut — the first reconstruction over the cut.
+/// Two compactions: the first at `h`, the second at `h - back`, each with
+/// or without the copy file. The reports come back with the stage.
+fn compact_twice(
+    s: &Stage,
+    h: i64,
+    back: i64,
+    first_file: bool,
+    second_file: bool,
+) -> (
+    engramma_core::cell::CompactReport,
+    engramma_core::cell::CompactReport,
+) {
+    let r1 = s.cell.compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: first_file }).unwrap(/* t */);
+    let r2 = s.cell.compact(h - back, &engramma_core::cell::CompactOptions { keep_snapshot: second_file }).unwrap(/* t */);
+    (r1, r2)
+}
+
 fn supersede_above(cell: &Cell, pid: &Ulid) {
     let mut n = note_of(5, "il mio colore preferito è il blu");
     n.supersedes = vec![*pid];
@@ -137,11 +162,12 @@ fn assert_the_queue_stands(cell: &Cell, pid: &Ulid, status: Status, ctx: &str) {
         vec!["accept user".to_string()],
         "{ctx}: the registry holds the user's decision"
     );
-    assert_eq!(cell.get(pid).unwrap(/* t */).status, status, "{ctx}: the note's state");
-    assert!(
-        cell.verify().unwrap(/* t */).ok(),
-        "{ctx}: verify is green"
+    assert_eq!(
+        cell.get(pid).unwrap(/* t */).status,
+        status,
+        "{ctx}: the note's state"
     );
+    assert!(cell.verify().unwrap(/* t */).ok(), "{ctx}: verify is green");
 }
 
 /// `cut_goes_back`, WITH the copy file (the reviewer's `zz_back_keep`):
@@ -152,15 +178,21 @@ fn assert_the_queue_stands(cell: &Cell, pid: &Ulid, status: Status, ctx: &str) {
 fn cut_goes_back_with_the_copy_file() {
     let s = accepted_proposal("taglio-copia");
     let h = head(&s.cell);
-    s.cell
-        .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: false })
-        .unwrap(/* t */);
-    s.cell
-        .compact(h - 1, &engramma_core::cell::CompactOptions { keep_snapshot: true })
-        .unwrap(/* t */);
+    let (r1, r2) = compact_twice(&s, h, 1, false, true);
+    assert!(r1.compacted, "the first call compacted");
+    assert!(
+        !r2.compacted,
+        "the second call, below the cut made, did nothing"
+    );
+    assert_eq!(r2.cut_seq, r1.cut_seq, "and answers the true cut");
     assert_the_queue_stands(&s.cell, &s.pid, Status::Active, "after the two compactions");
     supersede_above(&s.cell, &s.pid);
-    assert_the_queue_stands(&s.cell, &s.pid, Status::Superseded, "after the supersede above the cut");
+    assert_the_queue_stands(
+        &s.cell,
+        &s.pid,
+        Status::Superseded,
+        "after the supersede above the cut",
+    );
 }
 
 /// `cut_goes_back`, WITHOUT the copy file (the reviewer's
@@ -169,15 +201,17 @@ fn cut_goes_back_with_the_copy_file() {
 fn cut_goes_back_without_the_copy_file() {
     let s = accepted_proposal("taglio-secco");
     let h = head(&s.cell);
-    s.cell
-        .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: false })
-        .unwrap(/* t */);
-    s.cell
-        .compact(h - 1, &engramma_core::cell::CompactOptions { keep_snapshot: false })
-        .unwrap(/* t */);
+    let (r1, r2) = compact_twice(&s, h, 1, false, false);
+    assert!(r1.compacted && !r2.compacted, "the second call did nothing");
+    assert_eq!(r2.cut_seq, r1.cut_seq, "and answers the true cut");
     assert_the_queue_stands(&s.cell, &s.pid, Status::Active, "after the two compactions");
     supersede_above(&s.cell, &s.pid);
-    assert_the_queue_stands(&s.cell, &s.pid, Status::Superseded, "after the supersede above the cut");
+    assert_the_queue_stands(
+        &s.cell,
+        &s.pid,
+        Status::Superseded,
+        "after the supersede above the cut",
+    );
 }
 
 /// The control: the same cut twice is the story with no defect, on every
@@ -186,22 +220,27 @@ fn cut_goes_back_without_the_copy_file() {
 fn the_same_cut_twice_is_the_control() {
     let s = accepted_proposal("taglio-uguale");
     let h = head(&s.cell);
-    s.cell
-        .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: false })
-        .unwrap(/* t */);
-    s.cell
-        .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: true })
-        .unwrap(/* t */);
+    let (r1, r2) = compact_twice(&s, h, 0, false, true);
+    assert!(
+        r1.compacted && r2.compacted,
+        "the same cut registers the restart point again"
+    );
+    assert_eq!(r2.cut_seq, r1.cut_seq, "and the cut does not move");
     assert_the_queue_stands(&s.cell, &s.pid, Status::Active, "after the two compactions");
     supersede_above(&s.cell, &s.pid);
-    assert_the_queue_stands(&s.cell, &s.pid, Status::Superseded, "after the supersede above the cut");
+    assert_the_queue_stands(
+        &s.cell,
+        &s.pid,
+        Status::Superseded,
+        "after the supersede above the cut",
+    );
 }
 
-/// A cut at or below the one already made does NOTHING: the report
-/// answers the true cut, and the registered cut does not move. It is not
-/// an error — Homun's automatic call must not fail when `keepLast` grows.
+/// A cut BELOW the one already made does NOTHING: the report answers the
+/// true cut, and the registered cut does not move. It is not an error —
+/// Homun's automatic call must not fail when `keepLast` grows.
 #[test]
-fn a_cut_at_or_below_the_made_one_changes_nothing() {
+fn a_cut_below_the_made_one_changes_nothing() {
     let s = accepted_proposal("taglio-fermo");
     let h = head(&s.cell);
     let first = s.cell
@@ -210,29 +249,66 @@ fn a_cut_at_or_below_the_made_one_changes_nothing() {
     let below = s.cell
         .compact(h - 1, &engramma_core::cell::CompactOptions { keep_snapshot: false })
         .unwrap(/* t */);
+    assert!(
+        first.compacted && !below.compacted,
+        "the first call compacted; the one below the cut made did nothing"
+    );
     assert_eq!(
         below.cut_seq, first.cut_seq,
         "the report answers the TRUE cut, not the one asked"
+    );
+    assert_eq!(below.head_seq, h, "the report speaks of the head of now");
+    assert!(
+        below.bytes_before == below.bytes_after,
+        "a call that does nothing moves no byte"
     );
     assert_eq!(
         registered_cut(&s.cell),
         first.cut_seq,
         "the registered cut did not go back"
     );
-    // the same cut, asked again: the true cut again
-    let same = s.cell
-        .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: true })
-        .unwrap(/* t */);
-    assert_eq!(same.cut_seq, first.cut_seq, "the same cut asked again answers the true cut");
-    assert_eq!(registered_cut(&s.cell), first.cut_seq);
     // and a forward cut still works
     supersede_above(&s.cell, &s.pid);
     let h2 = head(&s.cell);
     let forward = s.cell
         .compact(h2, &engramma_core::cell::CompactOptions { keep_snapshot: false })
         .unwrap(/* t */);
+    assert!(forward.compacted, "a cut above the made one lands");
     assert_eq!(forward.cut_seq, h2, "a cut above the made one lands");
     assert_eq!(registered_cut(&s.cell), h2);
+}
+
+/// The same cut, asked again, is not a cut that goes back: the restart
+/// point takes the form asked (a file snapshot becomes a checkpoint, and
+/// the other way round — the v0.3.2 conversion) and the cut does not move.
+#[test]
+fn the_same_cut_registers_the_restart_point_again() {
+    let s = accepted_proposal("taglio-forma");
+    let h = head(&s.cell);
+    let with_file = s.cell
+        .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: true })
+        .unwrap(/* t */);
+    assert!(
+        with_file.compacted && with_file.snapshot.is_some(),
+        "a compaction with its file"
+    );
+    let as_checkpoint = s.cell
+        .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: false })
+        .unwrap(/* t */);
+    assert!(
+        as_checkpoint.snapshot.is_none(),
+        "the same cut turns the file into a checkpoint (v0.3.2)"
+    );
+    assert_eq!(as_checkpoint.cut_seq, h, "the cut did not move");
+    assert_eq!(registered_cut(&s.cell), h);
+    assert_the_queue_stands(&s.cell, &s.pid, Status::Active, "after the two compactions");
+    supersede_above(&s.cell, &s.pid);
+    assert_the_queue_stands(
+        &s.cell,
+        &s.pid,
+        Status::Superseded,
+        "after the supersede above the cut",
+    );
 }
 
 /// `verify` checks the threshold: an operation whose payload is removed
@@ -247,21 +323,28 @@ fn verify_names_a_payload_removed_above_the_cut() {
     s.cell
         .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: false })
         .unwrap(/* t */);
-    assert!(s.cell.verify().unwrap(/* t */).ok(), "the healthy cell verifies");
+    assert!(
+        s.cell.verify().unwrap(/* t */).ok(),
+        "the healthy cell verifies"
+    );
     // the operation the pushed-back record leaves above the cut: the
     // one AT the cut the compaction really made (the head, the `decide`)
     let offender = s.cell.debug_column(&format!(
         "SELECT op_id FROM ops WHERE seq = {h} AND payload_state = 'redacted'"
     ))
     .unwrap(/* t */)[0]
-    .clone();
+        .clone();
     // the hand-made damage: the record says one step less than the
     // payloads the compaction took
-    let raw = rusqlite::Connection::open(s.dir.path().join("taglio-verifica.sqlite")).unwrap(/* t */);
+    let raw =
+        rusqlite::Connection::open(s.dir.path().join("taglio-verifica.sqlite")).unwrap(/* t */);
     raw.execute("UPDATE snapshots SET seq = seq - 1", []).unwrap(/* t */);
     drop(raw);
     let report = s.cell.verify().unwrap(/* t */);
-    assert!(!report.ok(), "a payload removed above the cut is a broken cell");
+    assert!(
+        !report.ok(),
+        "a payload removed above the cut is a broken cell"
+    );
     let mismatch = report.mismatch.expect(/* t */ "the report names the break");
     assert!(
         mismatch.contains(&offender) && mismatch.contains(&format!("seq {h}")),
@@ -285,16 +368,25 @@ fn the_frontier_that_goes_down_changes_nothing() {
     for i in 6..10 {
         cell.put_note(&note_of(i, "nota di riempimento"), "user").unwrap(/* t */);
     }
-    let h = head(&cell);
+    let h = head(cell);
     cell.mark_shared().unwrap(/* t */);
     cell.record_session_ack("portatile").unwrap(/* t */);
-    assert_eq!(cell.stable_frontier().unwrap(/* t */), h, "one device: the frontier is the head");
+    assert_eq!(
+        cell.stable_frontier().unwrap(/* t */),
+        h,
+        "one device: the frontier is the head"
+    );
     let first = cell
         .compact(h - 2, &engramma_core::cell::CompactOptions { keep_snapshot: false })
         .unwrap(/* t */);
-    assert_eq!(first.cut_seq, h - 2, "the first compaction lands under the frontier");
+    assert_eq!(
+        first.cut_seq,
+        h - 2,
+        "the first compaction lands under the frontier"
+    );
     // a new device enters and the frontier falls below the cut
-    let raw = rusqlite::Connection::open(s.dir.path().join("taglio-frontiera.sqlite")).unwrap(/* t */);
+    let raw =
+        rusqlite::Connection::open(s.dir.path().join("taglio-frontiera.sqlite")).unwrap(/* t */);
     raw.execute(
         "INSERT INTO device_acks (device, ack_seq, at) VALUES ('nuovo', ?1, '')",
         [h - 4],
@@ -309,7 +401,18 @@ fn the_frontier_that_goes_down_changes_nothing() {
     let second = cell
         .compact(h, &engramma_core::cell::CompactOptions { keep_snapshot: false })
         .unwrap(/* t */);
-    assert_eq!(second.cut_seq, first.cut_seq, "the frontier does not drag the cut back");
-    assert_eq!(registered_cut(cell), first.cut_seq, "the registered cut stands");
+    assert!(
+        !second.compacted,
+        "the frontier does not drag the cut back: nothing was compacted"
+    );
+    assert_eq!(
+        second.cut_seq, first.cut_seq,
+        "the frontier does not drag the cut back"
+    );
+    assert_eq!(
+        registered_cut(cell),
+        first.cut_seq,
+        "the registered cut stands"
+    );
     assert!(cell.verify().unwrap(/* t */).ok(), "the cell verifies");
 }

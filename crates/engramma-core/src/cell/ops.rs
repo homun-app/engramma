@@ -1168,6 +1168,12 @@ pub(crate) fn records_a_version(kind: OpKind) -> bool {
 /// turns the old `INSERT OR REPLACE` into a conditional one. Above the
 /// cut the row is live derivation and rewrites as it always did.
 ///
+/// v0.6.14 (N1.4): the guard reads the cut INLINE, from the one table
+/// it lives in (`snapshots`, the same words as `registered_cut`). This is
+/// the hottest read of the engine — every write photographs — and the
+/// subquery costs no round trip; a bound parameter would cost one. It is
+/// the ONE inline read; every other reader goes through the function.
+///
 /// v0.6.13 (M1): the photograph now takes the WHOLE OBJECT — beside the
 /// note row, the derived rows a reconstruction deletes (the queue row,
 /// the registry rows, the `supersedes` rows of the new side) are
