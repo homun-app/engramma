@@ -87,6 +87,21 @@ spetta alla fase che lo trova: la fa la fase che lo chiude.
    Se **c'era già**, si **dichiara** aperto in `open-defects.txt` col seme
    e il verdetto dello script, e si va avanti.
 
+   Il file `crates/engramma-core/tests/open-defects.txt` esiste solo
+   quando c'è almeno un difetto aperto: **dalla v0.6.14 non c'è più**
+   (l'ultimo dichiarato, la perdita di testo esposta dal cestino, era
+   chiuso dalla v0.6.9: i suoi due casi registrati cadono sul tag
+   `fase-v0.6.8` e passano da `fase-v0.6.9` in poi — REPORT della
+   v0.6.14). Quando una fase trova di nuovo un difetto pre-esistente,
+   ricrea il file e i due cancelli che lo guardavano in
+   `properties_inventory.rs`, com'erano nella v0.6.13.
+
+Una proprietà il cui ingresso era una terna o un valore strutturato
+prima della v0.6.14 ha anche un gemello `_with(…)`, che prende gli
+ingressi come furono scritti: i controesemmi che proptest aveva
+persistito in quella forma sono test deterministici nei file delle
+proprietà, e si rigiocano da lì.
+
 ## Livello 3: la caccia notturna (`scripts/caccia-notte.sh`)
 
 Gira su `main` (parametro `RAMO`) a `nice -n 19` con due fili, in una

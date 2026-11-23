@@ -139,10 +139,14 @@ con_limite() {
 }
 
 prima_riga() {
-  # la prima riga del MESSAGGIO di caduta (dopo il «panicked at …:»), o il
-  # motivo di proptest; «-» a una corsa verde
-  grep -A 400 '^failures:' "$1" 2>/dev/null | grep -v '^failures:$' | grep -m1 -E '.' \
-    | sed 's/^ *//' | cut -c1-200
+  # la prima riga del MESSAGGIO di caduta: la prima riga non vuota dopo il
+  # «panicked at …:»; senza un panic (una corsa che non compila), la prima
+  # riga con «error»; «-» a una corsa verde
+  awk '
+    /panicked at / { p = 1; next }
+    p && NF { print; exit }
+    !p && /^error/ && !e { e = 1; print; exit }
+  ' "$1" 2>/dev/null | sed 's/^ *//' | cut -c1-200
 }
 
 # la rotazione: le proprietà dalla più costosa alla più economica (il costo
@@ -182,6 +186,9 @@ while [ "$i" -lt "$N" ]; do
   pacchetto=$(basename "$(dirname "$(dirname "$file")")")
   bersaglio=$(basename "$file" .rs)
   resto=$(( FINE - $(adesso) ))
+  # la finestra è finita fra un controllo e l'altro — e un limite di zero
+  # secondi spegnerebbe l'allarme: mai una corsa senza meno di un minuto
+  [ "$resto" -ge 60 ] || break
   fetta=$(( FETTA * 60 ))
   [ "$resto" -lt "$fetta" ] && fetta=$resto
   # il seme della notte: la data e la posizione della proprietà (proptest

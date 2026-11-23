@@ -36,13 +36,15 @@
 #    commit:
 #        CACCIABASE=<commit del cancello> CACCIASOLO="…" scripts/caccia.sh
 #
-# I difetti APERTI stanno in crates/engramma-core/tests/open-defects.txt
-# e le loro proprietà si girano COMUNQUE: un difetto dichiarato non è un
-# motivo per non giudicare il resto. Il giudizio su un rosso — «nasce da
-# questa fase o c'era già?» — ha un budget di 30 minuti e tre passi
-# meccanici (docs/caccia.md): la riproduzione deterministica del seme
-# (ogni proprietà ha un corpo `fn <nome>_body(seed: u64)`), lo stesso
-# seme sul tag precedente (scripts/seme-sul-tag.sh), il giudizio.
+# I difetti APERTI, quando ci sono, stanno in
+# crates/engramma-core/tests/open-defects.txt e le loro proprietà si
+# girano COMUNQUE: un difetto dichiarato non è un motivo per non giudicare
+# il resto (il file esiste solo con almeno un difetto aperto: dalla
+# v0.6.14 non c'è più). Il giudizio su un rosso — «nasce da questa fase o
+# c'era già?» — ha un budget di 30 minuti e tre passi meccanici
+# (docs/caccia.md): la riproduzione deterministica del seme (ogni
+# proprietà ha un corpo `fn <nome>_body(seed: u64)`), lo stesso seme sul
+# tag precedente (scripts/seme-sul-tag.sh), il giudizio.
 #
 # Uso:  scripts/caccia.sh                  # il cancello intero
 #       CACCIABASE=<ref> scripts/caccia.sh # la base della fase (default:
@@ -88,9 +90,11 @@ export RUST_TEST_THREADS=2
 export PROPTEST_VERBOSE=2
 
 INVENTARIO=crates/engramma-core/tests/properties.txt
+# i difetti aperti dichiarati: il file C'È solo quando c'è almeno un difetto
+# aperto (v0.6.14: l'ultimo dichiarato era chiuso dalla v0.6.9 — il file è
+# andato via con lui, come il suo cancello prescriveva)
 APERTI=crates/engramma-core/tests/open-defects.txt
 [ -f "$INVENTARIO" ] || { echo "manca $INVENTARIO" >&2; exit 1; }
-[ -f "$APERTI" ] || { echo "manca $APERTI" >&2; exit 1; }
 command -v perl >/dev/null 2>&1 || { echo "serve perl (il limite di tempo)" >&2; exit 1; }
 
 cd "$(dirname "$0")/.." || exit 1
@@ -106,7 +110,7 @@ TAB="$(printf '\t')"
 # l'inventario dev'essere onesto PRIMA di sprecare ore (e con lui la mappa
 # dei moduli: ogni proprietà la sua, ogni percorso che esiste)
 nice -n 19 cargo test --release -p engramma-core --test properties_inventory \
-  >/dev/null || { echo "l'inventario o i difetti aperti non tornano" >&2; exit 1; }
+  >/dev/null || { echo "l'inventario non torna (mappa dei moduli, #[test] di ogni proprietà)" >&2; exit 1; }
 # le corse sotto misurano il TEST, non la compilazione: si costruisce prima
 nice -n 19 cargo test --release -p engramma-core -p engramma-mcp --no-run \
   >"$LOGDIR/build.log" 2>&1 || { echo "la build in release è fallita: $LOGDIR/build.log" >&2; exit 1; }
@@ -184,7 +188,16 @@ casi_corsi() {
 }
 
 semi_di() {
-  grep -Eo 'seed [=:] [0-9]+' "$1" 2>/dev/null | head -3 | tr '\n' ' ' | sed 's/ *$//'
+  # il seme che cade è l'INGRESSO del caso minimo, quello che `<nome>_body`
+  # rigioca: lo scrive proptest nella sua diagnosi («input: N» — il Debug
+  # dell'errore); in mancanza, l'ingresso dell'ultimo caso caduto (al
+  # livello 2 proptest stampa l'ingresso di ogni caso: «Next test input:
+  # seed = N», che su una corsa VERDE non è un seme che cade)
+  {
+    grep -Eo 'input: [0-9]+' "$1" 2>/dev/null | sed 's/^input: /seed = /'
+    awk '/^proptest: Next test input: seed = / { s = $NF }
+         /^proptest: Test case failed/ { print "seed = " s }' "$1" 2>/dev/null
+  } | awk '!v[$0]++' | head -3 | tr '\n' ' ' | sed 's/ *$//'
 }
 
 : >"$REGISTRO"
@@ -197,12 +210,16 @@ TOCCATE_N=$(grep -v '^#' "$INVENTARIO" | grep -v '^$' | while read -r file nome 
   done
 done | wc -l | tr -d ' ')
 echo "caccia: fino a $NP proprietà dell'inventario, base $CACCIABASE, $TOCCATE_N toccate, obiettivo $OBIETTIVO minuti (suite compresa)"
-echo "difetti aperti dichiarati (si girano comunque):"
-sed -e 's/#.*//' -e '/^$/d' -e '/^#/d' "$APERTI" | while read -r file nome semi _x; do
-  [ -n "$file" ] || continue
-  echo "  - $nome: $semi"
-done
-echo "i semi dei difetti aperti stanno fuori dai file delle regressioni (controllato dall'inventario)"
+if [ -f "$APERTI" ]; then
+  echo "difetti aperti dichiarati (si girano comunque):"
+  sed -e 's/#.*//' -e '/^$/d' -e '/^#/d' "$APERTI" | while read -r file nome semi _x; do
+    [ -n "$file" ] || continue
+    echo "  - $nome: $semi"
+  done
+  echo "i semi dei difetti aperti stanno fuori dai file delle regressioni (controllato dall'inventario)"
+else
+  echo "nessun difetto aperto dichiarato"
+fi
 echo "file cambiati dalla base: $(wc -l <"$CAMBIATI" | tr -d ' ') — $CAMBIATI"
 
 # --- il piano: una riga per proprietà -----------------------------------
