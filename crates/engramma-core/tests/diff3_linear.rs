@@ -8,6 +8,29 @@
 
 use engramma_core::cell::conflicts::diff3_merge;
 use proptest::prelude::*;
+// v0.6.14 (N3): `current` is a trait method of the value trees
+use proptest::strategy::ValueTree as _;
+
+/// v0.6.14 (N3): a runner seeded by the property's OWN seed. The body of
+/// every property takes that one seed and derives its inputs from it
+/// through the same strategies the property always drew — so a failing
+/// seed replays in ONE case (`scripts/seme-sul-tag.sh <proprietà> <seme>
+/// <tag>`), on any tree that holds the body.
+fn seeded_runner(seed: u64) -> proptest::test_runner::TestRunner {
+    // ChaCha (the default) wants a 32-byte seed: the u64 is laid four times
+    let block = seed.to_le_bytes();
+    let mut bytes = [0_u8; 32];
+    for k in 0..4 {
+        bytes[k * 8..k * 8 + 8].copy_from_slice(&block);
+    }
+    proptest::test_runner::TestRunner::new_with_rng(
+        proptest::test_runner::Config::default(),
+        proptest::test_runner::TestRng::from_seed(
+            proptest::test_runner::RngAlgorithm::default(),
+            &bytes,
+        ),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // the v0.6.4 reference, frozen here: the quadratic table the fleet ran
@@ -138,18 +161,8 @@ fn the_twenty_thousand_line_diff3_stays_fast() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1024))]
     #[test]
-    fn the_new_diff3_decides_as_the_v064_one(
-        base in aligned_text(),
-        a in aligned_text(),
-        b in aligned_text(),
-    ) {
-        let mine = diff3_merge(&base, &a, &b);
-        let theirs = diff3_merge_v064(&base, &a, &b);
-        prop_assert_eq!(
-            mine, theirs,
-            "the linear alignment changed the merge: {:?} vs {:?} vs {:?}",
-            base, a, b
-        );
+    fn the_new_diff3_decides_as_the_v064_one(seed in any::<u64>()) {
+        the_new_diff3_decides_as_the_v064_one_body(seed)?;
     }
 }
 
@@ -262,59 +275,117 @@ fn r3_cost_at_5k_and_20k() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
     #[test]
-    fn the_long_alignment_is_still_a_lcs(
-        seed in any::<u64>(),
-        n in 520_usize..=1600,
-        edits in 1_u32..=120,
-    ) {
-        // a seeded scramble of a shared spine, with repeats
-        let mut rng = seed;
-        let mut next = move || {
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng
-        };
-        let spine: Vec<String> = (0..n).map(|i| {
-            if next() % 5 == 0 { "".into() } else { format!("r{}", i % 97) }
-        }).collect();
-        let mut scramble = |v: &[String], d: u32| -> Vec<String> {
-            let mut out = v.to_vec();
-            for _ in 0..d {
-                match next() % 3 {
-                    0 => { let at = (next() as usize) % out.len(); out.remove(at); }
-                    1 => { let at = (next() as usize) % (out.len() + 1);
-                           out.insert(at, format!("n{}", next() % 1000)); }
-                    _ => { let at = (next() as usize) % out.len(); out[at] = format!("c{}", next() % 1000); }
-                }
-            }
-            out
-        };
-        let a = scramble(&spine, edits);
-        let b = scramble(&spine, edits);
-        let la: Vec<&str> = a.iter().map(String::as_str).collect();
-        let lb: Vec<&str> = b.iter().map(String::as_str).collect();
-        // the reference: the table's LCS length (its own walk, bounded
-        // by the corpus — this test, not the engine)
-        let reference_len = lcs_len_v064(&la, &lb);
-        // the engine's answer comes through the merge's own halves: the
-        // alignment length equals the reference
-        let joined = |v: &[String]| v.join("\n");
-        let base_text = joined(&spine);
-        let a_text = joined(&a);
-        let b_text = joined(&b);
-        let _ = diff3_merge(&base_text, &a_text, &b_text);
-        // the engine's own alignment, straight from the module
-        let pairs = engramma_core::cell::conflicts::lcs_matches_for_test(&la, &lb);
-        // valid: strictly increasing on both sides, equal lines
-        for w in pairs.windows(2) {
-            prop_assert!(w[0].0 < w[1].0 && w[0].1 < w[1].1, "not increasing: {:?}", pairs);
-        }
-        for (i, j) in &pairs {
-            prop_assert_eq!(la[*i], lb[*j], "not a common subsequence: {:?}", pairs);
-        }
-        // and maximal: as long as the table's own LCS
-        prop_assert_eq!(pairs.len(), reference_len);
+    fn the_long_alignment_is_still_a_lcs(seed in any::<u64>()) {
+        the_long_alignment_is_still_a_lcs_body(seed)?;
     }
 }
 
 fn lcs_len_v064(a: &[&str], b: &[&str]) -> usize {
     lcs_matches_v064(a, b).len()
+}
+
+/// v0.6.14 (N3): the body of `the_new_diff3_decides_as_the_v064_one` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn the_new_diff3_decides_as_the_v064_one_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let (base, a, b) = ((aligned_text()), (aligned_text()), (aligned_text()))
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let mine = diff3_merge(&base, &a, &b);
+    let theirs = diff3_merge_v064(&base, &a, &b);
+    prop_assert_eq!(
+        mine,
+        theirs,
+        "the linear alignment changed the merge: {:?} vs {:?} vs {:?}",
+        base,
+        a,
+        b
+    );
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `the_long_alignment_is_still_a_lcs` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn the_long_alignment_is_still_a_lcs_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let (seed, n, edits) = ((any::<u64>()), (520_usize..=1600), (1_u32..=120))
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    // a seeded scramble of a shared spine, with repeats
+    let mut rng = seed;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let spine: Vec<String> = (0..n)
+        .map(|i| {
+            if next() % 5 == 0 {
+                "".into()
+            } else {
+                format!("r{}", i % 97)
+            }
+        })
+        .collect();
+    let mut scramble = |v: &[String], d: u32| -> Vec<String> {
+        let mut out = v.to_vec();
+        for _ in 0..d {
+            match next() % 3 {
+                0 => {
+                    let at = (next() as usize) % out.len();
+                    out.remove(at);
+                }
+                1 => {
+                    let at = (next() as usize) % (out.len() + 1);
+                    out.insert(at, format!("n{}", next() % 1000));
+                }
+                _ => {
+                    let at = (next() as usize) % out.len();
+                    out[at] = format!("c{}", next() % 1000);
+                }
+            }
+        }
+        out
+    };
+    let a = scramble(&spine, edits);
+    let b = scramble(&spine, edits);
+    let la: Vec<&str> = a.iter().map(String::as_str).collect();
+    let lb: Vec<&str> = b.iter().map(String::as_str).collect();
+    // the reference: the table's LCS length (its own walk, bounded
+    // by the corpus — this test, not the engine)
+    let reference_len = lcs_len_v064(&la, &lb);
+    // the engine's answer comes through the merge's own halves: the
+    // alignment length equals the reference
+    let joined = |v: &[String]| v.join("\n");
+    let base_text = joined(&spine);
+    let a_text = joined(&a);
+    let b_text = joined(&b);
+    let _ = diff3_merge(&base_text, &a_text, &b_text);
+    // the engine's own alignment, straight from the module
+    let pairs = engramma_core::cell::conflicts::lcs_matches_for_test(&la, &lb);
+    // valid: strictly increasing on both sides, equal lines
+    for w in pairs.windows(2) {
+        prop_assert!(
+            w[0].0 < w[1].0 && w[0].1 < w[1].1,
+            "not increasing: {:?}",
+            pairs
+        );
+    }
+    for (i, j) in &pairs {
+        prop_assert_eq!(la[*i], lb[*j], "not a common subsequence: {:?}", pairs);
+    }
+    // and maximal: as long as the table's own LCS
+    prop_assert_eq!(pairs.len(), reference_len);
+    Ok(())
 }

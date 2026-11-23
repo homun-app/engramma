@@ -20,6 +20,29 @@ use engramma_core::{Cell, Confidence, EmbedError, Embedder, Status, TextKind};
 use proptest::prelude::*;
 use time::OffsetDateTime;
 use ulid::Ulid;
+// v0.6.14 (N3): `current` is a trait method of the value trees
+use proptest::strategy::ValueTree as _;
+
+/// v0.6.14 (N3): a runner seeded by the property's OWN seed. The body of
+/// every property takes that one seed and derives its inputs from it
+/// through the same strategies the property always drew — so a failing
+/// seed replays in ONE case (`scripts/seme-sul-tag.sh <proprietà> <seme>
+/// <tag>`), on any tree that holds the body.
+fn seeded_runner(seed: u64) -> proptest::test_runner::TestRunner {
+    // ChaCha (the default) wants a 32-byte seed: the u64 is laid four times
+    let block = seed.to_le_bytes();
+    let mut bytes = [0_u8; 32];
+    for k in 0..4 {
+        bytes[k * 8..k * 8 + 8].copy_from_slice(&block);
+    }
+    proptest::test_runner::TestRunner::new_with_rng(
+        proptest::test_runner::Config::default(),
+        proptest::test_runner::TestRng::from_seed(
+            proptest::test_runner::RngAlgorithm::default(),
+            &bytes,
+        ),
+    )
+}
 
 /// The vocabulary the notes and the questions draw from: Italian words the
 /// stemmers treat differently, so matches are real.
@@ -309,65 +332,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
     #[test]
-    fn hidden_notes_leave_no_fingerprint(
-        bodies in proptest::collection::vec(body(), 4..10).prop_map(|v| {
-            // distinct bodies: two identical texts are an exact bm25 tie the
-            // tie-break must not be asked to settle — the property hunts the
-            // hidden-row fingerprint, not the sorter's patience
-            let mut seen = std::collections::BTreeSet::new();
-            v.into_iter().filter(|b| seen.insert(b.clone())).collect::<Vec<_>>()
-        }),
-        question in sentence(1, 3),
-        n_quarantined in 0_u32..3,
-        n_tombstones in 0_u32..3,
-    ) {
-        // base + hidden notes that MATCH the question (they must, to be a
-        // fingerprint), in their own cell
-        let dir_a = test_dir();
-        let cell_a = cell_of(dir_a.path(), &bodies);
-        let dir_b = test_dir();
-        let cell_b = cell_of(dir_b.path(), &bodies);
-        let matching = format!("{question} {question}");
-        for k in 0..n_quarantined {
-            let mut n = base_note(100 + k, &matching, now());
-            n.confidence = Confidence::External;
-            n.status = Status::Quarantined;
-            n.source = "import:web".into();
-            cell_b.put_note(&n, "t").unwrap(/* test-only */);
-        }
-        for k in 0..n_tombstones {
-            let n = base_note(200 + k, &matching, now());
-            let id = n.id;
-            cell_b.put_note(&n, "t").unwrap(/* test-only */);
-            cell_b.delete_note(&id, "t").unwrap(/* test-only */);
-        }
-        // v0.6, P0: no ε is declared anymore, so the hybrid mode runs on the
-        // DEFAULT (convex) fusion too — v0.5.3 kept it on RRF because the
-        // IDF ε could flip which candidate is the worst of the union and the
-        // convex `retain(score > 0)` cut it: a cliff born with the shared
-        // index, gone with it.
-        let sem = Semantic::new(std::sync::Arc::new(FakeEmbedder))
-            .with_mode(Mode::Hybrid);
-        let modes: &[(&str, Query, bool)] = &[
-            ("testo", Query::text(&question).k(8), false),
-            ("ibrida", Query::text(&question).k(8), true),
-            ("testo+grafo", Query::text(&question).k(8).graph_hops(2), false),
-        ];
-        for (what, q, hybrid) in modes {
-            let a = if *hybrid {
-                cell_a.search_semantic_with_now(q, now().get(), &sem).unwrap(/* test-only */).hits
-            } else {
-                cell_a.search_with_now(q, now().get()).unwrap(/* test-only */)
-            };
-            let b = if *hybrid {
-                cell_b.search_semantic_with_now(q, now().get(), &sem).unwrap(/* test-only */).hits
-            } else {
-                cell_b.search_with_now(q, now().get()).unwrap(/* test-only */)
-            };
-            if let Some(why) = diff(&snapshot(&a), &snapshot(&b), what) {
-                prop_assert!(false, "{}", why);
-            }
-        }
+    fn hidden_notes_leave_no_fingerprint(seed in any::<u64>()) {
+        hidden_notes_leave_no_fingerprint_body(seed)?;
     }
 }
 
@@ -426,4 +392,82 @@ fn the_zebedeo_tonno_case_is_bit_identical() {
     if let Some(why) = diff(&snapshot(&a), &snapshot(&b), "zebedeo") {
         panic!("{why}");
     }
+}
+
+/// v0.6.14 (N3): the body of `hidden_notes_leave_no_fingerprint` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn hidden_notes_leave_no_fingerprint_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let (bodies, question, n_quarantined, n_tombstones) = (
+        proptest::collection::vec(body(), 4..10).prop_map(|v| {
+            // distinct bodies: two identical texts are an exact bm25 tie the
+            // tie-break must not be asked to settle — the property hunts the
+            // hidden-row fingerprint, not the sorter's patience
+            let mut seen = std::collections::BTreeSet::new();
+            v.into_iter()
+                .filter(|b| seen.insert(b.clone()))
+                .collect::<Vec<_>>()
+        }),
+        sentence(1, 3),
+        0_u32..3,
+        0_u32..3,
+    )
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    // base + hidden notes that MATCH the question (they must, to be a
+    // fingerprint), in their own cell
+    let dir_a = test_dir();
+    let cell_a = cell_of(dir_a.path(), &bodies);
+    let dir_b = test_dir();
+    let cell_b = cell_of(dir_b.path(), &bodies);
+    let matching = format!("{question} {question}");
+    for k in 0..n_quarantined {
+        let mut n = base_note(100 + k, &matching, now());
+        n.confidence = Confidence::External;
+        n.status = Status::Quarantined;
+        n.source = "import:web".into();
+        cell_b.put_note(&n, "t").unwrap(/* test-only */);
+    }
+    for k in 0..n_tombstones {
+        let n = base_note(200 + k, &matching, now());
+        let id = n.id;
+        cell_b.put_note(&n, "t").unwrap(/* test-only */);
+        cell_b.delete_note(&id, "t").unwrap(/* test-only */);
+    }
+    // v0.6, P0: no ε is declared anymore, so the hybrid mode runs on the
+    // DEFAULT (convex) fusion too — v0.5.3 kept it on RRF because the
+    // IDF ε could flip which candidate is the worst of the union and the
+    // convex `retain(score > 0)` cut it: a cliff born with the shared
+    // index, gone with it.
+    let sem = Semantic::new(std::sync::Arc::new(FakeEmbedder)).with_mode(Mode::Hybrid);
+    let modes: &[(&str, Query, bool)] = &[
+        ("testo", Query::text(&question).k(8), false),
+        ("ibrida", Query::text(&question).k(8), true),
+        (
+            "testo+grafo",
+            Query::text(&question).k(8).graph_hops(2),
+            false,
+        ),
+    ];
+    for (what, q, hybrid) in modes {
+        let a = if *hybrid {
+            cell_a.search_semantic_with_now(q, now().get(), &sem).unwrap(/* test-only */).hits
+        } else {
+            cell_a.search_with_now(q, now().get()).unwrap(/* test-only */)
+        };
+        let b = if *hybrid {
+            cell_b.search_semantic_with_now(q, now().get(), &sem).unwrap(/* test-only */).hits
+        } else {
+            cell_b.search_with_now(q, now().get()).unwrap(/* test-only */)
+        };
+        if let Some(why) = diff(&snapshot(&a), &snapshot(&b), what) {
+            prop_assert!(false, "{}", why);
+        }
+    }
+    Ok(())
 }

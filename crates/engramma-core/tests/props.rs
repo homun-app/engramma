@@ -14,10 +14,33 @@ use engramma_core::{Cell, Confidence, NotePatch, Status};
 use proptest::prelude::*;
 use time::OffsetDateTime;
 use ulid::Ulid;
+// v0.6.14 (N3): `current` is a trait method of the value trees
+use proptest::strategy::ValueTree as _;
 
 // v0.6.7 (G4): the two-device forgetting property leans on the shared
 // conflict stage — fixed clocks, deterministic mints, the union of logs
 mod common;
+
+/// v0.6.14 (N3): a runner seeded by the property's OWN seed. The body of
+/// every property takes that one seed and derives its inputs from it
+/// through the same strategies the property always drew — so a failing
+/// seed replays in ONE case (`scripts/seme-sul-tag.sh <proprietà> <seme>
+/// <tag>`), on any tree that holds the body.
+fn seeded_runner(seed: u64) -> proptest::test_runner::TestRunner {
+    // ChaCha (the default) wants a 32-byte seed: the u64 is laid four times
+    let block = seed.to_le_bytes();
+    let mut bytes = [0_u8; 32];
+    for k in 0..4 {
+        bytes[k * 8..k * 8 + 8].copy_from_slice(&block);
+    }
+    proptest::test_runner::TestRunner::new_with_rng(
+        proptest::test_runner::Config::default(),
+        proptest::test_runner::TestRng::from_seed(
+            proptest::test_runner::RngAlgorithm::default(),
+            &bytes,
+        ),
+    )
+}
 
 fn ts(secs: i64) -> At {
     At(OffsetDateTime::from_unix_timestamp(1_700_000_000 + secs)
@@ -178,25 +201,14 @@ proptest! {
 
     /// `parse(serialize(n)) == n` for every generated note.
     #[test]
-    fn format_round_trip(note in any_note()) {
-        let text = note.serialize().unwrap(/* strategy keeps fields valid */);
-        let parsed = engramma_core::format::parse(&text, ParseMode::Strict).unwrap(/* serialized notes are valid */);
-        prop_assert_eq!(parsed.note, note.clone());
-        // stability: serialize(parse(serialize(x))) is a fixed point
-        let s1 = note.serialize().unwrap(/* as above */);
-        let parsed2 = engramma_core::format::parse(&s1, ParseMode::Strict).unwrap(/* as above */);
-        let s2 = parsed2.note.serialize().unwrap(/* as above */);
-        prop_assert_eq!(s1, s2);
+    fn format_round_trip(seed in any::<u64>()) {
+        format_round_trip_body(seed)?;
     }
 
     /// Replaying the log rebuilds exactly the same state.
     #[test]
     fn replay_equals_state(seed in any::<u64>()) {
-        let dir = common::test_dir();
-        let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* test-only */);
-        run_random_ops(&cell, seed, ops_count(seed));
-        let report = cell.verify().unwrap(/* test-only */);
-        prop_assert!(report.ok(), "verify failed: {:?}", report.mismatch);
+        replay_equals_state_body(seed)?;
     }
 
     /// v0.3 (P3): random ops, compaction, more ops — the full replay before
@@ -204,51 +216,7 @@ proptest! {
     /// very digest, and after the extra ops verify passes from the snapshot.
     #[test]
     fn compaction_keeps_verify_and_state(seed in any::<u64>()) {
-        let dir = common::test_dir();
-        let path = dir.path().join("c.sqlite");
-        let cell = Cell::create(&path, "p", "prop").unwrap(/* test-only */);
-        run_random_ops(&cell, seed, ops_count(seed));
-        // the full replay, before any compaction: verify compares it with
-        // the live state, and the digest of that state is the reference
-        let before = cell.verify().unwrap(/* test-only */);
-        prop_assert!(before.ok(), "pre-compaction verify: {:?}", before.mismatch);
-        let digest_before = cell.state_digest().unwrap(/* test-only */);
-        let head: i64 = cell
-            .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
-            .unwrap(/* test-only */)[0]
-            .parse()
-            .unwrap(/* test-only */);
-        // v0.6.8 (H2): the cut walks BELOW the head too (the JS binding
-        // cuts at `head - keepLast`; a shared cell at its frontier) —
-        // the head-only convention was the one ground the snapshot
-        // replay defect lived on
-        let cut = head - (seed % 3) as i64;
-        let snap = cell
-            .compact(cut, &engramma_core::cell::CompactOptions { keep_snapshot: true })
-            .unwrap(/* test-only */)
-            .snapshot
-            .unwrap(/* keep_snapshot always writes one */);
-        // v0.3.1 (P0.4): the snapshot is the LOGICAL state. Its recorded
-        // digest is its own — the payloads up to the cut are stripped from
-        // the file — and it must equal the live state's digest at the same
-        // head (the live cell forgot the very same payloads).
-        let recorded = cell
-            .debug_column(&format!(
-                "SELECT state_digest FROM snapshots WHERE seq = {cut}"
-            ))
-            .unwrap(/* test-only */);
-        let digest_after = cell.state_digest().unwrap(/* test-only */);
-        prop_assert_eq!(
-            recorded.first().map(String::as_str),
-            Some(digest_after.as_str())
-        );
-        let _ = digest_before; // the pre-compaction digest: replaced by the
-                               // logical-state comparison above
-        prop_assert!(snap.is_file());
-        // more ops, then verify replays the tail on the snapshot
-        run_random_ops(&cell, seed.wrapping_mul(3) | 1, 8);
-        let report = cell.verify().unwrap(/* test-only */);
-        prop_assert!(report.ok(), "verify after compaction: {:?}", report.mismatch);
+        compaction_keeps_verify_and_state_body(seed)?;
     }
 
     /// v0.3.1 (P0): random ops with `compact` and `purge` interleaved —
@@ -261,284 +229,23 @@ proptest! {
     /// the hidden-index leak of the verification lived.
     #[test]
     fn random_ops_compact_and_purge_leave_no_roots(seed in any::<u64>()) {
-        let dir = common::test_dir();
-        let path = dir.path().join("dimenticare.sqlite");
-        let cell = Cell::create(&path, "p", "prop").unwrap(/* test-only */);
-        let mut s = seed | 1;
-        let mut next = move || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            s
-        };
-        // (id, every word its body ever carried)
-        let mut living: Vec<(ulid::Ulid, Vec<String>)> = Vec::new();
-        let mut purged_words: Vec<String> = Vec::new();
-        // The discriminating letters sit at the FRONT: an Italian stem can
-        // drop the tail of a word (verboae -> verboa), and a purged word's
-        // stem must never be a substring of a living word's text.
-        let word_of = |i: u16| {
-            format!(
-                "{}{}parola",
-                char::from(b'a' + (i / 26) as u8),
-                char::from(b'a' + (i % 26) as u8)
-            )
-        };
-        let note_of = |i: u16, word: &str| Note {
-            id: {
-                let mut id = format!("01P{}{:05}", seed % 100, i);
-                while id.len() < 26 {
-                    id.push('0');
-                }
-                Ulid::from_string(&id).unwrap(/* test-only */)
-            },
-            note_type: NoteType::Fact,
-            title: None,
-            body: format!("{word} [[Roma]]"),
-            tags: vec![],
-            scope: None,
-            lang: Some(Lang::It),
-            source: "prop".into(),
-            confidence: Confidence::Stated,
-            status: Status::Active,
-            valid_from: None,
-            valid_to: None,
-            supersedes: vec![],
-            created_at: ts(1000),
-            updated_at: ts(1000),
-            extensions: vec![],
-        };
-        let draw = |pool: &[(ulid::Ulid, Vec<String>)], rnd: u64| {
-            if pool.is_empty() {
-                None
-            } else {
-                pool.get((rnd % pool.len() as u64) as usize)
-                    .map(|(id, _)| *id)
-            }
-        };
-        for i in 0..40_u16 {
-            match next() % 7 {
-                0 | 1 => {
-                    let w = word_of(i);
-                    let mut note = note_of(i, &w);
-                    // v0.6.7 (G4): one note in three is BORN in quarantine
-                    // — the Homun import path — so the generator crosses
-                    // the state transitions the old mix never touched
-                    if next() % 3 == 0 {
-                        note.status = Status::Quarantined;
-                    }
-                    if cell.put_note(&note, "prop").is_ok() {
-                        living.push((note.id, vec![w]));
-                    }
-                }
-                2 => {
-                    // a purge: the note and every body it ever had go
-                    if let Some(id) = draw(&living, next())
-                        && cell.get(&id).is_ok()
-                        && cell.purge(&id, "prop", "prop").is_ok()
-                    {
-                        if let Some((_, words)) = living.iter().find(|(n, _)| n == &id) {
-                            purged_words.extend(words.iter().cloned());
-                        }
-                        living.retain(|(n, _)| n != &id);
-                    }
-                }
-                3 => {
-                    // a patch moves a living note to a fresh word
-                    if let Some(id) = draw(&living, next()) {
-                        let w = word_of(200 + i);
-                        let patch = NotePatch {
-                            body: Some(format!("{w} [[Roma]]")),
-                            ..Default::default()
-                        };
-                        if cell.patch_note(&id, &patch, "prop").is_ok()
-                            && let Some(entry) = living.iter_mut().find(|(n, _)| n == &id)
-                        {
-                            entry.1.push(w);
-                        }
-                    }
-                }
-                4 => {
-                    // a supersede: the new note is the censor case when purged
-                    if let Some(id) = draw(&living, next()) {
-                        let w = word_of(400 + i);
-                        let mut new = note_of(600 + i, &w);
-                        new.supersedes = vec![id];
-                        if cell.supersede(&id, &new, None, "prop").is_ok() {
-                            living.retain(|(n, _)| n != &id);
-                            living.push((new.id, vec![w]));
-                        }
-                    }
-                }
-                5 => {
-                    // v0.6.7 (G4): the state transitions, in BOTH
-                    // directions — quarantine → active is the release the
-                    // reviewer's G1 proof used, active → quarantine walks
-                    // the hidden index the other way. Both take the row
-                    // out of an FTS index with a `delete`, and the purge
-                    // that follows must still forget the stems
-                    if let Some(id) = draw(&living, next()) {
-                        let status = cell
-                            .debug_column(&format!(
-                                "SELECT status FROM notes WHERE id = '{id}'"
-                            ))
-                            .unwrap_or_default()
-                            .first()
-                            .cloned();
-                        let to = match status.as_deref() {
-                            Some("quarantined") => Status::Active,
-                            _ => Status::Quarantined,
-                        };
-                        let _ = cell.set_status(&id, to, "prop");
-                    }
-                }
-                _ => {
-                    // a compaction somewhere inside the run — v0.3.2 (P0.1):
-                    // with or without the file, at random
-                    let head: i64 = cell
-                        .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
-                        .unwrap_or_default()
-                        .first()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    if head >= 1 {
-                        let cut = (head - (next() % 3) as i64).max(1);
-                        let opts = engramma_core::cell::CompactOptions {
-                            keep_snapshot: next() % 2 == 0,
-                        };
-                        let _ = cell.compact(cut, &opts);
-                    }
-                }
-            }
-        }
-        // a seed can draw the purge arm zero times: force one so every
-        // case really exercises the forgetting path
-        if purged_words.is_empty()
-            && let Some((id, words)) = living.first().cloned()
-            && cell.purge(&id, "prop", "prop").is_ok()
-        {
-            purged_words.extend(words);
-        }
-        prop_assert!(
-            !purged_words.is_empty(),
-            "the mix must purge something (seed {seed})"
-        );
-        let report = cell.verify().unwrap(/* test-only */);
-        prop_assert!(report.ok(), "verify: {:?}", report.mismatch);
-        drop(cell);
-        // no root of any purged word in the cell file, the WAL or any
-        // snapshot — the same needle rule as tests/forgetting.rs
-        let needles: Vec<String> = purged_words
-            .iter()
-            .flat_map(|w| {
-                let folded = engramma_core::text::strip_diacritics(&w.to_lowercase());
-                let stem = engramma_core::text::normalize(&folded, Some(Lang::It));
-                [folded, stem]
-            })
-            .collect();
-        let mut files: Vec<std::path::PathBuf> = vec![
-            path.clone(),
-            dir.path().join("dimenticare.sqlite-wal"),
-        ];
-        let mut snaps: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("dimenticare-snap-"))
-            })
-            .collect();
-        snaps.sort();
-        files.extend(snaps);
-        for f in files {
-            let raw = std::fs::read(&f).unwrap_or_default();
-            for n in &needles {
-                prop_assert!(
-                    !raw.windows(n.len()).any(|w| w == n.as_bytes()),
-                    "«{n}» sopravvive in {} (seed {seed})",
-                    f.display()
-                );
-            }
-        }
+        random_ops_compact_and_purge_leave_no_roots_body(seed)?;
     }
 
-    /// Export then import into a fresh cell gives the same notes and edges.    #[test]
+    /// Export then import into a fresh cell gives the same notes and edges.
+    // v0.6.14 (N3): `#[test]` was glued to the line above since the 7th of
+    // November (59092a6) — the property was never a test, and every hunt
+    // recorded it green without running it. The inventory checks it now.
+    #[test]
     fn export_import_equality(seed in any::<u64>()) {
-        let dir = common::test_dir();
-        let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* test-only */);
-        run_random_ops(&cell, seed, ops_count(seed));
-        // close open-ended state: delete nothing, just export
-        let out = dir.path().join("exp");
-        export(&cell, &out).unwrap(/* test-only */);
-        let cell2 = Cell::create(&dir.path().join("c2.sqlite"), "p", "prop").unwrap(/* test-only */);
-        let summary = import_cell(&cell2, &out, "prop").unwrap(/* export folders import cleanly */);
-        prop_assert!(summary.errors.is_empty(), "{summary:?}");
-        // compare notes and edges
-        let dump = |c: &Cell, sql: &str| -> Vec<String> {
-            c.debug_column(sql).unwrap(/* test-only */)
-        };
-        // Notes compared field by field through the API; `updated_at` is
-        // excluded: importing a confirmed `external` note replays a `confirm`
-        // op, which stamps its own (import-time) `updated_at`.
-        let ids = dump(
-            &cell,
-            "SELECT id FROM notes WHERE status != 'deleted' ORDER BY id",
-        );
-        prop_assert_eq!(
-            ids.len(),
-            dump(&cell2, "SELECT id FROM notes WHERE status != 'deleted'").len()
-        );
-        for id in &ids {
-            let a = cell
-                .get(&Ulid::from_string(id).unwrap(/* from our own column */))
-                .unwrap(/* test-only */);
-            let b = cell2
-                .get(&Ulid::from_string(id).unwrap(/* from our own column */))
-                .unwrap(/* test-only */);
-            prop_assert_eq!(a.note_type, b.note_type);
-            prop_assert_eq!(a.title, b.title);
-            prop_assert_eq!(a.body, b.body);
-            prop_assert_eq!(a.tags, b.tags);
-            prop_assert_eq!(a.scope, b.scope);
-            prop_assert_eq!(a.lang, b.lang);
-            prop_assert_eq!(a.source, b.source);
-            prop_assert_eq!(a.confidence, b.confidence);
-            prop_assert_eq!(a.status, b.status);
-            prop_assert_eq!(a.valid_from, b.valid_from);
-            prop_assert_eq!(a.valid_to, b.valid_to);
-            prop_assert_eq!(a.supersedes, b.supersedes);
-            prop_assert_eq!(a.created_at, b.created_at);
-            prop_assert_eq!(a.extensions, b.extensions);
-        }
-        // Edges of living notes: tombstones stay out of the export, so their
-        // (deleted-status) edges are not part of the exported state.
-        let edge_sql = "SELECT e.id || e.src || e.rel || e.dst FROM edges e                         JOIN notes n ON e.note_id = n.id AND n.status != 'deleted'                         ORDER BY e.id";
-        let edges1 = dump(&cell, edge_sql);
-        let edges2 = dump(&cell2, edge_sql);
-        prop_assert_eq!(edges1, edges2);
+        export_import_equality_body(seed)?;
     }
 
     /// The HLC is monotonic under arbitrary physical-clock readings,
     /// including jumps backwards.
     #[test]
-    fn hlc_monotonic(clock_readings in proptest::collection::vec(0u64..1_000_000, 1..100)) {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let t = Arc::new(AtomicU64::new(0));
-        let tc = Arc::clone(&t);
-        let mut clock = HlcClock::new("n1", move || tc.load(Ordering::Relaxed));
-        let mut prev: Option<Hlc> = None;
-        for r in clock_readings {
-            t.store(r, Ordering::Relaxed);
-            let h = clock.tick();
-            if let Some(p) = prev {
-                prop_assert!(h > p, "hlc went backwards: {p:?} -> {h:?}");
-            }
-            prev = Some(h);
-        }
+    fn hlc_monotonic(seed in any::<u64>()) {
+        hlc_monotonic_body(seed)?;
     }
 
     /// v0.6.7 (G4): the forgetting property at TWO devices, with conflict
@@ -552,315 +259,7 @@ proptest! {
     /// that: a report that lied would leave roots behind).
     #[test]
     fn purge_with_conflict_copies_leaves_no_roots(seed in any::<u64>()) {
-        use common::{cell_with, shared_init, union};
-        use std::sync::atomic::Ordering;
-        let mut s = seed | 1;
-        let mut next = move || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            s
-        };
-        let init = shared_init(&format!("oblio-copie/{seed}"));
-        let (a, wa) = cell_with("a");
-        let (b, wb) = cell_with("b");
-        for cell in [&a, &b] {
-            cell.ingest_op(&init).unwrap(/* t */);
-        }
-        let bword_of = |i: u16| {
-            format!(
-                "{}{}tonfo",
-                char::from(b'a' + (i / 26) as u8),
-                char::from(b'a' + (i % 26) as u8)
-            )
-        };
-        // every body word a note ever carried, and the words of the purged
-        let mut living: Vec<(ulid::Ulid, Vec<String>)> = Vec::new();
-        let mut purged_words: Vec<String> = Vec::new();
-        let mut reports: Vec<engramma_core::PurgeReport> = Vec::new();
-        let mut purged_with_copies = false;
-        let mut tick: u64 = 0;
-        let mut i: u16 = 0;
-        for _round in 0..48 {
-            i += 1;
-            let dev = next() % 2;
-            let (cell, wall) = if dev == 0 { (&a, &wa) } else { (&b, &wb) };
-            let pick = |pool: &[(ulid::Ulid, Vec<String>)], rnd: u64| {
-                pool.get((rnd % pool.len().max(1) as u64) as usize)
-                    .map(|(id, _)| *id)
-            };
-            match next() % 8 {
-                0..=2 => {
-                    // a body write: on a note this device holds, half the
-                    // time without any sync first — the concurrent branch
-                    let fresh = living.is_empty() || next() % 3 == 0;
-                    let (id, w) = if fresh {
-                        let w = bword_of(i);
-                        let note = {
-                            let mut n = common::base_note(u32::from(i), &format!("{w} [[Roma]]"));
-                            if next() % 4 == 0 {
-                                n.status = Status::Quarantined;
-                            }
-                            n
-                        };
-                        tick += 1;
-                        wall.store(common::K + tick, Ordering::SeqCst);
-                        if cell.put_note(&note, "prop:user").is_ok() {
-                            living.push((note.id, vec![w.clone()]));
-                        }
-                        (note.id, w)
-                    } else {
-                        let Some(id) = pick(&living, next()) else { continue };
-                        let w = bword_of(400 + i);
-                        tick += 1;
-                        wall.store(common::K + tick, Ordering::SeqCst);
-                        let actor = if next() % 2 == 0 { "prop:user" } else { "prop:bot" };
-                        let patch = NotePatch {
-                            body: Some(format!("{w} [[Roma]]")),
-                            ..Default::default()
-                        };
-                        if cell.patch_note(&id, &patch, actor).is_ok()
-                            && let Some(entry) = living.iter_mut().find(|(n, _)| n == &id)
-                        {
-                            entry.1.push(w.clone());
-                        }
-                        (id, w)
-                    };
-                    let _ = id;
-                    let _ = w;
-                }
-                3 => {
-                    // a header-only patch: no conflict may come of it
-                    if let Some(id) = pick(&living, next()) {
-                        tick += 1;
-                        wall.store(common::K + tick, Ordering::SeqCst);
-                        let _ = cell.patch_note(
-                            &id,
-                            &NotePatch {
-                                title: Some(Some(format!("il titolo {i}"))),
-                                ..Default::default()
-                            },
-                            "prop:user",
-                        );
-                    }
-                }
-                4 => {
-                    // the sync: everything flows both ways — and the
-                    // session ACKS land like the real service writes
-                    // them (v0.6.8, H2: the frontier is what the
-                    // devices CONFIRMED, so a compaction between two
-                    // syncs cuts below the head, the road the API walks)
-                    for op in &union(&a, &b) {
-                        let _ = a.ingest_op(op);
-                        let _ = b.ingest_op(op);
-                    }
-                    let _ = a.mark_shared();
-                    let _ = b.mark_shared();
-                    let _ = a.record_session_ack("b000000000x");
-                    let _ = b.record_session_ack("a000000000x");
-                }
-                5 => {
-                    // a resolution of one conflict copy this device sees
-                    if let Ok(list) = cell.conflicts()
-                        && let Some(first) = list.first()
-                    {
-                        let keep = if next() % 2 == 0 {
-                            engramma_core::ResolveKeep::Original
-                        } else {
-                            engramma_core::ResolveKeep::Copy
-                        };
-                        tick += 1;
-                        wall.store(common::K + tick, Ordering::SeqCst);
-                        let _ = cell.resolve_conflict(&first.copy_id, keep, None, "prop:user");
-                    }
-                }
-                6 => {
-                    // a compaction, with or without the snapshot file —
-                    // and the cut walks the TRUE roads (v0.6.8, H2): at
-                    // the head sometimes, below it most of the time (the
-                    // JS binding cuts at `head - keepLast`; a shared cell
-                    // compacts at the stable frontier the acks built).
-                    // The v0.6.7 convention — always the head — was the
-                    // one ground the verify defect lived on (seed
-                    // 9012498534905088620, declared open then, closed in
-                    // this phase).
-                    let head: i64 = cell
-                        .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
-                        .unwrap_or_default()
-                        .first()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
-                    let cut = head - (next() % 3) as i64;
-                    if cut >= 1 {
-                        let _ = cell.compact(
-                            cut,
-                            &engramma_core::cell::CompactOptions {
-                                keep_snapshot: next() % 2 == 0,
-                            },
-                        );
-                    }
-                }
-                _ => {
-                    // a purge — the note, its history and its copies go
-                    if let Some(id) = pick(&living, next()) {
-                        let copies: i64 = cell
-                            .debug_column(&format!(
-                                "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies
-                                 WHERE original_id = '{id}'"
-                            ))
-                            .unwrap_or_default()
-                            .first()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(0);
-                        tick += 1;
-                        wall.store(common::K + tick, Ordering::SeqCst);
-                        if let Ok(report) = cell.purge(&id, "prop", "prop:user") {
-                            if copies > 0 {
-                                purged_with_copies = true;
-                            }
-                            reports.push(report);
-                            if let Some((_, words)) = living.iter().find(|(n, _)| n == &id) {
-                                purged_words.extend(words.iter().cloned());
-                            }
-                            living.retain(|(n, _)| n != &id);
-                            // the purge travels: the other device takes it
-                            for op in &union(&a, &b) {
-                                let _ = a.ingest_op(op);
-                                let _ = b.ingest_op(op);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // a seed can go whole rounds without purging a note that HAD
-        // copies: force one, so every case really crosses the hole G3
-        // closed (the copy rows in the snapshot)
-        if !purged_with_copies {
-            // a real device purges what IT holds: the candidate must live
-            // on a (with its copies), or the minted purge would lean on a
-            // birds-eye knowledge no device has
-            let with_copies: Vec<ulid::Ulid> = living
-                .iter()
-                .filter(|(id, _)| {
-                    a.get(id).is_ok()
-                        && a.debug_column(&format!(
-                            "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies
-                             WHERE original_id = '{id}'"
-                        ))
-                        .unwrap_or_default()
-                        .first()
-                        .is_some_and(|n| n != "0")
-                })
-                .map(|(id, _)| *id)
-                .collect();
-            if let Some(id) = with_copies.first() {
-                if let Ok(report) = a.purge(id, "prop", "prop:user") {
-                    reports.push(report);
-                    if let Some((_, words)) = living.iter().find(|(n, _)| n == id) {
-                        purged_words.extend(words.iter().cloned());
-                    }
-                    living.retain(|(n, _)| n != id);
-                    for op in &union(&a, &b) {
-                        let _ = a.ingest_op(op);
-                        let _ = b.ingest_op(op);
-                    }
-                }
-            } else if let Some((id, words)) = living.iter().find(|(n, _)| a.get(n).is_ok()).cloned() {
-                tick += 1;
-                wa.store(common::K + tick, Ordering::SeqCst);
-                if let Ok(report) = a.purge(&id, "prop", "prop:user") {
-                    reports.push(report);
-                    purged_words.extend(words);
-                }
-                living.retain(|(n, _)| n != &id);
-                for op in &union(&a, &b) {
-                    let _ = a.ingest_op(op);
-                    let _ = b.ingest_op(op);
-                }
-            }
-        }
-        prop_assert!(
-            !purged_words.is_empty(),
-            "the mix must purge something (seed {seed})"
-        );
-        // `scrubbed: true` must be the truth — and here, with no reader
-        // open, every report must have said true
-        for r in &reports {
-            prop_assert!(r.scrubbed, "a purge with no readers said pending: {r:?}");
-        }
-        // the final settle: everything everywhere
-        for _ in 0..2 {
-            for op in &union(&a, &b) {
-                let _ = a.ingest_op(op);
-                let _ = b.ingest_op(op);
-            }
-        }
-        // NOTE (v0.6.8, H2's second layer — the spec's stop rule): the
-        // verify judging below this note is PARKED again, and the why is
-        // measured, not guessed. Walking the true roads (frontier cuts,
-        // cuts below the head), verify still diverges on notes whose
-        // out-of-order arrivals straddle the cut: the ANCHOR of the
-        // rematerialization — the pre-state snapshot a replay restarts
-        // from — keeps the state and the numbering of the cut it was
-        // written against, and no snapshot carries that history. Seeds
-        // 11476711120049502961 (the `version` counter) and
-        // 10840318560449401940 (a title) both bite; the copy-body layer
-        // of the same defect IS closed (seed 2864860944329123852, kept
-        // below as a regression seed). The property judges the OBLIVION,
-        // its mandate; the anchors' staleness stays OPEN in the REPORT
-        // with the diagnosis.
-        // The judge: no root of any purged body in ANY file of either
-        // device — the cells, the WALs, the snapshots
-        let needles: Vec<String> = purged_words
-            .iter()
-            .flat_map(|w| {
-                let folded = engramma_core::text::strip_diacritics(&w.to_lowercase());
-                let stem = engramma_core::text::normalize(&folded, Some(Lang::It));
-                [folded, stem]
-            })
-            .collect();
-        for cell in [&a, &b] {
-            let dir = cell
-                .file_path()
-                .parent()
-                .unwrap(/* our own cell */)
-                .to_path_buf();
-            let stem = cell
-                .file_path()
-                .file_stem()
-                .unwrap(/* our own cell */)
-                .to_string_lossy()
-                .to_string();
-            cell.retire().unwrap(/* t */);
-            let mut files: Vec<std::path::PathBuf> = vec![
-                dir.join(format!("{stem}.sqlite")),
-                dir.join(format!("{stem}.sqlite-wal")),
-            ];
-            let mut snaps: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with(&format!("{stem}-snap-")))
-                })
-                .collect();
-            snaps.sort();
-            files.extend(snaps);
-            for f in files {
-                let raw = std::fs::read(&f).unwrap_or_default();
-                for n in &needles {
-                    prop_assert!(
-                        !raw.windows(n.len()).any(|w| w == n.as_bytes()),
-                        "«{n}» sopravvive in {} (seed {seed})",
-                        f.display()
-                    );
-                }
-            }
-        }
+        purge_with_conflict_copies_leaves_no_roots_body(seed)?;
     }
 
     /// v0.6.11 (K2): `purge_takes_only_its_family` — l'oracolo sul
@@ -885,7 +284,7 @@ proptest! {
     /// verde.)
     #[test]
     fn purge_takes_only_its_family(seed in any::<u64>()) {
-        purge_takes_only_its_family_body(seed);
+        purge_takes_only_its_family_body(seed)
     }
 
     /// v0.6.13 (M3): **dalla quarantena si esce solo per decisione.**
@@ -900,7 +299,7 @@ proptest! {
     /// c'è); una decisione annullata resta annullata.
     #[test]
     fn quarantine_exits_only_by_decision(seed in any::<u64>()) {
-        quarantine_exits_body(seed);
+        quarantine_exits_only_by_decision_body(seed)?;
     }
 
     /// v0.6.12 (L2): **the frozen prefix is immutable.** After a
@@ -917,7 +316,7 @@ proptest! {
     /// transitively): every other note's frozen rows stay.
     #[test]
     fn frozen_prefix_is_immutable(seed in any::<u64>()) {
-        frozen_prefix_body(seed);
+        frozen_prefix_is_immutable_body(seed)?;
     }
 }
 
@@ -3125,4 +2524,772 @@ fn quarantine_exits_body(seed: u64) {
         assert!(a.verify().unwrap(/* t */).ok(), "verify A");
         assert!(b.verify().unwrap(/* t */).ok(), "verify B");
     }
+}
+
+/// v0.6.14 (N3): the body of `format_round_trip` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn format_round_trip_body(seed: u64) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let note = (any_note())
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let text = note.serialize().unwrap(/* strategy keeps fields valid */);
+    let parsed = engramma_core::format::parse(&text, ParseMode::Strict).unwrap(/* serialized notes are valid */);
+    prop_assert_eq!(parsed.note, note.clone());
+    // stability: serialize(parse(serialize(x))) is a fixed point
+    let s1 = note.serialize().unwrap(/* as above */);
+    let parsed2 = engramma_core::format::parse(&s1, ParseMode::Strict).unwrap(/* as above */);
+    let s2 = parsed2.note.serialize().unwrap(/* as above */);
+    prop_assert_eq!(s1, s2);
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `replay_equals_state` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn replay_equals_state_body(seed: u64) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let seed = (any::<u64>())
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let dir = common::test_dir();
+    let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* test-only */);
+    run_random_ops(&cell, seed, ops_count(seed));
+    let report = cell.verify().unwrap(/* test-only */);
+    prop_assert!(report.ok(), "verify failed: {:?}", report.mismatch);
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `compaction_keeps_verify_and_state` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn compaction_keeps_verify_and_state_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let seed = (any::<u64>())
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let dir = common::test_dir();
+    let path = dir.path().join("c.sqlite");
+    let cell = Cell::create(&path, "p", "prop").unwrap(/* test-only */);
+    run_random_ops(&cell, seed, ops_count(seed));
+    // the full replay, before any compaction: verify compares it with
+    // the live state, and the digest of that state is the reference
+    let before = cell.verify().unwrap(/* test-only */);
+    prop_assert!(before.ok(), "pre-compaction verify: {:?}", before.mismatch);
+    let digest_before = cell.state_digest().unwrap(/* test-only */);
+    let head: i64 = cell
+        .debug_column("SELECT CAST(MAX(seq) AS TEXT) FROM ops")
+        .unwrap(/* test-only */)[0]
+        .parse()
+        .unwrap(/* test-only */);
+    // v0.6.8 (H2): the cut walks BELOW the head too (the JS binding
+    // cuts at `head - keepLast`; a shared cell at its frontier) —
+    // the head-only convention was the one ground the snapshot
+    // replay defect lived on
+    let cut = head - (seed % 3) as i64;
+    let snap = cell
+        .compact(cut, &engramma_core::cell::CompactOptions { keep_snapshot: true })
+        .unwrap(/* test-only */)
+        .snapshot
+        .unwrap(/* keep_snapshot always writes one */);
+    // v0.3.1 (P0.4): the snapshot is the LOGICAL state. Its recorded
+    // digest is its own — the payloads up to the cut are stripped from
+    // the file — and it must equal the live state's digest at the same
+    // head (the live cell forgot the very same payloads).
+    let recorded = cell
+        .debug_column(&format!(
+            "SELECT state_digest FROM snapshots WHERE seq = {cut}"
+        ))
+        .unwrap(/* test-only */);
+    let digest_after = cell.state_digest().unwrap(/* test-only */);
+    prop_assert_eq!(
+        recorded.first().map(String::as_str),
+        Some(digest_after.as_str())
+    );
+    let _ = digest_before; // the pre-compaction digest: replaced by the
+    // logical-state comparison above
+    prop_assert!(snap.is_file());
+    // more ops, then verify replays the tail on the snapshot
+    run_random_ops(&cell, seed.wrapping_mul(3) | 1, 8);
+    let report = cell.verify().unwrap(/* test-only */);
+    prop_assert!(
+        report.ok(),
+        "verify after compaction: {:?}",
+        report.mismatch
+    );
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `random_ops_compact_and_purge_leave_no_roots` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn random_ops_compact_and_purge_leave_no_roots_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let seed = (any::<u64>())
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let dir = common::test_dir();
+    let path = dir.path().join("dimenticare.sqlite");
+    let cell = Cell::create(&path, "p", "prop").unwrap(/* test-only */);
+    let mut s = seed | 1;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    // (id, every word its body ever carried)
+    let mut living: Vec<(ulid::Ulid, Vec<String>)> = Vec::new();
+    let mut purged_words: Vec<String> = Vec::new();
+    // The discriminating letters sit at the FRONT: an Italian stem can
+    // drop the tail of a word (verboae -> verboa), and a purged word's
+    // stem must never be a substring of a living word's text.
+    let word_of = |i: u16| {
+        format!(
+            "{}{}parola",
+            char::from(b'a' + (i / 26) as u8),
+            char::from(b'a' + (i % 26) as u8)
+        )
+    };
+    let note_of = |i: u16, word: &str| Note {
+        id: {
+            let mut id = format!("01P{}{:05}", seed % 100, i);
+            while id.len() < 26 {
+                id.push('0');
+            }
+            Ulid::from_string(&id).unwrap(/* test-only */)
+        },
+        note_type: NoteType::Fact,
+        title: None,
+        body: format!("{word} [[Roma]]"),
+        tags: vec![],
+        scope: None,
+        lang: Some(Lang::It),
+        source: "prop".into(),
+        confidence: Confidence::Stated,
+        status: Status::Active,
+        valid_from: None,
+        valid_to: None,
+        supersedes: vec![],
+        created_at: ts(1000),
+        updated_at: ts(1000),
+        extensions: vec![],
+    };
+    let draw = |pool: &[(ulid::Ulid, Vec<String>)], rnd: u64| {
+        if pool.is_empty() {
+            None
+        } else {
+            pool.get((rnd % pool.len() as u64) as usize)
+                .map(|(id, _)| *id)
+        }
+    };
+    for i in 0..40_u16 {
+        match next() % 7 {
+            0 | 1 => {
+                let w = word_of(i);
+                let mut note = note_of(i, &w);
+                // v0.6.7 (G4): one note in three is BORN in quarantine
+                // — the Homun import path — so the generator crosses
+                // the state transitions the old mix never touched
+                if next() % 3 == 0 {
+                    note.status = Status::Quarantined;
+                }
+                if cell.put_note(&note, "prop").is_ok() {
+                    living.push((note.id, vec![w]));
+                }
+            }
+            2 => {
+                // a purge: the note and every body it ever had go
+                if let Some(id) = draw(&living, next())
+                    && cell.get(&id).is_ok()
+                    && cell.purge(&id, "prop", "prop").is_ok()
+                {
+                    if let Some((_, words)) = living.iter().find(|(n, _)| n == &id) {
+                        purged_words.extend(words.iter().cloned());
+                    }
+                    living.retain(|(n, _)| n != &id);
+                }
+            }
+            3 => {
+                // a patch moves a living note to a fresh word
+                if let Some(id) = draw(&living, next()) {
+                    let w = word_of(200 + i);
+                    let patch = NotePatch {
+                        body: Some(format!("{w} [[Roma]]")),
+                        ..Default::default()
+                    };
+                    if cell.patch_note(&id, &patch, "prop").is_ok()
+                        && let Some(entry) = living.iter_mut().find(|(n, _)| n == &id)
+                    {
+                        entry.1.push(w);
+                    }
+                }
+            }
+            4 => {
+                // a supersede: the new note is the censor case when purged
+                if let Some(id) = draw(&living, next()) {
+                    let w = word_of(400 + i);
+                    let mut new = note_of(600 + i, &w);
+                    new.supersedes = vec![id];
+                    if cell.supersede(&id, &new, None, "prop").is_ok() {
+                        living.retain(|(n, _)| n != &id);
+                        living.push((new.id, vec![w]));
+                    }
+                }
+            }
+            5 => {
+                // v0.6.7 (G4): the state transitions, in BOTH
+                // directions — quarantine → active is the release the
+                // reviewer's G1 proof used, active → quarantine walks
+                // the hidden index the other way. Both take the row
+                // out of an FTS index with a `delete`, and the purge
+                // that follows must still forget the stems
+                if let Some(id) = draw(&living, next()) {
+                    let status = cell
+                        .debug_column(&format!("SELECT status FROM notes WHERE id = '{id}'"))
+                        .unwrap_or_default()
+                        .first()
+                        .cloned();
+                    let to = match status.as_deref() {
+                        Some("quarantined") => Status::Active,
+                        _ => Status::Quarantined,
+                    };
+                    let _ = cell.set_status(&id, to, "prop");
+                }
+            }
+            _ => {
+                // a compaction somewhere inside the run — v0.3.2 (P0.1):
+                // with or without the file, at random
+                let head: i64 = cell
+                    .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
+                    .unwrap_or_default()
+                    .first()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                if head >= 1 {
+                    let cut = (head - (next() % 3) as i64).max(1);
+                    let opts = engramma_core::cell::CompactOptions {
+                        keep_snapshot: next() % 2 == 0,
+                    };
+                    let _ = cell.compact(cut, &opts);
+                }
+            }
+        }
+    }
+    // a seed can draw the purge arm zero times: force one so every
+    // case really exercises the forgetting path
+    if purged_words.is_empty()
+        && let Some((id, words)) = living.first().cloned()
+        && cell.purge(&id, "prop", "prop").is_ok()
+    {
+        purged_words.extend(words);
+    }
+    prop_assert!(
+        !purged_words.is_empty(),
+        "the mix must purge something (seed {seed})"
+    );
+    let report = cell.verify().unwrap(/* test-only */);
+    prop_assert!(report.ok(), "verify: {:?}", report.mismatch);
+    drop(cell);
+    // no root of any purged word in the cell file, the WAL or any
+    // snapshot — the same needle rule as tests/forgetting.rs
+    let needles: Vec<String> = purged_words
+        .iter()
+        .flat_map(|w| {
+            let folded = engramma_core::text::strip_diacritics(&w.to_lowercase());
+            let stem = engramma_core::text::normalize(&folded, Some(Lang::It));
+            [folded, stem]
+        })
+        .collect();
+    let mut files: Vec<std::path::PathBuf> =
+        vec![path.clone(), dir.path().join("dimenticare.sqlite-wal")];
+    let mut snaps: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("dimenticare-snap-"))
+        })
+        .collect();
+    snaps.sort();
+    files.extend(snaps);
+    for f in files {
+        let raw = std::fs::read(&f).unwrap_or_default();
+        for n in &needles {
+            prop_assert!(
+                !raw.windows(n.len()).any(|w| w == n.as_bytes()),
+                "«{n}» sopravvive in {} (seed {seed})",
+                f.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `export_import_equality` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn export_import_equality_body(seed: u64) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let seed = (any::<u64>())
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let dir = common::test_dir();
+    let cell = Cell::create(&dir.path().join("c.sqlite"), "p", "prop").unwrap(/* test-only */);
+    run_random_ops(&cell, seed, ops_count(seed));
+    // close open-ended state: delete nothing, just export
+    let out = dir.path().join("exp");
+    export(&cell, &out).unwrap(/* test-only */);
+    let cell2 = Cell::create(&dir.path().join("c2.sqlite"), "p", "prop").unwrap(/* test-only */);
+    let summary = import_cell(&cell2, &out, "prop").unwrap(/* export folders import cleanly */);
+    prop_assert!(summary.errors.is_empty(), "{summary:?}");
+    // compare notes and edges
+    let dump = |c: &Cell, sql: &str| -> Vec<String> {
+        c.debug_column(sql).unwrap(/* test-only */)
+    };
+    // Notes compared field by field through the API; `updated_at` is
+    // excluded: importing a confirmed `external` note replays a `confirm`
+    // op, which stamps its own (import-time) `updated_at`.
+    let ids = dump(
+        &cell,
+        "SELECT id FROM notes WHERE status != 'deleted' ORDER BY id",
+    );
+    prop_assert_eq!(
+        ids.len(),
+        dump(&cell2, "SELECT id FROM notes WHERE status != 'deleted'").len()
+    );
+    for id in &ids {
+        let a = cell
+            .get(&Ulid::from_string(id).unwrap(/* from our own column */))
+            .unwrap(/* test-only */);
+        let b = cell2
+            .get(&Ulid::from_string(id).unwrap(/* from our own column */))
+            .unwrap(/* test-only */);
+        prop_assert_eq!(a.note_type, b.note_type);
+        prop_assert_eq!(a.title, b.title);
+        prop_assert_eq!(a.body, b.body);
+        prop_assert_eq!(a.tags, b.tags);
+        prop_assert_eq!(a.scope, b.scope);
+        prop_assert_eq!(a.lang, b.lang);
+        prop_assert_eq!(a.source, b.source);
+        prop_assert_eq!(a.confidence, b.confidence);
+        prop_assert_eq!(a.status, b.status);
+        prop_assert_eq!(a.valid_from, b.valid_from);
+        prop_assert_eq!(a.valid_to, b.valid_to);
+        prop_assert_eq!(a.supersedes, b.supersedes);
+        prop_assert_eq!(a.created_at, b.created_at);
+        prop_assert_eq!(a.extensions, b.extensions);
+    }
+    // Edges of living notes: tombstones stay out of the export, so their
+    // (deleted-status) edges are not part of the exported state.
+    let edge_sql = "SELECT e.id || e.src || e.rel || e.dst FROM edges e                         JOIN notes n ON e.note_id = n.id AND n.status != 'deleted'                         ORDER BY e.id";
+    let edges1 = dump(&cell, edge_sql);
+    let edges2 = dump(&cell2, edge_sql);
+    prop_assert_eq!(edges1, edges2);
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `hlc_monotonic` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn hlc_monotonic_body(seed: u64) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let clock_readings = (proptest::collection::vec(0u64..1_000_000, 1..100))
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let t = Arc::new(AtomicU64::new(0));
+    let tc = Arc::clone(&t);
+    let mut clock = HlcClock::new("n1", move || tc.load(Ordering::Relaxed));
+    let mut prev: Option<Hlc> = None;
+    for r in clock_readings {
+        t.store(r, Ordering::Relaxed);
+        let h = clock.tick();
+        if let Some(p) = prev {
+            prop_assert!(h > p, "hlc went backwards: {p:?} -> {h:?}");
+        }
+        prev = Some(h);
+    }
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `purge_with_conflict_copies_leaves_no_roots` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn purge_with_conflict_copies_leaves_no_roots_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let seed = (any::<u64>())
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    use common::{cell_with, shared_init, union};
+    use std::sync::atomic::Ordering;
+    let mut s = seed | 1;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let init = shared_init(&format!("oblio-copie/{seed}"));
+    let (a, wa) = cell_with("a");
+    let (b, wb) = cell_with("b");
+    for cell in [&a, &b] {
+        cell.ingest_op(&init).unwrap(/* t */);
+    }
+    let bword_of = |i: u16| {
+        format!(
+            "{}{}tonfo",
+            char::from(b'a' + (i / 26) as u8),
+            char::from(b'a' + (i % 26) as u8)
+        )
+    };
+    // every body word a note ever carried, and the words of the purged
+    let mut living: Vec<(ulid::Ulid, Vec<String>)> = Vec::new();
+    let mut purged_words: Vec<String> = Vec::new();
+    let mut reports: Vec<engramma_core::PurgeReport> = Vec::new();
+    let mut purged_with_copies = false;
+    let mut tick: u64 = 0;
+    let mut i: u16 = 0;
+    for _round in 0..48 {
+        i += 1;
+        let dev = next() % 2;
+        let (cell, wall) = if dev == 0 { (&a, &wa) } else { (&b, &wb) };
+        let pick = |pool: &[(ulid::Ulid, Vec<String>)], rnd: u64| {
+            pool.get((rnd % pool.len().max(1) as u64) as usize)
+                .map(|(id, _)| *id)
+        };
+        match next() % 8 {
+            0..=2 => {
+                // a body write: on a note this device holds, half the
+                // time without any sync first — the concurrent branch
+                let fresh = living.is_empty() || next() % 3 == 0;
+                let (id, w) = if fresh {
+                    let w = bword_of(i);
+                    let note = {
+                        let mut n = common::base_note(u32::from(i), &format!("{w} [[Roma]]"));
+                        if next() % 4 == 0 {
+                            n.status = Status::Quarantined;
+                        }
+                        n
+                    };
+                    tick += 1;
+                    wall.store(common::K + tick, Ordering::SeqCst);
+                    if cell.put_note(&note, "prop:user").is_ok() {
+                        living.push((note.id, vec![w.clone()]));
+                    }
+                    (note.id, w)
+                } else {
+                    let Some(id) = pick(&living, next()) else {
+                        continue;
+                    };
+                    let w = bword_of(400 + i);
+                    tick += 1;
+                    wall.store(common::K + tick, Ordering::SeqCst);
+                    let actor = if next() % 2 == 0 {
+                        "prop:user"
+                    } else {
+                        "prop:bot"
+                    };
+                    let patch = NotePatch {
+                        body: Some(format!("{w} [[Roma]]")),
+                        ..Default::default()
+                    };
+                    if cell.patch_note(&id, &patch, actor).is_ok()
+                        && let Some(entry) = living.iter_mut().find(|(n, _)| n == &id)
+                    {
+                        entry.1.push(w.clone());
+                    }
+                    (id, w)
+                };
+                let _ = id;
+                let _ = w;
+            }
+            3 => {
+                // a header-only patch: no conflict may come of it
+                if let Some(id) = pick(&living, next()) {
+                    tick += 1;
+                    wall.store(common::K + tick, Ordering::SeqCst);
+                    let _ = cell.patch_note(
+                        &id,
+                        &NotePatch {
+                            title: Some(Some(format!("il titolo {i}"))),
+                            ..Default::default()
+                        },
+                        "prop:user",
+                    );
+                }
+            }
+            4 => {
+                // the sync: everything flows both ways — and the
+                // session ACKS land like the real service writes
+                // them (v0.6.8, H2: the frontier is what the
+                // devices CONFIRMED, so a compaction between two
+                // syncs cuts below the head, the road the API walks)
+                for op in &union(&a, &b) {
+                    let _ = a.ingest_op(op);
+                    let _ = b.ingest_op(op);
+                }
+                let _ = a.mark_shared();
+                let _ = b.mark_shared();
+                let _ = a.record_session_ack("b000000000x");
+                let _ = b.record_session_ack("a000000000x");
+            }
+            5 => {
+                // a resolution of one conflict copy this device sees
+                if let Ok(list) = cell.conflicts()
+                    && let Some(first) = list.first()
+                {
+                    let keep = if next() % 2 == 0 {
+                        engramma_core::ResolveKeep::Original
+                    } else {
+                        engramma_core::ResolveKeep::Copy
+                    };
+                    tick += 1;
+                    wall.store(common::K + tick, Ordering::SeqCst);
+                    let _ = cell.resolve_conflict(&first.copy_id, keep, None, "prop:user");
+                }
+            }
+            6 => {
+                // a compaction, with or without the snapshot file —
+                // and the cut walks the TRUE roads (v0.6.8, H2): at
+                // the head sometimes, below it most of the time (the
+                // JS binding cuts at `head - keepLast`; a shared cell
+                // compacts at the stable frontier the acks built).
+                // The v0.6.7 convention — always the head — was the
+                // one ground the verify defect lived on (seed
+                // 9012498534905088620, declared open then, closed in
+                // this phase).
+                let head: i64 = cell
+                    .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")
+                    .unwrap_or_default()
+                    .first()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let cut = head - (next() % 3) as i64;
+                if cut >= 1 {
+                    let _ = cell.compact(
+                        cut,
+                        &engramma_core::cell::CompactOptions {
+                            keep_snapshot: next() % 2 == 0,
+                        },
+                    );
+                }
+            }
+            _ => {
+                // a purge — the note, its history and its copies go
+                if let Some(id) = pick(&living, next()) {
+                    let copies: i64 = cell
+                        .debug_column(&format!(
+                            "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies
+                             WHERE original_id = '{id}'"
+                        ))
+                        .unwrap_or_default()
+                        .first()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    tick += 1;
+                    wall.store(common::K + tick, Ordering::SeqCst);
+                    if let Ok(report) = cell.purge(&id, "prop", "prop:user") {
+                        if copies > 0 {
+                            purged_with_copies = true;
+                        }
+                        reports.push(report);
+                        if let Some((_, words)) = living.iter().find(|(n, _)| n == &id) {
+                            purged_words.extend(words.iter().cloned());
+                        }
+                        living.retain(|(n, _)| n != &id);
+                        // the purge travels: the other device takes it
+                        for op in &union(&a, &b) {
+                            let _ = a.ingest_op(op);
+                            let _ = b.ingest_op(op);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // a seed can go whole rounds without purging a note that HAD
+    // copies: force one, so every case really crosses the hole G3
+    // closed (the copy rows in the snapshot)
+    if !purged_with_copies {
+        // a real device purges what IT holds: the candidate must live
+        // on a (with its copies), or the minted purge would lean on a
+        // birds-eye knowledge no device has
+        let with_copies: Vec<ulid::Ulid> = living
+            .iter()
+            .filter(|(id, _)| {
+                a.get(id).is_ok()
+                    && a.debug_column(&format!(
+                        "SELECT CAST(COUNT(*) AS TEXT) FROM conflict_copies
+                         WHERE original_id = '{id}'"
+                    ))
+                    .unwrap_or_default()
+                    .first()
+                    .is_some_and(|n| n != "0")
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if let Some(id) = with_copies.first() {
+            if let Ok(report) = a.purge(id, "prop", "prop:user") {
+                reports.push(report);
+                if let Some((_, words)) = living.iter().find(|(n, _)| n == id) {
+                    purged_words.extend(words.iter().cloned());
+                }
+                living.retain(|(n, _)| n != id);
+                for op in &union(&a, &b) {
+                    let _ = a.ingest_op(op);
+                    let _ = b.ingest_op(op);
+                }
+            }
+        } else if let Some((id, words)) = living.iter().find(|(n, _)| a.get(n).is_ok()).cloned() {
+            tick += 1;
+            wa.store(common::K + tick, Ordering::SeqCst);
+            if let Ok(report) = a.purge(&id, "prop", "prop:user") {
+                reports.push(report);
+                purged_words.extend(words);
+            }
+            living.retain(|(n, _)| n != &id);
+            for op in &union(&a, &b) {
+                let _ = a.ingest_op(op);
+                let _ = b.ingest_op(op);
+            }
+        }
+    }
+    prop_assert!(
+        !purged_words.is_empty(),
+        "the mix must purge something (seed {seed})"
+    );
+    // `scrubbed: true` must be the truth — and here, with no reader
+    // open, every report must have said true
+    for r in &reports {
+        prop_assert!(r.scrubbed, "a purge with no readers said pending: {r:?}");
+    }
+    // the final settle: everything everywhere
+    for _ in 0..2 {
+        for op in &union(&a, &b) {
+            let _ = a.ingest_op(op);
+            let _ = b.ingest_op(op);
+        }
+    }
+    // NOTE (v0.6.8, H2's second layer — the spec's stop rule): the
+    // verify judging below this note is PARKED again, and the why is
+    // measured, not guessed. Walking the true roads (frontier cuts,
+    // cuts below the head), verify still diverges on notes whose
+    // out-of-order arrivals straddle the cut: the ANCHOR of the
+    // rematerialization — the pre-state snapshot a replay restarts
+    // from — keeps the state and the numbering of the cut it was
+    // written against, and no snapshot carries that history. Seeds
+    // 11476711120049502961 (the `version` counter) and
+    // 10840318560449401940 (a title) both bite; the copy-body layer
+    // of the same defect IS closed (seed 2864860944329123852, kept
+    // below as a regression seed). The property judges the OBLIVION,
+    // its mandate; the anchors' staleness stays OPEN in the REPORT
+    // with the diagnosis.
+    // The judge: no root of any purged body in ANY file of either
+    // device — the cells, the WALs, the snapshots
+    let needles: Vec<String> = purged_words
+        .iter()
+        .flat_map(|w| {
+            let folded = engramma_core::text::strip_diacritics(&w.to_lowercase());
+            let stem = engramma_core::text::normalize(&folded, Some(Lang::It));
+            [folded, stem]
+        })
+        .collect();
+    for cell in [&a, &b] {
+        let dir = cell
+            .file_path()
+            .parent()
+            .unwrap(/* our own cell */)
+            .to_path_buf();
+        let stem = cell
+            .file_path()
+            .file_stem()
+            .unwrap(/* our own cell */)
+            .to_string_lossy()
+            .to_string();
+        cell.retire().unwrap(/* t */);
+        let mut files: Vec<std::path::PathBuf> = vec![
+            dir.join(format!("{stem}.sqlite")),
+            dir.join(format!("{stem}.sqlite-wal")),
+        ];
+        let mut snaps: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&format!("{stem}-snap-")))
+            })
+            .collect();
+        snaps.sort();
+        files.extend(snaps);
+        for f in files {
+            let raw = std::fs::read(&f).unwrap_or_default();
+            for n in &needles {
+                prop_assert!(
+                    !raw.windows(n.len()).any(|w| w == n.as_bytes()),
+                    "«{n}» sopravvive in {} (seed {seed})",
+                    f.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `quarantine_exits_only_by_decision` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn quarantine_exits_only_by_decision_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let seed = (any::<u64>())
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    quarantine_exits_body(seed);
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `frozen_prefix_is_immutable` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn frozen_prefix_is_immutable_body(seed: u64) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let seed = (any::<u64>())
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    frozen_prefix_body(seed);
+    Ok(())
 }

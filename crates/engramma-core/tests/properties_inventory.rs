@@ -19,17 +19,46 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// One inventory line: `path-from-the-workspace-root property_name`.
-fn parse_inventory(text: &str) -> BTreeSet<(String, String)> {
+/// One inventory line, THREE columns (v0.6.14, N3): the test file from
+/// the workspace root, the property name, and the modules the property
+/// exercises (comma-separated paths from the root) — the map that says
+/// whether a property is TOUCHED. The third column is mandatory: a
+/// property without a map could never be judged touched, and would get
+/// the short budget for ever.
+fn parse_inventory_lines(text: &str) -> Vec<(String, String, Vec<String>)> {
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| {
-            let (path, name) = l
-                .split_once(' ')
+            let mut parts = l.split_whitespace();
+            let path = parts
+                .next()
                 .unwrap_or_else(|| panic!("riga d'inventario malformata: «{l}»"));
-            (path.to_string(), name.trim().to_string())
+            let name = parts
+                .next()
+                .unwrap_or_else(|| panic!("riga d'inventario senza proprietà: «{l}»"));
+            let modules = parts.next().unwrap_or_else(|| {
+                panic!(
+                    "la proprietà «{path} {name}» non ha la mappa dei moduli (terza \
+                         colonna di properties.txt, v0.6.14 N3)"
+                )
+            });
+            let modules: Vec<String> = modules
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+                .collect();
+            (path.to_string(), name.to_string(), modules)
         })
+        .collect()
+}
+
+/// The inventory as the two sets the gates compare: `(path, name)`.
+fn parse_inventory(text: &str) -> BTreeSet<(String, String)> {
+    parse_inventory_lines(text)
+        .into_iter()
+        .map(|(path, name, _)| (path, name))
         .collect()
 }
 
@@ -77,6 +106,9 @@ fn test_sources(root: &Path) -> Vec<PathBuf> {
 /// The properties one source file declares: every `fn` inside a
 /// `proptest! { … }` block, blocks found by brace counting.
 fn properties_of(src: &str) -> Vec<String> {
+    without_test_attribute(src).into_iter().for_each(|name| {
+        panic!("la proprietà `{name}` non ha `#[test]`: non è un test, non gira mai")
+    });
     let mut found = Vec::new();
     // the FLOOR of each open proptest! block: the depth the line after
     // its opening brace sits at. A line is inside the block while its
@@ -115,6 +147,45 @@ fn properties_of(src: &str) -> Vec<String> {
     found
 }
 
+/// v0.6.14 (N3): every property of a `proptest!` block carries `#[test]`
+/// — the attribute that makes it a test. Without it the block mints a
+/// plain function nobody calls, `cargo test` skips it in silence, and a
+/// hunt records it green on zero cases: `export_import_equality` lost its
+/// attribute on the 7th of November (`59092a6`, the attribute glued to
+/// the end of a doc line) and `ports_matter_except_on_loopback_http`
+/// never had one — nine phases of green on nothing. The attribute must
+/// sit on its own line right above the `fn`, doc comments excluded.
+fn without_test_attribute(src: &str) -> Vec<String> {
+    let mut offenders = Vec::new();
+    let mut floors: Vec<usize> = Vec::new();
+    let mut depth = 0_usize;
+    let mut previous = String::new();
+    for line in src.lines() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        if line.contains("proptest!") && line.contains('{') {
+            floors.push(depth + line.matches('{').count() - line.matches('}').count());
+        }
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("fn ")
+            && let Some(name) = rest.split(['(', ':']).next()
+        {
+            let name = name.trim();
+            if !name.is_empty()
+                && floors.iter().any(|&f| depth >= f)
+                && previous.trim() != "#[test]"
+            {
+                offenders.push(name.to_string());
+            }
+        }
+        depth = (depth + line.matches('{').count()).saturating_sub(line.matches('}').count());
+        floors.retain(|&f| depth >= f);
+        previous = line.to_string();
+    }
+    offenders
+}
+
 #[test]
 fn properties_inventory() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -145,6 +216,45 @@ fn properties_inventory() {
     assert!(
         missing_from_inventory.is_empty() && missing_from_sources.is_empty(),
         "l'inventario delle proprietà non torna:\n  nei sorgenti ma NON nell'inventario (aggiungi la riga, o è una proprietà che il parser non vede — dichiara il limite): {missing_from_inventory:?}\n  nell'inventario ma NON nei sorgenti (la proprietà è stata tolta? v0.6.6, F2): {missing_from_sources:?}"
+    );
+}
+
+/// v0.6.14 (N3): every property has its module map, and every path of
+/// the map exists — the hunt reads this map to tell a TOUCHED property
+/// (a module it exercises changed since the phase's base, or its own
+/// test file), and a dead path would make a property look untouched for
+/// ever while the code it judges moves under it.
+#[test]
+fn every_property_has_its_module_map() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest
+        .ancestors()
+        .nth(2)
+        .expect(/* test-only */ "the workspace root");
+    let inventory_text = std::fs::read_to_string(manifest.join("tests/properties.txt"))
+        .expect(/* test-only */ "properties.txt");
+    let mut missing: Vec<String> = Vec::new();
+    for (path, name, modules) in parse_inventory_lines(&inventory_text) {
+        if modules.is_empty() {
+            missing.push(format!(
+                "«{path} {name}»: la mappa dei moduli è vuota (terza colonna di properties.txt)"
+            ));
+        }
+        // the test file IS the property's oracle: it belongs to the map
+        if !root.join(&path).is_file() {
+            missing.push(format!("«{path} {name}»: il file del test non esiste"));
+        }
+        for m in &modules {
+            if !root.join(m).is_file() {
+                missing.push(format!(
+                    "«{path} {name}»: la mappa nomina «{m}», che non esiste"
+                ));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "la mappa proprietà → moduli non torna: {missing:#?}"
     );
 }
 

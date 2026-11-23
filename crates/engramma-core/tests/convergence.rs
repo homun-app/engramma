@@ -24,6 +24,29 @@ use common::{
     shown_body_hash_of,
 };
 use engramma_core::cell::conflicts::ActorClass;
+// v0.6.14 (N3): `current` is a trait method of the value trees
+use proptest::strategy::ValueTree as _;
+
+/// v0.6.14 (N3): a runner seeded by the property's OWN seed. The body of
+/// every property takes that one seed and derives its inputs from it
+/// through the same strategies the property always drew — so a failing
+/// seed replays in ONE case (`scripts/seme-sul-tag.sh <proprietà> <seme>
+/// <tag>`), on any tree that holds the body.
+fn seeded_runner(seed: u64) -> proptest::test_runner::TestRunner {
+    // ChaCha (the default) wants a 32-byte seed: the u64 is laid four times
+    let block = seed.to_le_bytes();
+    let mut bytes = [0_u8; 32];
+    for k in 0..4 {
+        bytes[k * 8..k * 8 + 8].copy_from_slice(&block);
+    }
+    proptest::test_runner::TestRunner::new_with_rng(
+        proptest::test_runner::Config::default(),
+        proptest::test_runner::TestRng::from_seed(
+            proptest::test_runner::RngAlgorithm::default(),
+            &bytes,
+        ),
+    )
+}
 
 fn now() -> At {
     At(OffsetDateTime::from_unix_timestamp(1_810_000_000).unwrap(/* fixed */))
@@ -1112,57 +1135,8 @@ impl Fleet {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
     #[test]
-    fn the_fleet_converges(
-        seed in any::<u64>(),
-        devices in 2_u32..=4,
-        rounds in 12_u32..=28,
-    ) {
-        let fleet = fleet_run(seed, devices, rounds);
-        // every copy holds the same replicated state…
-        let digests: Vec<String> = fleet
-            .cells
-            .iter()
-            .map(|c| c.replicated_digest().unwrap(/* test-only */))
-            .collect();
-        let first = digests[0].clone();
-        if !digests.iter().all(|d| *d == first) {
-            eprintln!("CASE-FLEET seed {seed} devices {devices} rounds {rounds}");
-        }
-        prop_assert!(
-            digests.iter().all(|d| *d == first),
-            "the fleet did not converge: {digests:?}"
-        );
-        // …and the same state as a copy that received everything in total
-        // order
-        let mut union: std::collections::BTreeMap<String, Op> = std::collections::BTreeMap::new();
-        for cell in &fleet.cells {
-            for op in cell.ops().unwrap(/* test-only */) {
-                union.insert(op.op_id.to_string(), op);
-            }
-        }
-        let mut by_total: Vec<Op> = union.into_values().collect();
-        by_total.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
-        // the reference shares the fleet's frozen clock: the drift cap
-        // reads the INJECTED wall, and a bare copy would read the real one
-        // (the fleet base is months ahead of it)
-        let reference = {
-            let dir = common::test_dir();
-            let cell = Cell::open_bare(&dir.path().join("ref.sqlite")).unwrap(/* test-only */);
-            cell.inject_clock(engramma_core::hlc::HlcClock::new("ref00000000x", || FLEET_BASE_MS))
-                .unwrap(/* test-only */);
-            for op in &by_total {
-                cell.ingest_op(op).unwrap(/* test-only */);
-            }
-            Kept { cell, _dir: dir }
-        };
-        prop_assert_eq!(
-            reference.replicated_digest().unwrap(/* test-only */),
-            first,
-            "the total-order reference disagrees with the fleet"
-        );
-        // one copy's own log still verifies against its own replay
-        let vr = fleet.cells[0].verify().unwrap(/* test-only */);
-        prop_assert!(vr.ok(), "a converged copy fails verify: {vr:?}");
+    fn the_fleet_converges(seed in any::<u64>()) {
+        the_fleet_converges_body(seed)?;
     }
 }
 
@@ -1674,28 +1648,8 @@ fn a_local_write_rederives_the_conflict_set() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
     #[test]
-    fn every_copy_equals_its_reconstruction(
-        seed in any::<u64>(),
-        devices in 2_u32..=4,
-        rounds in 12_u32..=28,
-    ) {
-        let fleet = fleet_run(seed, devices, rounds);
-        for cell in &fleet.cells {
-            let live = cell.replicated_digest().unwrap(/* test-only */);
-            let (rebuilt, rebuilt_dump) = cell.rematerialize_for_test().unwrap(/* test-only */);
-            if live != rebuilt {
-                eprintln!(
-                    "CASE seed {seed} devices {devices} rounds {rounds}"
-                );
-            }
-            prop_assert_eq!(
-                live, rebuilt,
-                "the incremental state diverged from the reconstruction\n\
-                 --- live ---\n{}\n--- rebuilt ---\n{}",
-                cell.replicated_dump().unwrap(/* test-only */),
-                rebuilt_dump
-            );
-        }
+    fn every_copy_equals_its_reconstruction(seed in any::<u64>()) {
+        every_copy_equals_its_reconstruction_body(seed)?;
     }
 }
 
@@ -1862,36 +1816,8 @@ fn concurrent_creates_case(authors: u32) {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
     #[test]
-    fn no_body_text_is_lost(
-        seed in any::<u64>(),
-        devices in 2_u32..=4,
-        rounds in 12_u32..=28,
-    ) {
-        let mut runner = FleetRunner::new(seed, devices);
-        let mut saved: Vec<std::collections::HashSet<String>> =
-            runner.fleet.cells.iter().map(|_| std::collections::HashSet::new()).collect();
-        for r in 0..rounds {
-            runner.one_round();
-            let cell_refs: Vec<&Cell> = runner.fleet.cells.iter().collect();
-            if let Err(why) = judge_no_text_lost(
-                &cell_refs,
-                &runner.fleet.model,
-                &mut saved,
-                &format!("seed {seed} dev {devices} rounds {rounds} r{r}"),
-            ) {
-                prop_assert!(false, "{why}");
-            }
-        }
-        runner.finish();
-        let cell_refs: Vec<&Cell> = runner.fleet.cells.iter().collect();
-        if let Err(why) = judge_no_text_lost(
-            &cell_refs,
-            &runner.fleet.model,
-            &mut saved,
-            &format!("seed {seed} dev {devices} rounds {rounds} tail"),
-        ) {
-            prop_assert!(false, "{why}");
-        }
+    fn no_body_text_is_lost(seed in any::<u64>()) {
+        no_body_text_is_lost_body(seed)?;
     }
 }
 
@@ -1989,138 +1915,8 @@ fn lapide_active(cell: &Cell, original: &Ulid) -> bool {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
     #[test]
-    fn no_copy_closes_without_a_witness(
-        seed in any::<u64>(),
-        devices in 2_u32..=4,
-        rounds in 12_u32..=28,
-    ) {
-        let mut runner = FleetRunner::new(seed, devices);
-        let mut prev: Vec<Vec<(Ulid, Ulid, Ulid)>> =
-            runner.fleet.cells.iter().map(open_copies_with_loser).collect();
-        // v0.6.5 (E2): the reopen ledger — for every copy that closed,
-        // whether its close had a WITNESS and whether the set still
-        // DESERVED it. A copy open at round r+1 that was closed at r is
-        // a failure unless it closed undeserved (the winner-following
-        // rebirth: the filters and the winner's ancestry are the one
-        // closure and reopening that follow the winner — DESIGN § 4.3).
-        // A WITNESSED close never reopens: the witness is an existence,
-        // and with E2's fork it is monotone in the set.
-        let mut closed_at: Vec<std::collections::HashMap<Ulid, (bool, bool)>> =
-            runner.fleet.cells.iter().map(|_| std::collections::HashMap::new()).collect();
-        for _ in 0..rounds {
-            runner.one_round();
-            let now: Vec<Vec<(Ulid, Ulid, Ulid)>> =
-                runner.fleet.cells.iter().map(open_copies_with_loser).collect();
-            for (dev, (was, is)) in prev.iter().zip(&now).enumerate() {
-                let held: std::collections::HashSet<Ulid> =
-                    is.iter().map(|(c, _, _)| *c).collect();
-                for (copy, original, loser) in was {
-                    if held.contains(copy) {
-                        continue;
-                    }
-                    // admitted without a D1.6 witness: the purge and the
-                    // lapide (their own rules), and a set that no longer
-                    // DESERVES the copy (a graph an out-of-order arrival
-                    // completed made the loser the winner, or an ancestor
-                    // of it — the text lives in the note itself).
-                    // v0.6.8 (H4): the witness is the REFERENCE's word —
-                    // the rule of DESIGN § 4.3 written from scratch in
-                    // `common`, its diff3 is diffy's — and the engine must
-                    // AGREE with it: a disagreement fails here, with the
-                    // case, before any monotonicity is judged
-                    let witnessed = common::reference_witness(
-                        &runner.fleet.cells[dev],
-                        original,
-                        &loser.to_string(),
-                    )
-                    .unwrap_or(false);
-                    let engine = runner.fleet.cells[dev]
-                        .conflict_witness_for_test(original, loser)
-                        .unwrap_or(false);
-                    prop_assert!(
-                        witnessed == engine,
-                        "seed {seed}: copy {copy} — the engine and the reference \
-                         disagree on the witness (engine {engine}, reference {witnessed})"
-                    );
-                    let deserved = runner.fleet.cells[dev]
-                        .conflict_deserved_for_test(original, loser)
-                        .unwrap_or(true);
-                    prop_assert!(
-                        witnessed
-                            || original_purged(&runner.fleet.cells[dev], original)
-                            || lapide_active(&runner.fleet.cells[dev], original)
-                            || !deserved,
-                        "seed {seed}: copy {copy} closed without a witness"
-                    );
-                    closed_at[dev].insert(*copy, (witnessed, deserved));
-                }
-                // absent → present (v0.6.5, E2): a closed copy that is
-                // open again — only a winner-following rebirth may come
-                // back; a witnessed close never does. v0.6.7 (G2): the
-                // v0.6.6 lapide exception is GONE from this direction.
-                // The witness no longer depends on the lapide — a write
-                // the lapide beat still attests what its author saw — so
-                // a set can only grow into having a witness, never out
-                // of one: the rebirth the exception used to absolve (the
-                // hunt of v0.6.6, seed 3753902730771729170) is a defect
-                // now, and the copies of a deleted note are the bin's
-                // hidden contents anyway. The close direction keeps its
-                // own lapide clause (the lapide as dominance, the
-                // v0.6.5 rule).
-                for (copy, _original, _) in is {
-                    if let Some((witnessed_close, deserved_close)) =
-                        closed_at[dev].remove(copy)
-                    {
-                        prop_assert!(
-                            !witnessed_close && !deserved_close,
-                            "seed {seed}: copy {copy} reopened — it closed \
-                             witnessed ({witnessed_close}) or deserved ({deserved_close})"
-                        );
-                    }
-                }
-            }
-            prev = now;
-        }
-        // the tail (propose, decide, maybe purge, settles) closes copies
-        // too — the purge by its own dominance, the rest by witness
-        runner.finish();
-        let now: Vec<Vec<(Ulid, Ulid, Ulid)>> =
-            runner.fleet.cells.iter().map(open_copies_with_loser).collect();
-        for (dev, (was, is)) in prev.iter().zip(&now).enumerate() {
-            let held: std::collections::HashSet<Ulid> =
-                is.iter().map(|(c, _, _)| *c).collect();
-            for (copy, original, loser) in was {
-                if held.contains(copy) {
-                    continue;
-                }
-                // v0.6.8 (H4): the reference judges the tail too, and the
-                // engine must agree with it
-                let witnessed = common::reference_witness(
-                    &runner.fleet.cells[dev],
-                    original,
-                    &loser.to_string(),
-                )
-                .unwrap_or(false);
-                let engine = runner.fleet.cells[dev]
-                    .conflict_witness_for_test(original, loser)
-                    .unwrap_or(false);
-                prop_assert!(
-                    witnessed == engine,
-                    "seed {seed}: copy {copy} — the engine and the reference \
-                     disagree on the witness in the tail (engine {engine}, reference {witnessed})"
-                );
-                prop_assert!(
-                    witnessed
-                        || original_purged(&runner.fleet.cells[dev], original)
-                        || original_row_gone(&runner.fleet.cells[dev], original)
-                        || lapide_active(&runner.fleet.cells[dev], original)
-                        || !runner.fleet.cells[dev]
-                            .conflict_deserved_for_test(original, loser)
-                            .unwrap_or(true),
-                    "seed {seed}: copy {copy} closed in the tail without a witness"
-                );
-            }
-        }
+    fn no_copy_closes_without_a_witness(seed in any::<u64>()) {
+        no_copy_closes_without_a_witness_body(seed)?;
     }
 }
 
@@ -2227,4 +2023,287 @@ fn generator_frequencies_1000_fleets() {
         "E4/1000 flotte: ritocchi R4 (titolo sopra una scrittura non ancora sincronizzata) {r4_bursts}, \
          di cui il corpo ha perso {r4_lost}, scritture d'agente su corpo umano (R1) {r1_followups}"
     );
+}
+
+/// v0.6.14 (N3): the body of `the_fleet_converges` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn the_fleet_converges_body(seed: u64) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let (seed, devices, rounds) = ((any::<u64>()), (2_u32..=4), (12_u32..=28))
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let fleet = fleet_run(seed, devices, rounds);
+    // every copy holds the same replicated state…
+    let digests: Vec<String> = fleet
+        .cells
+        .iter()
+        .map(|c| c.replicated_digest().unwrap(/* test-only */))
+        .collect();
+    let first = digests[0].clone();
+    if !digests.iter().all(|d| *d == first) {
+        eprintln!("CASE-FLEET seed {seed} devices {devices} rounds {rounds}");
+    }
+    prop_assert!(
+        digests.iter().all(|d| *d == first),
+        "the fleet did not converge: {digests:?}"
+    );
+    // …and the same state as a copy that received everything in total
+    // order
+    let mut union: std::collections::BTreeMap<String, Op> = std::collections::BTreeMap::new();
+    for cell in &fleet.cells {
+        for op in cell.ops().unwrap(/* test-only */) {
+            union.insert(op.op_id.to_string(), op);
+        }
+    }
+    let mut by_total: Vec<Op> = union.into_values().collect();
+    by_total.sort_by(|p, q| p.hlc.cmp(&q.hlc).then(p.op_id.cmp(&q.op_id)));
+    // the reference shares the fleet's frozen clock: the drift cap
+    // reads the INJECTED wall, and a bare copy would read the real one
+    // (the fleet base is months ahead of it)
+    let reference = {
+        let dir = common::test_dir();
+        let cell = Cell::open_bare(&dir.path().join("ref.sqlite")).unwrap(/* test-only */);
+        cell.inject_clock(engramma_core::hlc::HlcClock::new("ref00000000x", || FLEET_BASE_MS))
+            .unwrap(/* test-only */);
+        for op in &by_total {
+            cell.ingest_op(op).unwrap(/* test-only */);
+        }
+        Kept { cell, _dir: dir }
+    };
+    prop_assert_eq!(
+        reference.replicated_digest().unwrap(/* test-only */),
+        first,
+        "the total-order reference disagrees with the fleet"
+    );
+    // one copy's own log still verifies against its own replay
+    let vr = fleet.cells[0].verify().unwrap(/* test-only */);
+    prop_assert!(vr.ok(), "a converged copy fails verify: {vr:?}");
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `every_copy_equals_its_reconstruction` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn every_copy_equals_its_reconstruction_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let (seed, devices, rounds) = ((any::<u64>()), (2_u32..=4), (12_u32..=28))
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let fleet = fleet_run(seed, devices, rounds);
+    for cell in &fleet.cells {
+        let live = cell.replicated_digest().unwrap(/* test-only */);
+        let (rebuilt, rebuilt_dump) = cell.rematerialize_for_test().unwrap(/* test-only */);
+        if live != rebuilt {
+            eprintln!("CASE seed {seed} devices {devices} rounds {rounds}");
+        }
+        prop_assert_eq!(
+            live,
+            rebuilt,
+            "the incremental state diverged from the reconstruction\n\
+             --- live ---\n{}\n--- rebuilt ---\n{}",
+            cell.replicated_dump().unwrap(/* test-only */),
+            rebuilt_dump
+        );
+    }
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `no_body_text_is_lost` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn no_body_text_is_lost_body(seed: u64) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let (seed, devices, rounds) = ((any::<u64>()), (2_u32..=4), (12_u32..=28))
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let mut runner = FleetRunner::new(seed, devices);
+    let mut saved: Vec<std::collections::HashSet<String>> = runner
+        .fleet
+        .cells
+        .iter()
+        .map(|_| std::collections::HashSet::new())
+        .collect();
+    for r in 0..rounds {
+        runner.one_round();
+        let cell_refs: Vec<&Cell> = runner.fleet.cells.iter().collect();
+        if let Err(why) = judge_no_text_lost(
+            &cell_refs,
+            &runner.fleet.model,
+            &mut saved,
+            &format!("seed {seed} dev {devices} rounds {rounds} r{r}"),
+        ) {
+            prop_assert!(false, "{why}");
+        }
+    }
+    runner.finish();
+    let cell_refs: Vec<&Cell> = runner.fleet.cells.iter().collect();
+    if let Err(why) = judge_no_text_lost(
+        &cell_refs,
+        &runner.fleet.model,
+        &mut saved,
+        &format!("seed {seed} dev {devices} rounds {rounds} tail"),
+    ) {
+        prop_assert!(false, "{why}");
+    };
+    Ok(())
+}
+
+/// v0.6.14 (N3): the body of `no_copy_closes_without_a_witness` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn no_copy_closes_without_a_witness_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let (seed, devices, rounds) = ((any::<u64>()), (2_u32..=4), (12_u32..=28))
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let mut runner = FleetRunner::new(seed, devices);
+    let mut prev: Vec<Vec<(Ulid, Ulid, Ulid)>> = runner
+        .fleet
+        .cells
+        .iter()
+        .map(open_copies_with_loser)
+        .collect();
+    // v0.6.5 (E2): the reopen ledger — for every copy that closed,
+    // whether its close had a WITNESS and whether the set still
+    // DESERVED it. A copy open at round r+1 that was closed at r is
+    // a failure unless it closed undeserved (the winner-following
+    // rebirth: the filters and the winner's ancestry are the one
+    // closure and reopening that follow the winner — DESIGN § 4.3).
+    // A WITNESSED close never reopens: the witness is an existence,
+    // and with E2's fork it is monotone in the set.
+    let mut closed_at: Vec<std::collections::HashMap<Ulid, (bool, bool)>> = runner
+        .fleet
+        .cells
+        .iter()
+        .map(|_| std::collections::HashMap::new())
+        .collect();
+    for _ in 0..rounds {
+        runner.one_round();
+        let now: Vec<Vec<(Ulid, Ulid, Ulid)>> = runner
+            .fleet
+            .cells
+            .iter()
+            .map(open_copies_with_loser)
+            .collect();
+        for (dev, (was, is)) in prev.iter().zip(&now).enumerate() {
+            let held: std::collections::HashSet<Ulid> = is.iter().map(|(c, _, _)| *c).collect();
+            for (copy, original, loser) in was {
+                if held.contains(copy) {
+                    continue;
+                }
+                // admitted without a D1.6 witness: the purge and the
+                // lapide (their own rules), and a set that no longer
+                // DESERVES the copy (a graph an out-of-order arrival
+                // completed made the loser the winner, or an ancestor
+                // of it — the text lives in the note itself).
+                // v0.6.8 (H4): the witness is the REFERENCE's word —
+                // the rule of DESIGN § 4.3 written from scratch in
+                // `common`, its diff3 is diffy's — and the engine must
+                // AGREE with it: a disagreement fails here, with the
+                // case, before any monotonicity is judged
+                let witnessed = common::reference_witness(
+                    &runner.fleet.cells[dev],
+                    original,
+                    &loser.to_string(),
+                )
+                .unwrap_or(false);
+                let engine = runner.fleet.cells[dev]
+                    .conflict_witness_for_test(original, loser)
+                    .unwrap_or(false);
+                prop_assert!(
+                    witnessed == engine,
+                    "seed {seed}: copy {copy} — the engine and the reference \
+                     disagree on the witness (engine {engine}, reference {witnessed})"
+                );
+                let deserved = runner.fleet.cells[dev]
+                    .conflict_deserved_for_test(original, loser)
+                    .unwrap_or(true);
+                prop_assert!(
+                    witnessed
+                        || original_purged(&runner.fleet.cells[dev], original)
+                        || lapide_active(&runner.fleet.cells[dev], original)
+                        || !deserved,
+                    "seed {seed}: copy {copy} closed without a witness"
+                );
+                closed_at[dev].insert(*copy, (witnessed, deserved));
+            }
+            // absent → present (v0.6.5, E2): a closed copy that is
+            // open again — only a winner-following rebirth may come
+            // back; a witnessed close never does. v0.6.7 (G2): the
+            // v0.6.6 lapide exception is GONE from this direction.
+            // The witness no longer depends on the lapide — a write
+            // the lapide beat still attests what its author saw — so
+            // a set can only grow into having a witness, never out
+            // of one: the rebirth the exception used to absolve (the
+            // hunt of v0.6.6, seed 3753902730771729170) is a defect
+            // now, and the copies of a deleted note are the bin's
+            // hidden contents anyway. The close direction keeps its
+            // own lapide clause (the lapide as dominance, the
+            // v0.6.5 rule).
+            for (copy, _original, _) in is {
+                if let Some((witnessed_close, deserved_close)) = closed_at[dev].remove(copy) {
+                    prop_assert!(
+                        !witnessed_close && !deserved_close,
+                        "seed {seed}: copy {copy} reopened — it closed \
+                         witnessed ({witnessed_close}) or deserved ({deserved_close})"
+                    );
+                }
+            }
+        }
+        prev = now;
+    }
+    // the tail (propose, decide, maybe purge, settles) closes copies
+    // too — the purge by its own dominance, the rest by witness
+    runner.finish();
+    let now: Vec<Vec<(Ulid, Ulid, Ulid)>> = runner
+        .fleet
+        .cells
+        .iter()
+        .map(open_copies_with_loser)
+        .collect();
+    for (dev, (was, is)) in prev.iter().zip(&now).enumerate() {
+        let held: std::collections::HashSet<Ulid> = is.iter().map(|(c, _, _)| *c).collect();
+        for (copy, original, loser) in was {
+            if held.contains(copy) {
+                continue;
+            }
+            // v0.6.8 (H4): the reference judges the tail too, and the
+            // engine must agree with it
+            let witnessed =
+                common::reference_witness(&runner.fleet.cells[dev], original, &loser.to_string())
+                    .unwrap_or(false);
+            let engine = runner.fleet.cells[dev]
+                .conflict_witness_for_test(original, loser)
+                .unwrap_or(false);
+            prop_assert!(
+                witnessed == engine,
+                "seed {seed}: copy {copy} — the engine and the reference \
+                 disagree on the witness in the tail (engine {engine}, reference {witnessed})"
+            );
+            prop_assert!(
+                witnessed
+                    || original_purged(&runner.fleet.cells[dev], original)
+                    || original_row_gone(&runner.fleet.cells[dev], original)
+                    || lapide_active(&runner.fleet.cells[dev], original)
+                    || !runner.fleet.cells[dev]
+                        .conflict_deserved_for_test(original, loser)
+                        .unwrap_or(true),
+                "seed {seed}: copy {copy} closed in the tail without a witness"
+            );
+        }
+    }
+    Ok(())
 }

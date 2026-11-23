@@ -15,6 +15,29 @@ use engramma_core::{Cell, Confidence, NotePatch, Status};
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use ulid::Ulid;
+// v0.6.14 (N3): `current` is a trait method of the value trees
+use proptest::strategy::ValueTree as _;
+
+/// v0.6.14 (N3): a runner seeded by the property's OWN seed. The body of
+/// every property takes that one seed and derives its inputs from it
+/// through the same strategies the property always drew — so a failing
+/// seed replays in ONE case (`scripts/seme-sul-tag.sh <proprietà> <seme>
+/// <tag>`), on any tree that holds the body.
+fn seeded_runner(seed: u64) -> proptest::test_runner::TestRunner {
+    // ChaCha (the default) wants a 32-byte seed: the u64 is laid four times
+    let block = seed.to_le_bytes();
+    let mut bytes = [0_u8; 32];
+    for k in 0..4 {
+        bytes[k * 8..k * 8 + 8].copy_from_slice(&block);
+    }
+    proptest::test_runner::TestRunner::new_with_rng(
+        proptest::test_runner::Config::default(),
+        proptest::test_runner::TestRng::from_seed(
+            proptest::test_runner::RngAlgorithm::default(),
+            &bytes,
+        ),
+    )
+}
 
 fn now() -> At {
     At(OffsetDateTime::from_unix_timestamp(1_810_000_000).unwrap(/* fixed */))
@@ -474,128 +497,142 @@ proptest! {
     /// purge, censorship and compaction never move the identity, on any
     /// generated history and any generated cut.
     #[test]
-    fn the_identity_never_moves_on_generated_histories(
-        steps in prop::collection::vec(step_strategy(), 1..24),
-        bodies in prop::collection::vec(body(), 1..24),
-        cut in 0.0f64..1.0,
-    ) {
-        let dir = test_dir();
-        let cell = Cell::create(&dir.path().join("g.sqlite"), "gen", "device-a")
-            .unwrap(/* t */);
-        cell.set_signer(std::sync::Arc::new(FakeSigner {
-            device: "fakesigningdevice".into(),
-            key: [11; 32],
-        }))
+    fn the_identity_never_moves_on_generated_histories(seed in any::<u64>()) {
+        the_identity_never_moves_on_generated_histories_body(seed)?;
+    }
+}
+
+/// v0.6.14 (N3): the body of `the_identity_never_moves_on_generated_histories` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn the_identity_never_moves_on_generated_histories_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let (steps, bodies, cut) = (
+        (prop::collection::vec(step_strategy(), 1..24)),
+        (prop::collection::vec(body(), 1..24)),
+        (0.0f64..1.0),
+    )
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let dir = test_dir();
+    let cell = Cell::create(&dir.path().join("g.sqlite"), "gen", "device-a")
+        .unwrap(/* t */);
+    cell.set_signer(std::sync::Arc::new(FakeSigner {
+        device: "fakesigningdevice".into(),
+        key: [11; 32],
+    }))
+    .unwrap(/* t */);
+
+    // run the generated history: impossible steps (a patch of a note
+    // that is not there) are skipped — the history is what DID happen
+    let mut living: Vec<Ulid> = Vec::new();
+    let mut next_id = 100_u32;
+    for (i, step) in steps.iter().enumerate() {
+        let text = bodies[i % bodies.len()].clone();
+        let pick = |living: &[Ulid], i: usize| living[i % living.len()];
+        match step {
+            Step::Put => {
+                let n = note(next_id, &text);
+                next_id += 1;
+                if cell.put_note(&n, "device-a").is_ok() {
+                    living.push(n.id);
+                }
+            }
+            Step::Patch(k) => {
+                if !living.is_empty() {
+                    let _ = cell.patch_note(
+                        &pick(&living, *k as usize),
+                        &NotePatch {
+                            body: Some(text),
+                            ..Default::default()
+                        },
+                        "device-a",
+                    );
+                }
+            }
+            Step::Delete(k) => {
+                if !living.is_empty() {
+                    let _ = cell.delete_note(&pick(&living, *k as usize), "device-a");
+                }
+            }
+            Step::Supersede(k) => {
+                if !living.is_empty() {
+                    let old = pick(&living, *k as usize);
+                    let mut new = note(next_id, &text);
+                    next_id += 1;
+                    new.supersedes = vec![old];
+                    if cell.supersede(&old, &new, None, "device-a").is_ok() {
+                        living.retain(|id| *id != old);
+                        living.push(new.id);
+                    }
+                }
+            }
+            Step::Purge(k) => {
+                if !living.is_empty() {
+                    let id = pick(&living, *k as usize);
+                    if cell.purge(&id, "oblio", "device-a").is_ok() {
+                        living.retain(|x| *x != id);
+                    }
+                }
+            }
+        }
+    }
+
+    // the identities at the cut: content_hash, sig AND payload digest
+    let before: BTreeMap<String, (String, Option<String>, String)> = cell
+        .ops()
+        .unwrap(/* t */)
+        .into_iter()
+        .map(|o| {
+            (
+                o.op_id.to_string(),
+                (o.content_hash.clone(), o.sig.clone(), o.payload_digest.clone()),
+            )
+        })
+        .collect();
+    prop_assume!(!before.is_empty());
+
+    // a compaction at the generated cut, under the whole history
+    let head: i64 = cell
+        .debug_column("SELECT CAST(COALESCE(MAX(seq),0) AS TEXT) FROM ops")
+        .unwrap(/* t */)[0]
+        .parse()
+        .unwrap(/* t */);
+    // the cut stays WITHIN the live log (compact refuses anything else)
+    let cut_seq = (1.0 + (head as f64 - 1.0) * cut).floor() as i64;
+    let cut_seq = cut_seq.clamp(1, head);
+    cell.compact(cut_seq, &engramma_core::cell::CompactOptions::default())
         .unwrap(/* t */);
 
-        // run the generated history: impossible steps (a patch of a note
-        // that is not there) are skipped — the history is what DID happen
-        let mut living: Vec<Ulid> = Vec::new();
-        let mut next_id = 100_u32;
-        for (i, step) in steps.iter().enumerate() {
-            let text = bodies[i % bodies.len()].clone();
-            let pick = |living: &[Ulid], i: usize| living[i % living.len()];
-            match step {
-                Step::Put => {
-                    let n = note(next_id, &text);
-                    next_id += 1;
-                    if cell.put_note(&n, "device-a").is_ok() {
-                        living.push(n.id);
-                    }
-                }
-                Step::Patch(k) => {
-                    if !living.is_empty() {
-                        let _ = cell.patch_note(
-                            &pick(&living, *k as usize),
-                            &NotePatch { body: Some(text), ..Default::default() },
-                            "device-a",
-                        );
-                    }
-                }
-                Step::Delete(k) => {
-                    if !living.is_empty() {
-                        let _ = cell.delete_note(&pick(&living, *k as usize), "device-a");
-                    }
-                }
-                Step::Supersede(k) => {
-                    if !living.is_empty() {
-                        let old = pick(&living, *k as usize);
-                        let mut new = note(next_id, &text);
-                        next_id += 1;
-                        new.supersedes = vec![old];
-                        if cell.supersede(&old, &new, None, "device-a").is_ok() {
-                            living.retain(|id| *id != old);
-                            living.push(new.id);
-                        }
-                    }
-                }
-                Step::Purge(k) => {
-                    if !living.is_empty() {
-                        let id = pick(&living, *k as usize);
-                        if cell.purge(&id, "oblio", "device-a").is_ok() {
-                            living.retain(|x| *x != id);
-                        }
-                    }
-                }
-            }
-        }
-
-        // the identities at the cut: content_hash, sig AND payload digest
-        let before: BTreeMap<String, (String, Option<String>, String)> = cell
-            .ops()
-            .unwrap(/* t */)
-            .into_iter()
-            .map(|o| {
-                (
-                    o.op_id.to_string(),
-                    (o.content_hash.clone(), o.sig.clone(), o.payload_digest.clone()),
-                )
-            })
-            .collect();
-        prop_assume!(!before.is_empty());
-
-        // a compaction at the generated cut, under the whole history
-        let head: i64 = cell
-            .debug_column("SELECT CAST(COALESCE(MAX(seq),0) AS TEXT) FROM ops")
-            .unwrap(/* t */)[0]
-            .parse()
-            .unwrap(/* t */);
-        // the cut stays WITHIN the live log (compact refuses anything else)
-        let cut_seq = (1.0 + (head as f64 - 1.0) * cut).floor() as i64;
-        let cut_seq = cut_seq.clamp(1, head);
-        cell.compact(cut_seq, &engramma_core::cell::CompactOptions::default())
-            .unwrap(/* t */);
-
-        // nothing moved — one byte less and this fails
-        let after: BTreeMap<String, (String, Option<String>, String)> = cell
-            .ops()
-            .unwrap(/* t */)
-            .into_iter()
-            .map(|o| {
-                (
-                    o.op_id.to_string(),
-                    (o.content_hash.clone(), o.sig.clone(), o.payload_digest.clone()),
-                )
-            })
-            .collect();
-        for (id, was) in &before {
-            prop_assert_eq!(
-                after.get(id),
-                Some(was),
-                "op {} moved its identity",
-                id
+    // nothing moved — one byte less and this fails
+    let after: BTreeMap<String, (String, Option<String>, String)> = cell
+        .ops()
+        .unwrap(/* t */)
+        .into_iter()
+        .map(|o| {
+            (
+                o.op_id.to_string(),
+                (o.content_hash.clone(), o.sig.clone(), o.payload_digest.clone()),
+            )
+        })
+        .collect();
+    for (id, was) in &before {
+        prop_assert_eq!(after.get(id), Some(was), "op {} moved its identity", id);
+    }
+    // and every censored body still has the shape the censor produces
+    for op in cell.ops().unwrap(/* t */) {
+        if op.payload_state.as_str() == "censored" {
+            prop_assert!(
+                engramma_core::cell::ops::censor_shape_ok(&op),
+                "op {} has a censored body outside the censor's shape",
+                op.op_id
             );
         }
-        // and every censored body still has the shape the censor produces
-        for op in cell.ops().unwrap(/* t */) {
-            if op.payload_state.as_str() == "censored" {
-                prop_assert!(
-                    engramma_core::cell::ops::censor_shape_ok(&op),
-                    "op {} has a censored body outside the censor's shape",
-                    op.op_id
-                );
-            }
-        }
-        prop_assert!(cell.verify().unwrap(/* t */).ok());
     }
+    prop_assert!(cell.verify().unwrap(/* t */).ok());
+    Ok(())
 }

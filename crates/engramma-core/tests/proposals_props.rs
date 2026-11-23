@@ -18,6 +18,29 @@ use engramma_core::{Cell, Confidence, NotePatch, Status};
 use proptest::prelude::*;
 use time::OffsetDateTime;
 use ulid::Ulid;
+// v0.6.14 (N3): `current` is a trait method of the value trees
+use proptest::strategy::ValueTree as _;
+
+/// v0.6.14 (N3): a runner seeded by the property's OWN seed. The body of
+/// every property takes that one seed and derives its inputs from it
+/// through the same strategies the property always drew — so a failing
+/// seed replays in ONE case (`scripts/seme-sul-tag.sh <proprietà> <seme>
+/// <tag>`), on any tree that holds the body.
+fn seeded_runner(seed: u64) -> proptest::test_runner::TestRunner {
+    // ChaCha (the default) wants a 32-byte seed: the u64 is laid four times
+    let block = seed.to_le_bytes();
+    let mut bytes = [0_u8; 32];
+    for k in 0..4 {
+        bytes[k * 8..k * 8 + 8].copy_from_slice(&block);
+    }
+    proptest::test_runner::TestRunner::new_with_rng(
+        proptest::test_runner::Config::default(),
+        proptest::test_runner::TestRng::from_seed(
+            proptest::test_runner::RngAlgorithm::default(),
+            &bytes,
+        ),
+    )
+}
 
 /// A tiny deterministic generator (SplitMix64): the sequence must be a pure
 /// function of the seed, or a failing case cannot be replayed by hand.
@@ -78,56 +101,94 @@ proptest! {
 
 
 #[test]
-    fn proposal_sequences_keep_the_invariants(
-        seed in any::<u64>(),
-        steps in proptest::collection::vec(0u8..9, 12..48),
-    ) {
-        let dir = test_dir();
-        let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* test-only */);
-        cell.set_policy(serde_json::json!({ "write": "propose" }), "t")
-            .unwrap(/* test-only */);
-        let mut rng = Rng(seed);
-        let mut clock = 0_u64;
-        let mut counter = 0_u64;
+    fn proposal_sequences_keep_the_invariants(seed in any::<u64>()) {
+        proposal_sequences_keep_the_invariants_body(seed)?;
+    }
+}
 
-        // the model: what the sequence built
-        let mut active: Vec<Ulid> = Vec::new();       // human + accepted notes
-        let mut queue: Vec<Ulid> = Vec::new();        // proposals in the queue (pending/reverted)
-        let mut marker_of: std::collections::HashMap<Ulid, String> = std::collections::HashMap::new();
-        let mut decided: Vec<Ulid> = Vec::new();      // proposals with a live decision
+/// v0.6.14 (N3): the body of `proposal_sequences_keep_the_invariants` in ONE case — the seed
+/// derives every input through the property's own strategies
+/// (`seeded_runner`). The property in the `proptest!` block
+/// hands its seed to this function; a failing seed replays here.
+fn proposal_sequences_keep_the_invariants_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let (seed, steps) = ((any::<u64>()), (proptest::collection::vec(0u8..9, 12..48)))
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    let dir = test_dir();
+    let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* test-only */);
+    cell.set_policy(serde_json::json!({ "write": "propose" }), "t")
+        .unwrap(/* test-only */);
+    let mut rng = Rng(seed);
+    let mut clock = 0_u64;
+    let mut counter = 0_u64;
 
-        for step in steps {
-            counter += 1;
-            clock += 1 + rng.below(3) as u64;
-            let at = t(clock);
-            let marker = format!("marcatore{counter}");
-            match step {
-                0 | 1 => {
-                    // human write
-                    let body = format!("il fatto {marker} detto dall'utente");
-                    let n = base_note(body.clone(), at);
-                    cell.put_note(&n, "cli").unwrap(/* test-only */);
-                    marker_of.insert(n.id, marker.clone());
-                    active.push(n.id);
+    // the model: what the sequence built
+    let mut active: Vec<Ulid> = Vec::new(); // human + accepted notes
+    let mut queue: Vec<Ulid> = Vec::new(); // proposals in the queue (pending/reverted)
+    let mut marker_of: std::collections::HashMap<Ulid, String> = std::collections::HashMap::new();
+    let mut decided: Vec<Ulid> = Vec::new(); // proposals with a live decision
+
+    for step in steps {
+        counter += 1;
+        clock += 1 + rng.below(3) as u64;
+        let at = t(clock);
+        let marker = format!("marcatore{counter}");
+        match step {
+            0 | 1 => {
+                // human write
+                let body = format!("il fatto {marker} detto dall'utente");
+                let n = base_note(body.clone(), at);
+                cell.put_note(&n, "cli").unwrap(/* test-only */);
+                marker_of.insert(n.id, marker.clone());
+                active.push(n.id);
+            }
+            2 => {
+                // propose something new (a fifth of the times the SAME
+                // text as an active note: the duplicate refusal fires too)
+                let body = if !active.is_empty() && rng.below(5) == 0 {
+                    format!(
+                        "il fatto marcatore{} detto dall'utente",
+                        counter.saturating_sub(1).max(1)
+                    )
+                } else {
+                    format!("la proposta {marker} sostenuta dall'assistente")
+                };
+                let note = base_note(body, at);
+                let id = note.id;
+                let out = cell.propose(
+                    &ProposalInput {
+                        note,
+                        mode: ProposalMode::New,
+                        client: Some("test".into()),
+                        reason: Some("perché".into()),
+                    },
+                    "mcp:test",
+                    &engramma_core::cell::proposals::ProposeContext::default(),
+                )
+                .unwrap(/* test-only */);
+                if out.id.is_some() {
+                    marker_of.insert(id, marker);
+                    queue.push(id);
                 }
-                2 => {
-                    // propose something new (a fifth of the times the SAME
-                    // text as an active note: the duplicate refusal fires too)
-                    let body = if !active.is_empty() && rng.below(5) == 0 {
-                        format!("il fatto marcatore{} detto dall'utente", counter.saturating_sub(1).max(1))
-                    } else {
-                        format!("la proposta {marker} sostenuta dall'assistente")
-                    };
-                    let note = base_note(body, at);
+            }
+            3 => {
+                // propose a supersede of a living note
+                if let Some(&target) = active.last() {
+                    let note = base_note(format!("la rettifica {marker} dell'assistente"), at);
                     let id = note.id;
                     let out = cell.propose(
                         &ProposalInput {
                             note,
-                            mode: ProposalMode::New,
-                            client: Some("test".into()),
-                            reason: Some("perché".into()),
+                            mode: ProposalMode::Supersede(target),
+                            client: None,
+                            reason: None,
                         },
                         "mcp:test",
+
                         &engramma_core::cell::proposals::ProposeContext::default(),
                     )
                     .unwrap(/* test-only */);
@@ -136,157 +197,156 @@ proptest! {
                         queue.push(id);
                     }
                 }
-                3 => {
-                    // propose a supersede of a living note
-                    if let Some(&target) = active.last() {
-                        let note = base_note(format!("la rettifica {marker} dell'assistente"), at);
-                        let id = note.id;
-                        let out = cell.propose(
-                            &ProposalInput {
-                                note,
-                                mode: ProposalMode::Supersede(target),
-                                client: None,
-                                reason: None,
-                            },
-                            "mcp:test",
-
-                            &engramma_core::cell::proposals::ProposeContext::default(),
-                        )
-                        .unwrap(/* test-only */);
-                        if out.id.is_some() {
-                            marker_of.insert(id, marker);
-                            queue.push(id);
-                        }
-                    }
-                }
-                4 | 5 => {
-                    // decide a queued proposal (accept or reject)
-                    if !queue.is_empty()
-                        && let Some(id) = queue.get(rng.below(queue.len())).copied()
-                    {
-                        let accept = step == 4;
-                        let r = cell.decide(
-                            &id,
-                            &DecisionInput {
-                                action: if accept {
-                                    DecisionAction::Accept { edited: None }
-                                } else {
-                                    DecisionAction::Reject
-                                },
-                                reason: Some("perché".into()),
-                                review: None,
-                            },
-                            "user@cli",
-                        );
-                        if r.is_ok() {
-                            queue.retain(|x| *x != id);
-                            if accept {
-                                active.push(id);
-                            }
-                            decided.push(id);
-                        }
-                    }
-                }
-                6 => {
-                    // a human correction of an active note
-                    if let Some(&id) = active.last() {
-                        let body = format!("il fatto {marker} corretto a mano");
-                        cell.patch_note(
-                            &id,
-                            &NotePatch { body: Some(body), ..Default::default() },
-                            "cli",
-                        )
-                        .unwrap(/* test-only */);
-                        marker_of.insert(id, marker);
-                    }
-                }
-                7 => {
-                    // a human supersede of an active note
-                    if let Some(&old) = active.last() {
-                        let n = base_note(format!("il fatto {marker} sostituito a mano"), at);
-                        cell.supersede(&old, &n, None, "cli").unwrap(/* test-only */);
-                        marker_of.insert(n.id, marker);
-                        active.retain(|x| *x != old);
-                        active.push(n.id);
-                    }
-                }
-                _ => {}
             }
-            // reverts: after any step, try reverting a live decision
-            if rng.below(3) == 0 && !decided.is_empty() {
-                let ds = cell.decisions(&DecisionsFilter::default()).unwrap(/* test-only */);
-                if let Some(d) = ds.get(rng.below(ds.len().max(1))) {
-                    let outcome = cell.revert_decision(&d.op_id, "ripensamento", "user@cli");
-                    match outcome {
-                        Ok(engramma_core::cell::proposals::RevertOutcome::Reverted { proposal, .. }) => {
-                            // invariant 2: no human op may sit between the
-                            // decision and the revert, on the note or the target
-                            let ops = cell.ops().unwrap(/* test-only */);
-                            let dseq = ops.iter().find(|o| o.op_id == d.op_id).map(|o| o.seq).unwrap_or(i64::MAX);
-                            let later: Vec<_> = ops
-                                .iter()
-                                .filter(|o| o.seq > dseq)
-                                .filter(|o| o.note_id == Some(proposal) || d.target.is_some_and(|t| o.note_id == Some(t)))
-                                .collect();
-                            for o in later {
-                                prop_assert!(!matches!(
+            4 | 5 => {
+                // decide a queued proposal (accept or reject)
+                if !queue.is_empty()
+                    && let Some(id) = queue.get(rng.below(queue.len())).copied()
+                {
+                    let accept = step == 4;
+                    let r = cell.decide(
+                        &id,
+                        &DecisionInput {
+                            action: if accept {
+                                DecisionAction::Accept { edited: None }
+                            } else {
+                                DecisionAction::Reject
+                            },
+                            reason: Some("perché".into()),
+                            review: None,
+                        },
+                        "user@cli",
+                    );
+                    if r.is_ok() {
+                        queue.retain(|x| *x != id);
+                        if accept {
+                            active.push(id);
+                        }
+                        decided.push(id);
+                    }
+                }
+            }
+            6 => {
+                // a human correction of an active note
+                if let Some(&id) = active.last() {
+                    let body = format!("il fatto {marker} corretto a mano");
+                    cell.patch_note(
+                        &id,
+                        &NotePatch { body: Some(body), ..Default::default() },
+                        "cli",
+                    )
+                    .unwrap(/* test-only */);
+                    marker_of.insert(id, marker);
+                }
+            }
+            7 => {
+                // a human supersede of an active note
+                if let Some(&old) = active.last() {
+                    let n = base_note(format!("il fatto {marker} sostituito a mano"), at);
+                    cell.supersede(&old, &n, None, "cli").unwrap(/* test-only */);
+                    marker_of.insert(n.id, marker);
+                    active.retain(|x| *x != old);
+                    active.push(n.id);
+                }
+            }
+            _ => {}
+        }
+        // reverts: after any step, try reverting a live decision
+        if rng.below(3) == 0 && !decided.is_empty() {
+            let ds = cell.decisions(&DecisionsFilter::default()).unwrap(/* test-only */);
+            if let Some(d) = ds.get(rng.below(ds.len().max(1))) {
+                let outcome = cell.revert_decision(&d.op_id, "ripensamento", "user@cli");
+                match outcome {
+                    Ok(engramma_core::cell::proposals::RevertOutcome::Reverted {
+                        proposal,
+                        ..
+                    }) => {
+                        // invariant 2: no human op may sit between the
+                        // decision and the revert, on the note or the target
+                        let ops = cell.ops().unwrap(/* test-only */);
+                        let dseq = ops
+                            .iter()
+                            .find(|o| o.op_id == d.op_id)
+                            .map(|o| o.seq)
+                            .unwrap_or(i64::MAX);
+                        let later: Vec<_> = ops
+                            .iter()
+                            .filter(|o| o.seq > dseq)
+                            .filter(|o| {
+                                o.note_id == Some(proposal)
+                                    || d.target.is_some_and(|t| o.note_id == Some(t))
+                            })
+                            .collect();
+                        for o in later {
+                            prop_assert!(
+                                !matches!(
                                     o.kind.as_str(),
-                                    "put_note" | "patch_note" | "set_status" | "supersede"
-                                        | "delete_note" | "restore" | "confirm"
-                                ), "revert landed over a later human op: {}", o.kind.as_str());
-                            }
-                            queue.push(proposal);
-                            active.retain(|x| *x != proposal);
+                                    "put_note"
+                                        | "patch_note"
+                                        | "set_status"
+                                        | "supersede"
+                                        | "delete_note"
+                                        | "restore"
+                                        | "confirm"
+                                ),
+                                "revert landed over a later human op: {}",
+                                o.kind.as_str()
+                            );
                         }
-                        Ok(engramma_core::cell::proposals::RevertOutcome::Purged { .. }) => {}
-                        Err(_) => { /* conflict: allowed, expected over later ops */ }
+                        queue.push(proposal);
+                        active.retain(|x| *x != proposal);
                     }
+                    Ok(engramma_core::cell::proposals::RevertOutcome::Purged { .. }) => {}
+                    Err(_) => { /* conflict: allowed, expected over later ops */ }
                 }
-            }
-
-            // invariant 1 (checked continuously): every queued proposal is
-            // invisible to the default search, text and graph alike
-            for id in &queue {
-                let Some(marker) = marker_of.get(id) else { continue };
-                let hits = cell
-                    .search(&Query::text(marker).k(10))
-                    .unwrap(/* test-only */);
-                prop_assert!(
-                    hits.iter().all(|h| h.note.id != *id),
-                    "queued proposal {id} leaked into the text search"
-                );
-                let graphed = cell
-                    .search(&Query::text(marker).k(10).graph_hops(1))
-                    .unwrap(/* test-only */);
-                prop_assert!(
-                    graphed.iter().all(|h| h.note.id != *id),
-                    "queued proposal {id} leaked through the graph"
-                );
             }
         }
 
-        // invariants 3 and 4: the from-zero replay equals the live cell
-        let report = cell.verify().unwrap(/* test-only */);
-        prop_assert!(report.ok(), "verify: {:?}", report.mismatch);
-        prop_assert!(matches!(report.replay, engramma_core::cell::Replay::Full));
-
-        // and the bulk revert over everything the test decided stays honest:
-        // every ACTIVE decision is either revertable or conflicting (the
-        // purged ones have no registry row; the already-reverted ones are
-        // skipped, not recounted)
-        let report = cell
-            .revert_decisions(
-                &RevertFilter { by: Some("user@cli".into()), ..Default::default() },
-                true,
-            )
-            .unwrap(/* test-only */);
-        let active = cell
-            .decisions(&DecisionsFilter {
-                state: Some(engramma_core::cell::proposals::DecisionState::Active),
-                ..Default::default()
-            })
-            .unwrap(/* test-only */)
-            .len();
-        prop_assert_eq!(report.reverted + report.conflicts.len(), active);
+        // invariant 1 (checked continuously): every queued proposal is
+        // invisible to the default search, text and graph alike
+        for id in &queue {
+            let Some(marker) = marker_of.get(id) else {
+                continue;
+            };
+            let hits = cell
+                .search(&Query::text(marker).k(10))
+                .unwrap(/* test-only */);
+            prop_assert!(
+                hits.iter().all(|h| h.note.id != *id),
+                "queued proposal {id} leaked into the text search"
+            );
+            let graphed = cell
+                .search(&Query::text(marker).k(10).graph_hops(1))
+                .unwrap(/* test-only */);
+            prop_assert!(
+                graphed.iter().all(|h| h.note.id != *id),
+                "queued proposal {id} leaked through the graph"
+            );
+        }
     }
+
+    // invariants 3 and 4: the from-zero replay equals the live cell
+    let report = cell.verify().unwrap(/* test-only */);
+    prop_assert!(report.ok(), "verify: {:?}", report.mismatch);
+    prop_assert!(matches!(report.replay, engramma_core::cell::Replay::Full));
+
+    // and the bulk revert over everything the test decided stays honest:
+    // every ACTIVE decision is either revertable or conflicting (the
+    // purged ones have no registry row; the already-reverted ones are
+    // skipped, not recounted)
+    let report = cell
+        .revert_decisions(
+            &RevertFilter { by: Some("user@cli".into()), ..Default::default() },
+            true,
+        )
+        .unwrap(/* test-only */);
+    let active = cell
+        .decisions(&DecisionsFilter {
+            state: Some(engramma_core::cell::proposals::DecisionState::Active),
+            ..Default::default()
+        })
+        .unwrap(/* test-only */)
+        .len();
+    prop_assert_eq!(report.reverted + report.conflicts.len(), active);
+    Ok(())
 }
