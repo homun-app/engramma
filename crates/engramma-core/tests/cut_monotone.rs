@@ -560,10 +560,7 @@ fn without_the_copy_file_the_corner_is_declared() {
         "the corner names the object: {corner}"
     );
     assert!(corner.contains("registro"), "and what is lost: {corner}");
-    assert!(
-        corner.contains("da Some(4) a Some(5)"),
-        "and the two cuts: {corner}"
-    );
+    assert!(corner.contains("da 4 a 5"), "and the two cuts: {corner}");
 }
 
 /// The same damaged cell, with the copy file: there is no corner — the

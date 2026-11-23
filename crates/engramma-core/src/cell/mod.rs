@@ -372,10 +372,11 @@ fn declared_corners(conn: &Connection) -> Result<Vec<String>, CellError> {
         })
         .unwrap_or_default();
     Ok(vec![format!(
-        "angolo dichiarato: il taglio di compattazione tornò indietro (da {from:?} a {to:?}) \
+        "angolo dichiarato: il taglio di compattazione tornò indietro (da {} a {}) \
          con un motore prima della v0.6.14, e senza file di copia la migrazione non ha \
-         potuto ricostruire {} oggetto/i dalla coda in su: {} — le righe restano come le ha \
-         trovate",
+         potuto ricostruire {} oggetto/i: {} — le righe restano come le ha trovate",
+        from.unwrap_or(0),
+        to.unwrap_or(0),
         unserved.len(),
         unserved.join(", ")
     )])
@@ -4943,11 +4944,16 @@ pub fn state_digest(conn: &Connection) -> Result<String, CellError> {
 /// cut lives. It is the `seq` of the newest row of `snapshots`, the
 /// compaction's record (head hash, state digest, file, `redacted_by`); 0
 /// when the cell never compacted. Until this phase the cut was registered
-/// there already but READ by eight hand-written queries in four files;
+/// there already but READ by eight hand-written queries in five files;
 /// every reader goes through this function now — the materializer, the
 /// arrival guard of a shared cell, the photograph's guard, `verify`, the
 /// migrations — so «where is the cut» has one answer, and the monotone
 /// rule of [`Cell::compact`] is the only writer.
+///
+/// The eight hand-written reads it replaces, in five files: `mod.rs`
+/// three times (the arrival guard, the reconstruction oracle,
+/// `last_cut_seq`), then `material.rs`, `conflicts.rs`, `ops.rs` and
+/// `schema.rs`.
 pub(crate) fn registered_cut(conn: &Connection) -> Result<i64, CellError> {
     let cut: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM snapshots", [], |r| {
         r.get(0)
