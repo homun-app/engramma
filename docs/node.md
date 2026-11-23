@@ -435,7 +435,7 @@ Notevoli:
   `pretest` di `npm test` e `test:electron` costruisce la CLI: il caso
   normale è sempre fresco.
 
-## La compattazione: un difetto chiuso, e perché resta spenta (v0.6.12)
+## La compattazione: l'ancora intera, e perché resta spenta ancora (v0.6.13)
 
 La verifica della v0.6.11 lasciava la release locale a una condizione:
 **con la compattazione spenta**, perché «dimentica per sempre» poteva
@@ -453,18 +453,27 @@ intatti). Il difetto di sync che restava aperto (l'ancora che
 invecchia, H2 secondo strato) è chiuso anche lui, e la cella condivisa
 rifiuta con un errore leggibile un arrivo che cada dentro il prefisso.
 
-**Per Homun: la compattazione resta spenta, per ora.** Liberato dal
-`VersionNotFound`, l'oracolo della purga ha mostrato due altri difetti
-che nascono **solo con un taglio** (provati con e senza compattazione
-sullo stesso seme), entrambi pre-esistenti sulla v0.6.11 e dichiarati
-aperti in `open-defects.txt`:
+**v0.6.13: i due difetti della v0.6.12 sono chiusi — e la caccia ne ha
+trovati due altri, dello stesso sangue.** L'ancora di una nota ora è
+**l'oggetto intero**: la fotografia prende coda, registro e righe
+`supersedes` accanto alla riga della nota, la ricostruzione li
+ripristina allo stato del taglio prima di rigiocare la coda, e la
+purga del chiudente riapre il lato vecchio. Il contratto lo dice nei
+test nuovi (propose → decide → compact → purge: la coda sopravvive
+intera; 64/64, con i 63 di ieri intatti), le celle d'oro v0612 e
+v0613 aprono e verificano, e l'invariante nuovo — **dalla quarantena
+si esce solo per decisione** — fa la guardia.
 
-- una purga **fallisce** (`is not a proposal`) quando la
-  rimaterializzazione rigioca una decisione la cui proposta sta sotto
-  il taglio — è il flusso delle correzioni accettate: «dimentica per
-  sempre» risponde con un errore;
-- la purga di una nota fuori famiglia fa tornare **attiva** una nota
-  che era in quarantena.
+**Per Homun: la compattazione resta spenta lo stesso.** La caccia a
+20 000 ha trovato DUE difetti nuovi nelle semantiche della coda e del
+`restore` (dichiarati aperti in `open-defects.txt` coi semi):
+
+- un `restore` dell'utente dopo annullamento e riaccettazione: la
+  rimaterializzazione che una purga forza riordina le versioni, e la
+  nota cambia stato senza che nessuna riga lo racconti;
+- una proposta accettata e poi chiusa da un supersede: alla fine la
+  coda dice `pending` e lo stato `superseded` — contenuto nato in
+  quarantena visibile con la coda che non lo racconta più.
 
 Fino alla fase che li chiude, `compact(keepLast)` non si chiama. Quando
 si potrà: `keepLast` è quante operazioni restano vive sopra il taglio

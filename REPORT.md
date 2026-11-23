@@ -11772,6 +11772,394 @@ loro posto (le cache dei test del CLI); nessun processo acceso. In
 vuota `sonda-t-SmTu`, del 20 e del 21 novembre: precedenti a questa
 fase, non mie, non toccati.
 
+# REPORT — Engramma v0.6.13 (l'ancora è l'oggetto intero, e dalla quarantena si esce solo per decisione)
+
+Base `main` @ `acec27f`. Una fase breve che chiude i due difetti dichiarati
+dalla verifica v0.6.12 (erano uno solo: la regola del prefisso congelato
+applicata a metà), estende la regola a ogni riga derivata, e aggiunge
+l'invariante di sicurezza della quarantena. Lo schema sale a 23, l'ALPN a
+`sync/8` e `mailbox/8`, il contratto JS si estende (`propose`, `decide`,
+`proposals`).
+
+## M1 — l'ancora è l'oggetto intero
+
+**Rossi prima della correzione** (commit `58973e5`), tutti rossi per la
+ragione giusta:
+
+- i quattro casi del revisore (`anchor_object.rs`): l'annullata col
+  taglio diventava `Active` e perdeva la coda; la pendente col taglio
+  restava giusta (il controllo);
+- i semi `8394280236933449584` («is not a proposal») e
+  `9848218401348450188` (Quarantined → Active), ora deterministici in
+  `purge_family_defect_seeds_of_v0613_run_clean`;
+- **il sospetto `supersedes` era FONDATO**: `supersede(A → N)` sotto il
+  taglio, una ricostruzione di N sopra, e la riga non tornava più — la
+  purga di N non riapriva A (A restava `Superseded`: rosso al primo
+  colpo);
+- la rejection sopra il taglio (la `decide` che rigioca non trovava la
+  coda: la purga falliva per sempre);
+- tag e archi dichiarati, «nata sotto il taglio, modificata sopra,
+  ricostruita»: verdi GIÀ sulla v0.6.12 — sono funzioni della riga
+  della nota, e l'ancora della nota li ricrea col reindex (il test lo
+  prova e resta).
+
+**La correzione** (commit `dfe61ac`):
+
+- **schema 23, tabella `object_anchors`**: la fotografia di
+  `ops::snapshot` prende, accanto alla riga della nota, le righe
+  derivate dell'oggetto intero — la coda (`proposals`), il registro
+  (`decisions`), le righe `supersedes` del nuovo lato — sotto la stessa
+  operazione. DERIVATA, mai nel digest replicato; la purga della nota
+  prende le sue ancore con sé (i metadati della coda sono contenuto del
+  corpo).
+- **la ricostruzione** ripristina l'oggetto intero allo stato
+  dell'ancora, poi rigioca la coda. La riga nata sotto il taglio e
+  modificata sopra torna allo stato al taglio e la modifica si rigioca:
+  l'annullata resta in quarantena con la coda `reverted`.
+- **la fotografia viene PRIMA dell'effetto**: `apply_revert_decision`
+  fotografava DOPO gli aggiornamenti della coda — l'ancora conteneva il
+  post-stato e il rigioco dell'annullamento trovava `reverted_by` già
+  scritto e non faceva nulla (la manifestazione `Active` in un'altra
+  forma). Ora legge la nota e fotografa prima di toccare coda e
+  registro.
+- **`reopen_target` cancella la riga `supersedes` in entrambe le
+  metà** (come l'inserimento della `decide`, che è sempre stato di
+  entrambe): la ricostruzione della proposta sola non lascia più la
+  chiusura che il proprio annullamento ha disfatto.
+- **la purga del CHIUDENTE riapre il lato vecchio** (`purge_state`): la
+  chiusura era opera del purgato (K1); la riga viva torna allo stato
+  che la chiusura stessa fotografò — la stessa parola del rigioco
+  integrale, dove la metà dominata non si applica. Vale nel vivo E
+  dentro il file dell'istantanea (il cui registro congelato non può
+  conoscere la purga: il chiudente È la nota dimenticata dalla
+  chiamata). Senza questa, il `verify` cadeva: il vivo riapriva e il
+  rebuild no. Cammina con la disciplina FTS degli altri cambi di stato
+  (il cambio d'indice, e solo quello, sposta la riga; gli archi
+  dichiarati seguono la nota).
+- **la migrazione v23** costruisce le ancore che una cella compattata
+  dalla v0.6.12 non ha mai preso: dal FILE di copia quando c'è (è lo
+  stato al taglio per costruzione), altrimenti per ROLLBACK degli
+  effetti sopra il taglio (i payload sopra il taglio sono interi: gli
+  effetti si calcolano; la coda risolve il flavor con la camminata dei
+  decide/revert a o sotto il taglio e la parola della fotografia
+  dell'ancora). **L'angolo dichiarato**: un cambio di stato a o sotto
+  il taglio che nasconde il flavor dell'ultima decisione ( Quarantined
+  dopo una `set_status`, `Superseded` dopo una chiusura) lascia la
+  cella al comportamento della v0.6.12 — le righe vive, rigioco
+  idempotente (l'`INSERT OR REPLACE` del registro e l'annullamento che
+  trova `reverted_by` già scritto non muovono nulla).
+- **il costo**: la prima misura dava −7% sull'inserimento; la
+  fotografia VUOTA non si scrive più (commit `54d2a4a`) — l'oggetto
+  comune (niente coda, registro né nuovo lato) paga una sonda su tre
+  indici per fotografia, e una `put` di nota NUOVA non fotografa niente
+  (come è sempre stato: la fotografa solo chi riscrive). Rileggi i
+  numeri sotto.
+
+**Le celle d'oro**: `v0612` (creata col motore di PRIMA del cambio di
+schema, commit `571657c`: la storia della fase — proposta accettata SUL
+taglio, annullata sopra — congelata com'era) e `v0613` (la stessa
+scena del v068 più la correzione d'agente accettata prima del taglio).
+`golden_cell.rs` apre tutte e tre: la v0612 verifica, la migrazione le
+ha costruito l'ancora, e la purga del bersaglio riesce con la coda
+intatta.
+
+## M2 — gli oracoli fotografano l'oggetto intero, e lo schema non si dimentica
+
+- `purge_takes_only_its_family` fotografa, per ogni nota fuori dalla
+  famiglia, anche la riga di coda (modo, bersaglio, stato, decider), il
+  registro e le righe `supersedes` del nuovo lato. Le eccezioni
+  dichiarate restano quelle (le riaperture; le righe che nominano la
+  purgata — la riga di coda il cui BERSAGLIO è la purgata resta, col
+  suo stato: K1).
+- `frozen_prefix_is_immutable` congela anche l'IDENTITÀ delle righe
+  derivate nate a o sotto il taglio (il CONTENUTO può cambiare sopra il
+  taglio: una decisione aggiorna la coda; una riga nata sotto il taglio
+  non SPARISCE mai) e le ancore `object_anchors` nate a o sotto il
+  taglio. La sezione purga accetta in perdita famiglia, riaperture e
+  righe che nominano la purgata, per tabella.
+- **`anchor_tables`**: le due liste (`ANCHOR_NOTE_TABLES`,
+  `NON_ANCHOR_NOTE_TABLES`, in `schema.rs`, ciascuna fuori col suo
+  motivo) sono la coppia unica; il test legge `sqlite_master` e fallisce
+  se una tabella con una colonna di nota non sta in nessuna delle due —
+  e se una lista nomina una tabella che lo schema non ha.
+- **I denti** (ramo `denti-v0613`, rimessi le DELETE di oggi senza
+  ripristino né riaperture, poi buttato): `purge_takes_only_its_family`
+  cade su «righe supersedes cambiate» (seme `6056734418331109737`) e i
+  due semi del difetto su «is not a proposal»;
+  `frozen_prefix_is_immutable` cade su «the frozen prefix LOST rows» —
+  una riga `supersedes` nata al taglio (seme `810213400236197034`).
+  Sulla causa, non sullo stato della nota.
+
+## M3 — dalla quarantena si esce solo per decisione
+
+La proprietà `quarantine_exits_only_by_decision` (**la 29ª
+dell'inventario**, `properties.txt` a 40 righe di commento incluse):
+un invariante di STATO su storie generate (scritture anche esterne,
+proposte d'agente, decisioni, annullamenti, supersede, cambi di stato,
+compattazioni sotto la testa, purghe), giudicato dopo OGNI operazione,
+nella forma a una cella e in quella a due dispositivi (giudizio su
+entrambi a ogni sistemata). Tre regole, lette dal registro e dallo
+stato, mai dal meccanismo.
+
+**Le uscite legittime, lette dal codice** (il REPORT le elenca, come
+chiesto):
+
+1. la `decide` con `Accept` — chiunque può deciderla, ma l'invariante
+   esige un attore NON della classe agente (`classify_actor`: `user`,
+   `*:user`, `user@*`; un `reviewer:*` è macchina anche lui, e la sua
+   decisione NON conta per l'invariante — la parola dell'utente che lo
+   ha configurato peserà nei permessi della v0.7.0). La nota può essere
+   la proposta OPPURE il bersaglio della correzione accettata (la
+   decisione la chiude: visibile `superseded`, ed è la parola
+   dell'utente);
+2. la `confirm` (l'utente promuove una `external`);
+3. la `set_status` verso `active`;
+4. la `restore` di una versione visibile.
+
+**Non sono uscite**: la riapertura di una purga (riporta a uno stato
+che la nota aveva — se era la quarantena, in quarantena torna); la
+put/patch (lo stato si conserva); l'annullamento che trova `reverted_by`
+già scritto (il perdente concorrente dell'ordine totale: non muove
+nulla, per dichiarazione, e l'accetto che nomina resta in piedi — la
+regola 3 della proprietà giudica solo gli annullamenti che hanno
+GOVERNATO la coda, `state = 'reverted'`). **Vie della quarantena**
+(l'elenco chiesto): la proposta (`propose`), la nascita `external`
+(`put`/import), la `set_status`, la patch che porta `confidence:
+external`, la copia di conflitto dell'agente (D2, motivo «conflitto»).
+L'oracolo della regola 2 chiede la riga di coda alle nate da proposta;
+le altre vie hanno la loro vista (lettura per id, pagina di revisione,
+conflitto per id; l'ELENCO della coda nasconde le copie in cestino, la
+riga resta).
+
+**I denti** (stesso ramo): la proprietà cade su
+`791864621965193080` — «la nota è in quarantena nata da una proposta,
+senza la sua riga di coda» — la causa, non lo stato; e su un fratello
+della regola 1 (una chiusa resta visibile senza decisione: la
+riapertura disattivata). Il generatore, corretto in `88e1090`, ridà il
+bersaglio alla lista dei vivi dopo un annullamento — la forma del
+difetto di sicurezza della v0.6.12 dev'essere pescabile dalla purga.
+
+**Gli angoli dichiarati del giudice**: sotto il taglio i payload sono
+scheletri — l'`uscita per tipo di operazione` legge il genere e
+l'attore (che sopravvivono); una `set_status` verso la quarantena può
+spacciarsi per uscita (il caso si legge a mano); l'ingresso si data con
+le operazioni di ingresso quando il payload c'è, altrimenti con le
+fotografie di stato quarantena (che dicono «c'è stata», mai quando: la
+barra si abbassa a «un'uscita qualunque»).
+
+## M4 — le cartelle dei test hanno un nome nostro in ogni crate
+
+121 conversioni a `common::test_dir()` (sync, cli, vault, embed — ogni
+crate ha il suo `tests/common/mod.rs` con l'aiuto e lo spazzino) e ai
+`Builder` col prefisso nei moduli `#[cfg(test)]` dentro `src` (core,
+embed, mcp). Lo spazzino gira all'inizio della suite di OGNI crate
+(una prova dentro il common). Il meta-test `test_folder_names` cammina
+i sorgenti di ogni crate — `tests` e `src` — e fallisce al primo
+`tempfile::tempdir()` o `TempDir::new()` nudo. **Le otto `.tmp*` del 22
+novembre restano dove sono**: non attribuibili nemmeno col prefisso
+nuovo (sono di un motore che il prefisso non lo aveva), `$TMPDIR` è
+condiviso, e la decisione è dell'utente.
+
+## Il contratto JS e l'ALPN
+
+- `propose()`, `decide()` e `proposals()` nel binding Node (il contratto
+  SI ESTENDE): la proposta d'agente, la decisione, la compattazione e
+  la purga del bersaglio tengono la coda intatta. `revertDecision`
+  resta fuori, per dichiarazione della fase. **63 test esistenti
+  identici + 1 nuovo: 64/64 in Node e in Electron.**
+- **l'ALPN sale a `engramma/sync/8` e `engramma/mailbox/8`**: M1 cambia
+  lo stato derivato di storie valide (la coda e il registro di una
+  proposta ricostruita sopra il taglio, la riapertura della purga) —
+  regole 7 contro regole 8 derivano stati diversi dalle stesse
+  operazioni. Il test `protocol_version` parla ora di 8 contro 7:
+  l'handshake muore sull'ALPN, `PEER_OUTDATED` nomina il dispositivo, e
+  non uno scambio si muove.
+
+## I test
+
+- `anchor_object.rs` 9/9 (i quattro del revisore, il sospetto
+  `supersedes`, la rejection, i tag, la migrazione sul checkpoint);
+  `anchor_tables` 1/1; `test_folder_names` 1/1;
+  `properties_inventory` 3/3 (l'inventario a 29);
+  `props.rs` 16/16 con i semi del difetto chiuso; `golden_cell.rs`
+  apre v068 + v0612 + v0613; la suite del workspace è verde (nessun
+  rosso in nessuna crate); `cargo clippy --workspace --all-targets`
+  senza avvisi; `cargo fmt` pulito.
+
+## Le misure
+
+Sonde identiche copiate in worktree sul tag e sul commit finale, fuori
+dal repo, corse senza `nice`, `uptime` accanto a ogni corsa. Il carico
+dell'utente al lavoro: **2,4–3,5** per tutta la durata.
+
+- **Inserimento** (10 000 note, note/s, mediana):
+
+  | coppia | base (v0.6.3) | fase | v0.6.12 | fase |
+  |---|---|---|---|---|
+  | 1 | 4820,3 | 4470,7 | 4540,7 | 4510,2 |
+  | 2 | 4873,3 | 4537,6 | 4562,2 | 4512,9 |
+  | 3 | 4853,0 | 4513,2 | 4576,8* | — |
+  | 4 | 4821,2 | 4516,4 | — | — |
+
+  Mediana base 4837,1, fase 4514,8: **−6,7% contro la v0.6.3 — sopra il
+  +5%**, e il perché si legge nella colonna v0.6.12: il tag di ieri è
+  già a 4551,5 (−5,9% dalla v0.6.3 su questa sonda: dieci fasi di
+  prezzo cumulato, la v0.6.12 stessa misurò −4,4% sul SUO corpus).
+  **Il prezzo di QUESTA fase è 4514,8 contro 4551,5: −0,8%** — la
+  sonda delle tre tabelle per fotografia, e la `put` di nota nuova non
+  fotografa niente (la fotografa solo chi riscrive, come è sempre
+  stato).
+- **Ricerca** (200 domande, p50/p95 ms): contro la v0.6.3, p50
+  0,569 → 0,604 (**+6,2%**, sopra il +5%; contro la v0.6.12: 0,602 →
+  0,612, **+0,3%**: il motore di ricerca non è stato toccato, è il
+  cumulo); p95 0,752 → 0,806 (+7,2%, con escursioni 0,713–1,046 al
+  giro scarico della macchina).
+- **La sonda della purga** (10 000 note, compattazione con istantanea,
+  una purga): 131,1 → 135,0 ms, **+3,0%**, dentro il +10%. La riapertura
+  del lato vecchio e la fotografia dell'ancora costano questo.
+- **`verify` su 10 000 note, contro `fase-v0.6.9`**: 983,9 → 999,2 ms,
+  **+1,6%**, dentro il +10%.
+- **`compact()` su 10 000 note col taglio a `head − 100`, contro
+  `fase-v0.6.12`**: 95,0 → 95,0 ms (due coppie: 95,1/94,9 base,
+  95,1/94,7 fase), **±0%**, dentro il +15% — l'ancora non si calcola
+  alla compattazione (esiste già), nemmeno quella dell'oggetto intero.
+- **NUOVA — la stessa misura con 1 000 proposte decise nella cella**:
+  105,0 → 106,6 ms (104,8/105,3 base, 105,8/107,5 fase), **+1,5%** —
+  l'ancora più grossa delle mille proposte costa questo, alla
+  compattazione.
+
+## La caccia — la prima corsa, e il difetto che ha trovato
+
+La prima caccia (`target/caccia/20261123-011020`, 22 428 s in tutto):
+28 proprietà su 29 verdi a 20 000 casi. **Una rossa: la proprietà
+NUOVA**, `quarantine_exits_only_by_decision`, seme
+`10047751813916750872` (669 successi prima del caso) — e le cinque
+corse della suite a 2048 rosse tutte dello STESSO seme (la persistenza
+lo rigioca).
+
+**Il giudizio: difetto nuovo, di questa fase, trovato dalla proprietà
+nuova e corretto PRIMA del tag.** La storia del seme: una proposta
+d'agente in modo `new` (X) accettata e annullata (X in quarantena,
+coda `reverted`); poi una SECONDA proposta in modo supersede il cui
+bersaglio è X, accettata dall'utente (X chiusa, `superseded` —
+legittimo: la decisione è dell'utente); poi la PURGA della seconda
+proposta (il chiudente). Il lato vecchio doveva riaprire in quarantena
+— la foto pre-chiusura c'era — e invece restava `superseded`: una
+decisione annullata sopravviveva alla purga del chiudente. La causa è
+mia, in `newest_closing_of`: il ramo `decide` restituiva il chiudente
+NUDO (la colonna `note_id`, «01P8670…») mentre il ramo `supersede` lo
+restituiva nella forma d'oggetto («note:01P8670…») — il confronto
+della dominanza non matchava mai per le chiusure nate da una `decide`,
+e la riapertura non partiva. Corretto (`'note:' || o.note_id`, commit
+`24ba5ab`); il seme è nel file delle regressioni e rigiocа verde.
+
+**La regola della fase è onesta fino in fondo**: un commit dopo la
+caccia che tocca `crates/*/src` obbliga a rifarla — e il fix tocca
+`material.rs`. La caccia è stata RIDATTA INTERA sul commit finale
+(`24ba5ab`); la sua tabella sta sotto.
+
+## La caccia — la corsa buona (sul commit finale `24ba5ab`)
+
+23 615 s in tutto, 29 proprietà a 20 000 casi + 5 corse della suite a
+2 048. Il registro: `target/caccia/20261123-082135`.
+
+| corsa | esito | tempo |
+|---|---|---|
+| the_fleet_converges | verde | 1026 s |
+| every_copy_equals_its_reconstruction | verde | 1062 s |
+| no_copy_closes_without_a_witness | verde | 745 s |
+| no_body_text_is_lost (dichiarato aperto) | verde | 758 s |
+| the_new_diff3_decides_as_the_v064_one | verde | 6 s |
+| the_long_alignment_is_still_a_lcs | verde | 136 s |
+| the_identity_never_moves_on_generated_histories | verde | 349 s |
+| hidden_notes_leave_no_fingerprint | verde | 509 s |
+| proposal_sequences_keep_the_invariants | verde | 791 s |
+| format_round_trip | verde | 7 s |
+| replay_equals_state | verde | 922 s |
+| compaction_keeps_verify_and_state | verde | 1311 s |
+| random_ops_compact_and_purge_leave_no_roots | verde | 2062 s |
+| purge_with_conflict_copies_leaves_no_roots | verde | 3016 s |
+| export_import_equality | verde | 1 s |
+| hlc_monotonic | verde | 0 s |
+| purge_takes_only_its_family | verde | 2382 s |
+| frozen_prefix_is_immutable | verde | 1813 s |
+| 10 proprietà MCP (oauth) | verdi | ≤ 52 s |
+| **quarantine_exits_only_by_decision** | **ROSSO** | 83 s |
+| suite-1 (2048) | ROSSO — seme 402504895431060428 | 1518 s |
+| suite-2..4 (2048) | ROSSI — semi 11895058361907748327, 402504895431060428 | 1235–1242 s |
+| suite-5 (2048) | ROSSO — semi 11895058361907748327, 11558843446952054066 | 1363 s |
+
+**Il giudizio su ogni rosso:**
+
+- **Seme `402504895431060428` — falso positivo dell'oracolo,
+  CORRETTO.** La forma a due dispositivi: l'annullamento (hlc …d408)
+  precede nell'ordine TOTALE la decisione che chiude (…d409), ma sulla
+  ricevente arriva PRIMA (seq 8 < seq 6 mente). Il motore applica
+  l'ordine totale e ha ragione; il giudice confrontava per seq. Il
+  giudice ora parla (hlc, op_id) — commit `5034ff8`, il seme è in
+  regressione e rigioca verde.
+- **Seme `11895058361907748327` — DIFETTO NUOVO, DICHIARATO APERTO**
+  (`open-defects.txt`). Una nota chiusa da una decide accettata,
+  annullata, poi RIAPERTA da un `restore` dell'utente — stato
+  `superseded` SENZA riga, legittimo — torna `Active` dopo la purga
+  di una nota qualunque: la rimaterializzazione che la purga forza
+  riordina le versioni e il `restore` nomina un numero che nel rigioco
+  tiene un'altra fotografia. Territorio del determinismo del
+  `restore`, preesistente, esposto dall'oracolo della purga allargato
+  all'oggetto intero.
+- **Seme `11558843446952054066` — DIFETTO NUOVO, DICHIARATO APERTO**
+  (`open-defects.txt`). Proposta d'agente in modo `new`, accettata
+  dall'utente, poi chiusa da un supersede dell'utente: alla fine la
+  coda dice `pending` e lo stato `superseded` — contenuto nato in
+  quarantena reso visibile con la coda che non racconta più la nota.
+  Trovato dalla proprietà nuova, alla sua prima caccia.
+
+La suite a 128 casi gira verde con i semi aperti fuori dalle
+regressioni (`properties_inventory` controlla il cancello).
+
+## Difetti nuovi trovati in questa fase
+
+Tre, tutti dall'oracolo nuovo o allargato, tutti giudicati:
+
+1. **Corretto prima del tag**: la riapertura della purga non partiva
+   per le chiusure nate da una `decide` — il chiudente restituito
+   nudo, senza `note:` (seme `10047751813916750872`, prima caccia;
+   commit `24ba5ab`).
+2. **Dichiarato aperto**: il `restore` dopo annullamento e
+   riaccettazione riordina le versioni nel rigioco della purga (seme
+   `11895058361907748327`).
+3. **Dichiarato aperto**: la coda `pending` con lo stato `superseded`
+   — la riga di coda non racconta più la nota (seme
+   `11558843446952054066`).
+
+## La release locale, con la compattazione accesa
+
+**NON PRONTA.** (**Linux verde**: `scripts/linux.sh` — fmt + clippy
+`-D warnings` + tutta la suite del workspace nel container arm64,
+rete chiusa, sorgente in sola lettura.) I due difetti dichiarati della v0.6.12 sono chiusi e
+la loro storia gira pulita (semi fissi, oracoli allargati, celle d'oro
+v0612 e v0613); ma la caccia ha trovato DUE difetti nuovi nelle
+semaniche della coda e del `restore` — e il secondo, in particolare,
+è dello stesso sangue dell'invariante della quarantena: contenuto
+nato in quarantena che finisce visibile con la coda che non lo
+racconta più. Sono dichiarati aperti coi semi; la fase che li chiude
+deciderà la release. Per Homun la compattazione resta spenta.
+
+## La pulizia
+
+`du -sh target`: **25 G all'inizio, 27 G alla fine** (le due cacce in
+release e le celle d'oro; niente cancellato — la pulizia del disco è
+dell'utente). In `$TMPDIR`, alla fine: **le cartelle `engramma-test-*`
+nostre a zero** (nessuna cancellata a mano: le droppano le prove),
+**`engramma-node-*` a zero**, le otto `.tmp*` del 22 novembre restano
+dove sono (non attribuibili, decisione dell'utente). Nessun processo
+lasciato acceso. Le cache `engramma-cli-*` e il volume Docker
+`engramma-linux-target` intatti, come da mandato.
+
+## La build sul tag
+
+(COMPILAZIONE-DOPO-IL-TAG)
+
 ## Verifica v0.6.12 (revisore, 2026-11-22)
 
 Fatta sul tag `fase-v0.6.12` (`3e7b7c6`), a priorità minima. Le sonde stanno
