@@ -81,9 +81,6 @@ proptest! {
         ordinary_public_v4_is_public_body(seed)?;
     }
 
-    /// The port-ignoring exception applies ONLY to http + loopback: for
-    /// https, or another host, a different port is a different redirect.
-    #[test]
     /// v0.5.3 (P3.5): 6to4 is judged by the IPv4 it embeds — a reserved v4
     /// in a 6to4 coat is never public, a public one always is.
     /// (v0.6.14, N3: this carried `#[test]` TWICE — one above the doc
@@ -100,7 +97,9 @@ proptest! {
     fn nat64_teredo_and_ipv4_compatible_are_never_public(seed in any::<u64>()) {
         nat64_teredo_and_ipv4_compatible_are_never_public_body(seed)?;
     }
-    /// Same path, two ports: when the ports differ the URIs differ, except
+    /// The port-ignoring exception applies ONLY to http + loopback: for
+    /// https, or another host, a different port is a different redirect —
+    /// same path, two ports: when the ports differ the URIs differ, except
     /// over plain `http` on a loopback host. (v0.6.14, N3: this property
     /// had no `#[test]` — it never ran, and the hunts recorded it green.
     /// The inventory checks it now.)
