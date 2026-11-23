@@ -37,7 +37,8 @@ esista. Le toccate prendono 10 minuti, le altre 2 — i due valori sono
 parametri dello script (`TOCCATE`, `ALTRE`). Se la somma supera
 l'obiettivo (`OBIETTIVO`, 100 minuti, suite compresa), i budget si
 riducono in proporzione: prima le toccate, mai sotto il budget delle
-altre.
+altre. Una proprietà che raggiunge i 20 000 casi senza esaurire il suo
+budget non si riduce: il massimo dei casi costa quello che costa.
 
 **Una corsa sola della suite a 2048** (`SUITE_CASI`; `0` per saltarla).
 

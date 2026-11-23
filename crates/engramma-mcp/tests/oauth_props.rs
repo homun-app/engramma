@@ -86,6 +86,9 @@ proptest! {
     #[test]
     /// v0.5.3 (P3.5): 6to4 is judged by the IPv4 it embeds — a reserved v4
     /// in a 6to4 coat is never public, a public one always is.
+    /// (v0.6.14, N3: this carried `#[test]` TWICE — one above the doc
+    /// comment and one below — so the harness registered it two times and
+    /// every run, every hunt included, ran it double.)
     #[test]
     fn sixto_four_is_the_ipv4_it_carries(seed in any::<u64>()) {
         sixto_four_is_the_ipv4_it_carries_body(seed)?;

@@ -23,7 +23,10 @@
 #    moduli è la terza colonna dell'inventario (properties.txt), guardata
 #    da `properties_inventory`. Le toccate prendono TOCCATE minuti, le
 #    altre ALTRE. Se la somma supera l'obiettivo i budget si riducono in
-#    proporzione — prima le toccate, mai sotto il budget delle altre.
+#    proporzione — prima le toccate, mai sotto il budget delle altre. Chi
+#    raggiunge MAX_CASI senza esaurire il suo budget (una proprietà che
+#    costa poco) prende il massimo dei casi e non si riduce: il massimo
+#    costa quello che costa, ed è già contato.
 #
 # 3. UNA corsa sola della suite a SUITE_CASI, non cinque.
 #
@@ -261,7 +264,7 @@ done <"$PIANO"
 
 # --- i budget: il tempo dove la fase ha toccato --------------------------
 # Il costo di una proprietà mai misurata (fermata o rossa in calibrazione)
-# resta -1: prende il budget per intero, fino a MAX_CASI.
+# resta -1: è già giudicata, e la corsa sotto la salta.
 PIANO3="$LOGDIR/piano3.tsv"
 awk -F'\t' -v OFS='\t' \
   -v obiettivo="$OBIETTIVO" -v suite="$SUITE_MISURATA" \
@@ -271,24 +274,31 @@ awk -F'\t' -v OFS='\t' \
   END {
     pool = obiettivo * 60 - suite
     if (pool < 0) pool = 0
-    su = 0; st = 0
+    su = 0; st = 0; fisso = 0
     for (i = 1; i <= n; i++) {
-      b = (toc[i] == 1 ? toccate_min : altre_min) * 60
-      eff = b
-      if (cost[i] > 0) { e = maxc * cost[i] / 1000000; if (e < b) eff = e }
-      effn[i] = eff
-      if (toc[i] == 1) st += eff; else su += eff
+      b[i] = (toc[i] == 1 ? toccate_min : altre_min) * 60
+      capo[i] = -1
+      if (cost[i] > 0) {
+        capo[i] = maxc * cost[i] / 1000000     # i secondi di MAX_CASI casi
+        if (capo[i] <= b[i]) fisso += capo[i]  # poco costosa: il massimo, intero
+        else if (toc[i] == 1) st += b[i]
+        else su += b[i]
+      }
     }
     fu = 1; ft = 1
-    if (su > pool && su > 0) fu = pool / su
-    rest = pool - su * fu
+    rest = pool - fisso
+    if (su > rest && su > 0) fu = rest / su
+    rest = rest - su * fu
     if (st > rest && st > 0) ft = rest / st
     for (i = 1; i <= n; i++) {
-      bud = effn[i] * (toc[i] == 1 ? ft : fu)
-      if (cost[i] <= 0) casi = maxc
-      else casi = int(bud * 1000000 / cost[i] + 0.5)
-      if (casi < minc) casi = minc
-      if (casi > maxc) casi = maxc
+      if (cost[i] <= 0) { bud = 0; casi = 0 }
+      else if (capo[i] <= b[i]) { bud = capo[i]; casi = maxc }
+      else {
+        bud = b[i] * (toc[i] == 1 ? ft : fu)
+        casi = int(bud * 1000000 / cost[i] + 0.5)
+        if (casi < minc) casi = minc
+        if (casi > maxc) casi = maxc
+      }
       print nome[i], pkg[i], tgt[i], toc[i], cost[i], int(bud), casi
     }
   }' "$PIANO2" >"$PIANO3"
