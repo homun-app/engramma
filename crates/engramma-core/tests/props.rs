@@ -3298,25 +3298,34 @@ fn quarantine_exits_only_by_decision_body(seed: u64) {
 }
 
 /// v0.6.14: the defect the phase's gate found, DECLARED OPEN
-/// (`open-defects.txt`; REPORT, «Il cancello nuovo»). Two linked
-/// proposals — P1, new, and a correction P2 that has P1 as its target —
-/// are both accepted; then the user cancels P1's acceptance on one
-/// device and P2's on another, before syncing. Each cancel is legitimate
-/// where it is made (on one device the second is refused: «conflict …
-/// later operations»); together, in the total order, the cancel of P2
-/// reopens P1 «as the closing photographed it» — active — and P1 is
-/// visible with its own decision cancelled. No compaction, no purge: two
-/// devices and two cancels. It falls on `fase-v0.6.13` with the same
-/// message (`seme-sul-tag.sh`): pre-existing, and its diagnosis belongs
-/// to the phase that closes it. The suite must run, so the case is not
-/// in it: this test is IGNORED, and it is run by hand —
+/// (`open-defects.txt`; REPORT, «Il cancello nuovo»): a cancel of a
+/// LINKED proposal reopens its target without looking at the target's own
+/// cancelled decision — the note is visible with no standing decision
+/// (rule 3). Two shapes, two seeds:
+/// - `1835111131785192683`: P1 (new) and the correction P2 over P1 are
+///   both accepted; then the user cancels P1's acceptance on one device
+///   and P2's on another, before syncing. Each cancel is legitimate where
+///   it is made (on one device the second is refused: «conflict … later
+///   operations»); together, in the total order, the cancel of P2 reopens
+///   P1 «as the closing photographed it» — active;
+/// - `2472647288214113510`: P1 accepted, the correction P2 over P1
+///   REJECTED; the acceptance of P1 cancelled (P1 back in quarantine),
+///   then the reject of P2 cancelled: P1 is active again (a second,
+///   concurrent cancel of P1, same base, loses the total order and moves
+///   nothing, as declared).
+///
+/// Two devices; no compaction, no purge. Both fall on `fase-v0.6.13`
+/// with the same message (`seme-sul-tag.sh`): pre-existing, and the
+/// diagnosis belongs to the phase that closes it. The suite must run, so
+/// the cases are not in it: this test is IGNORED, and it is run by hand —
 /// `cargo test -p engramma-core --test props the_declared_defect_of_v0614 -- --ignored`
 /// It FALLS while the defect is open. When a phase closes it, this test
 /// turns green: drop the `ignore`, drop the row from `open-defects.txt`.
 #[test]
-#[ignore = "il difetto dichiarato: due annullamenti concorrenti, su due dispositivi, di due proposte legate — cade finché resta aperto"]
+#[ignore = "il difetto dichiarato: l'annullamento di una proposta legata riapre il bersaglio con la decisione annullata — cade finché resta aperto"]
 fn the_declared_defect_of_v0614_two_devices() {
     quarantine_exits_only_by_decision_body(1_835_111_131_785_192_683);
+    quarantine_exits_only_by_decision_body(2_472_647_288_214_113_510);
 }
 
 /// v0.6.14 (N3): the canonical name of the body — the story is
