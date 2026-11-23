@@ -39,8 +39,8 @@
 # I difetti APERTI, quando ci sono, stanno in
 # crates/engramma-core/tests/open-defects.txt e le loro proprietà si
 # girano COMUNQUE: un difetto dichiarato non è un motivo per non giudicare
-# il resto (il file esiste solo con almeno un difetto aperto: dalla
-# v0.6.14 non c'è più). Il giudizio su un rosso — «nasce da questa fase o
+# il resto (il file esiste solo con almeno un difetto aperto). Il
+# giudizio su un rosso — «nasce da questa fase o
 # c'era già?» — ha un budget di 30 minuti e tre passi meccanici
 # (docs/caccia.md): la riproduzione deterministica del seme (ogni
 # proprietà ha un corpo `fn <nome>_body(seed: u64)`), lo stesso seme sul
@@ -91,8 +91,7 @@ export PROPTEST_VERBOSE=2
 
 INVENTARIO=crates/engramma-core/tests/properties.txt
 # i difetti aperti dichiarati: il file C'È solo quando c'è almeno un difetto
-# aperto (v0.6.14: l'ultimo dichiarato era chiuso dalla v0.6.9 — il file è
-# andato via con lui, come il suo cancello prescriveva)
+# aperto, e va via con l'ultimo (v0.6.14: ricreato dal cancello della fase)
 APERTI=crates/engramma-core/tests/open-defects.txt
 [ -f "$INVENTARIO" ] || { echo "manca $INVENTARIO" >&2; exit 1; }
 command -v perl >/dev/null 2>&1 || { echo "serve perl (il limite di tempo)" >&2; exit 1; }
