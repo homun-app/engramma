@@ -2056,10 +2056,34 @@ fn judge_the_purge(
                 .find(|(rid, _)| rid == id)
                 .is_some_and(|(_, held)| held.contains(&after.status));
         if !reopening {
+            let pre_rows = cell
+                .debug_column(&format!(
+                    "SELECT new_id FROM supersedes WHERE old_id = '{id}'"
+                ))
+                .unwrap_or_default();
+            let purged_closers: Vec<String> = pre_rows
+                .iter()
+                .filter(|c| {
+                    cell.debug_column(&format!(
+                        "SELECT CAST(COUNT(*) AS TEXT) FROM ops o
+                         JOIN op_objects oo ON oo.op_id = o.op_id
+                         WHERE oo.object = 'note:{c}' AND o.kind = 'purge'"
+                    ))
+                    .unwrap_or_default()
+                    .first()
+                    .is_some_and(|n| n != "0")
+                })
+                .cloned()
+                .collect();
+            let fam: Vec<String> = reopened
+                .iter()
+                .map(|(r, _)| r.to_string())
+                .take(6)
+                .collect();
             assert_eq!(
                 before.status, after.status,
-                "stato cambiato [{ctx}]: {id} (prima {:?}, dopo {:?})",
-                before.status, after.status
+                "stato cambiato [{ctx}]: {id} (prima {:?}, dopo {:?});                  history={:?}; chiudenti-dopo-purga={pre_rows:?} (purged: {purged_closers:?});                  reopened={fam:?}",
+                before.status, after.status, before.history
             );
         }
         // v0.6.12 (L2): the history too — the numbers and the bodies of
@@ -2501,10 +2525,10 @@ fn statuses_now(cell: &Cell) -> Vec<(String, String)> {
 /// skeleton says the kind), a `set_status`/`patch_note` whose payload
 /// still speaks, and any PHOTOGRAPH of a quarantined state (the version
 /// rows never go).
-fn last_quarantine_entry(cell: &Cell, id: &str) -> Option<i64> {
+fn last_quarantine_entry(cell: &Cell, id: &str) -> Option<(String, String)> {
     let via_ops = cell
         .debug_column(&format!(
-            "SELECT CAST(COALESCE(MAX(o.seq), 0) AS TEXT) FROM ops o
+            "SELECT o.hlc || char(31) || o.op_id FROM ops o
              JOIN op_objects oo ON oo.op_id = o.op_id
              LEFT JOIN op_payloads p ON p.op_id = o.op_id
              WHERE oo.object = 'note:{id}'
@@ -2512,23 +2536,31 @@ fn last_quarantine_entry(cell: &Cell, id: &str) -> Option<i64> {
                     OR (o.kind = 'set_status'
                         AND json_extract(p.body, '$.status') = 'quarantined')
                     OR (o.kind = 'patch_note'
-                        AND json_extract(p.body, '$.set.confidence') = 'external'))"
+                        AND json_extract(p.body, '$.set.confidence') = 'external'))
+             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1"
         ))
         .unwrap_or_default()
-        .first()
-        .and_then(|s| s.parse::<i64>().ok())
-        .filter(|s| *s > 0);
+        .into_iter()
+        .next()
+        .and_then(|r| {
+            let (hlc, op) = r.split_once('\u{1f}')?;
+            Some((hlc.to_string(), op.to_string()))
+        });
     let via_photos = cell
         .debug_column(&format!(
-            "SELECT CAST(COALESCE(MAX(o.seq), 0) AS TEXT)
+            "SELECT o.hlc || char(31) || o.op_id
              FROM note_versions nv JOIN ops o ON o.op_id = nv.op_id
              WHERE nv.note_id = '{id}'
-               AND json_extract(nv.snapshot_json, '$.status') = 'quarantined'"
+               AND json_extract(nv.snapshot_json, '$.status') = 'quarantined'
+             ORDER BY o.hlc DESC, o.op_id DESC LIMIT 1"
         ))
         .unwrap_or_default()
-        .first()
-        .and_then(|s| s.parse::<i64>().ok())
-        .filter(|s| *s > 0);
+        .into_iter()
+        .next()
+        .and_then(|r| {
+            let (hlc, op) = r.split_once('\u{1f}')?;
+            Some((hlc.to_string(), op.to_string()))
+        });
     // the PHOTO evidence says «it was quarantined once» but never WHEN
     // the entry happened: an exit's own pre-state photograph (a decide
     // photographs the quarantined note it is about to lift) would pose
@@ -2538,7 +2570,9 @@ fn last_quarantine_entry(cell: &Cell, id: &str) -> Option<i64> {
     if via_ops.is_some() {
         via_ops
     } else if via_photos.is_some() {
-        Some(0)
+        // any exit at all: the photo says «it was quarantined once» but
+        // the entry op's key is unreadable under the cut
+        Some(("".to_string(), "".to_string()))
     } else {
         None
     }
@@ -2550,32 +2584,36 @@ fn last_quarantine_entry(cell: &Cell, id: &str) -> Option<i64> {
 /// engine's own word on the classes is `classify_actor`)? A purge's
 /// reopening is NOT one: it returns a state the note HAD — if that
 /// state was the quarantine, the note lands back in it.
-fn has_a_legitimate_exit(cell: &Cell, id: &str, after: i64) -> bool {
+fn has_a_legitimate_exit(cell: &Cell, id: &str, after: (&str, &str)) -> bool {
     // the decisions the registry holds (their flavor and their actor
     // survive the cut — the table is derived state, never redacted).
     // The note can be the PROPOSAL (the decision lifts it) or the
     // TARGET of the accepted correction (the decision closes it —
     // visible as superseded, and the decision is the user's own word)
+    // the comparisons live in the TOTAL order (hlc, op_id), never in the
+    // local seq of arrival: on the receiving device a decision can LAND
+    // before the cancel it answers, and the cancel before the closing it
+    // follows — the seqs lie, the total order is the story (found by the
+    // 20 000 hunt, seed 402504895431060428)
+    let after_sql = format!(
+        "(o.hlc > '{}' OR (o.hlc = '{}' AND o.op_id > '{}'))",
+        after.0, after.0, after.1
+    );
     let accepted = cell
         .debug_column(&format!(
-            "SELECT d.actor || char(31) || o.seq FROM decisions d
+            "SELECT d.actor FROM decisions d
              JOIN ops o ON o.op_id = d.op_id
              LEFT JOIN proposals p ON p.note_id = d.proposal
              WHERE (d.proposal = '{id}' OR p.target = '{id}')
-               AND d.decision = 'accept'"
+               AND d.decision = 'accept' AND {after_sql}"
         ))
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|r| {
-            let (actor, seq) = r.split_once('\u{1f}')?;
-            Some((actor.to_string(), seq.parse::<i64>().ok()?))
-        })
-        .any(|(actor, seq)| {
-            seq > after
-                && !matches!(
-                    engramma_core::cell::conflicts::classify_actor(&actor),
-                    engramma_core::cell::conflicts::ActorClass::Agent
-                )
+        .any(|actor| {
+            !matches!(
+                engramma_core::cell::conflicts::classify_actor(&actor),
+                engramma_core::cell::conflicts::ActorClass::Agent
+            )
         });
     if accepted {
         return true;
@@ -2588,25 +2626,18 @@ fn has_a_legitimate_exit(cell: &Cell, id: &str, after: i64) -> bool {
     // payload's target is the declared corner: a `set_status` to
     // quarantine may pose as an exit, and the case is read by hand)
     cell.debug_column(&format!(
-        "SELECT o.actor || char(31) || CAST(o.seq AS TEXT)
-         FROM ops o
+        "SELECT o.actor FROM ops o
          JOIN op_objects oo ON oo.op_id = o.op_id
-         WHERE oo.object = 'note:{id}' AND o.seq > {after}
+         WHERE oo.object = 'note:{id}' AND {after_sql}
            AND o.kind IN ('confirm', 'set_status', 'restore')"
     ))
     .unwrap_or_default()
     .into_iter()
-    .any(|r| {
-        let Some((actor, seq)) = r.split_once('\u{1f}') else {
-            return false;
-        };
-        seq.parse::<i64>().is_ok_and(|seq| {
-            seq > after
-                && !matches!(
-                    engramma_core::cell::conflicts::classify_actor(actor),
-                    engramma_core::cell::conflicts::ActorClass::Agent
-                )
-        })
+    .any(|actor| {
+        !matches!(
+            engramma_core::cell::conflicts::classify_actor(&actor),
+            engramma_core::cell::conflicts::ActorClass::Agent
+        )
     })
 }
 
@@ -2623,11 +2654,12 @@ fn judge_quarantine_invariant(cell: &Cell, ctx: &str) {
         let visible = status == "active" || status == "superseded";
         if visible
             && let Some(entry) = last_quarantine_entry(cell, &id)
-            && !has_a_legitimate_exit(cell, &id, entry)
+            && !has_a_legitimate_exit(cell, &id, (&entry.0, &entry.1))
         {
+            let entry_hlc = &entry.0;
             panic!(
                 "quarantine_exits_only_by_decision [{ctx}]: la nota {id} è `{status}` \
-                 senza una decisione che la spieghi (ingresso in quarantena a seq {entry})"
+                 senza una decisione che la spieghi (ingresso in quarantena a {entry_hlc})"
             );
         }
         if status == "quarantined" {
@@ -2665,9 +2697,9 @@ fn judge_quarantine_invariant(cell: &Cell, ctx: &str) {
     // accept it named still stands). When the queue says `reverted` the
     // cancel DID move the note, and only a NEW decision may lift it
     // back into a visible state.
-    let cancelled: Vec<(String, i64)> = cell
+    let cancelled: Vec<(String, String, String)> = cell
         .debug_column(
-            "SELECT d.proposal || char(31) || CAST(r.seq AS TEXT)
+            "SELECT d.proposal || char(31) || r.hlc || char(31) || r.op_id
              FROM decisions d
              JOIN ops r ON r.op_id = d.reverted_by
              JOIN proposals p ON p.note_id = d.proposal
@@ -2676,18 +2708,22 @@ fn judge_quarantine_invariant(cell: &Cell, ctx: &str) {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|r| {
-            let (p, s) = r.split_once('\u{1f}')?;
-            Some((p.to_string(), s.parse().ok()?))
+            let mut it = r.splitn(3, '\u{1f}');
+            Some((
+                it.next()?.to_string(),
+                it.next()?.to_string(),
+                it.next()?.to_string(),
+            ))
         })
         .collect();
-    for (id, revert_seq) in cancelled {
+    for (id, revert_hlc, revert_op) in cancelled {
         let status: Option<String> = cell
             .debug_column(&format!("SELECT status FROM notes WHERE id = '{id}'"))
             .unwrap_or_default()
             .into_iter()
             .next();
         let visible = matches!(status.as_deref(), Some("active") | Some("superseded"));
-        if visible && !has_a_legitimate_exit(cell, &id, revert_seq) {
+        if visible && !has_a_legitimate_exit(cell, &id, (&revert_hlc, &revert_op)) {
             panic!(
                 "quarantine_exits_only_by_decision [{ctx}]: la decisione annullata di {id} \
                  non basta — la nota è di nuovo visibile senza una nuova decisione"
