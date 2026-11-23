@@ -1748,6 +1748,18 @@ fn purge_family_defect_seeds_of_v0613_run_clean() {
     }
 }
 
+/// v0.6.14 (N1): the seed of the v0.6.13 declaration on the quarantine
+/// invariant, deterministic. The reviewer traced it: two compactions,
+/// the second with a cut BELOW the first (15, then 14, with the copy
+/// file); the `decide` that accepts has its payload already gone, sits
+/// above the new cut, replays as nothing — and at the first
+/// reconstruction the queue says `pending` under a `superseded` note,
+/// with no registry row. RED on the v0.6.13 base.
+#[test]
+fn quarantine_defect_seed_of_v0613_runs_clean() {
+    quarantine_exits_body(11558843446952054066);
+}
+
 /// v0.6.12 (L3): the sweeper. A run KILLED mid-flight (a Ctrl-C on a
 /// long hunt) leaves behind whatever test folders were in flight — the
 /// three `.tmp*` of the 21st of November were exactly that, with
