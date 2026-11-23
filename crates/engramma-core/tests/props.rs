@@ -1748,6 +1748,19 @@ fn purge_family_defect_seeds_of_v0613_run_clean() {
     }
 }
 
+/// v0.6.14 (N2): the other seed of the v0.6.13 declaration,
+/// deterministic — `purge_takes_only_its_family`, the `restore` that
+/// wrote the state. The reviewer replayed the same body on the v0.6.12
+/// tag and it falls the same way (`01P4962…`: `Superseded` before,
+/// `Active` after): a note closed by an accepted correction, cancelled,
+/// then put back `superseded` by the user's restore with no closing row,
+/// turned `Active` at the purge of an unrelated note. RED on the v0.6.13
+/// base.
+#[test]
+fn purge_family_restore_seed_of_v0613_runs_clean() {
+    purge_takes_only_its_family_body(11895058361907748327);
+}
+
 /// v0.6.14 (N1): the seed of the v0.6.13 declaration on the quarantine
 /// invariant, deterministic. The reviewer traced it: two compactions,
 /// the second with a cut BELOW the first (15, then 14, with the copy
