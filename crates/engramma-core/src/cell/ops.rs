@@ -1206,6 +1206,22 @@ pub(crate) fn snapshot(
     Ok(())
 }
 
+/// v0.6.13 (M1): does this note hold ANY derived row of the anchor —
+/// a queue row, a registry row, a `supersedes` row of the new side?
+/// One probe over three indexes; the common note answers none, and its
+/// photograph is the EMPTY object — which needs no storing: an absent
+/// anchor restores nothing, exactly as an empty one would.
+pub(crate) fn has_derived_rows(tx: &Transaction<'_>, id: &Ulid) -> Result<bool, CellError> {
+    let any: i64 = tx.query_row(
+        "SELECT (SELECT COUNT(*) FROM proposals WHERE note_id = ?1)
+              + (SELECT COUNT(*) FROM decisions WHERE proposal = ?1)
+              + (SELECT COUNT(*) FROM supersedes WHERE new_id = ?1)",
+        [id.to_string()],
+        |r| r.get(0),
+    )?;
+    Ok(any > 0)
+}
+
 /// v0.6.13 (M1): the DERIVED rows of one note's object, as one
 /// photograph — the queue row, the registry rows, the `supersedes` rows
 /// of the new side. Read as JSON so the writer (`snapshot_object`) and
@@ -1277,6 +1293,13 @@ pub(crate) fn derived_anchor_json(tx: &Transaction<'_>, id: &Ulid) -> Result<Str
 /// and takes the FIRST, so a later photograph under a later operation
 /// never hides an earlier one).
 fn snapshot_object(tx: &Transaction<'_>, id: &Ulid, op_id: &Ulid) -> Result<(), CellError> {
+    // the EMPTY object (the common note: no queue, no registry, no new
+    // side) is not stored: an absent anchor restores nothing, exactly
+    // as an empty one would, and the write path pays one probe instead
+    // of a photograph per note
+    if !has_derived_rows(tx, id)? {
+        return Ok(());
+    }
     let json = derived_anchor_json(tx, id)?;
     tx.execute(
         "INSERT INTO object_anchors (note_id, op_id, anchor_json)
