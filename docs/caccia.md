@@ -75,14 +75,29 @@ spetta alla fase che lo trova: la fa la fase che lo chiude.
    ```sh
    scripts/seme-sul-tag.sh <proprietà> <seme> <tag> [corpo]
    ```
-   Un worktree del tag dentro `target/` (mai in `$TMPDIR`), con la stessa
-   `CARGO_TARGET_DIR`; nel file di test della proprietà un test che chiama
+   Un worktree del tag dentro `target/` (mai in `$TMPDIR`), che si
+   costruisce **nella sua cartella di build** (il `target` del worktree, e
+   se ne va con lui); nel file di test della proprietà un test che chiama
    il corpo col seme; il verdetto — **«cade anche sul tag»** (esce 1) o
    **«non cade sul tag»** (esce 0); il worktree si toglie da solo alla
    fine, anche se il test fallisce. Sui tag prima della v0.6.14 solo tre
    proprietà hanno un corpo (`purge_takes_only_its_family_body`,
    `frozen_prefix_body`, `quarantine_exits_body`): per le altre lo script
    lo dice (esce 3).
+
+   **La cartella di build non si condivide con l'albero principale, e lo
+   script controlla il motore.** Due alberi diversi nella stessa
+   `CARGO_TARGET_DIR` danno manufatti con lo stesso nome, e cargo giudica
+   fresco un manufatto i cui sorgenti, *quelli che ha elencato nella
+   build prima*, non sono cambiati — non guarda l'albero che ha davanti.
+   Si rischia di provare il motore di oggi col file di test del tag, e
+   «cade anche sul tag» con il motore di oggi cade uguale. Nella v0.6.14
+   andò così per tutta la fase, e ogni verdetto fu rifatto in fondo
+   (REPORT). Lo script adesso non dà un verdetto se la **libreria** del
+   tag non risulta compilata in quella corsa dal worktree (cargo,
+   `--message-format=json`) e se lo **schema** di una cella nuova non è
+   quello che il tag dichiara nel suo `schema.rs`. Costa una build intera
+   a corsa: è il prezzo di un verdetto che significa quel che dice.
 3. **Il giudizio.** Se il difetto **nasce da questa fase**, si corregge.
    Se **c'era già**, si **dichiara** aperto in `open-defects.txt` col seme
    e il verdetto dello script, e si va avanti.
@@ -93,8 +108,19 @@ spetta alla fase che lo trova: la fa la fase che lo chiude.
    novembre 2026 sono successi entrambi i casi (REPORT della v0.6.14):
    l'ultimo dichiarato, la perdita di testo esposta dal cestino, era
    chiuso dalla v0.6.9 — i suoi due casi registrati cadono sul tag
-   `fase-v0.6.8` e passano da `fase-v0.6.9` in poi — e il cancello della
-   fase ne ha trovato un altro, a due dispositivi, che sta nel file.
+   `fase-v0.6.8` e passano da `fase-v0.6.9` in poi — e le cacce della
+   fase ne hanno trovati altri due, che stanno nel file: uno il cancello
+   (a due dispositivi), uno la prova della caccia notturna (col file di
+   copia).
+
+**Un rosso di una proprietà che ha già un difetto dichiarato si smista
+uguale.** Non è per forza «quello»: nella stessa fase la proprietà della
+quarantena è caduta due volte con **due difetti diversi** (il messaggio
+li distingue: «la decisione annullata … non basta» contro «state differs
+around …»), e il secondo, trovato dalla prova notturna, nasce solo con
+un taglio che ha tenuto il file di copia. I tre passi sono gli stessi, e
+il verdetto «cade anche sul tag» vale per quel seme, non per la
+proprietà.
 
 Una proprietà il cui ingresso era una terna o un valore strutturato
 prima della v0.6.14 ha anche un gemello `_with(…)`, che prende gli

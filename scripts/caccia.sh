@@ -126,8 +126,9 @@ CAMBIATI="$LOGDIR/cambiati.txt"
   git ls-files --others --exclude-standard
 } | sort -u >"$CAMBIATI"
 
-# il costo per caso dell'ULTIMA caccia che l'ha misurato (una corsa verde:
-# casi corsi e secondi), cercando all'indietro nei registri
+# il costo per caso dell'ULTIMA caccia che l'ha misurato (una corsa con
+# dei casi: verdi, rosse e ferme al tempo lo lasciano tutte), cercando
+# all'indietro nei registri
 COSTI="$LOGDIR/costi.txt"
 for d in $(ls -dt target/caccia/*/ 2>/dev/null | grep -v "^$LOGDIR/"); do
   [ -f "${d}misura.tsv" ] || continue
@@ -336,11 +337,19 @@ while IFS="$TAB" read -r nome pacchetto bersaglio toccata costo budget casi; do
   t=$(($(adesso) - t0))
   corsi=$(casi_corsi "$registro")
   semi=$(semi_di "$registro")
+  # il costo per caso lo lascia OGNI corsa con dei casi — verde, rossa o
+  # ferma al tempo. Fino alla fine della v0.6.14 lo lasciava solo una verde:
+  # la caccia dopo ricalibrava la proprietà rossa con una corsa sola, al
+  # rumore (nella corsa finale della fase 168 ms per caso contro i 76 delle
+  # corse del giorno prima: 1 615 casi invece di 3 500, e un verde — REPORT)
   costo_us=""
+  if [ "$corsi" -gt 0 ]; then
+    costo_us=$(awk -v s="$t" -v c="$corsi" 'BEGIN { printf "%d", s * 1000000 / c }')
+  fi
   if [ "$st" -eq 0 ]; then
     esito=verde
     [ "$corsi" -gt 0 ] || corsi=$casi
-    costo_us=$(awk -v s="$t" -v c="$corsi" 'BEGIN { printf "%d", s * 1000000 / c }')
+    [ -n "$costo_us" ] || costo_us=$(awk -v s="$t" -v c="$corsi" 'BEGIN { printf "%d", s * 1000000 / c }')
     printf 'verde %ss (%s, toccata=%s, budget %ss, %s casi)\n' "$t" "$pacchetto/$nome" "$toccata" "$budget" "$corsi"
   elif [ "$st" -eq 124 ]; then
     esito=TEMPO
