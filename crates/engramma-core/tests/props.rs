@@ -3342,7 +3342,8 @@ fn the_declared_defect_of_v0614_two_devices() {
 /// - `2008146196850474940`: a note closed by a supersede that sits ON the
 ///   cut does not reopen when, above the cut, its closing note is purged —
 ///   the whole replay reopens it. The wrong state is there WITHOUT the file
-///   too, and `verify` does not see it (green without the file, red with).
+///   too, and `verify` does not see it (green without the file, red with);
+/// - `3784521736327746000`: shape A again, from the redo for `props.rs`.
 ///
 /// The judge of the single-cell form falls at its last assert in all
 /// three. All fall on `fase-v0.6.13` with the same message
@@ -3355,6 +3356,7 @@ fn the_declared_defect_of_v0614_after_a_cut() {
     quarantine_exits_only_by_decision_body(4_712_539_371_536_976_430);
     quarantine_exits_only_by_decision_body(2_309_209_543_203_644_442);
     quarantine_exits_only_by_decision_body(2_008_146_196_850_474_940);
+    quarantine_exits_only_by_decision_body(3_784_521_736_327_746_000);
 }
 
 /// v0.6.14 (N3): the canonical name of the body — the story is
