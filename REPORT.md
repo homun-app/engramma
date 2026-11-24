@@ -153,3 +153,26 @@ aperto e separato: `open-defects.txt` è la lista d'ingresso. Fuori da
 questa fase, come dichiarato: `revertDecision` nel binding, le
 correzioni Windows, l'installazione della caccia notturna, la fusione a
 righe e i permessi per attore — le scelte delle prossime fasi, dell'utente.
+
+### Verifica (revisore, 2026-11-24)
+
+Rifatto sul tag `5a81806`, a CPU bassa: `build-sha.sh` dà **gli stessi tre
+SHA** (`.node` `70b83608…aab57e`, 51 241 080 B: build riproducibile); JS
+67/67 in Node e in Electron; `compact_gate` 2/2 e `mcp` 12/12; workspace a
+`PROPTEST_CASES=64` senza caduti; `golden_cell` verde; i due difetti
+dichiarati cadono ancora (`--ignored`). Corsa 45439718377: verdi tutti i
+bloccanti; la conclusione «cancelled» viene da `macos-15-intel`.
+Gli hook di privacy passano sui 12 commit. **Verdetto: consegnata, la
+release locale è pronta.** Tre note, nessuna bloccante:
+
+- `advisories` non è solo «manutenzione»: due vulnerabilità vere,
+  `url` 2.5.8 e `rmcp` 3.8.0 (lato client HTTP; qui `rmcp` è solo
+  server). Va fatto `cargo update` e messo in `deny.toml` un `ignore`
+  motivato; poi le vulnerabilità diventano bloccanti, il resto no.
+- Il CI salta per intero `quarantine_exits_only_by_decision`: la regola 3
+  della quarantena non ha cancello finché il difetto è aperto. Meglio
+  seme fisso nel CI (`PROPTEST_RNG_SEED`) e proprietà dentro: un rosso
+  allora è sempre nuovo.
+- `macos-15-intel` rende «cancelled» la corsa intera: spostarlo su
+  `schedule`. Nel verdetto, «`crates/*/src` non cambia» vale per
+  `engramma-core`: binding e CLI sono cambiati, com'era previsto.
