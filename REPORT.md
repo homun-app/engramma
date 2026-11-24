@@ -13573,3 +13573,122 @@ conseguenze, in ordine:
   strip del secondo tentativo — roba mia, non cancellata perché il
   mandato vieta di toccare `target/`.
 
+
+## Verifica v0.6.14 (revisore, 2026-11-24)
+
+Consegnata **per lo sviluppo**. N1, N2 e N3 reggono. Il verdetto «release
+locale con la compattazione accesa: NON PRONTA» è giusto, e i due difetti
+nuovi sono pre-esistenti e dichiarati bene.
+
+### Le prove sul tag
+
+Prima delle prove l'utente ha deciso di cancellare `target/debug` (24 GB):
+il disco era a 894 MB liberi. Le prove sono state fatte col repo sul tag
+`fase-v0.6.14` (`3bd25f0`), `nice -n 19`, 2 fili:
+
+- **`scripts/build-sha.sh` riproduce gli SHA del REPORT:**
+  - `.node` 51 240 760 B, `f43dd58e…`;
+  - `index.js` `cd26043e…`;
+  - `index.d.ts` 31 800 B, `f9961c21…`.
+- **Il contratto JS**, con la CLI e l'addon dello stesso commit: 65/65 in
+  Node e 65/65 in Electron.
+- **`engramma-core` in release**, con `PROPTEST_CASES=64`: 40 suite, 387
+  passati, 0 caduti, 9 ignorati. Dentro ci sono:
+  - `cut_monotone`, con la sonda del revisore `cut_goes_back` nelle due
+    varianti;
+  - `restore_content`;
+  - le cinque celle d'oro;
+  - i semi della v0.6.13 come casi fissi.
+- **I due test ignorati dei difetti dichiarati cadono**, quindi i sei semi
+  di `open-defects.txt` ricadono davvero.
+- **Il cancello vale per il motore consegnato.** Fra `c30302f` (il commit
+  del cancello) e `main` nessun file di `crates/*/src` cambia. Fra il tag e
+  `main` cambia solo il REPORT.
+
+### Linux: ancora da fare, e il perché
+
+Il motore di `e05cb4a`, dove Linux era verde, è identico a quello del tag:
+dopo cambiano solo test, script e documenti. Il buco resta piccolo.
+
+Sul commit finale `scripts/linux.sh` non è partito. Docker non legge un blob
+della sua immagine (`input/output error`), e il registro della sua macchina
+virtuale mostra errori di I/O sul disco interno dal 24 novembre alle 10:49.
+Sono gli effetti del disco dell'host pieno. Il riavvio di Docker Desktop
+non è bastato: il demone risponde 500 a ogni chiamata. Rimetterlo in piedi
+vuol dire ripulire i dati di Docker, cosa che tocca anche le immagini di
+altri progetti: la decisione è dell'utente. Linux va rifatto dopo.
+
+### Sui due difetti dichiarati
+
+**Il difetto del taglio è il terzo di fila nella stessa famiglia**, e la
+ragione è strutturale. Lo stato di una nota oggi si ricava per tre strade:
+- il rigioco integrale;
+- l'ancora più il rigioco sopra il taglio;
+- la ricostruzione dal file di copia.
+
+Ogni regola del ciclo di vita (la riapertura della purga, la quarantena, il
+restore) va quindi scritta, e tenuta uguale, tre volte. Le cacce trovano
+proprio i punti in cui le tre strade divergono.
+
+Lo stato dell'arte (gli snapshot di Raft, le proiezioni dell'event
+sourcing) ha due parti:
+1. **una sola funzione di derivazione**,
+   `stato = fold(punto_di_partenza, op)`. L'ancora del taglio e il file di
+   copia sono due forme dello stesso punto di partenza, e il rigioco
+   integrale è il caso col punto di partenza vuoto. Con un codice solo, le
+   strade non possono divergere.
+2. **un oracolo differenziale come cancello**: per ogni storia e ogni
+   taglio legale, lo stato col taglio (con file e senza) è uguale allo
+   stato del rigioco integrale. Il REPORT lo propone come primo passo, ed è
+   giusto. Il revisore lo vuole **proprietà di prima classe del cancello**,
+   non un test accanto agli altri: è l'unico oracolo che vede la forma B,
+   oggi muta per `verify`.
+
+Un'ipotesi da provare, non una diagnosi. Nella forma B (`2008…`) il
+`supersede` sta **sul** taglio e la purga del chiudente sopra non lo
+riapre. Sa di un confine incluso/escluso fra quello che l'ancora fotografa
+e quello che il rigioco sopra il taglio rilegge. La regola «una purga
+riapre ciò che il chiudente chiuse» deve trovare il chiudente anche quando
+la sua operazione non ha più il payload.
+
+**Il difetto a due dispositivi** (la regola 3) non passa dal taglio. Va
+chiuso con la stessa disciplina: il bersaglio si riapre solo se la sua
+decisione è ancora in piedi nell'ordine totale, non «come la chiusura lo
+fotografò».
+
+### Altre note
+
+- **La `external` confermata che non si modifica** (il terzo difetto
+  dichiarato) non è detto che sia un difetto. Una fonte esterna confermata
+  può essere, per progetto, immutabile salvo una nuova versione. È una
+  decisione di prodotto da scrivere in DESIGN, non un difetto da tenere
+  aperto per inerzia.
+- **La cartella di build condivisa fra alberi** è una scoperta vera e
+  importante. Per i pacchetti del workspace, cargo hasha il percorso in
+  modo relativo alla radice, quindi due checkout danno manufatti con lo
+  stesso nome, e la freschezza guarda i sorgenti elencati l'ultima volta.
+  `seme-sul-tag.sh` ora costruisce nella cartella del worktree e controlla
+  la libreria compilata e lo schema letto: è la correzione giusta.
+- **Il disco.** In questa fase `target/` è passato da 27 a 32 GB, e il disco
+  pieno ha rotto una build e Docker. La regola proposta: all'inizio di ogni
+  fase `du -sh target` con una soglia, e sopra soglia la decisione
+  dell'utente su `target/debug` (ricostruibile), prima delle corse lunghe,
+  non dopo.
+- **Le cartelle temporanee.** In `$TMPDIR` le `engramma-test-*` e le
+  `engramma-node-*` sono a zero. Le `.tmp*` sono 54: non sono di Engramma,
+  e il revisore non le tocca.
+
+### Verdetto
+
+N1 (il taglio va solo avanti, `verify` controlla la soglia, la migrazione
+v24 ripara), N2 (il restore riporta il contenuto) e N3 (la caccia a tre
+livelli): consegnati. La caccia nuova ha ripagato nella fase stessa: ha
+trovato due proprietà che non giravano dal 7 novembre e due difetti
+pre-esistenti che sei cacce a 20 000 casi non avevano visto.
+
+La compattazione resta spenta per Homun. La prossima fase:
+- unifica la derivazione;
+- mette l'oracolo differenziale nel cancello;
+- chiude il difetto del taglio nelle due forme e quello a due dispositivi.
+
+Linux sul commit finale resta da fare quando Docker torna in piedi.
