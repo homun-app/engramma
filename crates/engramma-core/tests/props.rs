@@ -3329,25 +3329,32 @@ fn the_declared_defect_of_v0614_two_devices() {
 }
 
 /// v0.6.14: the SECOND defect the hunts of this phase found, DECLARED
-/// OPEN (`open-defects.txt`; REPORT, «La caccia notturna — la prova»), on
-/// the seed of the night proof (proptest: `minimal failing input: seed =
-/// 4712539371536976430`). One cell. The story, read from the log —
-/// facts, not a diagnosis: a correction proposal P over a note N; the
-/// user closes N with a supersede; P is accepted; a compaction WITH its
-/// copy file (the cut at seq 7); above the cut, the purge of the note
-/// that had closed two notes — N among them, the target of the accepted
-/// P. At the end the materialized state and the whole replay say N is
-/// `superseded`, the reconstruction FROM THE FILE says `active`: `verify`
-/// is not green («state differs around …»), and the judge of the
-/// single-cell form falls at its last assert. The same story without the
-/// copy file is green, and so is the story with no cut: the defect is
-/// born only with a cut that kept its file. It falls on `fase-v0.6.13`
-/// with the same message (`seme-sul-tag.sh`): pre-existing. IGNORED, run
+/// OPEN (`open-defects.txt`; REPORT, «Il cancello nuovo»), on three seeds
+/// — the first from the night proof, the others from the final gate and
+/// from the full-budget run of this property. One cell. The story, read
+/// from the logs — facts, not a diagnosis: after a compaction (a cut),
+/// above the cut the purge of a note that had closed others is not
+/// applied as the whole replay applies it. Two shapes:
+/// - `4712539371536976430`, `2309209543203644442`: the state WITH the cut
+///   is the state of the whole replay, but the reconstruction FROM THE COPY
+///   FILE says another — `verify` is red with the file («state differs
+///   around …»), green without;
+/// - `2008146196850474940`: a note closed by a supersede that sits ON the
+///   cut does not reopen when, above the cut, its closing note is purged —
+///   the whole replay reopens it. The wrong state is there WITHOUT the file
+///   too, and `verify` does not see it (green without the file, red with).
+///
+/// The judge of the single-cell form falls at its last assert in all
+/// three. All fall on `fase-v0.6.13` with the same message
+/// (`seme-sul-tag.sh`), and for the third the three variants of the story
+/// give, on the tag, the same states as today: pre-existing. IGNORED, run
 /// by hand; it FALLS while the defect is open.
 #[test]
-#[ignore = "il difetto dichiarato: dopo una compattazione col file di copia, la ricostruzione dal file non concorda col rigioco — cade finché resta aperto"]
-fn the_declared_defect_of_v0614_from_the_copy_file() {
+#[ignore = "il difetto dichiarato: dopo un taglio, la purga di un chiudente sopra il taglio non è quella del rigioco integrale — cade finché resta aperto"]
+fn the_declared_defect_of_v0614_after_a_cut() {
     quarantine_exits_only_by_decision_body(4_712_539_371_536_976_430);
+    quarantine_exits_only_by_decision_body(2_309_209_543_203_644_442);
+    quarantine_exits_only_by_decision_body(2_008_146_196_850_474_940);
 }
 
 /// v0.6.14 (N3): the canonical name of the body — the story is
