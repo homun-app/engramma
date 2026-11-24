@@ -214,7 +214,7 @@ jobs:
       - name: Build the addon for this platform
         working-directory: crates/engramma-node
         run: |
-          npm install
+          npm ci
           npm run build
       - name: The builtin models are not in CI
         run: >-
