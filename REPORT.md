@@ -99,9 +99,61 @@ toccato: il gate risponde `CLOSED` prima del controllo sperimentale.
   su macOS; il runner x86 che a freddo superava i 25 minuti per pochi
   secondi — ora un job `warm` costruisce i binari prima di `test
   (ubuntu-latest)`).
+- **La corsa buona**: [45439718377](https://github.com/homun-app/engramma/actions/runs/45439718377)
+  sul commit `adab0d7`, tentativo 3 — **verde in tutti i job bloccanti**:
+  rustfmt 0,2 min; clippy 0,5 (arm64 Linux) e 1,1 (macOS); deny
+  licenses+bans 0,3; warm 1,3; test 16,5 (arm64 Linux), 23,2 (macOS),
+  11,8 (x86 Linux); contratto JS 5,2 (arm64 Linux) e 4,1 (macOS). Il job
+  più lungo sta sotto i 25 minuti. Non bloccanti in quella corsa:
+  Windows (compilazione, come sopra), advisories (come sopra), e
+  `test (macos-15-intel)` annullato più volte dal mancato assegnamento
+  di un runner macOS — zero passi eseguiti, 15 minuti esatti di coda:
+  infrastruttura GitHub, non il workflow (le ritentative che hanno avuto
+  il runner sono girate verdi).
+- **I test locali**: suite del workspace **696 test, 0 caduti** (85
+  binari, proprietà ai casi pieni dei sorgenti, modelli presenti);
+  contratto JS **67/67 in Node** e **67/67 in Electron** (i 65 di ieri +
+  i 2 nuovi); `golden_cell` verde (`the_golden_cell_opens_verifies_and_holds_its_facts`).
 
-(da completare: la corsa finale, i test locali, il tag, lo SHA)
+(da completare: il tag, lo SHA)
 
 ### La release locale
 
-(da dichiarare a fine fase)
+**la release locale: pronta.** Le condizioni, una per una:
+
+1. **la compattazione è dietro l'interruttore** — `compact()` del binding
+   rifiuta con `EXPERIMENTAL` senza `{ experimental: ['compaction'] }`,
+   `engramma compact` vuole `--sperimentale`; nessuna strada del motore
+   compatta da sola;
+2. **nessun difetto aperto è raggiungibile dall'API di Homun senza
+   l'opzione sperimentale** — i quattro semi del taglio chiedono proprio
+   quella chiamata; i due semi a due dispositivi chiedono la CLI
+   (`engramma revert`), che Homun non usa: la raggiungibilità esatta è
+   scritta accanto a ogni riga di `open-defects.txt`;
+3. **il CI è verde** nei job bloccanti (la corsa qui sopra);
+4. **le celle d'oro sono verdi** (`golden_cell` nella suite locale);
+5. **`build-sha.sh` gira sul tag** (i numeri sotto).
+
+### Il verdetto
+
+Consegnati: F1 (il CI vero, livello 1 della caccia e cancello di ogni
+push), F2 (la compattazione dietro l'interruttore, la raggiungibilità dei
+difetti dichiarati, la sezione di docs/node.md), F3 (le fasi leggere,
+dalla prossima fase semplicemente da leggere in `docs/fasi.md`). Il
+motore non ha cambiato una riga di `crates/*/src`: la caccia non è
+partita, come da regola.
+
+Il CI vero ha già pagato il suo prezzo in fase: ha mostrato una prova
+locale verde per accelerazione della macchina (il recency nel
+byte-per-byte dell'MCP) e ha detto che un cancello non può giudicare i
+difetti dichiarati. Le due lezioni stanno nel workflow, non nella
+disciplina.
+
+Il filone della compattazione (la derivazione unica, l'oracolo
+differenziale col taglio come cancello, i due difetti dichiarati) resta
+aperto e separato: `open-defects.txt` è la lista d'ingresso.
+
+Fuori da questa fase, come dichiarato: `revertDecision` nel binding, le
+correzioni Windows (API solo-Unix in sync e mcp), l'installazione della
+caccia notturna, la fusione a righe e i permessi per attore (le scelte
+delle prossime fasi, dell'utente).
