@@ -916,6 +916,14 @@ fn confirm_with_the_2026_input_required_round() {
 /// running). The wire answer of `memory_search` must be EXACTLY what it was
 /// before — ids, order, scores, ranks — with no `2 and 3 without 1` and no
 /// displaced answer: over HTTP that would be an oracle on hidden notes.
+///
+/// v0.6.15 (F1): the search asks `as_of` — a bitemporal question, where
+/// the recency factor is exactly 1. The wall-clock score carries
+/// `recency_of(now)`, quantised to WHOLE SECONDS: when the two searches
+/// straddle a second boundary (a slower runner: the Linux arm64 CI met
+/// it) the raw score moves in the eighth decimal and the byte equality
+/// fails WITH THE ENGINE INTACT. With `as_of` the answer is a function of
+/// the index alone, and the bytes can be equal on every platform.
 #[test]
 fn mcp_search_is_indistinguishable_with_hidden_notes() {
     let dir = common::test_dir();
@@ -941,7 +949,7 @@ fn mcp_search_is_indistinguishable_with_hidden_notes() {
             "method": "tools/call",
             "params": {
                 "name": "memory_search",
-                "arguments": {"cell": "gatti", "query": "gatto"}
+                "arguments": {"cell": "gatti", "query": "gatto", "as_of": "2027-02-01"}
             }
         })
     };
