@@ -109,7 +109,13 @@ gate risponde `CLOSED` prima del controllo sperimentale.
   contratto JS **67/67 in Node** e **67/67 in Electron** (i 65 di ieri +
   i 2 nuovi); `golden_cell` verde (`the_golden_cell_opens_verifies_and_holds_its_facts`).
 
-(da completare: il tag, lo SHA)
+- **Il tag e la build**: `fase-v0.6.15` annotato, solo locale, punta al
+  commit `5a81806` (`git cat-file -t fase-v0.6.15^{}` dice `commit`).
+  `scripts/build-sha.sh` sul tag gira: i tre file dell'aggancio, letti
+  dal disco —
+  `engramma.darwin-arm64.node` 51 241 080 B, SHA256 `70b83608…aab57e`;
+  `index.js` 36 239 B, `cd26043e…80e311`; `index.d.ts` 32 615 B,
+  `7020ae60…0fc2427`.
 
 ### La release locale
 
