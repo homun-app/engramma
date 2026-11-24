@@ -1,5 +1,6 @@
-# cargo-deny configuration. Advisory checks need the network and are skipped
-# in this project's offline CI (`cargo deny check licenses bans` only).
+# cargo-deny configuration. The CI runs `licenses bans` and `advisories`
+# (both blocking, since v0.6.16): a new advisory stops the next push until
+# it is fixed by an update or silenced here with a reasoned `ignore`.
 
 # v0.6: only the platforms engramma ships on. iroh carries wasm-only
 # dependencies (ws_stream_wasm and friends, under the Unlicense) that never
@@ -17,6 +18,26 @@ targets = [
 [advisories]
 version = 2
 yanked = "warn"
+# Every entry is a standing decision with its own reason, dated. A NEW
+# advisory (one not listed here) fails the check and blocks the push.
+ignore = [
+  # RUSTSEC-2026-0592, url 2.5.8 (2026-11-24): stack overflow in
+  # `Url::origin()` on deeply nested `blob:` URLs. No fixed release is
+  # published (`cargo update -p url` keeps 2.5.8), and crates/*/src never
+  # calls `Url::origin()` (grep, 2026-11-24) — the affected entry point has
+  # no caller here. Revisit when the fix ships: the ignore goes, the check
+  # stays.
+  "RUSTSEC-2026-0592",
+  # RUSTSEC-2024-0436, paste unmaintained (2026-11-24): pulled in by
+  # `tokenizers` <- `engramma-embed` (cargo tree -i, macro-only crate).
+  # Replacing it is a phase of its own (declared out of v0.6.16).
+  "RUSTSEC-2024-0436",
+  # RUSTSEC-2026-0543, chrono unmaintained (2026-11-24): pulled in by
+  # `rmcp` and `schemars` (MCP) and by `tokio-rustls-acme` <- `iroh-relay`
+  # <- `iroh` <- `engramma-sync` (cargo tree -i). Replacing it is a phase
+  # of its own (declared out of v0.6.16).
+  "RUSTSEC-2026-0543",
+]
 
 [licenses]
 version = 2
