@@ -13528,5 +13528,18 @@ cancellate. Nessun processo lasciato acceso, nessun worktree fuori dal principal
 
 ## La build sul tag
 
-@@BUILD@@
+`scripts/build-sha.sh` col repo sul tag `fase-v0.6.14` (albero pulito,
+commit `3bd25f0` — il commit dei documenti; il codice e i test sono
+quelli di `07f5cc5`):
+
+- costruzione sul commit `3bd25f0` (il tag annotato punta lì; costruita
+  altrove dà un altro SHA — il binario porta il commit);
+- `engramma.darwin-arm64.node` **51 240 760 B**, SHA256
+  `f43dd58e7575576a534280fb976216ac3d946dded5ffeadda9986164e0f78c2f`;
+- `index.js` 36 239 B, SHA256
+  `cd26043ecf56124be115f58a25368049dec67d48515109b31de588646280e311`
+  (identico alla v0.6.13: il binding JS cambiato si riflette in
+  `index.d.ts` e nel `.node`, non in `index.js`);
+- `index.d.ts` 31 800 B, SHA256
+  `f9961c213718be4e730e6f3bcc314c5b8cbb981fcf844d1f25fef44f44f9d992`.
 
