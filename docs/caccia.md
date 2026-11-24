@@ -110,17 +110,27 @@ spetta alla fase che lo trova: la fa la fase che lo chiude.
    chiuso dalla v0.6.9 — i suoi due casi registrati cadono sul tag
    `fase-v0.6.8` e passano da `fase-v0.6.9` in poi — e le cacce della
    fase ne hanno trovati altri due, che stanno nel file: uno il cancello
-   (a due dispositivi), uno la prova della caccia notturna (col file di
-   copia).
+   (a due dispositivi: annullamenti concorrenti di proposte legate), uno
+   le cacce dopo il cancello (la purga di un chiudente sopra il taglio:
+   tre semi, due forme).
 
 **Un rosso di una proprietà che ha già un difetto dichiarato si smista
 uguale.** Non è per forza «quello»: nella stessa fase la proprietà della
 quarantena è caduta due volte con **due difetti diversi** (il messaggio
 li distingue: «la decisione annullata … non basta» contro «state differs
-around …»), e il secondo, trovato dalla prova notturna, nasce solo con
-un taglio che ha tenuto il file di copia. I tre passi sono gli stessi, e
-il verdetto «cade anche sul tag» vale per quel seme, non per la
-proprietà.
+around …»), e il secondo, trovato dalla prova notturna, nasce dal
+taglio. I tre passi sono gli stessi, e il verdetto «cade anche sul tag»
+vale per quel seme, non per la proprietà.
+
+**Un verde di una proprietà che ha un difetto dichiarato può essere un
+verde breve.** Nella corsa finale della v0.6.14 la proprietà della
+quarantena prese 1 615 casi — e fu verde, senza incontrare i due difetti
+che le stanno dichiarati — perché la corsa prima era stata rossa e una
+corsa rossa non lasciava il suo costo per caso: la calibrazione di una
+corsa sola lesse 168 ms per caso, il doppio del vero. Ora il costo lo
+lascia ogni corsa con dei casi. Ma la lezione resta: davanti al verde di
+una proprietà con una riga in `open-defects.txt` si guarda quanti casi ha
+corsi, e la si rifà a budget intero.
 
 Una proprietà il cui ingresso era una terna o un valore strutturato
 prima della v0.6.14 ha anche un gemello `_with(…)`, che prende gli

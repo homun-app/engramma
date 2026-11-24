@@ -12454,3 +12454,1079 @@ frontiera stabile). La prossima fase li chiude tutti e due alla radice:
 - il `restore` riporta il contenuto, non lo stato.
 
 Poi la caccia, intera, anche sulla proprietà della quarantena.
+# REPORT — Engramma v0.6.14 (il taglio va solo avanti, il restore riporta il contenuto, e la caccia diventa a livelli)
+
+Base `main` @ `19c083c`. È la fase che decide la **release locale con la
+compattazione accesa**. Chiude alla radice i due difetti aperti dalla
+v0.6.13 — tutti e due pre-esistenti, come la verifica del revisore li ha
+pesati — e cambia forma alla caccia: da un blocco unico da 6 h 33 min a
+un cancello a budget di tempo più una caccia notturna che non blocca
+niente. Lo schema sale a 24, l'ALPN a `sync/9` e `mailbox/9`, il contratto
+JS si estende (`compacted` nel rapporto di `compact()`,
+`declaredCorners` in `verify()`).
+
+Per strada ha chiuso una dichiarazione che non era più vera (l'ultimo
+difetto «aperto» della suite era chiuso dalla v0.6.9: sotto), ha rimesso
+in gioco due proprietà che non giravano da settimane, e ha trovato **due
+difetti pre-esistenti** — uno il cancello, uno la prova della caccia
+notturna e poi dal cancello definitivo —, dichiarati e non toccati.
+**Per questo la release locale con la compattazione accesa NON è pronta**
+(in fondo): uno dei due è un difetto del taglio, e nella forma in cui c'è
+anche senza file di copia `verify` non lo vede.
+
+La lista dei commit, nell'ordine:
+
+| commit | cosa |
+|---|---|
+| `fec8ffe` | i rossi di N1 |
+| `db36111` | N1: il taglio monotono, `verify` della soglia, il taglio letto da una funzione sola |
+| `ffa756d` | N1.3: la migrazione v24 e la cella d'oro `v0613-indietro` |
+| `9df7647` | i rossi di N2 |
+| `503865d` | N2: il restore riporta il contenuto; l'ALPN 9 |
+| `d815f60` | N3: i corpi `_body(seed)`, la mappa nell'inventario, due proprietà risuscitate |
+| `216c312` | N3: gli script della caccia e `docs/caccia.md` |
+| `5f0c2b7` | il contratto JS: `compacted`, `declaredCorners`, il test 65 |
+| `8141d04` | la CLI, DESIGN, `cli.md`, `sync.md`; `open-defects.txt` senza le due righe della v0.6.13 |
+| `5674c0f` | la ripartizione dei budget del cancello; il commento a `sixto_four…` (senza la correzione: vedi `dd20d5c`) |
+| `dd20d5c` | via davvero l'attributo disperso di `sixto_four_is_the_ipv4_it_carries` |
+| `c30302f` | il messaggio dell'angolo dichiarato; il commento di `registered_cut` |
+| `53bb905` | i gemelli `_with(…)`, le regressioni dell'epoca a terna, il difetto del cestino chiuso, `open-defects.txt` via, la cella d'oro `v0614` |
+| `74fa2bb` | gli script: la colonna dei semi, il file dei difetti aperti facoltativo, la caccia notturna corretta |
+| `737be5c` | la trappola dei corpi annidati: due corpi derivavano un secondo seme (sotto); il rosso del cancello dichiarato aperto; `open-defects.txt` e i suoi due cancelli tornati |
+| `e05cb4a` | il secondo rosso del rifaccimento, nella riga dichiarata: lo stesso difetto in un'altra forma |
+| `ca2110e` | il rosso della prova notturna: un secondo difetto pre-esistente, riga nuova e riproduzione ignorata |
+| `7e8bbcd` | gli script della caccia corretti: `seme-sul-tag.sh` prova il motore del tag (la quarta trappola, in alto); `caccia.sh` registra il costo anche alle corse rosse; `docs/caccia.md` |
+| `26a8419` | il secondo difetto è del taglio, non del file: tre semi e due forme; il verdetto «non pronta» |
+| `07f5cc5` | il quarto seme del difetto del taglio (dal rifacimento per `props.rs`) nella riga e nella riproduzione |
+
+Il cancello della fase è girato per intero su `ca2110e`; `07f5cc5` è il
+commit finale di codice e test — tocca `props.rs` (i semi della
+riproduzione ignorata), e per la regola del commit finale le dieci
+proprietà di quel file sono andate un'altra volta (sotto). Dopo
+`c30302f` non è cambiato nessun `src`.
+
+## Prima di tutto: le trappole dell'ambiente, trovate salendo
+
+Quattro, e tre sono della stessa famiglia: un artefatto che sembra fresco
+e non lo è. Due le ho trovate salendo; la terza l'ho trovata nelle misure,
+guardando due binari; la quarta — la stessa trappola, in uno strumento
+della fase — solo rileggendo, a fase quasi chiusa, e mi ha costretto a
+rifare dei verdetti già scritti.
+
+**Il fingerprint di cargo.** La prima volta che ho fatto girare la sonda
+del revisore (`zz_review_v0613.rs`) sull'albero di oggi, l'esito NON era
+quello scritto nella verifica: la coda era **vuota** e il registro vuoto,
+non `pending`. Erano parola per parola gli esiti che il revisore
+attribuisce al **tag v0.6.12**. Ho guardato: una cella creata in debug
+da questo albero aveva `schema_version = 22` e nessuna tabella
+`object_anchors`. La libreria debug di `engramma-core` in `target/`
+(costruita alle 15:42, durante la verifica del revisore) conteneva il
+motore della v0.6.12, e cargo la riteneva fresca: **il controllo di
+freschezza di cargo legge le date dei file**, e i sorgenti avevano date
+più vecchie dell'artefatto. Qualunque test avessi scritto fin lì avrebbe
+giudicato il motore sbagliato. Rimedio: toccare le date di tutti i
+sorgenti (git non lo vede) e ricostruire; da lì in poi la sonda dice
+esattamente ciò che ha scritto il revisore. Può ricapitare ogni volta che
+un tag vecchio viene costruito nell'albero principale: **un esito che non
+torna con il REPORT si controlla contro lo `schema_version` di una cella
+nuova, prima di credere al motore.**
+
+**Le cache del CLI in `$TMPDIR`.** `relay_cli.rs` costruisce due varianti
+della CLI in due cache fuori dal repo (`engramma-cli-relay` e
+`engramma-cli-plain`, 2,1 G l'una). Tre test sono caduti perché in entrambe
+`libsqlite3-sys` non compilava: `couldn't read …/out/bindgen.rs`. Le
+cartelle `out/` portano come data di modifica le **03:35 del 23 novembre**
+— prima di questa fase: qualcosa aveva tolto `bindgen.rs` e l'rlib, e
+cargo non se n'accorgeva. Il mandato vieta di cancellare in quelle cache,
+quindi non le ho ripulite: ho fatto rigirare lo script di build di
+`libsqlite3-sys` attraverso la sua manopola `rerun-if-env-changed`
+(`SQLITE_MAX_VARIABLE_NUMBER=32766` in una corsa), poi una corsa di
+default che lo rifà girare e torna alla configurazione normale. Da lì
+`relay_cli` 7/7. Nessun file cancellato.
+
+**La cartella di build condivisa fra alberi diversi — due volte.** Cargo
+mette nei nomi dei manufatti tutto fuorché il percorso dell'albero: due
+alberi diversi nella stessa `CARGO_TARGET_DIR` scrivono e leggono gli
+stessi file, e un manufatto è «fresco» se i sorgenti che **l'ultima
+build ha elencato** non sono cambiati da allora — non guarda l'albero che
+ha davanti. La prima volta fu nello script delle misure, e la vedi sotto
+(0,21 s, due binari identici al byte). La seconda volta era in
+`scripts/seme-sul-tag.sh`, com'era dal principio della fase — il brief
+chiedeva la stessa `CARGO_TARGET_DIR` — e la vidi solo rileggendo quel
+pezzo. Lì il rischio è più sottile: il file di test è del tag (cargo lo
+ricompila, e i numeri di riga dei panic sono quelli del tag), ma la
+**libreria** può essere quella lasciata dall'ultima build dell'albero
+principale — il motore di oggi. E i verdetti che avevo scritto non lo
+distinguevano: sui semi dei due difetti dichiarati il motore di oggi cade
+come il tag, e «CADE ANCHE» era la risposta in tutti e due i casi. Un
+indizio c'era, e nessuno — me compreso — l'aveva guardato: ogni build era
+durata da 2 a 10 secondi. Che cosa resta in piedi di quei verdetti: due,
+i semi di N1 e di N2, che il motore di oggi fa passare e che pure
+caddero — lì la libreria era del tag; degli altri non si può dire
+niente. **Ho rifatto tutti i verdetti** con lo script corretto — si
+costruisce nella cartella del worktree, e non dà un verdetto se la
+libreria del tag non risulta compilata in quella corsa dal worktree, o
+se lo schema di una cella nuova non è quello che il tag dichiara —:
+nessun verdetto è cambiato, e ora significano. Ogni corsa costruisce
+da zero (25–39 secondi), la libreria del tag risulta compilata in quella
+corsa dal worktree, e lo schema che il motore dichiara a runtime è
+quello del tag: **22** sulla v0.6.12, **23** sulla v0.6.13. Il seme di N2
+cade sulla v0.6.12, quello di N1 cade sulla v0.6.13, l'`8394…` non ci
+cade; i due semi del difetto a due dispositivi e i tre del difetto del
+taglio cadono sulla v0.6.13; i due casi del cestino cadono sulla v0.6.8
+tutti e due e passano dalla v0.6.9 alla v0.6.13, tag per tag. La
+tabella è più in basso, e i verdetti sono quelli di queste corse.
+
+**La lezione che ne tiro è una, per tutte e quattro:** un esito che non
+torna — e anche uno che torna troppo bene — si controlla contro qualcosa
+che non dipende dalla build: lo schema di una cella nuova, l'hash di un
+binario, il tempo di una compilazione.
+
+## N1 — il taglio va solo avanti
+
+**I rossi** (commit `fec8ffe`), tutti rossi sulla base per la ragione
+giusta:
+
+- `cut_goes_back_with_the_copy_file` e `…_without_the_copy_file` — la
+  sonda minima del revisore, copiata con un nome mio: dopo il supersede
+  dell'utente sopra il taglio **la coda dice `new pending`** invece di
+  `new accepted`;
+- `a_cut_at_or_below_the_made_one_changes_nothing`: il rapporto rispondeva
+  **4** invece di 5 — il taglio era tornato indietro;
+- `the_frontier_that_goes_down_changes_nothing`: in una cella condivisa
+  la frontiera sotto il taglio lo trascinava **da 7 a 5**;
+- `verify_names_a_payload_removed_above_the_cut`: `verify` restava verde
+  su una cella col payload tolto sopra il taglio registrato;
+- il seme `11558843446952054066`, test deterministico
+  (`quarantine_defect_seed_of_v0613_runs_clean`): «la nota `01P3827…` è
+  `superseded` senza una decisione che la spieghi»;
+- il controllo, `the_same_cut_twice_is_the_control`, verde già sulla base.
+
+**La regola** (commit `db36111`): il taglio è una soglia monotona, come
+l'indice dell'istantanea di Raft e il `log start offset` di Kafka.
+`compact` con un taglio **sotto** quello già fatto non fa niente e
+risponde nel rapporto il taglio vero (`compacted: false`): non è un
+errore, così la chiamata automatica di Homun non fallisce quando `keepLast`
+cresce. Vale anche quando è la frontiera stabile a tirare il taglio sotto
+quello fatto.
+
+**Uno scostamento dichiarato dal brief: «a o sotto» è diventato «sotto».**
+Il brief dice che un taglio *a o sotto* quello già fatto non fa niente.
+Il punto *a* — lo **stesso** taglio — l'ho lasciato com'era dalla v0.3.2:
+riregistra il punto di riavvio nella forma chiesta (un'istantanea con file
+diventa un punto di controllo e viceversa). Il motivo è nel primo giro
+della suite: `a_v031_cell_with_a_snapshot_migrates_and_compacts_to_a_checkpoint`
+(`forgetting.rs`) pretende proprio quella conversione allo stesso taglio —
+è il percorso di aggiornamento da v0.3.1, sorvegliato da allora. «Uguale»
+non è «indietro»: la soglia non scende lo stesso, e il difetto nasce solo
+da un taglio più basso. Il test `the_same_cut_registers_the_restart_point_again`
+fissa la scelta. Se si vuole fermo anche l'«uguale», è una riga (`<`
+invece di `<=` in `compact`) più quell'aspettativa.
+
+**Dove sta il taglio.** Nella tabella `snapshots`: la `seq` della riga più
+alta, il record della compattazione (hash di testa, digest dello stato,
+file, `redacted_by`). Era registrato lì già prima — in un posto solo — ma
+**letto da otto query a mano in cinque file** (`mod.rs` ×3,
+`material.rs`, `conflicts.rs`, `ops.rs`, `schema.rs`). Da questa fase una
+funzione sola risponde, `registered_cut` in `cell/mod.rs`, e ogni lettore
+passa da lei: la rimaterializzazione, la guardia dell'arrivo in una cella
+condivisa, `compact`, `verify`, le migrazioni. Resta **una** lettura
+inline, dichiarata: la guardia della fotografia in `ops::snapshot`, la
+strada più calda del motore (ogni scrittura fotografa) — la sottoquery
+non costa un giro, un parametro legato sì. (Nel messaggio di `db36111` ho
+scritto «quattro file»: sono cinque; il commento nel codice è corretto da
+`c30302f`.)
+
+**`verify` e la soglia.** Ogni operazione col payload tolto (`redacted`)
+sta a o sotto il taglio registrato. Una che sta sopra è una cella rotta:
+`snapshot_ok` è falso e `mismatch` la nomina («the compaction cut went
+back: operation … (decide, seq 5) has its payload removed ABOVE the
+registered cut (4)»). Le **`censored`** della purga non c'entrano: le
+produce solo la purga, che sostituisce un corpo con la forma censurata e
+lo tiene; il taglio non le fa mai (cancella e segna `redacted`). Possono
+stare a qualunque `seq`, sopra il taglio compreso (la chiusura di un
+`supersede` la cui nota nuova è stata purgata), e restano rigiocabili.
+E le rimozioni `redacted` **della purga** — le scritture della nota
+purgata, che `forget_note_payloads` dimentica a qualunque `seq` — sono
+spiegate dalla nota purgata: la regola e la migrazione le riconoscono da
+lì (`note_id` di un `purge`), altrimenti ogni purga sopra il taglio
+sembrerebbe una cella rotta. Questo il brief non lo nominava: l'ho
+trovato leggendo `forget_note_payloads`.
+
+**La frontiera che scende.** Il test la scrive a mano (una riga in
+`device_acks` sotto il taglio), perché con `record_session_ack` com'è —
+l'ack è la testa della sua sessione, e il minimo non scende — **oggi
+nessuna chiamata pubblica la fa scendere**. Il revisore scrive «scende
+quando entra un dispositivo nuovo»: non ho trovato la strada. La regola
+guarda la forma lo stesso, e il test lo dichiara.
+
+**La migrazione v24** (commit `ffa756d`). Il record torna al massimo `seq`
+col payload tolto dal taglio (le rimozioni della purga non contano; un
+`purge` stesso lo dimentica solo il taglio). Poi ogni oggetto con
+operazioni sopra il taglio **sbagliato** — gli unici che una
+ricostruzione col taglio sbagliato poteva toccare — si ricostruisce:
+
+- **con il file di copia, dal file**: le sue righe sono lo stato che la
+  compattazione congelò; le operazioni sopra la testa del file rigiocano
+  sopra (`FileAnchor` nella rimaterializzazione: la stessa macchina,
+  ancorata al file invece che a una fotografia). Fotografie di versione e
+  ancore che la ricostruzione aveva cancellato tornano dal file;
+- **senza file, niente**. E qui ho sbagliato una volta, e lo scrivo:
+  avevo scritto la migrazione per ricostruire «dalle fotografie quando
+  bastano». Poi ho preparato il danno a mano e ho guardato: **dopo una
+  ricostruzione col taglio sbagliato anche le fotografie sopra il taglio
+  vero sono rovinate** — il rigioco le rifà sullo stato già rovinato, e
+  la riscrittura dell'àncora copre quella del supersede (resta una riga
+  sola in `note_versions`: quella della `decide`). Rifare la stessa
+  ricostruzione avrebbe riprodotto il danno dichiarandolo riparato. Il
+  file è l'unica voce; senza file l'angolo è dichiarato. (La strada dal
+  file è quella del secondo difetto che le cacce hanno dichiarato, sotto:
+  la riparazione eredita quel che quella strada dice.)
+
+**L'angolo dichiarato.** Ciò che gli scheletri del registro **provano**
+perduto: un `propose`, un `decide`, un `supersede`, un `link` col payload
+via (a o sotto il taglio vero) senza la sua riga derivata. **Cosa resta
+perso senza il file di copia**: la riga di coda d'una proposta che il
+taglio ha dimenticato, la riga del registro d'una decisione, la riga
+`supersedes` d'una chiusura, la riga d'un arco manuale — restano come la
+migrazione le trova. Mai inventare una decisione che il registro non ha
+più. Il marcatore locale `meta.cut_repair_corner` (fuori dai digest e dal
+file di copia) le nomina; `verify` lo riporta in `declared_corners` come
+angolo noto, non come rottura.
+
+**Il limite dichiarato.** Un taglio all'indietro superato poi da una
+compattazione in avanti (prima dell'aggiornamento) non lascia traccia
+della causa: il file di copia successivo congela lo stato rovinato, e la
+migrazione non lo vede.
+
+**La cella d'oro `v0613-indietro`** è costruita col motore della v0.6.13,
+in un worktree del tag `fase-v0.6.13` dentro `target/` (rimosso subito):
+taglio vero 4, registrato 3, coda `new pending`, registro vuoto, `verify`
+verde alla cieca. Aperta dalla v0.6.14: il record torna a 4, la proposta
+si ricostruisce dal file, `verify` è verde `FromSnapshot { seq: 4 }` con
+la coda `new accepted` e il registro `accept user:golden`; una scrittura
+sopra il taglio la lascia intera. Sette test della riparazione preparati a
+mano (`cut_monotone.rs`): con file, angolo senza file, taglio indietro
+senza scritture sopra, cella sana, lo stesso taglio due volte.
+
+**La cella d'oro `v0614`**, di questa fase (schema 24,
+`examples/make_golden_cell_v0614.rs`): una nota chiusa e ripristinata a
+una versione della vita attiva (il contenuto torna, la chiusura resta),
+una `external` confermata e ripristinata (resta in quarantena), una
+proposta accettata con la compattazione e il suo file e una seconda
+compattazione chiesta sotto (non fa niente), il supersede dell'utente
+sopra il taglio (la coda resta `accepted`). Taglio 13, testa 15.
+
+## N2 — il restore riporta il contenuto, non lo stato
+
+**I rossi** (commit `9df7647`), tutti rossi sulla base:
+
+- una versione attiva su una nota chiusa la riportava **`Active`**;
+- una versione attiva su una nota in quarantena la faceva **uscire**
+  (`Active`: un'uscita senza decisione);
+- una versione in quarantena rimetteva in quarantena una **`external`
+  confermata**;
+- la confidenza tornava `Stated` invece di restare `Inferred`; la fonte
+  tornava `user` invece di restare `import:web`;
+- le due liste non esistevano;
+- il seme `11895058361907748327` (`purge_family_restore_seed_of_v0613_runs_clean`):
+  «`01P4962…` prima `Superseded`, dopo `Active`».
+
+**La regola** (commit `503865d`): il ciclo di vita è una macchina a stati,
+e la cambiano solo `supersede`, `decide`, `revert_decision`, `set_status`,
+`confirm`, `delete`, `purge`. Il `restore` è il `git revert` di un file:
+il testo torna, i rami restano. Le due liste sono scritte una volta sola,
+accanto all'operazione (`RESTORE_CONTENT_FIELDS`, `RESTORE_KEPT_FIELDS` in
+`cell/ops.rs`), e il test `every_field_of_note_is_content_or_lifecycle`
+(`restore_content.rs`) le legge dal motore e i campi dalla definizione
+della struct: un campo che `Note` guadagna e non sta in nessuna delle due
+lo fa cadere (l'idea di `anchor_tables`). Sedici campi: nove di contenuto,
+sette di ciclo di vita e provenienza.
+
+| lista | campo | perché |
+|---|---|---|
+| contenuto | `note_type` | che cosa è la nota: lo dice il testo |
+| contenuto | `title` | il titolo che il testo porta nel frontmatter |
+| contenuto | `body` | il testo |
+| contenuto | `tags` | la classificazione che il testo porta nel frontmatter |
+| contenuto | `scope` | per chi è il testo |
+| contenuto | `lang` | in che lingua è scritto (la scorciatoia dello stemmer) |
+| contenuto | `valid_from` | la validità che il contenuto dichiara |
+| contenuto | `valid_to` | idem — **tranne su una nota chiusa**, dove il campo è la chiusura e resta (la regola che `apply_put` già teneva) |
+| contenuto | `extensions` | il frontmatter `x-*`, in ordine di file |
+| ciclo di vita e provenienza | `id` | l'identità: un restore è della nota, mai di un'altra |
+| ciclo di vita e provenienza | `status` | lo stato del ciclo di vita |
+| ciclo di vita e provenienza | `confidence` | come la cella è venuta in possesso del testo: decide la visibilità insieme allo stato |
+| ciclo di vita e provenienza | `supersedes` | la relazione di chiusura: opera del `supersede` che ha fatto la nota |
+| ciclo di vita e provenienza | `source` | **la mia scelta**: è provenienza — chi propone la timbra, l'import timbra il percorso; una proprietà dell'esistenza della nota, che nasce con lei, e nessuna regola la legge come contenuto di versione |
+| ciclo di vita e provenienza | `created_at` | la data di nascita è della NOTA, non della versione (la regola di `apply_put`) |
+| ciclo di vita e provenienza | `updated_at` | il timbro del restore stesso, come ogni operazione che scrive |
+
+**Le uscite della quarantena.** Il `restore` esce da `has_a_legitimate_exit`
+e dall'elenco di DESIGN §8.5: chi sta in quarantena ci resta.
+
+**Le celle che esistono già.** La migrazione v24 rimaterializza le note con
+un `restore` rigiocabile nel registro (sopra il taglio, o ovunque senza
+taglio). **Sulle celle d'oro zero note cambiano stato**: nessuna delle
+quattro di prima ha un `restore` nel registro (v068, v0612, v0613,
+v0613-indietro: letto dagli `ops` di ciascuna); la quinta, `v0614`, nasce
+con le regole nuove.
+
+**L'ALPN sale a `engramma/sync/9` e `engramma/mailbox/9`**: il test
+`protocol_version` parla di 9 contro 8.
+
+**Un difetto pre-esistente trovato strada facendo, dichiarato e non
+toccato.** Una nota `external` **confermata** non si può modificare:
+`write_note` rifiuta ogni riscrittura («an `external` note can only be
+`quarantined`»), perché `allow_external_active` era dato solo a
+`confirm` — nemmeno un ritocco al titolo, nemmeno un `restore`. Per il
+`restore` ho dovuto passarci (la riscrittura conserva lo stato che
+`confirm` ha già dato, non promuove niente: altrimenti la regola nuova
+avrebbe fatto fallire con un errore il restore di una confermata). Per
+`patch` e `put` non l'ho toccato: è fuori dal mandato di questa fase.
+
+## Il contratto JS
+
+- `CompactView.compacted` e `VerifyView.declaredCorners` (il contratto SI
+  ESTENDE). Il test 65esimo: una proposta d'agente, la `decide` che
+  accetta, `compact()` con un `keepLast` piccolo, `compact()` con un
+  `keepLast` più grande (`compacted: false`, `cutSeq` fermo), una
+  scrittura sopra il taglio: `proposals()` dice ancora `accepted`,
+  `verify()` è verde. Il suo gemello Rust (`cut_goes_back_*`) era rosso
+  sulla base; il test JS è nato dopo la correzione, e la sua caduta sulla
+  base è per costruzione (il campo `compacted` non esisteva, e la coda
+  tornava `pending`).
+- **64 test identici + 1: 65 su 65 sotto Node (50,3 s) e 65 su 65 sotto
+  Electron (51,4 s)**, sul commit finale `e05cb4a`, con l'addon e la CLI
+  ricostruiti (`npm run build`). I 64 di prima sono identici al byte: il
+  diff da `fase-v0.6.13` su `__test__/` è 79 righe aggiunte in
+  `engine.test.js` e zero tolte (`sync` 11, `sync-pair` 15, `bench` 2
+  com'erano; `engine` da 36 a 37). Nessuno dei 64 pretendeva che il
+  `restore` riportasse lo stato: il binding non ha `restore`.
+
+## N3 — la caccia a livelli
+
+**I corpi.** Ogni proprietà ha `fn <nome>_body(seed: u64)`: la proprietà
+prende un seme e lo passa al corpo, che ricava ogni ingresso con un
+generatore seminato (`seeded_runner`: le stesse strategie di sempre, ChaCha
+con un seme di 32 byte). Un seme che cade si rigioca in un caso solo.
+Undici proprietà — quelle che prima pescavano una terna o un valore
+strutturato — hanno anche un gemello `_with(…)`, che prende gli ingressi
+come furono scritti: è la strada per cui si rigiocano i casi che la storia
+aveva registrato in quella forma (sotto).
+
+**L'inventario.** `properties.txt` ha la terza colonna: la mappa proprietà
+→ moduli. `properties_inventory` controlla che ogni proprietà abbia la sua
+mappa e che ogni percorso esista (`every_property_has_its_module_map`), e
+che ogni proprietà porti `#[test]` (sotto).
+
+**Tre cose pre-esistenti trovate scrivendo i corpi.**
+
+1. **Due proprietà non giravano da settimane.** `export_import_equality`
+   aveva l'attributo `#[test]` **incollato in fondo a un commento** dal 7
+   novembre (`59092a6`, v0.3.2), e `ports_matter_except_on_loopback_http`
+   non l'ha mai avuto (il suo `#[test]` era rimasto sopra un commento,
+   attaccato alla proprietà seguente): il blocco `proptest!` coniava una
+   funzione che nessuno chiamava. **Nove fasi di verde su zero casi** (e
+   nelle tabelle delle cacce «verde in 1 s»). Ora girano e passano; il
+   controllo `without_test_attribute` ha i denti provati (incollato di
+   nuovo l'attributo, cade).
+2. **`sixto_four_is_the_ipv4_it_carries` era registrato due volte** — due
+   `#[test]`, uno sopra e uno sotto il commento — e ogni caccia lo faceva
+   girare il doppio (512 righe per caso a 256 casi: così l'ho visto).
+   `oauth_props --list`: 10 test, uno per proprietà.
+3. **L'ultimo difetto «dichiarato aperto» era chiuso dalla v0.6.9.** Con
+   i corpi a seme unico i semi dichiarati nella v0.6.8 per «la perdita di
+   testo esposta dal cestino» — il primo elemento di una terna `(seed,
+   dispositivi, giri)` — non riproducevano più la storia: `devices` e
+   `rounds` ora derivano dal seme. Ho recuperato le terne sul tag della
+   dichiarazione e le ho rigiocate tag per tag, con il gemello `_with` —
+   due volte: la seconda in fondo alla fase, con il motore di ogni tag
+   verificato (libreria compilata in quella corsa dal worktree, schema
+   letto a runtime: 22 dalla v0.6.8 alla v0.6.12, 23 sulla v0.6.13; il
+   registro: `target/v0614/verdetti/terna-su-<tag>.log`):
+
+   | tag | `6467221993839934612` (3 dispositivi, 18 giri) | `9368190224066329310` (2 dispositivi, 28 giri) |
+   |---|---|---|
+   | `fase-v0.6.8` | **CADE** («device 1 LOST the body of `01MCC5RM00VGD…`») | **CADE** («device 0 LOST the body of `01MCC5RM00N6…` on note `01MCC5RM0ZHFWMAZSAA3SY8QS6`»: la stessa nota `…QS6` del REPORT di allora) |
+   | `fase-v0.6.9`, `.10`, `.11`, `.12`, `.13` | passa | passa |
+
+   Oggi: 0 cadute su 15 corse del caso registrato, e nessuna delle 51
+   terne del primo seme. Il difetto ha smesso di cadere con la **v0.6.9**
+   ed è rimasto dichiarato per cinque fasi perché le cacce non lo
+   incontravano più (cinque a 20 000 casi) e niente rigiocava il caso. La
+   causa non l'ho diagnosticata: chiudere non è il lavoro di questa fase.
+   I due casi sono la regressione fissa
+   `the_declared_defect_of_v068_stays_closed`; **`open-defects.txt` è
+   andato via con l'ultima riga, e con lui i due cancelli che lo
+   leggevano** — com'era scritto nel cancello stesso («un file senza
+   difetti aperti va cancellato con i test che lo leggono»). Ed è
+   tornato nella stessa fase, con i due cancelli (`737be5c`): le cacce
+   hanno trovato due difetti pre-esistenti, sotto.
+   **Questo è uno scostamento dal brief**, che diceva «resta la riga della
+   perdita di testo esposta dal cestino»: i suoi casi passano, e una riga
+   «aperta» coi semi che non cadono sarebbe una dichiarazione falsa.
+
+**Le regressioni dell'epoca a terna.** Lo stesso cambio di forma rendeva
+stantie le **47 righe `cc`** che proptest aveva persistito per le
+proprietà a ingresso strutturato: lette come un seme unico, si decodificano
+in casi mai successi. Sono test deterministici nei file delle proprietà:
+le 36 terne della flotta attraverso i quattro corpi
+(`the_regressions_of_the_tuple_era_stay_green`), 6 di `indistinguishability`,
+1 di `identity`, 1 di `diff3_linear`; per `format_round_trip` le due note
+valide fanno il giro e la terza — una mappa `x-` con la chiave ripetuta —
+resta come la regola che insegnò: il parser rigoroso la rifiuta, ed è
+per questo che il generatore deduplica (`dedup_ext`). I file di regressione
+portano una nota che dice dove sono andati i casi.
+
+**Il cancello — `scripts/caccia.sh`.** Budget di tempo, non numero di
+casi. Le proprietà toccate prendono 10 minuti, le altre 2, e i budget si
+riducono in proporzione se la somma supera l'obiettivo — chi raggiunge i
+20 000 casi senza esaurire il suo budget non si riduce. Una corsa sola
+della suite a 2048. Il registro `misura.tsv` dice i casi corsi davvero.
+
+**Il cancello definitivo, in tutto, sul commit `ca2110e`.** Coi parametri
+di default (base della fase `fase-v0.6.13`: tutte le 29 proprietà
+toccate; obiettivo 100 minuti; una corsa della suite a 2048 casi), dalle
+06:26:23 alle 08:28:13: **7 310 s — 2 h 01 min 50 s**, oltre l'obiettivo
+di 1 h 45 min. Le corse delle proprietà hanno preso 86,2 minuti (5 174
+s), le calibrazioni 49 s, la suite 34,6 minuti (2 078 s). È il prezzo del
+mattino: la macchina era più carica (carico 5–7, le applicazioni
+dell'utente aperte) e molte corse hanno superato il budget nominale
+restando nel margine che lo script si dà (metà del budget e due minuti):
+le più lunghe `hidden_notes_leave_no_fingerprint` 601 s su 467,
+`purge_takes_only_its_family` 466 su 267, `frozen_prefix_is_immutable`
+440 su 267. La sera prima, a macchina più ferma, le corse erano durate
+62,6 minuti e la suite 23,9.
+
+Il registro: `target/caccia/20261124-062623/`.
+
+
+
+| proprietà | toccata | budget | casi corsi | tempo | esito |
+|---|---|---|---|---|---|
+| `the_fleet_converges` | sì | 267 s | 5 171 | 302 s | verde |
+| `every_copy_equals_its_reconstruction` | sì | 267 s | 5 656 | 265 s | verde |
+| `no_copy_closes_without_a_witness` | sì | 267 s | 7 575 | 267 s | verde |
+| `no_body_text_is_lost` | sì | 267 s | 7 410 | 263 s | verde |
+| `the_new_diff3_decides_as_the_v064_one` | sì | 4 s | 20 000 | 3 s | verde |
+| `the_long_alignment_is_still_a_lcs` | sì | 180 s | 20 000 | 134 s | verde |
+| `the_identity_never_moves_on_generated_histories` | sì | 353 s | 20 000 | 443 s | verde |
+| `hidden_notes_leave_no_fingerprint` | sì | 467 s | 20 000 | 601 s | verde |
+| `proposal_sequences_keep_the_invariants` | sì | 267 s | 7 484 | 331 s | verde |
+| `format_round_trip` | sì | 1 s | 20 029 | 2 s | verde |
+| `replay_equals_state` | sì | 267 s | 6 368 | 358 s | verde |
+| `compaction_keeps_verify_and_state` | sì | 267 s | 4 582 | 275 s | verde |
+| `random_ops_compact_and_purge_leave_no_roots` | sì | 267 s | 2 864 | 252 s | verde |
+| `purge_with_conflict_copies_leaves_no_roots` | sì | 267 s | 1 686 | 267 s | verde |
+| `export_import_equality` | sì | 267 s | 5 227 | 306 s | verde |
+| `hlc_monotonic` | sì | 0 s | 20 029 | 2 s | verde |
+| `purge_takes_only_its_family` | sì | 267 s | 2 238 | 466 s | verde |
+| `frozen_prefix_is_immutable` | sì | 267 s | 2 875 | 440 s | verde |
+| `rfc1918_is_never_public` | sì | 1 s | 20 000 | 1 s | verde |
+| `loopback_linklocal_and_cgnat_are_never_public` | sì | 1 s | 20 000 | 1 s | verde |
+| `multicast_and_reserved_v4_are_never_public` | sì | 1 s | 20 000 | 1 s | verde |
+| `mapped_reserved_v4_is_never_public` | sì | 78 s | 20 000 | 1 s | verde |
+| `reserved_v6_blocks_are_never_public` | sì | 1 s | 20 000 | 1 s | verde |
+| `ordinary_public_v4_is_public` | sì | 1 s | 20 000 | 0 s | verde |
+| `sixto_four_is_the_ipv4_it_carries` | sì | 1 s | 20 000 | 1 s | verde |
+| `nat64_teredo_and_ipv4_compatible_are_never_public` | sì | 0 s | 20 000 | 1 s | verde |
+| `ports_matter_except_on_loopback_http` | sì | 1 s | 20 000 | 1 s | verde |
+| `the_path_must_match_even_on_loopback_http` | sì | 1 s | 20 000 | 1 s | verde |
+| `quarantine_exits_only_by_decision` | sì | 267 s | 1 615 | 188 s | verde — **un verde breve**: vedi sotto |
+| *suite del nucleo (2048 casi)* | — | — | 2 048 | 2078 s | **ROSSO** — `quarantine_exits_only_by_decision`, seme `2309209543203644442` (il minimo che cade) |
+
+**Le 29 proprietà sono verdi, con 380 809 casi corsi — ma un verde va
+letto con l'asterisco.** `quarantine_exits_only_by_decision` ha corso
+**1 615 casi** e basta. Il giorno prima le corse l'avevano lasciata
+rossa, e una corsa rossa non registrava il costo per caso (lo script lo
+calcolava solo per le verdi): stamattina è stata ricalibrata con una
+corsa sola di 285 casi, che ha letto **168 ms per caso** — il doppio
+delle corse del giorno prima — e il piano le ha dato 1 586 casi. Con
+1 615 casi i due difetti dichiarati non si incontrano. Due rimedi:
+`caccia.sh` registra ora il costo anche alle corse rosse (`7e8bbcd`), e
+la proprietà è andata **da sola, a budget intero**: **rossa al 128º
+caso**, 19 s (registro `target/caccia/20261124-084713/`) — il terzo
+seme del secondo difetto.
+
+**La suite a 2048 casi è rossa**: `quarantine_exits_only_by_decision`,
+il caso di seme `2309209543203644442` (`verify: state differs around:
+01P4939…`) — il secondo seme del secondo difetto. Le altre 19 proprietà
+della suite del nucleo sono passate (1 387 s), e tutte le altre suite
+verdi.
+
+**Il rifacimento per le dieci proprietà di `props.rs`** (l'ultimo
+commit, `26a8419`, tocca il loro file; stessi budget del cancello
+definitivo; registro `target/caccia/20261124-090125/`):
+**Il rifacimento per le dieci proprietà di `props.rs`** (l'ultimo
+commit, `26a8419`, tocca il loro file; stessi budget del cancello
+definitivo; registro `target/caccia/20261124-090125/`):
+
+| proprietà | toccata | budget | casi corsi | tempo | esito |
+|---|---|---|---|---|---|
+| `format_round_trip` | sì | 1 s | 20 029 | 6 s | verde |
+| `replay_equals_state` | sì | 489 s | 8 741 | 538 s | verde |
+| `compaction_keeps_verify_and_state` | sì | 489 s | 8 189 | 685 s | verde |
+| `random_ops_compact_and_purge_leave_no_roots` | sì | 489 s | 5 595 | 801 s | verde |
+| `purge_with_conflict_copies_leaves_no_roots` | sì | 489 s | 3 122 | 746 s | verde |
+| `export_import_equality` | sì | 489 s | 8 395 | 752 s | verde |
+| `hlc_monotonic` | sì | 1 s | 20 029 | 1 s | verde |
+| `purge_takes_only_its_family` | sì | 489 s | 2 381 | 519 s | verde |
+| `frozen_prefix_is_immutable` | sì | 489 s | 3 229 | 533 s | verde |
+| `quarantine_exits_only_by_decision` | sì | 489 s | 105 | 14 s | **ROSSO** — seme dell'ingresso `3784521736327746000` |
+| *suite del nucleo (- casi)* | — | — | - | - s | **non corsa (SUITE_CASI=0)** — seme dell'ingresso `-` |
+
+9 verdi su 10, **79 710 casi in 76,6 minuti** (4 595 s): anche qui le
+corse hanno superato il budget nominale restando nel margine, per il
+carico del mattino. La decima è **rossa al caso 105**: `verify: state
+differs around: 01P1679…` — seme `3784521736327746000`. I tre passi:
+riprodotto 3 su 3 in release; **CADE ANCHE sul tag `fase-v0.6.13`**
+collo script corretto, stesso messaggio; pre-esistente, nella riga del
+secondo difetto (`07f5cc5`): la forma A, il quarto seme.
+
+**I rossi, e lo smistamento in tre passi.** Le cacce della fase hanno
+trovato **due difetti pre-esistenti**, tutti e due sulla proprietà
+dell'invariante della quarantena, `quarantine_exits_only_by_decision` — e
+diversi fra loro: il cancello ha trovato il primo, in due forme; la prova
+della caccia notturna ha trovato il secondo, che il cancello definitivo e
+la corsa a budget intero hanno ritrovato in tre semi e due forme. Tutti
+**cadono anche sul tag `fase-v0.6.13`**, col motore del tag verificato;
+nessuno nasce da questa fase; tutti sono dichiarati aperti in
+`open-defects.txt` coi semi e i verdetti, e non toccati: la diagnosi
+spetta alla fase che li chiude. Il secondo, in una delle sue forme, è
+quello che tiene chiusa la compattazione (in fondo).
+
+**Il primo: l'annullamento di una proposta legata riapre il bersaglio
+con la decisione annullata (a due dispositivi).** Regola 3
+dell'invariante: «la decisione annullata di `01P3601…` non basta — la
+nota è di nuovo visibile senza una nuova decisione».
+
+*Una trappola mia, prima dei tre passi.* Il seme che proptest riportava
+(`15322035099793551940`) **non ricadeva**: 0 su 30 in debug, 0 su 30 in
+release, 0 anche dopo 2 500 casi precedenti; e `seme-sul-tag.sh` con
+quel seme diceva «NON cade sul tag `fase-v0.6.13`». Un verdetto che
+avrebbe dichiarato «nasce da questa fase» — ed era il frutto di un errore
+mio. Per due proprietà che avevano **già** un corpo con un altro nome
+(`quarantine_exits_body` dalla v0.6.13, `frozen_prefix_body` dalla
+v0.6.12) lo script del refactor dei corpi aveva fatto **un corpo dentro
+il corpo**: `<nome>_body` ricavava dal seme un *secondo* `u64` e
+raccontava la storia con quello. Proptest è onesto — stampa il seme che
+passa alla proprietà (verificato con una proprietà minima che si limita
+a stamparlo) — ma la storia girava con l'altro. L'ho visto strumentando
+il corpo: proptest dice `15322035099793551940`, il corpo entra con
+`1835111131785192683`. Corretto in `737be5c` (alias senza derivazione: il
+seme riportato è quello della storia). I tre passi, rifatti col seme
+giusto:
+
+1. **la riproduzione deterministica**:
+   `quarantine_exits_body(1835111131785192683)` — **10 cadute su 10**
+   processi, in release;
+2. **lo stesso seme sul tag precedente**:
+   `seme-sul-tag.sh quarantine_exits_only_by_decision 1835111131785192683 fase-v0.6.13 quarantine_exits_body`
+   — **CADE ANCHE sul tag `fase-v0.6.13`**, stesso messaggio;
+3. **il giudizio: pre-esistente, dichiarato aperto** (`open-defects.txt`,
+   col seme e il verdetto).
+
+La storia, letta dal registro delle due celle (fatti, non diagnosi): due
+proposte legate — P1 (`01P3601…`, nuova) e P2, una correzione che ha P1
+come bersaglio — sono accettate entrambe; poi l'utente annulla
+l'accettazione di P1 su un dispositivo e quella di P2 su un altro, prima
+di sincronizzare. Ogni annullamento è legittimo dove è fatto; insieme,
+nell'ordine totale, l'annullamento di P2 riapre P1 «come la chiusura la
+fotografò» — attiva — mentre la sua decisione è annullata.
+
+*Che cosa si raggiunge, e che cosa no* (sonda a mano). Su **un
+dispositivo solo** la storia non si raggiunge: il primo annullamento
+riesce, il secondo è rifiutato («conflict: the proposal (or its target)
+has later operations»). Nella storia a due dispositivi **non c'è né
+compattazione né purga**: non è un difetto del taglio.
+
+**La seconda forma** (il rifacimento del cancello per le due proprietà
+dei corpi annidati, 2 363 casi): `2472647288214113510`, stesso tag, stesso
+verdetto — ma la storia è un'altra. P1 accettata; la correzione P2 su P1
+**rifiutata**; annullata l'accettazione di P1 (P1 torna in quarantena);
+poi annullato il rifiuto di P2 — e **P1 torna attiva**, con la coda
+`reverted` e la sua decisione annullata. C'è anche un annullamento
+duplicato di P1, dalla stessa base (due dispositivi): perde l'ordine
+totale e non muove nulla, com'è dichiarato. Stessa famiglia — «un
+annullamento di una proposta legata riapre il bersaglio senza guardare
+che la decisione del bersaglio è già annullata» — in una forma che non
+conoscevo (`e05cb4a`). La riproduzione a mano è
+`the_declared_defect_of_v0614_two_devices` (ignorato: cade finché resta
+aperto).
+
+**Il secondo: dopo un taglio, la purga di un chiudente sopra il taglio
+non è quella del rigioco integrale.** L'ha trovato la prova della caccia
+notturna (sotto); poi il cancello definitivo, nella suite; poi la corsa
+di questa proprietà a budget intero, rossa al 128º caso. **Tre semi**, lo
+stesso messaggio (`verify: Some("state differs around: …")`), tutti nella
+forma **a una cella**, al suo ultimo controllo. Il primo l'avevo
+descritto come «il difetto del file di copia»; il terzo ha mostrato che
+non è così, e la descrizione che vale è questa.
+
+*I tre passi*, per ciascun seme: la riproduzione deterministica — **3
+cadute su 3**, in release, in una frazione di secondo; lo stesso seme sul
+tag precedente, collo script corretto (libreria del tag compilata in
+quella corsa, schema 23 letto dal motore) — **CADE ANCHE sul tag
+`fase-v0.6.13`**, stesso messaggio, tutti e tre; il giudizio —
+pre-esistente, dichiarato aperto.
+
+*La storia, letta dai registri* (fatti, non diagnosi): in tutte e tre
+c'è una compattazione con il file di copia e, sopra il taglio, **la purga
+di una nota che ne aveva chiuse altre**. Le tre storie, ripetute senza
+compattazione e con lo stesso taglio senza file — lo stesso flusso di
+numeri a caso, quindi le stesse operazioni (nel terzo seme le ho
+confrontate una per una: ventuna per ventuna):
+
+| seme | com'è caduta (taglio **con** file) | lo stesso taglio, **senza** file | **senza** taglio |
+|---|---|---|---|
+| `4712539371536976430` | `verify` **rosso**; lo stato è quello senza taglio | `verify` verde; lo stato è quello senza taglio | verde |
+| `2309209543203644442` | `verify` **rosso**; lo stato è quello senza taglio | `verify` verde; lo stato è quello senza taglio | verde |
+| `2008146196850474940` | `verify` **rosso**; una nota resta chiusa | `verify` verde; **la stessa nota resta chiusa** | verde; **la nota riapre** |
+
+Due forme, allora:
+
+- **A** (i primi due semi): lo stato col taglio è quello del rigioco
+  integrale; è la ricostruzione **dal file** a dire un altro stato. Il
+  file è quel che serve a `verify` per vederlo.
+- **B** (il terzo seme): l'utente chiude una nota con un supersede
+  (operazione 13) e **il taglio è lì** (seq 13); la prima operazione sopra
+  il taglio è la purga della nota che chiudeva due note. L'altra riapre,
+  questa **resta chiusa**; il rigioco integrale la riapre. Lo stato
+  sbagliato **c'è anche senza file**, e `verify` non lo vede: il suo
+  riferimento, in una cella col taglio, è la ricostruzione dal taglio,
+  che sbaglia uguale. Col file lo vede, perché lì la ricostruzione dal
+  file dice quel che dice il rigioco integrale.
+
+*Il terzo seme, sul tag, nelle tre varianti* (lo stesso strumento, il
+motore verificato): **gli stessi tre stati di oggi** — senza taglio la
+nota riapre; col taglio, senza file, resta chiusa e `verify` è verde; col
+file `verify` è rosso.
+
+**Che cosa cambia nel ritratto.** Avevo scritto «nasce solo con un
+taglio che ha tenuto il file». Non è vero: nasce dal taglio; il file lo
+rende solo visibile. Per l'uso di Homun — `compact(keepLast)`, che non
+tiene il file — è la forma B quella che conta: una purga, sopra un
+taglio, può lasciare chiusa una nota che il rigioco integrale
+riaprirebbe, e niente lo dice. Quanto sia frequente non lo so. Le tre
+storie le hanno trovate le cacce perché col file `verify` è rosso; senza
+file la stessa storia è verde, e **nessuna proprietà oggi confronta una
+storia col taglio con la stessa storia senza**. Un oracolo che lo faccia
+è il primo lavoro della fase che chiude il difetto (l'idea è quella di
+`purge_takes_only_its_family`: fotografa, purga, confronta col rigioco).
+
+Il binding compatta senza file se non lo si chiede; la CLI tiene il file
+solo con `--keep-snapshot`. La riproduzione a mano è
+`the_declared_defect_of_v0614_after_a_cut` (ignorato: i tre semi, cade
+finché resta aperto).
+
+**La storia del cancello.** Otto lanci; vale l'ultimo — e, per ogni
+proprietà, l'ultimo in cui è corsa. I primi tre li ho fermati io:
+
+1. dopo 8 minuti — la ripartizione dei budget, riducendo in proporzione,
+   portava anche le proprietà quasi gratuite a 9 313 casi invece di
+   20 000 (corretto in `5674c0f`);
+2. dopo 2 minuti — un messaggio che stampava `Some(4)` e un commento
+   sbagliato nel `src` (`c30302f`): toccarli dopo sarebbe costato la
+   ripetizione del cancello;
+3. dopo 32 minuti (sette proprietà già verdi nel registro) — la scoperta
+   dei semi dichiarati non più riproducibili e delle righe `cc` stantie
+   (`53bb905`, `74fa2bb`).
+
+In `5674c0f` ho commesso un errore che il commit dopo corregge: ho
+scritto il commento a `sixto_four…` senza togliere davvero l'attributo.
+
+La **quarta corsa** è andata intera, su `74fa2bb` (registro
+`target/caccia/20261123-195832/`): **5 429 s — 1 h 30 min 29 s**, sotto
+l'obiettivo (62,6 minuti di corse, 3,7 di calibrazione — la prima corsa
+coi budget di tempo, nessuna misura prima —, 23,9 di suite). Le 29
+proprietà erano tutte **toccate** — il refactor dei corpi ha cambiato
+ogni file d'oracolo — quindi nessuna ha potuto avere i 10 minuti per
+intero: le pesanti si sono divise 215 s l'una, le economiche hanno preso
+i 20 000 casi. Il registro conta **366 253 casi corsi** sulle 28 verdi;
+la 29ª è caduta sul difetto a due dispositivi (2 603 casi), e la suite a
+2048 (1 434 s) è caduta sullo stesso caso (19 proprietà passate, la
+ventesima no). Il **rifacimento**
+per le due proprietà dei corpi annidati (regola del commit finale,
+`CACCIABASE=74fa2bb CACCIASOLO="quarantine_exits_only_by_decision
+frozen_prefix_is_immutable"`, registro `target/caccia/20261123-215538/`):
+`frozen_prefix_is_immutable` verde a budget intero (636 s, 6 775 casi),
+la quarantena rossa di nuovo — la seconda forma del primo difetto. Poi i
+tre commit di dichiarazione (`737be5c`, `e05cb4a`, `ca2110e`) toccano
+l'oracolo di tutte le proprietà di `props.rs`: da qui la **quinta corsa,
+per intero**, su `ca2110e` — invece di un rifacimento a pezzi, che
+sarebbe costato lo stesso; la **sesta**, la proprietà della quarantena da
+sola a budget intero (rossa al 128º caso); e la **settima**, il
+rifacimento per le dieci proprietà di `props.rs` dopo `26a8419`.
+
+Un'altra sciaguratezza, qui: ho modificato `caccia.sh` — la correzione
+del costo — **mentre il cancello lo stava eseguendo**. Una shell legge lo
+script dal file un pezzo alla volta, e un file che cambia sotto i piedi
+può farle leggere spazzatura. Me ne sono accorto subito e l'ho rimesso
+identico al byte in venti secondi, per di più dentro l'esecuzione di un
+comando solo (la suite); lo script è arrivato in fondo pulito, e la
+correzione l'ho applicata a cancello finito. Ma poteva costare la corsa
+intera.
+
+**La caccia notturna — la prova.** `DURATA=20 FETTA=5 scripts/caccia-notte.sh`,
+il 23 novembre dalle 23:25:10 alle 23:45:11: venti minuti e un secondo, e
+si è fermata da sola.
+
+- `uptime` prima: carico **6,15 6,64 6,01**; dopo: **2,86 3,25 3,98**.
+- Il repo prima e dopo è identico: `e05cb4a`, gli stessi due documenti
+  modificati, nessun commit, nessun `.proptest-regressions` riscritto
+  (la persistenza di proptest la spegne lo script).
+- **Quattordici proprietà.** La rotazione parte dalla più costosa
+  (`purge_with_conflict_copies_leaves_no_roots`, 161 ms per caso
+  nell'ultima caccia) ed è la data a dire da dove cominciare: 23
+  novembre × 4 fette, modulo 29 — la ventesima posizione. Le economiche
+  hanno preso il tetto dei 200 000 casi in pochi secondi; la quarantena è
+  caduta a 968 casi; le tre più costose hanno avuto la fetta intera;
+  `frozen_prefix_is_immutable` ha avuto i 170 secondi che restavano.
+- Esce **1**: c'è un rosso — il secondo difetto dichiarato (sopra, «Il
+  secondo»). Lo smistamento è stato quello dei tre passi.
+- `target/caccia-notte/20261123/`: 141 MB in 18 file (le nove corse da
+  200 000 casi pesano 16 MB l'una: chi la installa lo sappia).
+
+`semi.txt` — la proprietà, il seme del generatore (`PROPTEST_RNG_SEED`,
+derivato dalla data e dalla posizione: quella notte si rifà uguale), la
+prima riga del messaggio («-»: verde):
+
+| proprietà | seme | prima riga del messaggio |
+|---|---|---|
+| `rfc1918_is_never_public` | 20261183783369 | - |
+| `reserved_v6_blocks_are_never_public` | 20261183791288 | - |
+| `ports_matter_except_on_loopback_http` | 20261183799207 | - |
+| `ordinary_public_v4_is_public` | 20261183807126 | - |
+| `multicast_and_reserved_v4_are_never_public` | 20261183815045 | - |
+| `loopback_linklocal_and_cgnat_are_never_public` | 20261183822964 | - |
+| `hlc_monotonic` | 20261183830883 | - |
+| `mapped_reserved_v4_is_never_public` | 20261183838802 | - |
+| `nat64_teredo_and_ipv4_compatible_are_never_public` | 20261183846721 | - |
+| `quarantine_exits_only_by_decision` | 20261183854640 | `verify: Some("state differs around: 01P33340101000000000000000 … "status":"superseded" … the other side holds: … "status":"active"`) — il caso: seme `4712539371536976430` |
+| `purge_with_conflict_copies_leaves_no_roots` | 20261183862559 | - |
+| `purge_takes_only_its_family` | 20261183870478 | - |
+| `random_ops_compact_and_purge_leave_no_roots` | 20261183878397 | - |
+| `frozen_prefix_is_immutable` | 20261183886316 | - |
+
+**L'installazione è dell'utente** e non è fatta: lo script e il plist di
+esempio (`scripts/it.engramma.caccia-notte.plist`) stanno nel repo, le
+istruzioni in `docs/caccia.md`, e niente è stato caricato in
+`launchd`.
+
+**`seme-sul-tag.sh`, provato** — e provato una seconda volta, in fondo
+alla fase, con lo script corretto (la quarta trappola, in alto). I verdetti
+sono quelli delle corse rifatte: ogni riga porta lo schema che il motore
+ha dichiarato a runtime, uguale a quello del tag.
+
+| comando | verdetto | schema letto |
+|---|---|---|
+| `seme-sul-tag.sh purge_takes_only_its_family 11895058361907748327 fase-v0.6.12` | **CADE ANCHE sul tag fase-v0.6.12** (`01P4962…`: prima `Superseded`, dopo `Active`) | 22 |
+| `seme-sul-tag.sh purge_takes_only_its_family 8394280236933449584 fase-v0.6.13` | **NON cade sul tag fase-v0.6.13** (il difetto della v0.6.12, chiuso dalla v0.6.13) | 23 |
+| `seme-sul-tag.sh quarantine_exits_only_by_decision 11558843446952054066 fase-v0.6.13 quarantine_exits_body` | **CADE ANCHE sul tag fase-v0.6.13** («`01P3827…` è `superseded` senza una decisione che la spieghi») | 23 |
+| `seme-sul-tag.sh quarantine_exits_only_by_decision 1835111131785192683 fase-v0.6.13 quarantine_exits_body` | **CADE ANCHE sul tag fase-v0.6.13** («la decisione annullata di `01P3601…` non basta — la nota è di nuovo visibile») | 23 |
+| `seme-sul-tag.sh quarantine_exits_only_by_decision 2472647288214113510 fase-v0.6.13 quarantine_exits_body` | **CADE ANCHE sul tag fase-v0.6.13** (stesso messaggio, su `01P4925…`) | 23 |
+| `seme-sul-tag.sh quarantine_exits_only_by_decision 4712539371536976430 fase-v0.6.13 quarantine_exits_body` | **CADE ANCHE sul tag fase-v0.6.13** (`verify: state differs around: 01P3334…`) | 23 |
+| `seme-sul-tag.sh quarantine_exits_only_by_decision 2309209543203644442 fase-v0.6.13 quarantine_exits_body` | **CADE ANCHE sul tag fase-v0.6.13** (`verify: state differs around: 01P4939…`) | 23 |
+| `seme-sul-tag.sh quarantine_exits_only_by_decision 2008146196850474940 fase-v0.6.13 quarantine_exits_body` | **CADE ANCHE sul tag fase-v0.6.13** (`verify: state differs around: 01P9225…`) | 23 |
+| `seme-sul-tag.sh format_round_trip 12345 fase-v0.6.13` | il tag non ha il corpo: esce 3 | — |
+
+Il worktree se n'è andato da solo ogni volta (con la sua cartella di
+build). Sui tag prima della v0.6.14 solo tre proprietà hanno un corpo:
+per la quarantena si chiama `quarantine_exits_body`, ed è il caso del
+quarto argomento.
+
+## I test
+
+Tutti sul commit finale di codice e test, `07f5cc5` (i numeri della
+suite dell'intero workspace e del contratto JS, in fondo, sono di
+`26a8419`; `07f5cc5` aggiunge solo il quarto seme alla riproduzione
+ignorata e alla riga).
+
+- **N1**: `cut_monotone.rs` 13/13 — i due `cut_goes_back` del revisore coi
+  nomi miei, il controllo, lo stesso taglio che si registra di nuovo, il
+  taglio sotto che non fa niente, `verify` che nomina l'operazione, la
+  frontiera che scende, le cinque della riparazione preparate a mano (con
+  il file, l'angolo senza file, il taglio indietro senza scritture sopra,
+  la cella sana, il taglio indietro che nessuno ha coperto); i semi
+  fissi `quarantine_defect_seed_of_v0613_runs_clean` (N1) e
+  `purge_family_restore_seed_of_v0613_runs_clean` (N2); `golden_cell.rs`
+  apre le cinque celle (v068, v0612, v0613, v0613-indietro, v0614) e ne
+  controlla i fatti.
+- **N2**: `restore_content.rs` 7/7, con
+  `every_field_of_note_is_content_or_lifecycle`; `protocol_version` 2/2
+  (l'ALPN 9 contro 8).
+- **N3**: `properties_inventory` 4/4 (la mappa, l'attributo, il file dei
+  difetti aperti); `props.rs` 20 + 2 ignorati (le riproduzioni dei
+  due difetti dichiarati); `convergence.rs` 19 + 1 ignorato (le 36 terne
+  dell'epoca a terna e i due casi del cestino, ora fisse e verdi);
+  `identity` 4, `diff3_linear` 5, `indistinguishability` 3,
+  `proposals_props` 1, `oauth_props` 10 (uno per proprietà).
+- **La suite dell'intero workspace su macOS** (sul commit `26a8419`):
+  `cargo fmt --check` pulito, `cargo clippy --workspace --all-targets`
+  senza avvisi, e la suite **verde sul resto, rossa su un solo test:
+  `quarantine_exits_only_by_decision`, seme `3784521736327746000`** — il
+  quarto seme del difetto del taglio, dichiarato `07f5cc5`. Nessun altro
+  test è caduto (la corsa si ferma al primo fallimento: 41 suite, 433
+  passati). Il test ignorato che lo riproduce cade per dichiarazione.
+
+## Le misure, col doppio cancello
+
+Sonde identiche (fuori dal repo), nei worktree del tag `fase-v0.6.13`
+(«base»), del commit finale («fase»: i sorgenti di `e05cb4a`; i commit dopo non
+toccano `src`) e di `fase-v0.6.3`, in release, corse senza
+`nice`, l'`uptime` accanto a ogni corsa, a **coppie alternate** (l'ordine
+dentro la coppia cambia a ogni coppia). Una cella di 10 000 note:
+inserimento, 200 ricerche, `verify`, `compact()` a `head − 100`; poi la
+stessa compattazione in una cella con 1 000 proposte decise; poi la sonda
+della purga (compattazione con istantanea, una purga).
+
+**Una terza trappola di cargo — e avrebbe falsato tutto.** La prima
+versione dello script condivideva `CARGO_TARGET_DIR` fra i tre alberi
+(come fa `seme-sul-tag.sh`). I binari dei primi due avevano lo **stesso
+nome** e la seconda build non compilava niente (0,21 s: «Finished» e
+basta). Li ho confrontati: **identici al byte**. Cargo giudica freschi i
+manufatti dell'albero di prima, perché le date dei *suoi* sorgenti non
+sono cambiate. Avrei misurato la base contro se stessa: +0,0% su ogni
+misura, un verdetto perfetto e falso. Ora ogni albero si costruisce nella
+sua cartella di build (dentro il suo worktree, che se ne va con lui), lo
+script si rifiuta se `engramma-core` non risulta compilato, e la sonda
+stampa lo schema della cella che apre: **23** per la base, **24** per la
+fase, **20** per la v0.6.3.
+
+**La macchina.** Una prima sessione, la sera (23:21–23:24), è stata
+disturbata e la lascio fuori dichiarandola: il carico è salito da 4,8 a
+10,7 su 10 processori durante le corse, lo swap era a 7,1 GB su 8 e un
+demone di sistema (`mediaanalysisd`) aveva da poco preso mano; la terza
+coppia veniva il doppio più lenta. I numeri sono quelli del mattino dopo
+(06:06–06:19), **15 coppie, 30 corse**, col carico da 2,4 a 5,4: le
+applicazioni dell'utente aperte, nessuna compilazione. La macchina non è
+stata «ferma» in senso assoluto, e si vede: qualche corsa è disturbata
+(gli estremi degli intervalli, sotto), per questo il giudizio sta alla
+**mediana delle coppie** e l'intervallo è riportato intero.
+
+Ogni corsa (il numero della coppia; «base» `fase-v0.6.13`, «fase» il
+commit finale):
+
+| coppia | corsa | carico | inserimento (note/s) | ricerca p50 / p95 (ms) | verify (ms) | compact (ms) | compact + 1 000 proposte (ms) | sonda della purga (ms) |
+|---|---|---|---|---|---|---|---|---|
+| 2.1 | base | 2,43 | 4 872,2 | 0,199 / 0,216 | 913,3 | 94,7 | 116,3 | 218,5 |
+| 2.1 | fase | 3,06 | 3 221,8 | 0,214 / 0,856 | 1 799,9 | 174,4 | 123,8 | 155,3 |
+| 2.2 | fase | 4,92 | 4 150,1 | 0,205 / 0,231 | 1 045,7 | 125,7 | 116,2 | 140,0 |
+| 2.2 | base | 4,31 | 4 454,4 | 0,207 / 0,226 | 1 033,1 | 93,3 | 114,7 | 145,1 |
+| 2.3 | base | 4,21 | 4 492,9 | 0,208 / 0,229 | 1 000,6 | 99,9 | 128,0 | 158,5 |
+| 2.3 | fase | 4,26 | 4 521,0 | 0,205 / 0,232 | 984,3 | 96,7 | 115,8 | 135,7 |
+| 2.4 | fase | 3,50 | 4 499,0 | 0,209 / 0,237 | 1 007,8 | 96,2 | 116,7 | 140,6 |
+| 2.4 | base | 4,25 | 4 546,2 | 0,207 / 0,222 | 998,5 | 105,4 | 109,7 | 147,3 |
+| 2.5 | base | 3,82 | 4 728,0 | 0,206 / 0,239 | 957,5 | 96,8 | 114,7 | 133,2 |
+| 2.5 | fase | 3,20 | 4 452,2 | 0,205 / 0,261 | 988,2 | 96,3 | 140,8 | 150,8 |
+| 3.1 | base | 3,46 | 4 513,3 | 0,212 / 0,243 | 991,2 | 93,6 | 118,0 | 139,0 |
+| 3.1 | fase | 3,60 | 4 464,2 | 0,204 / 0,224 | 1 008,8 | 108,5 | 133,6 | 143,5 |
+| 3.2 | fase | 3,87 | 4 379,7 | 0,205 / 0,231 | 1 006,0 | 104,4 | 118,3 | 134,2 |
+| 3.2 | base | 3,56 | 4 443,1 | 0,208 / 0,234 | 1 009,6 | 110,0 | 121,4 | 139,3 |
+| 3.3 | base | 2,88 | 4 435,3 | 0,204 / 0,232 | 1 000,6 | 105,2 | 112,6 | 139,4 |
+| 3.3 | fase | 3,05 | 4 442,8 | 0,204 / 0,219 | 1 023,1 | 107,4 | 119,1 | 141,5 |
+| 3.4 | fase | 2,88 | 4 479,1 | 0,206 / 0,229 | 1 027,4 | 93,9 | 116,4 | 139,4 |
+| 3.4 | base | 2,80 | 4 492,0 | 0,210 / 0,692 | 1 007,3 | 95,3 | 124,9 | 136,7 |
+| 3.5 | base | 2,73 | 4 459,8 | 0,204 / 0,225 | 1 016,7 | 96,3 | 127,2 | 178,3 |
+| 3.5 | fase | 3,52 | 4 370,7 | 0,202 / 0,219 | 1 006,0 | 110,3 | 117,0 | 139,0 |
+| 3.6 | fase | 3,51 | 4 564,6 | 0,202 / 0,219 | 1 000,5 | 97,4 | 114,7 | 139,1 |
+| 3.6 | base | 3,17 | 4 555,4 | 0,212 / 0,249 | 1 006,1 | 97,3 | 117,1 | 148,5 |
+| 3.7 | base | 3,26 | 4 409,8 | 0,209 / 0,248 | 1 021,9 | 92,6 | 115,3 | 141,6 |
+| 3.7 | fase | 2,64 | 4 493,1 | 0,205 / 0,228 | 1 004,3 | 95,5 | 134,2 | 139,9 |
+| 3.8 | fase | 3,60 | 4 551,9 | 0,202 / 0,232 | 1 010,1 | 110,1 | 117,1 | 134,1 |
+| 3.8 | base | 3,42 | 4 422,6 | 0,201 / 0,215 | 1 046,7 | 95,1 | 177,4 | 141,1 |
+| 3.9 | base | 5,40 | 4 507,8 | 0,205 / 0,222 | 983,2 | 97,7 | 118,7 | 144,9 |
+| 3.9 | fase | 4,03 | 4 537,3 | 0,210 / 0,228 | 998,8 | 100,7 | 128,8 | 150,0 |
+| 3.10 | fase | 4,83 | 4 259,0 | 0,207 / 0,244 | 1 037,8 | 98,7 | 118,3 | 142,7 |
+| 3.10 | base | 4,88 | 4 356,1 | 0,205 / 0,229 | 1 020,1 | 102,3 | 115,8 | 135,3 |
+
+Il giudizio — per fase contro `fase-v0.6.13`, **mediana delle 15 coppie** (per l'inserimento, che è un ritmo, il segno è quello del **tempo per nota**, che è quello che conta):
+
+| misura | mediana base (v0.6.13) | mediana fase | fase contro base | intervallo delle coppie | cancello |
+|---|---|---|---|---|---|
+| inserimento di 10 000 note | 4 492 note/s | 4 464 note/s | tempo per nota **+1,0%** | da -2,8% a +51,2% | +2% |
+| ricerca, p50 | 0,207 ms | 0,205 ms | **-1,0%** | da -4,7% a +7,5% | +2% |
+| ricerca, p95 | 0,229 ms | 0,231 ms | **+1,3%** | da -66,9% a +296,3% | +2% |
+| `verify` su 10 000 note | 1 006,1 ms | 1 007,8 ms | **+1,2%** | da -3,5% a +97,1% | +5% |
+| `compact()`, taglio a `head − 100` | 96,8 ms | 100,7 ms | **+2,1%** | da -8,7% a +84,2% | +5% |
+| `compact()`, con 1 000 proposte decise | 117,1 ms | 118,3 ms | **+2,2%** | da -34,0% a +22,8% | +5% |
+| sonda della purga | 141,6 ms | 140,0 ms | **-3,5%** | da -28,9% a +13,2% | +5% |
+
+Tutte e sette le misure sono **dentro il cancello**. L'inserimento e la
+ricerca p95 stanno ai bordi del loro (rispettivamente +1,0% e +1,3% su
+un +2%): con un intervallo delle coppie così largo non si può dire di
+meno di «nessun peggioramento che si veda sopra il rumore», e non si può
+dire di più. Di meccanismo, in questa fase, la scrittura di una nota non
+ne ha presi: `put_note` non è stata toccata, e il taglio si legge da una
+funzione sola con la stessa query di prima.
+
+**Il cumulo contro `fase-v0.6.3`** — la sonda leggera (inserimento e
+ricerca), due corse per lato, alternate; i numeri, **senza giudizio**:
+
+| corsa | inserimento (note/s) | ricerca p50 / p95 (ms) | carico |
+|---|---|---|---|
+| fase | 4 201,7 | 0,204 / 0,231 | 3,99 |
+| v0.6.3 | 4 322,6 | 0,180 / 0,205 | 3,99 |
+| v0.6.3 | 4 439,5 | 0,180 / 0,200 | 4,07 |
+| fase | 4 200,1 | 0,209 / 0,324 | 4,07 |
+
+## Linux
+
+**Verde sul commit `e05cb4a`** (il terzo dell'elenco): `scripts/linux.sh`
+— `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` e tutta
+la suite del workspace nel container arm64 (`--cpus=2`, rete chiusa,
+sorgente in sola lettura): 84 suite, 694 passati, 0 caduti, 12 ignorati,
+gli stessi numeri di macOS; 19 min 44 s.
+
+**Sul commit finale NON rifatta, e il perché va dichiarato.** Rifatta alle
+10:18 di oggi, è caduta in otto test della sync con errori di I/O dal
+disco («disk I/O error», «Input/output error» creando cartelle in `/tmp`
+nel container). La macchina qui non c'entra col codice: **il disco
+dell'utente è pieno** — 1,4 GB liberi su 460 GB (100%) — e Docker a quel
+punto non riesce più nemmeno a leggere la lista delle proprie immagini
+(blob «expected at …: input/output error»). Il mandato vieta di
+cancellare il volume `engramma-linux-target`, le cache e `target/`, e il
+disco dell'utente non lo tocco. `linux.sh` va rifatto a macchina con
+spazio: **è l'unico controllo del commit finale che resta da fare.**
+
+## Difetti nuovi trovati in questa fase
+
+**Nati da questa fase e ancora aperti: nessuno.** Nati da questa fase e
+chiusi dentro la fase stessa:
+
+- i **corpi annidati** (`737be5c`): per due proprietà il refactor dei
+  corpi faceva un corpo dentro il corpo, e il seme che proptest riportava
+  non ricadeva — una riproduzione che mente è peggio di un rosso;
+- la **ripartizione dei budget** del cancello (`5674c0f`): riducendo in
+  proporzione portava le proprietà quasi gratuite a 9 313 casi;
+- l'attributo `#[test]` di `sixto_four…` **tolto a metà** (`5674c0f`),
+  tolto davvero in `dd20d5c`.
+
+**Pre-esistenti, trovati strada facendo** (l'ordine è quello in cui li
+ho trovati):
+
+1. **L'annullamento di una proposta legata riapre il bersaglio con la
+   decisione annullata** — due dispositivi; regola 3 dell'invariante
+   della quarantena. Trovato dal cancello, in due forme (semi
+   `1835111131785192683` e `2472647288214113510`). **Dichiarato aperto,
+   non toccato.**
+2. **Dopo un taglio, la purga di un chiudente sopra il taglio non è
+   quella del rigioco integrale** — due forme: la ricostruzione dal file
+   di copia dice un altro stato (`verify` rosso col file, verde senza), e
+   una nota chiusa sul taglio non riapre quando sopra il taglio viene
+   purgato il suo chiudente (lo stato sbagliato c'è anche senza file, e
+   `verify` non lo vede). Trovato dalla prova della caccia notturna
+   (seme `4712539371536976430`), poi dalla suite del cancello definitivo
+   (`2309209543203644442`) e dalla corsa a budget intero
+   (`2008146196850474940`) e dalla corsa del rifacimento per `props.rs`
+   (`3784521736327746000`, la forma A di nuovo). **Dichiarato aperto, non
+   toccato: è quello che tiene chiusa la compattazione.**
+3. **Una nota `external` confermata non si può modificare** (`patch`,
+   `put` falliscono in `write_note`; nemmeno il titolo). Aggirato solo
+   per il `restore`. Nessun seme: è il comportamento dell'API,
+   riprodotto a mano. **Dichiarato aperto, non toccato.**
+4. **Due proprietà senza `#[test]` mai girate** dal 7 novembre —
+   corrette, e l'inventario ora lo controlla.
+5. **Una proprietà registrata due volte** — corretta.
+6. **Una dichiarazione non più vera**: il difetto «aperto» della v0.6.8
+   era chiuso dalla v0.6.9 — chiuso per evidenza, i casi in regressione.
+7. **Un limite dichiarato** della migrazione: un taglio all'indietro
+   superato da una compattazione in avanti non lascia traccia. E un
+   secondo: la riparazione ricostruisce **dal file** — la stessa strada
+   del difetto 2. Sulla cella d'oro `v0613-indietro` e sui sette casi
+   preparati a mano è verde; una storia come quella del difetto 2 sopra il
+   taglio riparato erediterebbe quel che la strada dal file dice.
+8. **L'ambiente**: il fingerprint di cargo con le date dei sorgenti (in
+   alto), la cartella di build condivisa fra alberi (nelle misure e in
+   `seme-sul-tag.sh`), le cache del CLI in `$TMPDIR` (in alto), e il
+   **disco dell'utente pieno** (1,4 GB su 460: «Linux» sopra) — che ha
+   reso non ripetibile l'ultimo controllo sul commit finale.
+
+## La release locale, con la compattazione accesa
+
+**NON PRONTA.** La riga che il brief chiede:
+
+> **la release locale, con la compattazione accesa: NON PRONTA.** I due
+> difetti della v0.6.13 sono chiusi alla radice; ma le cacce di questa
+> fase hanno trovato, sotto, **un altro difetto del taglio** — la purga
+> di un chiudente sopra il taglio non è quella del rigioco integrale, e
+> nella forma in cui c'è anche senza file di copia `verify` non lo vede.
+> Dichiarato aperto coi semi (`open-defects.txt`); per Homun la
+> compattazione resta spenta fino alla fase che lo chiude.
+
+**La ragione.** Lo standard è quello delle due fasi prima: un difetto
+dichiarato che nasce col taglio basta a tenere la compattazione spenta —
+due nella v0.6.12, due nella v0.6.13. Oggi ne resta uno di questa
+famiglia, ma nella forma più insidiosa: **silenzioso nell'uso di Homun**.
+Con il file di copia `verify` lo dice; senza file — `compact(keepLast)`,
+che non tiene il file — lo stato della cella si allontana dal rigioco
+integrale (una nota chiusa resta chiusa dopo la purga del suo chiudente)
+e niente lo segnala. Quanto sia frequente non lo so; so che c'è, che
+c'era già sulla v0.6.13, e che non si chiude in questa fase.
+
+Per qualche ora il verdetto era un altro — «pronta, senza file di copia»
+— e stava su una descrizione sbagliata del difetto («nasce solo col
+file»). A rovesciarlo è stato il terzo seme, trovato dalla corsa a budget
+intero di stamattina: la stessa storia senza file dà lo stato sbagliato,
+e `verify` è verde.
+
+**Che cosa è pronto, e non va perso:**
+
+- i due difetti che tenevano spenta la compattazione dalla v0.6.12 sono
+  chiusi **alla radice** (N1, N2): i rossi del revisore sono verdi, i
+  semi fissi girano puliti, le celle d'oro `v0613-indietro` e `v0614`
+  aprono;
+- ciò che era muto ora parla, per quel che riguarda il taglio che torna
+  indietro: `verify` controlla la soglia, e la migrazione ripara le celle
+  già toccate;
+- il cancello sul commit finale: **29 proprietà verdi con 380 809 casi** (la quarantena con l'asterisco
+del verde breve), e il rifacimento per le dieci di `props.rs`: 9 verdi
+con 79 710 casi, la decima rossa sul caso dichiarato. La suite a 2048 e
+quella dell'intero workspace sono cadute **entrambe su casi della stessa
+famiglia** (semi `2309…` e `3784…`);
+- le misure sono dentro il cancello, tutte e sette;
+- il contratto JS è 65 su 65 in Node e in Electron, con i 64 di prima
+  identici al byte; Linux è verde;
+- **la caccia a tre livelli funziona**: in una fase ha trovato due
+  difetti pre-esistenti che sei cacce a 20 000 casi non avevano visto, e
+  per ognuno c'è un seme che ricade e un verdetto sul tag col motore
+  verificato.
+
+**Che cosa manca per accendere la compattazione** — il lavoro della fase
+che chiude, nell'ordine in cui lo farei:
+
+1. **un oracolo che confronti una storia col taglio con la stessa storia
+   senza**: oggi nessuna proprietà lo fa, ed è per questo che la forma B
+   si vedeva solo col file di copia (l'idea è quella di
+   `purge_takes_only_its_family`: fotografa, purga, confronta col rigioco
+   integrale);
+2. **la chiusura del difetto del taglio**, nelle due forme — e allora i
+   tre semi sono la regressione;
+3. e, separato, **il difetto a due dispositivi** dell'invariante della
+   quarantena: non passa dalla compattazione, c'è anche a compattazione
+   spenta, ma Homun sincronizza (dalla v0.6.1), e chi usa due dispositivi
+   deve saperlo.
+
+**Che cosa resta all'utente.** Il verdetto è una raccomandazione: la
+decisione è sua. Le strade: tenere la compattazione spenta — la strada
+sicura di sempre, e la cella cresce —; accenderla lo stesso, sapendo che
+una purga sopra un taglio può lasciare chiusa una nota che doveva
+riaprire, di rado e senza che `verify` lo dica; aspettare la fase che
+chiude. Per Homun, le istruzioni sono in `docs/node.md`. E una cosa che
+non c'entra con l'accendere: una nota `external` confermata non si può
+modificare (difetto pre-esistente, dichiarato).
+
+## La pulizia
+
+`du -sh target`: **27 G all'inizio, 32 G alla fine** (le cinque cacce in release e le celle d'oro; niente cancellato — la pulizia del disco è dell'utente, che ne ha bisogno: il disco è pieno, «Linux» sopra). In `$TMPDIR`, alla fine: **le cartelle `engramma-test-*`, `engramma-node-*` e `.tmp*` nostre a
+zero** (nessuna cancellata a mano: le droppano le prove — gli `engramma-test-*`
+scomparsi anche per effetto del disco pieno, che può aver impedito alle
+prove di crearle), le due cache `engramma-cli-relay` e `engramma-cli-plain`
+dove sono, 2,1 G l'una, toccate e guarite all'inizio della fase e mai
+cancellate. Nessun processo lasciato acceso, nessun worktree fuori dal principale (`git worktree list`). Le cache `engramma-cli-*` in `$TMPDIR` (2,1 G l'una) e il volume Docker `engramma-linux-target` intatti, come da mandato. La caccia notturna non è installata: lo script e il plist d'esempio stanno nel repo, l'installazione è dell'utente.
+
+## La build sul tag
+
+@@BUILD@@
+

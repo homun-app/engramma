@@ -103,6 +103,7 @@ export class Cell {
   verify(): Promise<VerifyView>
   repair(): Promise<RepairView>          // v0.6.10, J2: { moved: [{old, new}] }
   compact(keepLast: number, opts?: { keepSnapshot?: boolean }): Promise<CompactView>
+  //   v0.6.14: CompactView.compacted — false se il taglio chiesto stava sotto quello già fatto (nulla si muove, cutSeq è il taglio vero)
   vaultViews(): Promise<VaultView[]>
   vaultUnbind(dirOrViewId: string): Promise<void>
 }
@@ -481,7 +482,81 @@ si potrà: `keepLast` è quante operazioni restano vive sopra il taglio
 una memoria che cresce, non una funzione dell'utente. Con la
 compattazione spenta i due semi sono verdi, e la condizione della
 v0.6.11 resta la strada sicura (la v0.6.12 al posto della v0.6.11).
-I numeri e i giudizi sono nel REPORT della fase.
+I numeri e i giudizi sono nel REPORT della fase. (Li ha chiusi la
+v0.6.14: la sezione dopo.)
+
+## La compattazione: il taglio va solo avanti, e resta spenta lo stesso (v0.6.14)
+
+I due difetti dichiarati dalla v0.6.13 sono chiusi alla radice, tutti e
+due pre-esistenti (la verifica del revisore li ha pesati: lo stesso seme
+cade anche sul tag di prima).
+
+- **il taglio va solo avanti.** Il difetto: `compact(keepLast)` con un
+  `keepLast` più grande di quello del giorno prima chiedeva un taglio
+  SOTTO quello già fatto, e il motore lo accettava. I payload fra i due
+  tagli erano già andati; alla prima ricostruzione sopra il taglio nuovo
+  la `decide` che aveva accettato una proposta rigiocava senza payload e
+  atterrava come niente: la proposta tornava `pending`, il registro
+  perdeva la riga dell'utente, e `verify` restava verde. Oggi quella
+  chiamata non fa niente e lo dice: `compacted: false`, `cutSeq` fermo al
+  taglio vero. **Alzare `keepLast` non fa danni: il taglio non scende.**
+  `verify()` controlla anche la soglia (un payload tolto sopra il taglio
+  registrato è una cella rotta) e ha un campo nuovo,
+  `declaredCorners: string[]` — prosa, mai un fallimento: l'angolo che
+  porta una cella già toccata dal taglio all'indietro se non aveva il
+  file di copia da cui ricostruire.
+- **il `restore` riporta il contenuto, non lo stato** (in Rust: CLI e
+  pagina di revisione; il binding non ha `restore`): una nota chiusa
+  resta chiusa con la sua chiusura, una in quarantena ci resta.
+
+Il contratto lo dice nel test 65esimo (64 identici + 1: **65 su 65 in
+Node e 65 su 65 in Electron**, sul commit finale della fase): una proposta
+d'agente, la `decide` che accetta, `compact(0)`, poi `compact(10)` —
+`compacted` è `false` e `cutSeq` non si muove — e una scrittura sopra il
+taglio sulla proposta: `proposals()` dice ancora `accepted`.
+
+**Per Homun: la compattazione resta spenta lo stesso.** Il taglio va
+solo avanti e il `restore` riporta il contenuto, ma le cacce della fase
+hanno trovato **due difetti pre-esistenti** — tutti
+e due cadono anche sul tag `fase-v0.6.13` —, dichiarati aperti in
+`open-defects.txt` coi semi (REPORT della fase):
+
+- **dopo un taglio, la purga di una nota che ne aveva chiuse altre, sopra
+  il taglio, non è quella del rigioco integrale.** In una forma lo stato
+  col taglio è giusto ma la ricostruzione **dal file di copia** dice un
+  altro stato: `verify()` è rosso («state differs around»). Nell'altra
+  una nota chiusa da un supersede che sta **sul taglio** non riapre
+  quando, sopra il taglio, viene purgata la nota che la chiudeva — e
+  questo **c'è anche senza file di copia, e `verify()` non lo vede**.
+  Senza taglio le stesse storie sono verdi. Per questo non basta
+  «compattare senza `keepSnapshot`»: toglie solo il caso in cui
+  `verify()` se ne accorge, non il danno.
+- **la quarantena, con due dispositivi.** Con due dispositivi
+  sincronizzati, due annullamenti **concorrenti** di proposte legate (una
+  proposta e la correzione che la prende di mira) possono rendere di
+  nuovo visibile una nota la cui accettazione è annullata: l'invariante
+  della quarantena (DESIGN § 8.5) non è una garanzia in quel caso. Non
+  passa dalla compattazione — c'è anche a compattazione spenta. Su un
+  dispositivo solo il motore rifiuta il secondo annullamento
+  («conflict»).
+
+Fino alla fase che li chiude, `compact(keepLast)` non si chiama; la
+condizione della v0.6.11 resta la strada sicura (la v0.6.12 al posto
+della v0.6.11).
+
+Quando si potrà accendere: `keepLast` è quante operazioni restano vive
+sopra il taglio — il binding taglia a `head − keepLast` (sotto la
+frontiera stabile, in una cella condivisa). È la manutenzione di una
+memoria che cresce, non una funzione dell'utente: conviene chiamarlo a
+fine turno o su una soglia, non a ogni scrittura. Un punto di partenza è
+il `--keep-last` della CLI, 1000. Alzarlo non fa danni (il taglio non
+scende); abbassarlo taglia di più. Chiedere lo stesso taglio due volte
+non è un errore: riporta il punto di riavvio alla testa di oggi, nella
+forma chiesta. Le celle scritte con la v0.6.13 e un taglio tornato
+indietro vengono riparate all'apertura quando hanno il file di copia;
+senza, `verify()` lo dice in `declaredCorners`. (La riparazione
+ricostruisce dal file: la stessa strada della prima forma del difetto qui
+sopra.)
 
 ## Cosa riapre la purga, e come dirlo prima (v0.6.11, K1)
 
