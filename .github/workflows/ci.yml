@@ -222,6 +222,12 @@ jobs:
           vector tests of the JS contract skip with their message
           (node --test prints the # SKIP lines); the rest runs, text+graph"
       - run: npm test --ignore-scripts
+        # the four contract files run ONE AT A TIME (--test-concurrency=1,
+        # in package.json): node --test defaults to one process per file,
+        # core count permitting — and the S4 sync window (5 s for a whole
+        # session, the event lands when the session ENDS) missed it on the
+        # 3-core runner with bench and engine eating cores in parallel
+        # (45509102496). The gate does not measure runner load.
         working-directory: crates/engramma-node
 
   deny:
