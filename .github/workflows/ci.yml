@@ -133,7 +133,7 @@ jobs:
               echo "::notice::open-defects.txt declares '$prop': skipped here — the hunt (scripts/caccia.sh) runs it anyway and the REPORT judges (docs/caccia.md)"
             done < crates/engramma-core/tests/open-defects.txt
           fi
-          cargo test --workspace --locked $skips
+          cargo test --workspace --locked -- $skips
 
   # the same suite on x86_64, after `warm` built the binaries (the slowest
   # runner of the three: cold it misses the 25-minute cap by seconds)
@@ -163,7 +163,7 @@ jobs:
               echo "::notice::open-defects.txt declares '$prop': skipped here — the hunt (scripts/caccia.sh) runs it anyway and the REPORT judges (docs/caccia.md)"
             done < crates/engramma-core/tests/open-defects.txt
           fi
-          cargo test --workspace --locked $skips
+          cargo test --workspace --locked -- $skips
 
   js:
     name: js contract (${{ matrix.os }})
@@ -277,4 +277,4 @@ jobs:
               echo "::notice::open-defects.txt declares '$prop': skipped here — the hunt (scripts/caccia.sh) runs it anyway and the REPORT judges (docs/caccia.md)"
             done < crates/engramma-core/tests/open-defects.txt
           fi
-          cargo test --workspace --locked $skips
+          cargo test --workspace --locked -- $skips
