@@ -3473,12 +3473,15 @@ impl Cell {
         // NOT_FOUND even without the opt-in
         let permits = self.enter(env)?;
         if !self.experimental_compaction {
-            return Err(recode(env, transport_err(
-                "EXPERIMENTAL",
-                "la compattazione è sperimentale: i difetti dichiarati del taglio \
+            return Err(recode(
+                env,
+                transport_err(
+                    "EXPERIMENTAL",
+                    "la compattazione è sperimentale: i difetti dichiarati del taglio \
                  (crates/engramma-core/tests/open-defects.txt) sono aperti — \
                  apri la cella con { experimental: ['compaction'] } per usarla lo stesso",
-            )));
+                ),
+            ));
         }
         Ok(AsyncTask::new(CompactTask {
             cell: self.cell.clone(),

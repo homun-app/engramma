@@ -67,9 +67,16 @@ fn compact_without_sperimentale_refuses_and_moves_nothing() {
         .arg("compact")
         .output()
         .unwrap(/* t */);
-    assert_eq!(out.status.code(), Some(2), "a usage error, like every bad argument");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a usage error, like every bad argument"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("sperimentale"), "the message names the switch: {stderr}");
+    assert!(
+        stderr.contains("sperimentale"),
+        "the message names the switch: {stderr}"
+    );
     assert!(
         stderr.contains("open-defects.txt"),
         "the message names the reason: {stderr}"
@@ -85,7 +92,12 @@ fn compact_without_sperimentale_refuses_and_moves_nothing() {
         .arg("verify")
         .output()
         .unwrap(/* t */);
-    assert!(verify.status.success(), "{}{}", String::from_utf8_lossy(&verify.stdout), String::from_utf8_lossy(&verify.stderr));
+    assert!(
+        verify.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr)
+    );
 
     // with the flag: the compaction runs as it always did
     let out = Command::new(env!("CARGO_BIN_EXE_engramma"))
