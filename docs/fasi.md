@@ -19,11 +19,22 @@ leggere. Le regole:
    tag precedente, col doppio cancello della v0.6.14. Se la fase non lo
    tocca, niente misure.
 4. **La caccia, a livelli:**
-   - a ogni push, il CI (livello 1, `.github/workflows/ci.yml`);
-   - il cancello di `scripts/caccia.sh` **solo** se la fase tocca
-     `crates/*/src`, e solo sulle proprietà toccate;
+   - a ogni push, il CI (livello 1, `.github/workflows/ci.yml`) — dal
+     v0.6.16 deterministico col seme fisso `PROPTEST_RNG_SEED`: un rosso
+     del cancello è sempre una regressione;
+   - il cancello di `scripts/caccia.sh` **solo** se la fase tocca codice
+     coperto da una proprietà della suite — l'inventario
+     `crates/engramma-core/tests/properties.txt` — e solo sulle
+     proprietà toccate: il binding e la CLI non fanno partire il
+     cancello (v0.6.16; prima la regola diceva «crates/*/src»);
    - il cancello intero prima di una release che cambia il motore;
    - la caccia notturna resta com'è (l'installazione è dell'utente).
 5. **Un tema per fase, scelto dal prodotto:** cosa serve a Homun. Un difetto
    che una caccia trova in una funzione sperimentale va dichiarato, non
    inseguito.
+6. **Il triage dei difetti** (v0.6.16). Un difetto si corregge nella
+   fase in cui si trova solo se è raggiungibile dall'API stabile di
+   Homun — la sezione «Cosa Homun può usare» di `docs/node.md` — **e**
+   perde dati, oppure lascia uno stato che `verify` non vede. Tutti gli
+   altri si dichiarano in `open-defects.txt`, con chi li raggiunge e
+   cosa succede, e la fase va avanti.
