@@ -13543,3 +13543,30 @@ quelli di `07f5cc5`):
 - `index.d.ts` 31 800 B, SHA256
   `f9961c213718be4e730e6f3bcc314c5b8cbb981fcf844d1f25fef44f44f9d992`.
 
+**Il dopo della build, e lo stato in cui lascio i binari — dichiarato.**
+Dopo la build sul tag il disco dell'utente è arrivato a fondo (239 MB
+liberi, poi 122 dopo l'ultimo tentativo: «No space left on device»). Le
+conseguenze, in ordine:
+
+- la **ricontrolla JS sul tag** non è riuscita, per due volte, e nessuna
+  delle due è il contratto: la prima il banco l'ha rifiutata da sé
+  (CLI `db84e76` contro addon `3bd25f0`: il difetto della v0.6.10 che
+  rifiuta un aggancio disallineato, difeso bene); la seconda perché la
+  CLI, ricostruita per farla combaciare, è morta **durante lo strip**
+  («IO failure on output stream: No space left on device») ed è rimasta
+  un file di **368 byte** che non gira. Un secondo tentativo senza strip
+  (`CARGO_PROFILE_RELEASE_STRIP=false`) ha cambiato l'impronta del
+  profilo e ha rimesso mano a tutte le dipendenze, mangiando altro
+  spazio senza produrre niente: fermato lì. Ho smesso di costruire.
+- **l'ultimo verde JS completo resta quello di ieri mattina sul commit
+  `26a8419`: 65/65 in Node e 65/65 in Electron**, con l'addon e la CLI
+  allineati (10:32–10:33). Il tag differisce da quel commit solo per
+  documenti (`3bd25f0` e `db84e76`).
+- sul disco: l'**addon** è quello della build sul tag (verde nel
+  contratto com'era quello di `26a8419`: il codice è lo stesso); la
+  **CLI** in `target/release/engramma` è **rotta** (368 byte, non gira) e
+  va ricostruita quando c'è spazio: `cargo build -p engramma-cli
+  --release`. In `target/release` sono rimasti anche i manufatti parziali
+  del profilo senza strip del secondo tentativo — roba mia, non
+  cancellata perché il mandato vieta di toccare `target/`.
+
