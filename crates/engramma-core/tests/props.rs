@@ -3328,6 +3328,28 @@ fn the_declared_defect_of_v0614_two_devices() {
     quarantine_exits_only_by_decision_body(2_472_647_288_214_113_510);
 }
 
+/// v0.6.14: the SECOND defect the hunts of this phase found, DECLARED
+/// OPEN (`open-defects.txt`; REPORT, «La caccia notturna — la prova»), on
+/// the seed of the night proof (proptest: `minimal failing input: seed =
+/// 4712539371536976430`). One cell. The story, read from the log —
+/// facts, not a diagnosis: a correction proposal P over a note N; the
+/// user closes N with a supersede; P is accepted; a compaction WITH its
+/// copy file (the cut at seq 7); above the cut, the purge of the note
+/// that had closed two notes — N among them, the target of the accepted
+/// P. At the end the materialized state and the whole replay say N is
+/// `superseded`, the reconstruction FROM THE FILE says `active`: `verify`
+/// is not green («state differs around …»), and the judge of the
+/// single-cell form falls at its last assert. The same story without the
+/// copy file is green, and so is the story with no cut: the defect is
+/// born only with a cut that kept its file. It falls on `fase-v0.6.13`
+/// with the same message (`seme-sul-tag.sh`): pre-existing. IGNORED, run
+/// by hand; it FALLS while the defect is open.
+#[test]
+#[ignore = "il difetto dichiarato: dopo una compattazione col file di copia, la ricostruzione dal file non concorda col rigioco — cade finché resta aperto"]
+fn the_declared_defect_of_v0614_from_the_copy_file() {
+    quarantine_exits_only_by_decision_body(4_712_539_371_536_976_430);
+}
+
 /// v0.6.14 (N3): the canonical name of the body — the story is
 /// `frozen_prefix_body` (its name since the v0.6.12), with the property's
 /// seed as it is (see `quarantine_exits_only_by_decision_body`).
