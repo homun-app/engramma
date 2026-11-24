@@ -13562,11 +13562,14 @@ conseguenze, in ordine:
   `26a8419`: 65/65 in Node e 65/65 in Electron**, con l'addon e la CLI
   allineati (10:32–10:33). Il tag differisce da quel commit solo per
   documenti (`3bd25f0` e `db84e76`).
-- sul disco: l'**addon** è quello della build sul tag (verde nel
-  contratto com'era quello di `26a8419`: il codice è lo stesso); la
-  **CLI** in `target/release/engramma` è **rotta** (368 byte, non gira) e
-  va ricostruita quando c'è spazio: `cargo build -p engramma-cli
-  --release`. In `target/release` sono rimasti anche i manufatti parziali
-  del profilo senza strip del secondo tentativo — roba mia, non
-  cancellata perché il mandato vieta di toccare `target/`.
+- **il recupero, a disco parzialmente risalito (1,0 GB)**: la CLI è
+  stata ricostruita (`cargo build -p engramma-cli --release`: 58,4 MB,
+  commit `44dc80f`, schema 24) e con lei l'addon, sullo stesso commit; il
+  contratto è **di nuovo verde: 65/65 in Node e 65/65 in Electron** con
+  l'aggancio allineato (npm test e test:electron uscita 0). Sul disco
+  l'aggancio è quindi quello di `44dc80f`; i numeri della build del tag
+  restano quelli sopra, registrati quando l'ha prodotta `build-sha.sh`.
+  In `target/release` sono rimasti i manufatti parziali del profilo senza
+  strip del secondo tentativo — roba mia, non cancellata perché il
+  mandato vieta di toccare `target/`.
 
