@@ -50,6 +50,13 @@ env:
   CARGO_INCREMENTAL: "0"
   # the builtin models are not pulled in CI: the model tests skip and SAY so
   ENGRAMMA_SKIP_MODEL_TESTS: "1"
+  # the CI suite runs every property at 128 cases — the phase's own budget
+  # (props is 128 in the source; convergence at 512 and diff3 at 1024 are
+  # the LOCAL suite's fuller budget, and the 3-core macOS runner does not
+  # fit them under the 25-minute cap). The env var overrides the source's
+  # `with_cases` (measured: convergence 512→2 went from ~7 min to 37 s);
+  # the regression files still pin their seeds at any count.
+  PROPTEST_CASES: "128"
 
 jobs:
   fmt:
