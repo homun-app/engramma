@@ -292,7 +292,16 @@ happen: the purge says so and exits with code **5** (`scrubbed: false`,
 cell close, and `--json` carries the same fields. A failed `VACUUM` or
 PRAGMA is an error, never a silent success.
 
-### `engramma compact [--keep-last N] [--keep-snapshot]`
+### `engramma compact [--sperimentale] [--keep-last N] [--keep-snapshot]`
+
+**(v0.6.15, F2) Sperimentale, dietro un interruttore esplicito.** Senza
+`--sperimentale` il comando rifiuta (exit 2) e dice perché: i difetti
+dichiarati del taglio sono aperti
+(`crates/engramma-core/tests/open-defects.txt`). La compattazione è
+un'ottimizzazione — la manutenzione di una memoria che cresce — e finché
+i suoi difetti sono aperti sta all'utente deciderla, non al motore. Il
+binding JS chiede la stessa cosa all'apertura della cella:
+`{ experimental: ['compaction'] }` (docs/node.md).
 
 Registers a **checkpoint** and forgets the payloads up to `head − N`
 (default `keep-last` 1000): the row records the head hash and the state

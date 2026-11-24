@@ -342,6 +342,11 @@ enum Command {
         /// the logical state; purge scrubs it with the cell)
         #[arg(long)]
         keep_snapshot: bool,
+        /// v0.6.15 (F2): the compaction is experimental — without this flag
+        /// the command refuses and says why (the declared defects of the
+        /// cut are open: crates/engramma-core/tests/open-defects.txt)
+        #[arg(long)]
+        sperimentale: bool,
     },
     /// Consolidation candidates: near duplicates and probable
     /// contradictions — the engine proposes, the application decides (v0.3)
@@ -1459,7 +1464,17 @@ fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Compact {
             keep_last,
             keep_snapshot,
+            sperimentale,
         } => {
+            // v0.6.15 (F2): behind an explicit switch, like the binding's
+            // `experimental: ['compaction']` — same reason, same refusal
+            if !sperimentale {
+                return Err(CliError::usage(
+                    "la compattazione è sperimentale: i difetti dichiarati del taglio \
+                     (crates/engramma-core/tests/open-defects.txt) sono aperti — \
+                     aggiungi --sperimentale per usarla lo stesso",
+                ));
+            }
             let cell = open_cell(cli)?;
             let head: i64 = cell
                 .debug_column("SELECT CAST(COALESCE(MAX(seq), 0) AS TEXT) FROM ops")

@@ -41,6 +41,38 @@ appena dopo `Engine.open`), non più l'embedding; nella v0.4.4 era ~2,3 GB.
 Le soglie di riposo più basse richiedono l'embedding fuori processo:
 opzione della v0.5.
 
+## Cosa Homun può usare (v0.6.15)
+
+**L'API stabile è il contratto qui sotto** — `Engine`, `Cell`, la sync e
+i suoi eventi: tutto ciò che la sezione «Il contratto» e le sezioni che
+seguono documentano, con i codici d'errore stabili. La release locale si
+dichiara su questo: nessun difetto aperto è raggiungibile da quest'API
+senza un'opzione esplicita.
+
+**Sperimentale (dietro un interruttore): la compattazione.** `compact()`
+funziona solo su una cella aperta con
+`e.cell(nome, { experimental: ['compaction'] })`; senza, rifiuta con
+`e.code === 'EXPERIMENTAL'` e un messaggio che dice perché (i difetti
+dichiarati del taglio, `crates/engramma-core/tests/open-defects.txt`,
+sono aperti), e la cella non cambia. La CLI fa lo stesso con
+`engramma compact --sperimentale`. La compattazione è la manutenzione di
+una memoria che cresce, non una funzione dell'utente: finché i suoi
+difetti sono aperti, non sta al motore deciderla. `revertDecision` non
+è nel binding (il test del contratto che legge `index.d.ts` lo controlla
+finché la riga a due dispositivi di `open-defects.txt` è aperta).
+
+**Le due regole che restano**, a monte di ogni API:
+
+1. **`decide()` solo da un gesto dell'utente.** La coda delle proposte
+   esiste perché l'agente propone e la persona decide: nessun codice di
+   Homun chiama `decide()` per conto dell'utente, mai — nemmeno con le
+   migliori intenzioni (un'accettazione automatica è una scrittura col
+   nome dell'utente che l'utente non ha fatto).
+2. **La `external` confermata è di sola lettura.** Una nota `external`
+   confermata è una fonte: il suo contenuto non si modifica, cambia
+   solo per una nuova versione che la sostituisce (il flusso correctione
+   e approvazione). Homun la legge, non la riscrive.
+
 ## Costruzione
 
 ```console
@@ -77,7 +109,7 @@ export interface EngineOptions {
 }
 export class Engine {
   static open(opts: EngineOptions): Promise<Engine>
-  cell(name: string, opts?: { create?: boolean; actor?: string }): Promise<Cell>
+  cell(name: string, opts?: { create?: boolean; actor?: string; experimental?: string[] }): Promise<Cell>
   cells(): Promise<string[]>
   dropCell(name: string, reason: string): Promise<DropView>   // v0.4.2: oblio di una cella intera
   modelStatus(): Promise<{ present: boolean; id?: string; bytes?: number }>
@@ -103,6 +135,8 @@ export class Cell {
   verify(): Promise<VerifyView>
   repair(): Promise<RepairView>          // v0.6.10, J2: { moved: [{old, new}] }
   compact(keepLast: number, opts?: { keepSnapshot?: boolean }): Promise<CompactView>
+  //   v0.6.15: SPERIMENTALE — solo su celle aperte con { experimental: ['compaction'] };
+  //   senza l'opzione rifiuta con EXPERIMENTAL e la cella non cambia
   //   v0.6.14: CompactView.compacted — false se il taglio chiesto stava sotto quello già fatto (nulla si muove, cutSeq è il taglio vero)
   vaultViews(): Promise<VaultView[]>
   vaultUnbind(dirOrViewId: string): Promise<void>

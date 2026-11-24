@@ -91,6 +91,10 @@ fn split_transport(err: &Error) -> (&'static str, String) {
                 // v0.6.9 (I1): «forgotten forever» — the id does not
                 // come back, not even from an old export
                 "NOTE_PURGED",
+                // v0.6.15 (F2): the call needs an experimental opt-in it
+                // did not get (today: compaction on a cell opened without
+                // `experimental: ['compaction']`)
+                "EXPERIMENTAL",
             ];
             let c: &str = code;
             match known.iter().find(|k| **k == c) {
@@ -475,6 +479,20 @@ pub struct CellOpts {
     /// of the engine's (`homun:bot-<id>`). The cell underneath is the same:
     /// two Cell objects with different actors write the same memory.
     pub actor: Option<String>,
+    /// v0.6.15 (F2): the experimental features this Cell opts into. Today
+    /// one: `'compaction'` — `compact()` refuses with `EXPERIMENTAL` on a
+    /// cell opened without it, because the declared defects of the cut
+    /// (`crates/engramma-core/tests/open-defects.txt`) are open. Nothing
+    /// else reads this list.
+    pub experimental: Option<Vec<String>>,
+}
+
+/// v0.6.15 (F2): does the open-options list ask for the experimental
+/// compaction? An unknown feature name is IGNORED (not an error): the list
+/// is a plain opt-in, and the caller that names a feature this binding
+/// does not have loses nothing but that feature.
+fn wants_compaction(experimental: Option<&Vec<String>>) -> bool {
+    experimental.is_some_and(|v| v.iter().any(|s| s == "compaction"))
 }
 
 #[napi(object)]
@@ -1293,6 +1311,9 @@ pub struct CellOpenTask {
     name: String,
     create: bool,
     actor: Option<String>,
+    /// v0.6.15 (F2): whether this Cell may call `compact()` (the explicit
+    /// `experimental: ['compaction']` of the open).
+    experimental_compaction: bool,
     _open: GateGuard,
 }
 
@@ -1334,7 +1355,10 @@ impl Task for CellOpenTask {
     }
 
     fn resolve(&mut self, _env: Env, out: Self::Output) -> Result<Self::JsValue> {
-        Ok(Cell::from_parts(out.0, out.1, out.2, out.3, out.4, out.5))
+        let compaction = self.experimental_compaction;
+        Ok(Cell::from_parts(
+            out.0, out.1, out.2, out.3, out.4, out.5, compaction,
+        ))
     }
 
     reject_recode!();
@@ -1707,7 +1731,10 @@ impl Engine {
             handle: self.handle.clone(),
             name,
             create: opts.as_ref().and_then(|o| o.create).unwrap_or(true),
-            actor: opts.and_then(|o| o.actor),
+            actor: opts.as_ref().and_then(|o| o.actor.clone()),
+            experimental_compaction: wants_compaction(
+                opts.as_ref().and_then(|o| o.experimental.as_ref()),
+            ),
             _open: self.handle.gate.enter_now().map_err(|e| recode(env, e))?,
         }))
     }
@@ -1911,6 +1938,10 @@ pub struct Cell {
     /// objects of a dropped generation stop working without an exception
     /// in the dark.
     tracker: Arc<Gate>,
+    /// v0.6.15 (F2): whether `compact()` may run — the cell was opened with
+    /// `experimental: ['compaction']`. The refusal is the binding's, not
+    /// the engine's: the engine stays as it is.
+    experimental_compaction: bool,
 }
 
 /// The two permits every Cell task holds (v0.4.2, P0.3): the engine's gate
@@ -1930,6 +1961,7 @@ impl Cell {
         actor: String,
         gate: Gate,
         tracker: Arc<Gate>,
+        experimental_compaction: bool,
     ) -> Self {
         Cell {
             cell,
@@ -1938,6 +1970,7 @@ impl Cell {
             actor,
             gate,
             tracker,
+            experimental_compaction,
         }
     }
 
@@ -3415,6 +3448,14 @@ impl Cell {
     /// Forget the payloads of the oldest operations, keeping the last
     /// `keepLast` replayable.
     ///
+    /// **v0.6.15 (F2): EXPERIMENTAL — an explicit opt-in.** The call works
+    /// only on a cell opened with `{ experimental: ['compaction'] }`;
+    /// without it, it refuses with code `EXPERIMENTAL` and the cell does
+    /// not change. The reason is declared, not fixed: the defects of the
+    /// cut listed in `crates/engramma-core/tests/open-defects.txt` are
+    /// open, and compaction is an optimization Homun keeps off — not a
+    /// function of its memory.
+    ///
     /// v0.6.14 (N1): **the cut only goes forward.** A `keepLast` so large
     /// that the cut would fall BELOW the one already made changes
     /// nothing: the call answers `compacted: false` with the true cut.
@@ -3428,11 +3469,22 @@ impl Cell {
         keep_last: i64,
         opts: Option<CompactOpts>,
     ) -> Result<AsyncTask<CompactTask>> {
+        // the gate first: a closed or dropped cell answers CLOSED /
+        // NOT_FOUND even without the opt-in
+        let permits = self.enter(env)?;
+        if !self.experimental_compaction {
+            return Err(recode(env, transport_err(
+                "EXPERIMENTAL",
+                "la compattazione è sperimentale: i difetti dichiarati del taglio \
+                 (crates/engramma-core/tests/open-defects.txt) sono aperti — \
+                 apri la cella con { experimental: ['compaction'] } per usarla lo stesso",
+            )));
+        }
         Ok(AsyncTask::new(CompactTask {
             cell: self.cell.clone(),
             keep_last: keep_last.max(0),
             keep_snapshot: opts.and_then(|o| o.keep_snapshot).unwrap_or(false),
-            _open: self.enter(env)?,
+            _open: permits,
         }))
     }
 

@@ -82,7 +82,9 @@ test('compact() then purge() of a supersede: the purge succeeds, the other histo
   const rootDir = root();
   const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
   try {
-    const cell = await e.cell('oblio-con-taglio');
+    // v0.6.15 (F2): compaction is an explicit opt-in — the tests that use
+    // compact() open the cell with it (and ONLY it)
+    const cell = await e.cell('oblio-con-taglio', { experimental: ['compaction'] });
     const old = await cell.put({
       body: 'la prima mano [[Roma]]',
       source: 'homun:test',
@@ -145,7 +147,7 @@ test('propose() then decide() then compact() then purge(): the queue row survive
   const rootDir = root();
   const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
   try {
-    const cell = await e.cell('ancora-intera');
+    const cell = await e.cell('ancora-intera', { experimental: ['compaction'] });
     const base = await cell.put({
       body: 'il mio colore preferito è il rosso [[Roma]]',
       source: 'homun:test',
@@ -208,7 +210,7 @@ test('compact() with a larger keepLast does not drag the cut back: the accepted 
   const rootDir = root();
   const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
   try {
-    const cell = await e.cell('taglio-avanti');
+    const cell = await e.cell('taglio-avanti', { experimental: ['compaction'] });
     await cell.put({
       body: 'una nota qualunque [[Milano]]',
       source: 'homun:test',
@@ -265,6 +267,61 @@ test('compact() with a larger keepLast does not drag the cut back: the accepted 
   } finally {
     await e.close();
   }
+});
+
+// v0.6.15 (F2): compaction is behind an explicit experimental opt-in. A cell
+// opened WITHOUT `{ experimental: ['compaction'] }` refuses `compact()` with
+// code EXPERIMENTAL and a message that says why (the declared defects of
+// the cut are open), and the cell does not change: same head, verify green.
+// The opt-in is per Cell open, over the same memory: with it, compact()
+// works.
+test('compact() without the experimental opt-in refuses, and the cell does not change', async () => {
+  const e = await engine();
+  const cell = await e.cell('senza-interruttore');
+  await cell.put({ body: 'una nota [[Roma]]', source: 's', confidence: 'stated' });
+  await cell.put({ body: 'un\'altra [[Roma]]', source: 's', confidence: 'stated' });
+  const head = (await cell.changesSince(0)).head;
+  // like every call-time refusal of the binding (the gate's CLOSED, the
+  // dropped cell's NOT_FOUND), the rejection is raised AT THE CALL, not
+  // in the async task: the async wrapper is what `await` sees
+  await assert.rejects(
+    async () => cell.compact(1),
+    (err) => err.code === 'EXPERIMENTAL' && /sperimentale/.test(err.message),
+  );
+  // nothing moved: the head is the same, no cut answers below it
+  const after = await cell.changesSince(0);
+  assert.equal(after.compacted, undefined, 'no cut landed');
+  assert.equal(after.head, head, 'the head did not move');
+  const v = await cell.verify();
+  assert.equal(v.ok, true, `verify: ${v.mismatch}`);
+  // the same memory, a Cell opened WITH the opt-in: compact() works
+  const opted = await e.cell('senza-interruttore', { experimental: ['compaction'] });
+  const done = await opted.compact(1);
+  assert.equal(done.compacted, true, 'the opt-in compacts');
+  await e.close();
+});
+
+// v0.6.15 (F2.4): the two-device defect (open-defects.txt, the seeds
+// 1835111131785192683 and 2472647288214113510) needs decision REVERTS, and
+// Homun cannot reach it because `revertDecision` is not in the binding —
+// the CLI's `revert` is the only road, and only who runs the CLI on a
+// synced cell walks it. The same field check anchor_tables.rs does on the
+// schema, on the declared API: if `revertDecision` enters index.d.ts while
+// that line is open, THIS fails — review the line first.
+test('index.d.ts declares no revertDecision while the two-device defect is open', () => {
+  const dts = fs.readFileSync(path.join(__dirname, '..', 'index.d.ts'), 'utf8');
+  const cell = dts.match(/export declare class Cell \{[\s\S]*?\n\}/);
+  assert.ok(cell, 'index.d.ts declares the Cell class');
+  const methods = [...cell[0].matchAll(/^  ([a-zA-Z_][a-zA-Z0-9_]*)\(/gm)].map((m) => m[1]);
+  assert.ok(methods.length > 10, `the Cell block was read: ${methods.length} methods`);
+  assert.ok(
+    !methods.includes('revertDecision'),
+    'revertDecision entered the binding, but the two-device defect of '
+      + 'crates/engramma-core/tests/open-defects.txt (quarantine_exits_only_by_decision, '
+      + 'seeds 1835…/2472…) is still open: review that line before exposing it',
+  );
+  // the opt-in of F2 is declared where compact() needs it
+  assert.match(dts, /experimental\?:/, 'CellOpts declares the experimental list');
 });
 
 test('purgePreview() names the note that would reopen, and moves nothing', async () => {
@@ -507,7 +564,7 @@ test('200 puts and 200 searches in parallel, no errors', async () => {
 
 test('changesSince streams the ops', async () => {
   const e = await engine();
-  const cell = await e.cell('flusso');
+  const cell = await e.cell('flusso', { experimental: ['compaction'] });
   const one = await cell.put({ body: 'prima', source: 's', confidence: 'stated' });
   const mid = (await cell.changesSince(0)).head;
   await cell.put({ body: 'seconda', source: 's', confidence: 'stated' });
@@ -1171,7 +1228,7 @@ test('dropCell reaches the views, and says the unreachable one (P0.3)', async ()
 test('dropCell spares the neighbors; a snapshot is not a cell (P0.1)', async () => {
   const rootDir = root();
   const e = await Engine.open({ root: rootDir, embedder: 'none', actor: 'homun' });
-  const storia = await e.cell('storia');
+  const storia = await e.cell('storia', { experimental: ['compaction'] });
   await storia.put({ body: 'la nota di storia', source: 's', confidence: 'stated' });
   // a REAL snapshot, the format compact writes: storia-snap-<head>.sqlite
   await storia.compact(1, { keepSnapshot: true });
