@@ -18,114 +18,178 @@ search** (text + graph + time) that **explains** every result.
   overwritten.
 - **Quarantine by default**: content scraped or inferred from third parties is
   born `quarantined` and never appears in results until a human confirms it.
-- **Mixed search (v0.2)**: text (BM25) and **meaning** (local embeddings)
-  fused, with the graph and time on top. Paraphrases with no word in common
-  with the note are found; the explanation says which branch carried each
-  result.
+- **Mixed search**: text (BM25) and **meaning** (local embeddings) fused, with
+  the graph and time on top. Paraphrases with no word in common with the note
+  are found; the explanation says which branch carried each result.
 - **MCP**: access for Claude and other MCP clients, over stdio or HTTP with
   OAuth 2.1, scoped to the cells you choose; writes follow each cell's policy
   (proposals in quarantine, review, rollback).
+- **Sync**: end-to-end encrypted synchronization between one owner's devices
+  (`engramma sync`, see `docs/sync.md`).
 
-**Status: v0.6.1 — the format is unstable.** The bidirectional Markdown
-view (`engramma vault`), the right to be forgotten (`purge`), the Node.js
-binding for in-process hosts (Homun), writes from other assistants with
-review and rollback, MCP over HTTP with OAuth 2.1, and end-to-end encrypted
-sync between one owner's devices (`engramma sync`, see `docs/sync.md`) are
-in. Next: the sync API for Node.js (v0.6.2), then organizations (v0.7).
-Tested on macOS arm64 and Linux arm64 (Docker); x86_64 and Windows are not
-tested yet. See `docs/DESIGN.md` § 12 for the full roadmap.
+## Status — a developer preview
 
-## Install from source
+**Version `0.6.17-beta.1`.** This is the first public release: a developer
+preview of the CLI and of the MCP server, for anyone who wants to give their
+memory to Claude or another MCP client. The engine is stable enough to trust
+with real notes — the [data promise](#the-data-promise) below is written down,
+line by line, each line with the test that proves it.
+
+What is **not** stable yet: the CLI's command surface may still move, the
+Node.js binding tracks its consumer's needs (see `docs/node.md`), and search
+scores may improve between versions (results can change order; nothing is
+lost). See `docs/DESIGN.md` § 12 for the roadmap — organizations are next
+(v0.7).
+
+## The data promise
+
+- **Every future version opens a cell written by this one, without losses.**
+  Each schema-changing release freezes a *golden cell* and every later version
+  must open and verify all of them.
+- **An older version refuses a cell written by a newer one, and does not touch
+  it**: a readable error, and the file stays byte for byte what it was.
+- **Sync refuses mismatched versions** before a single operation moves; you
+  update both devices and it resumes.
+- **The MCP tool names and arguments are stable** for the whole `0.6.x-beta`
+  series; a breaking change is announced in the `CHANGELOG.md`.
+
+The details, the limits (what an export is and is not), and the test behind
+each line: [`docs/compatibilita.md`](docs/compatibilita.md).
+
+## Install
+
+### The shell installer (macOS arm64, Linux arm64/x86_64)
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/homun-app/engramma/releases/latest/download/engramma-cli-installer.sh | sh
+```
+
+It downloads the right archive for your platform, checks its sha256, and puts
+the `engramma` binary in cargo's bin directory (`$HOME/.cargo/bin`, created if
+missing).
+
+While only `-beta` prereleases exist, GitHub's `latest` link has nothing to
+point at (prereleases are excluded from it): take the installer from the
+[releases page](https://github.com/homun-app/engramma/releases) — the fixed
+URL for this version is
+`https://github.com/homun-app/engramma/releases/download/v0.6.17-beta.1/engramma-cli-installer.sh`.
+
+**macOS, said honestly: the binaries are not signed.** A binary installed with
+the `curl` command above does **not** get the quarantine attribute, so
+Gatekeeper does not block it — the terminal installer is the recommended
+road. A tarball downloaded **from the browser** does get it; if you go that
+way, clear it once:
+
+```sh
+xattr -d com.apple.quarantine /path/to/engramma
+```
+
+Signing and notarization need an Apple Developer certificate as a repository
+secret — a decision still open; see the notes at the bottom.
+
+### Build from source
 
 Requires Rust 1.95 (edition 2024):
 
 ```sh
-git clone <this repository> engramma
+git clone https://github.com/homun-app/engramma.git
 cd engramma
-cargo build --release
+cargo build --release -p engramma-cli
 # binary: target/release/engramma
 ```
 
 Everything is offline-friendly: the dependencies are vendored in `Cargo.lock`
 and the tests never touch the network.
 
-## A complete example
+### Platforms
 
-```sh
-engramma init                          # creates ~/.engramma (or --root DIR)
+| Platform | Status |
+|---|---|
+| macOS arm64 (Apple Silicon) | **shipped and proven** — every release build is exercised (`init`, `add`, `search`, `verify`, MCP handshake) before publishing |
+| Linux arm64 (glibc) | **shipped and proven** — built on a native arm runner, exercised the same way |
+| Linux x86_64 (glibc) | **shipped and proven** — exercised in Docker |
+| macOS Intel | not shipped — its CI job is exploratory (non-blocking); it enters when it turns green and blocking |
+| Windows | not shipped — the engine does not compile there yet (Unix-only APIs in the sync and MCP layers) |
 
-# add a note (body from a file or stdin; source and confidence are required)
-cat > body.md <<'EOF'
-Fabio ha traslocato a [[Milano]] con [[Giulia]] a settembre 2026.
-EOF
-engramma add body.md --source user --confidence stated \
+## The first minute
+
+Real output from a run (the CLI speaks Italian):
+
+```console
+$ export ENGRAMMA_ROOT=~/engramma-demo
+$ engramma init
+inizializzato: /home/you/engramma-demo
+$ printf 'Fabio ha traslocato a [[Milano]] con [[Giulia]] a settembre 2026.\n' > body.md
+$ engramma add body.md --source user --confidence stated \
     --title "Fabio abita a Milano" --type fact --tag casa/milano --valid-from 2026-09-01
-
-# search (Italian stemming included: "traslocato" finds "trasloco")
-engramma search "traslocato"
-engramma search "dove abitava Fabio" --as-of 2026-08-15   # the past
-engramma search "dove abita Fabio" --json                 # stable JSON
-
-# the graph
-engramma neighbors Giulia
-engramma path Fabio "Studio Rossi"
-engramma timeline Fabio
-engramma tags casa
-
-# semantic search (v0.2): download the model once
-engramma model pull granite-embedding-97m-multilingual-r2
-engramma model use granite-embedding-97m-multilingual-r2   # blue/green + config
-engramma embed                                            # fill the vectors
-engramma search "in che città si è trasferita la coppia"   # no shared words
-engramma search "in che città si è trasferita la coppia" --mode text   # text only
-engramma search "Where does Fabio live?"                  # across languages
-
-# provenance, versions, verification
-engramma get <id>            # id prefix works too
-engramma history <id>
-engramma verify              # hash chain + full replay
-
-# folders
-engramma export out/                      # Engramma folder (lossless)
-engramma import out/                      # back into a cell, same state
-engramma import ~/obsidian-vault --obsidian
+aggiunta: 01M891B6NXMB3TQKK2DRNF99RG
+$ engramma search "traslocato"
+1. [active] Fabio abita a Milano (DRNF99RG)
+   punteggio 1.0000 (grezzo 0.6500)
+   liste: text
+   termini: trasloc
+   rango BM25: 1
+   supporto: strong
+   peso grafo: 0.35 (stacco 0.00)
+   validità: sempre → ora
+   fonte:
+$ engramma verify
+registro verificato: 2 operazioni, catena hash, ricostruzione e indice FTS a posto
 ```
 
-A quarantined note (from the web, unconfirmed):
+`[[Milano]]` and `[[Giulia]]` are entities: the graph grows with your notes.
+Semantic search (paraphrases, other languages) needs a local embedding model —
+`engramma model pull granite-embedding-97m-multilingual-r2`, then `engramma
+embed`; without one, search is text + graph, which is already mixed. The full
+command reference is [`docs/cli.md`](docs/cli.md).
 
-```sh
-engramma add rumor.md --source import:web --confidence external   # quarantined
-engramma search "the rumor topic"      # it never appears
-engramma confirm <id>                  # a human vouches for it
-```
+More of the surface: time-aware queries (`--as-of`), the Markdown vault view
+(`engramma vault`), the right to be forgotten (`engramma purge`), the review
+page (`engramma review`), export/import (`engramma export`).
 
-## MCP (read-only)
+## Give your memory to Claude
 
-`engramma mcp` speaks MCP over stdio and exposes only the cells you name
+`engramma mcp` speaks MCP over stdio and exposes **only the cells you name**
 (when there is just one, tool calls may omit the `cell` argument):
 
 ```sh
 engramma mcp --cells famiglia,preferenze
 ```
 
-Tools: `memory_search`, `memory_get`, `memory_neighbors`, `memory_tags`,
-`memory_timeline`. Every result carries its explanation (matched terms, graph
-path, validity) and its `source`. Quarantined notes never appear.
+Five tools, all read-only: `memory_search`, `memory_get`, `memory_neighbors`,
+`memory_tags`, `memory_timeline`. Every result carries its explanation
+(matched terms, graph path, validity) and its `source`. Quarantined notes
+never appear.
 
-**Claude Desktop** — `claude_desktop_config.json`:
+**Claude Desktop** — `~/Library/Application Support/Claude/claude_desktop_config.json`
+(format verified against the current MCP quickstart guide; not exercised on a
+live Claude Desktop for this release):
 
 ```json
 {
   "mcpServers": {
     "engramma": {
-      "command": "/path/to/engramma",
-      "args": ["mcp", "--root", "/Users/you/.engramma", "--cells", "famiglia"]
+      "command": "/absolute/path/to/engramma",
+      "args": ["mcp", "--root", "/absolute/path/to/engramma-root", "--cells", "famiglia"]
     }
   }
 }
 ```
 
-### Ollama or any OpenAI-compatible endpoint
+With `--write <cells>` (and `--actor <name>`) the assistant may *propose*
+facts through a sixth tool, `memory_propose`: proposals sit in a quarantine
+queue the search never sees, until you accept or reject them (`engramma
+proposals`, `engramma review`). No tool ever confirms, deletes or changes a
+policy — those stay yours. See [`docs/mcp.md`](docs/mcp.md).
+
+**Claude Code**:
+
+```sh
+claude mcp add engramma -- /absolute/path/to/engramma mcp --root ~/engramma-demo --cells famiglia
+```
+
+## Ollama or any OpenAI-compatible endpoint
 
 Write `<root>/config.json` (see `docs/cli.md`) and run `engramma embed`:
 
@@ -134,13 +198,15 @@ Write `<root>/config.json` (see `docs/cli.md`) and run `engramma embed`:
                  "url": "http://127.0.0.1:11434", "dim": 768 } }
 ```
 
-Without a configuration the search stays text + graph, exactly as in v0.1.
+## Documentation
 
-**Claude Code**:
-
-```sh
-claude mcp add engramma -- /path/to/engramma mcp --root ~/.engramma --cells famiglia
-```
+- [`docs/cli.md`](docs/cli.md) — the full command reference
+- [`docs/mcp.md`](docs/mcp.md) — the MCP server (stdio and HTTP)
+- [`docs/sync.md`](docs/sync.md) — end-to-end encrypted sync between devices
+- [`docs/compatibilita.md`](docs/compatibilita.md) — the data promise, with
+  the test that proves each line
+- [`docs/DESIGN.md`](docs/DESIGN.md) § 12 — the roadmap
+- [`CHANGELOG.md`](CHANGELOG.md) — what changed
 
 ## Layout
 
@@ -149,19 +215,17 @@ claude mcp add engramma -- /path/to/engramma mcp --root ~/.engramma --cells fami
 - `crates/engramma-embed` — the embedders: builtin ONNX via tract (pure
   Rust), Ollama, OpenAI-compatible HTTP
 - `crates/engramma-vault` — the bidirectional Markdown view (`engramma vault`)
-- `crates/engramma-node` — the Node.js (N-API) binding, for Homun and any
-  Node/Electron host (`docs/node.md`); its Rust allocations go through
-  mimalloc on macOS (v0.4.4; per-platform since v0.4.5)
+- `crates/engramma-node` — the Node.js (N-API) binding, for in-process hosts
 - `crates/engramma-cli` — the `engramma` binary
-- `crates/engramma-mcp` — the MCP server (stdio, read-only)
+- `crates/engramma-mcp` — the MCP server
+- `crates/engramma-sync` — the end-to-end encrypted sync
 - `spec/` — the note format specification, with valid/invalid examples used
   as tests
-- `bench/` — the benchmark (`engramma-bench`, deterministic corpus) and the
-  LongMemEval example (`bench/examples/longmemeval.rs`)
+- `bench/` — the benchmark (`engramma-bench`, deterministic corpus)
 - `scripts/linux.sh` — the workspace checks inside the Linux arm64 Docker
   image, offline
-- `docs/` — `DESIGN.md` (the project document), `cli.md`, `architecture.md`,
-  `node.md`
+- `dist-workspace.toml` — the release configuration (cargo-dist); the
+  workflow it generates is `.github/workflows/release.yml`
 
 ## Model licences
 
@@ -177,19 +241,9 @@ are absent; CI without models sets `ENGRAMMA_SKIP_MODEL_TESTS=1`.
 
 Apache-2.0 (see `LICENSE`).
 
+---
 
-## v0.3: la vista Obsidian, il diritto all'oblio
-
-- **`engramma vault init <cartella>`** esporta la cella in markdown e
-  lega ogni nota al suo file dall'`id` nell'intestazione; da lì in poi
-  **`engramma vault watch`** riconcilia ciò che cambiate a mano (anche
-  da Obsidian) con ciò che cambia la cella, con le copie di conflitto e
-  la guardia contro le cancellazioni di massa. Rinominare o spostare un
-  file non perde la nota.
-- **`engramma purge <id> --reason …`** dimentica una nota sul serio:
-  contenido, versioni, archi e i payload delle sue operazioni (registro
-  v2 a digest salati); `secure_delete` + `VACUUM` non lasciano byte nel
-  file. Le esportazioni fatte prima restano fuori dal nostro controllo.
-- **`engramma compact`** compatta il registro con un'istantanea;
-  **`engramma consolidate`** propone quasi duplicati e contraddizioni
-  aperte: decide l'applicazione, con l'utente.
+*Not in this release, on purpose: Apple codesigning/notarization (needs a
+certificate as a repository secret — a user decision), a Homebrew tap,
+crates.io publishing, Windows and macOS Intel builds. Each is tracked in the
+project's phase notes.*

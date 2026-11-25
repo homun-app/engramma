@@ -363,6 +363,43 @@ relation — `lives_in`, `works_at`, `partner_of` — two destinations,
 overlapping validity). Proposals only: the engine never merges. Not
 exposed over MCP.
 
+## v0.5 commands
+
+### `engramma proposals [show|accept|reject|review]`
+
+The queue of what the assistants proposed, and its decisions. Without a
+subcommand: the queue (and the decided ones with `--json`). `show <id>`
+is one proposal in full — note, proposer, decision, reviewer metadata.
+`accept <id>` makes the note active (`--edit`: fix the text first),
+`reject <id>` refuses it (the lapide keeps the text, the revert can
+undo), `review` retries the FAILED automatic reviews (never the
+escalated ones).
+
+### `engramma decisions [--by ACTOR] [--since DATE] [--until DATE] [--state active|reverted]`
+
+The decisions registry: who, when, what, why. `--by` takes an exact
+actor or a prefix (e.g. `reviewer:`); dates are `YYYY-MM-DD`, `--until`
+inclusive.
+
+### `engramma revert [DECISION] [--by ACTOR] [--since DATE]`
+
+Cancel decisions — the git revert of the registry. By decision op id
+(or its last-8 prefix), or in bulk with `--by` (every decision of that
+actor, prefix) narrowed by `--since`.
+
+### `engramma policy show|set`
+
+The cell's policy: who may propose, how far the machine may go.
+`set write=… reviewer=… min_confidence=… kinds=a,b
+allow_supersede=… max_auto_per_hour=…` — only from here, never from
+the web, never from MCP.
+
+### `engramma review [--port N] [--open]`
+
+The local review page: the queue, the decisions, the notes. Serves on
+127.0.0.1 only (any free port by default), `--open` opens the browser
+at the printed address, Ctrl-C stops it.
+
 ## v0.5.2 commands
 
 ### `mcp --http 127.0.0.1:8787 --public-url https://memoria.example.net [--cells a,b] [--write a] [--allow-dcr] [--compat chatgpt]`
@@ -427,8 +464,20 @@ Un solo servizio per radice (v0.6.2): un lucchetto esclusivo (`<radice>/sync.loc
 - `run [--relay <url>|--no-relay]` — una passata con ogni dispositivo vivo raggiungibile e il nodo cieco configurato, poi esce; il riepilogo JSON dice inviate/ricevute/rifiuti/conflitti/frontiera per cella, e per dispositivo se la sessione è avvenuta e per quale strada (diretta o via relay) — un irraggiungibile è una riga, non un errore
 - `serve [--relay <url>|--no-relay]` — in ascolto (ALPN `engramma/sync/3`), cancello all'accettazione, sincronizza a ogni scrittura locale (rimbalzo 2 s) e ogni 5 minuti; stop pulito su SIGINT/SIGTERM; convive con un altro processo che scrive sulla stessa radice. La scelta del relay si salva nella radice: la si dà una volta, non a ogni avvio (un flag esplicito vince)
 - `status` — per cella: dispositivi, ultima sessione, operazioni in attesa, frontiera stabile, epoca
-- `conflicts` — le copie di conflitto che questa copia tiene
-- `conflicts show <cella> <copia>` (v0.6.5) — una copia per intero: il corpo dell'originale, il corpo alla biforcazione e il corpo della copia — anche per una copia in quarantena, che `get` non mostra mai; una copia inesistente o chiusa risponde «non è una copia di conflitto aperta»
+
+## `engramma conflicts` (v0.6.4)
+
+The conflict copies to resolve: who lost, when, in quarantine or not —
+the copy is a note, read it with `get`.
+
+- `show <cella> <copia>` (v0.6.5) — una copia per intero: il corpo
+  dell'originale, il corpo alla biforcazione e il corpo della copia —
+  anche per una copia in quarantena, che `get` non mostra mai; una copia
+  inesistente o chiusa risponde «non è una copia di conflitto aperta»
+- `resolve <copia> --keep original|copy|merged [--body-file <f>]` — la
+  risoluzione: `original` tiene l'originale (la copia va via), `copy` fa
+  vincere il corpo della copia, `merged` prende la fusione a mano da un
+  file (`-` = stdin)
 
 ## `engramma mailbox` (v0.6.1)
 
