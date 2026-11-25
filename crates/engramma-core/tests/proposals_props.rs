@@ -564,20 +564,25 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
             6 => {
                 // a purge: the chain loses a member — and when the purged
                 // note was an ACCEPTED supersede, its closing goes with it
-                // and the target is open again (v0.6.10, J1)
+                // and the target goes back to WHAT IT WAS when it was
+                // closed (v0.6.10, J1): active only if it stood active —
+                // a quarantined proposal the accept had corrected goes
+                // back to the queue, and a proposal rejected after the
+                // closing stays a tombstone (the lapide wins)
                 if !active.is_empty() {
                     let i = rng.below(active.len());
                     let id = active[i];
-                    let closed_target = decided
+                    let reopen = decided
                         .iter()
                         .find(|(p, _, _, _)| *p == id)
-                        .and_then(|(_, t, closed, _)| closed.then_some(*t).flatten());
+                        .map(|(_, t, closed, was)| (closed.then_some(*t).flatten(), *was))
+                        .unwrap_or((None, false));
                     cell.purge(&id, "oblio", "cli").unwrap(/* test-only */);
                     active.remove(i);
                     purged.insert(id);
                     queue.retain(|(p, _)| *p != id);
                     decided.retain(|(p, _, _, _)| *p != id);
-                    if let Some(t) = closed_target
+                    if let (Some(t), true) = reopen
                         && !purged.contains(&t)
                         && !active.contains(&t)
                     {
