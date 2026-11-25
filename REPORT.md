@@ -147,6 +147,18 @@ Le due righe che cambiano nel sito (dopo il rilascio, le fa il revisore):
 - `src/data/engramma.mjs`, `const VERSION = "0.6.18-beta.1";` (il `TAG`
   deriva da lì, `ENGRAMMA_RELEASE` con lui).
 
+### La build sul tag
+
+Il tag `fase-v0.6.18`, annotato e solo locale, punta al commit della
+REPORT (`e9bd3d4`; `git cat-file -t fase-v0.6.18^{}` dice `commit`).
+`scripts/build-sha.sh` col repo sul tag: i tre file dell'aggancio, letti
+dal disco — `engramma.darwin-arm64.node` 51 258 376 B, SHA256
+`b4a8ceba…c87de`; `index.js` 36 463 B, `ac259d8b…8c48f`; `index.d.ts`
+32 615 B, `7020ae60…0fc2427`. Rispetto alla v0.6.17 cambiano il `.node`
+(07de323b…, 51 240 872 B) e `index.js` (babc97db…): dentro c'è la
+versione nuova e il codice `STALE_TARGET`; `index.d.ts` è identico, byte
+per byte, alla v0.6.16 e alla v0.6.17: l'API del binding non è cambiata.
+
 ### Il verdetto
 
 Consegnati: F1 (l'anteprima dal classificatore vero), F2 (`--proposed-by`
