@@ -1,6 +1,6 @@
 {
   "name": "engramma-node",
-  "version": "0.6.17-beta.1",
+  "version": "0.6.18-beta.1",
   "private": true,
   "description": "Node.js (N-API) binding of the Engramma memory engine",
   "license": "Apache-2.0",
