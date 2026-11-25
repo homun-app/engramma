@@ -112,6 +112,10 @@ and the tests never touch the network.
 | macOS Intel | not shipped — its CI job is exploratory (non-blocking); it enters when it turns green and blocking |
 | Windows | not shipped — the engine does not compile there yet (Unix-only APIs in the sync and MCP layers) |
 
+The Linux binaries are built on Ubuntu 24.04 and need **glibc ≥ 2.39**
+(Ubuntu 24.04+, Debian 13+, Fedora 40+; Debian 12's 2.36 is not enough —
+found by exercising the release build in Docker).
+
 ## The first minute
 
 Real output from a run (the CLI speaks Italian):
