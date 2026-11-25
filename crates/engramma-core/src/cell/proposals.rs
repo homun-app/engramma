@@ -396,6 +396,31 @@ pub struct RevertReport {
     pub purged: usize,
 }
 
+/// What [`Cell::revert_decision`] would do with one decision, read without
+/// writing anything — v0.6.18 (F1): the honest preview of a `--dry-run`.
+/// It comes from the SAME classifier the real revert runs, never from a
+/// second guess: the preview says what the revert would find on the ground,
+/// and the refusals the revert would raise come back as the same errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevertPreview {
+    /// The revert would go: the proposal returns to the queue (a closed
+    /// target, when any, reopens exactly as it was).
+    Revertable {
+        /// The proposal that would go back to the queue.
+        proposal: Ulid,
+    },
+    /// The content was purged after the decision: the log op would stand,
+    /// nothing would come back.
+    Purged {
+        /// The proposal whose content is gone.
+        proposal: Ulid,
+    },
+    /// Already cancelled: nothing to do.
+    AlreadyReverted,
+    /// Later operations stand in the way (the message names them).
+    Conflict(String),
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -1218,6 +1243,26 @@ impl Cell {
             });
         }
         Ok(out)
+    }
+
+    /// What [`Cell::revert_decision`] would do with this decision, read
+    /// without writing anything — v0.6.18 (F1): the preview a `--dry-run`
+    /// shows. The same classifier as the real revert, so the preview cannot
+    /// drift from what the revert would do; the refusals the revert would
+    /// raise come back as the same errors.
+    ///
+    /// # Errors
+    /// [`CellError::Invalid`] when the id is not a decision, or its payload
+    /// was compacted away and the target cannot be reopened exactly;
+    /// [`CellError::Db`] on SQL failures.
+    pub fn revert_preview(&self, decision_op: &Ulid) -> Result<RevertPreview, CellError> {
+        let inner = self.lock()?;
+        Ok(match classify_revert(&inner.conn, decision_op)? {
+            Classified::Revertable { note, .. } => RevertPreview::Revertable { proposal: note },
+            Classified::Purged { note } => RevertPreview::Purged { proposal: note },
+            Classified::AlreadyReverted => RevertPreview::AlreadyReverted,
+            Classified::Conflict(what) => RevertPreview::Conflict(what),
+        })
     }
 
     /// Cancel one decision: the proposal returns to the queue (quarantined

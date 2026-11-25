@@ -3353,6 +3353,49 @@ fn run_revert(
             ));
         }
         let full = resolve_decision_op(&cell, id)?;
+        // v0.6.18 (F1): the dry run PREVIEWS through the same classifier the
+        // real revert runs (`Cell::revert_preview`) — it used to fall
+        // through and revert for real
+        if dry_run {
+            use engramma_core::cell::proposals::RevertPreview as P;
+            let preview = cell.revert_preview(&full).map_err(CliError::from)?;
+            if cli.json {
+                print_json(&match preview {
+                    P::Revertable { proposal } => serde_json::json!({
+                        "dry_run": true,
+                        "outcome": "revertable",
+                        "proposal": proposal.to_string(),
+                    }),
+                    P::Purged { proposal } => serde_json::json!({
+                        "dry_run": true,
+                        "outcome": "purged",
+                        "proposal": proposal.to_string(),
+                    }),
+                    P::AlreadyReverted => serde_json::json!({
+                        "dry_run": true,
+                        "outcome": "already_reverted",
+                    }),
+                    P::Conflict(what) => serde_json::json!({
+                        "dry_run": true,
+                        "outcome": "conflict",
+                        "conflict": what,
+                    }),
+                });
+            } else {
+                match preview {
+                    P::Revertable { proposal } => println!(
+                        "annullerei: proposta di nuovo in coda: {}",
+                        id8_or(&proposal)
+                    ),
+                    P::Purged { .. } => {
+                        println!("annullerei nel registro, ma il contenuto era purgato: non torna");
+                    }
+                    P::AlreadyReverted => println!("già annullata: niente da fare"),
+                    P::Conflict(what) => println!("non annullerei: {what}"),
+                }
+            }
+            return Ok(());
+        }
         let outcome = cell
             .revert_decision(&full, "annullata dalla CLI", "user@cli")
             .map_err(CliError::from)?;

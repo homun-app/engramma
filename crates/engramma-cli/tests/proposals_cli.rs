@@ -293,6 +293,56 @@ fn decisions_list_filter_and_the_reverts() {
     assert_eq!(f.cell().get(&c).unwrap(/* t */).status, Status::Quarantined);
 }
 
+// v0.6.18 (F1): `revert <id> --dry-run` is a PREVIEW — the single-id path
+// ran the real revert and ignored the flag (found by the site capture, S12:
+// the proposal was back in the queue after a "dry run"). The bulk path
+// already honoured it; the preview must say what the real revert WOULD do,
+// from the same classifier, and write nothing.
+#[test]
+fn revert_dry_run_on_a_single_id_writes_nothing() {
+    let f = Fixture::new();
+    let id = f.propose("Fabio parla inglese.");
+    f.accept(&id, "user@cli");
+    let decision = f
+        .cell()
+        .decisions(&Default::default())
+        .unwrap(/* t */)
+        .iter()
+        .find(|d| d.proposal == id)
+        .unwrap(/* t */)
+        .op_id
+        .to_string();
+    let ops_before = f.run_json(&["verify", "--json"])["ops"]
+        .as_i64()
+        .unwrap(/* t */);
+
+    // the dry run answers, and changes nothing
+    let json = f.run_json(&["revert", &decision, "--dry-run", "--json"]);
+    assert_eq!(json["dry_run"], true);
+    let ops_after = f.run_json(&["verify", "--json"])["ops"]
+        .as_i64()
+        .unwrap(/* t */);
+    assert_eq!(ops_after, ops_before, "a dry run writes no operation");
+
+    // `decisions` still shows the decision active
+    let json = f.run_json(&["decisions", "--json"]);
+    let row = json["decisions"]
+        .as_array()
+        .unwrap(/* t */)
+        .iter()
+        .find(|r| r["proposal"] == id.to_string())
+        .unwrap(/* t */);
+    assert_eq!(row["state"], "active", "the dry run must not cancel it");
+    assert_eq!(row["reverted_by"], serde_json::Value::Null);
+    // the note is still active: the queue kept its accepted proposal
+    assert_eq!(f.cell().get(&id).unwrap(/* t */).status, Status::Active);
+
+    // a revert right after undoes it for real
+    let json = f.run_json(&["revert", &decision, "--json"]);
+    assert_eq!(json["outcome"]["reverted"], true);
+    assert_eq!(f.cell().get(&id).unwrap(/* t */).status, Status::Quarantined);
+}
+
 #[test]
 fn the_policy_reads_and_changes_from_the_cli_only() {
     let f = Fixture::new();
