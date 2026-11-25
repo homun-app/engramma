@@ -894,6 +894,10 @@ const READS_OTHER: &[(&str, &str)] = &[
     ("policy_of", "legge la politica, non le note"),
     ("policy", "la politica grezza, non le note"),
     ("decisions", "lo storico delle decisioni, non le note"),
+    (
+        "revert_preview",
+        "v0.6.18 (F1): l'anteprima di un annullamento, non le note",
+    ),
     ("meta", "i metadati del file, non le note"),
     ("models", "i modelli di embedding, non le note"),
     ("file_path", "il percorso del file"),
