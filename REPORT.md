@@ -3,6 +3,165 @@
 Una pagina per fase (docs/fasi.md). La storia fino alla v0.6.14, fase per
 fase, sta in [docs/storia/REPORT-fino-alla-v0.6.14.md](docs/storia/REPORT-fino-alla-v0.6.14.md).
 
+## v0.6.18 — la revisione mantiene le promesse
+
+Data: 2026-11-25. Base: `main` @ `1bfc611` (la `0.6.17-beta.1`). Tema: la
+coda delle proposte — proporre, rivedere, accettare, annullare — nei quattro
+punti dove la cattura del sito l'aveva colta in difetto. Ogni difetto è
+uscito col test rosso prima, sull'uscita del binario della base.
+
+### Cosa cambia
+
+- **F1 — `revert <id> --dry-run` non scrive.** Il ramo a id singolo di
+  `run_revert` chiamava `revert_decision` ignorando il flag: l'anteprima
+  annullava davvero e la proposta tornava in coda (S12 della cattura). Il
+  dry-run passa ora da **`Cell::revert_preview`**, la classificazione in
+  sola lettura (`classify_revert`) esposta dal core — l'anteprima è lo
+  stesso classificatore del revert vero, non una seconda strada che
+  indovina. L'esito (annullerei / purgato / conflitto / già annullata)
+  arriva a umano e in JSON con `dry_run: true`, come il ramo in blocco.
+- **F2 — annullare quello che un assistente ha proposto.** Le decisioni
+  sono firmate da chi decide, mai da chi propone: `revert --by mcp:…`
+  era accettato e annullava 0 decisioni in silenzio. Ora è un errore
+  d'uso (exit 2) che suggerisce il filtro nuovo: **`--proposed-by`**
+  (esatto o per prefisso, come `--by`), su `revert` e su `engramma
+  decisions`, combinabile con `--by`/`--since`/`--until`, col `--dry-run`
+  e la conferma `[s/N]`. Nel core è il campo `proposer` di `RevertFilter`
+  e `DecisionsFilter`; la selezione passa dalla tabella delle proposte,
+  guidata dagli op `decide` come oggi — e una decisione la cui proposta
+  è stata purgata resta attribuibile (l'envelope dell'op `propose`
+  conserva l'attore) e continua a contare tra le `purged`.
+  `docs/cli.md`: la sezione di `revert` spiega chi decide e chi propone.
+- **F3 — due correzioni della stessa nota.** Due proposte `supersede`
+  accettate una dopo l'altra lasciavano due note attive per lo stesso
+  fatto, senza copia di conflitto (S11b della cattura). Come in git: una
+  correzione vale contro la versione che correggeva. L'accettazione si
+  rifiuta con l'errore nuovo **`CellError::StaleTarget { target,
+  closed_by }`** — CLI exit 4 con il messaggio che dice quale nota l'ha
+  già corretta e cosa fare (reject, o una proposta nuova sulla nota
+  corrente); la proposta resta in coda. Il bersaglio purgato resta come
+  oggi (v0.6.11, K1); il revisore automatico continua a scalare quando
+  il bersaglio non è attivo (test dedicato in `tests/review.rs`);
+  annullata la prima correzione, il bersaglio torna attivo e la seconda
+  si accetta (test). Il binding Node riceve il codice stabile
+  **`STALE_TARGET`** (`docs/node.md`, sezione errori); la nota per Homun
+  (cosa mostra la scheda della proposta) sta nel per-homun, fuori dal
+  repo. Proprietà nuova nel
+  cancello: **per ogni catena di `supersede`, al massimo una nota
+  attiva** (`a_supersede_chain_keeps_at_most_one_active_note`, in
+  `properties.txt`, girata col cancello).
+- **F4 — la nota accettata si trova subito.** Una proposta accettata non
+  aveva il vettore finché non girava `engramma embed` (`copertura
+  vettori: 8/14 note` nella cattura): una domanda senza parole in comune
+  non la trovava, anche se attiva. Ora `proposals accept`, `proposals
+  review` (quando decide) e il revisore automatico del server MCP
+  calcolano il vettore delle note che diventano attive, come `add` fa con
+  `embed_after_write`; `--no-embed` su `accept` salta; senza embedder
+  l'accettazione riesce e lo dice. In MCP il vettore si calcola nello
+  stesso processo, dopo la decisione e fuori dal lock della scrittura; un
+  fallimento resta in attesa di `embed` e non è un errore della
+  decisione. **Il binding Node non cambia**: Homun ha il suo ciclo —
+  `docs/node.md` dice che chiama `cell.embedPending()` prima del richiamo
+  e a ogni `arrived` del sync (i vettori non viaggiano: si calcolano da
+  chi riceve).
+- **F5 — i ritocchi.** `mcp --actor` senza `--write`: l'errore nasceva in
+  `engramma-mcp` e la CLI lo riportava come interno (`mcp: …`, exit 4) —
+  il client MCP vedeva solo un server che muore; il controllo sta ora tra
+  le regole d'uso della CLI, accanto a «`--write` needs `--actor`»: exit
+  2, stesso messaggio. Il messaggio di `--compat` senza `--http` aveva
+  gli spazi spezzati: corretto. Versione **`0.6.18-beta.1`** nello stesso
+  modo della v0.6.17 (workspace, dipendenze interne,
+  `crates/engramma-node/package.json`, `cargo update -w`, test di
+  `--version`). CHANGELOG: la sezione `[0.6.18-beta.1]`, in inglese, per
+  gli sviluppatori della beta — apre col dry-run che ha annullato davvero.
+
+### I test rossi (sulla base `1bfc611`)
+
+- F1 (CLI): `assertion left == right failed` — `dry_run: Null` invece di
+  `true`: il ramo a id singolo non rispondeva da anteprima.
+- F2 (CLI): `a usage error, not silence:` — exit 0 invece di 2: `--by
+  mcp:` passava e annullava 0.
+- F3 (core): `the second accept must refuse: two active notes stand now`
+  — la seconda accettazione riusciva; (CLI) `not a silent second accept:`
+  — exit 0 invece di 4.
+- F4 (CLI): `the accepted note has its vector` — copertura `1/2` col
+  finto embedder HTTP dei test (server OpenAI-compatibile a 8 dimensioni
+  in `tests/common/mod.rs`, con sinonimo `impiegato→lavora`); (MCP)
+  `the vector branch joins` — `mode: "text"`, `hits: []`: il modello
+  resta in costruzione perché nessuno l'ha riempito dopo la decisione.
+- F5 (CLI): `a usage error, not a dead server:` — exit 4 (`mcp: …`)
+  invece di 2.
+
+### Le prove
+
+Suite del workspace col seme del CI (`PROPTEST_RNG_SEED=20261124`):
+**verde — 87 binari, 0 caduti**. `golden_cell` verde. Contratto JS del
+binding (il `.node` ricompilato e la CLI release, come il CI):
+**67 pass, 0 falliti**.
+
+La caccia col cancello sulle sole proprietà che coprono `proposals.rs`
+(7, `CACCIABASE=1bfc611 CACCIASOLO=…`): le sei esistenti verdi a budget
+pieno; la proprietà nuova è ROSSA al primo cancello (seme
+`12374479119677056745`) — **falso rosso dell'oracolo, non del motore**:
+il model della proprietà perdeva il bersaglio di un rifiuto e
+riattivava i bersagli riaperti senza leggere lo stato fotografato.
+Smistato (riproduzione del seme, il motore rifiutava giustamente,
+misurato a mano con la sequenza P/Q/R: il purge di R lascia la lapide
+di P e la decide successiva rifiuta con `StaleTarget`), corretto nel
+model due volte; il terzo rosso (seme `7557450892011188894`, ancora sul
+contro-oracolo dei rifiuti) chiude la questione: la semantica delle
+riaperture non si ricostruisce esatta senza un secondo motore, quindi
+l'invariante si verifica **sul reale** dopo ogni passo e la giustizia
+dei rifiuti resta ai test unitari, che pinnano le traiettorie una per
+una. Il cancello finale sulle due proprietà di `proposals_props.rs`
+(`CACCIABASE=01e3bb5`): **verdi — 13181 e 17203 casi**. Nessun difetto
+reale nuovo dalla caccia; i tre rossi sono tutti falsi dell'oracolo
+nuovo, documentati nei commit.
+
+La prova sul binario (cartella temporanea dello scratchpad, dati
+sintetici del sito, uscita accorciata): il dry-run risponde «annullerei:
+proposta di nuovo in coda» e `verify` conta le stesse operazioni prima e
+dopo; il revert subito dopo annulla. `revert --by mcp:claude-code` esce 2
+col suggerimento; `--proposed-by mcp:claude-code` ne annulla 2 con
+l'anteprima e la conferma. Le due correzioni della stessa nota: la
+seconda esce 4 con «l'ha già corretta …», la proposta resta in coda;
+annullata la prima, la seconda accetta. La ricerca subito dopo l'accept:
+«incorporate: 1», la copertura è 8/8, e la domanda senza parole in
+comune trova la nota con `liste: text, vector`, supporto `strong`.
+
+### Per il revisore: la sequenza del rilascio
+
+1. **Push di `main`** (i commit della fase, quello della REPORT in coda).
+2. **Tag `v0.6.18-beta.1`** sullo stesso commit spinto: `git tag -a
+   v0.6.18-beta.1 -m "…" && git push origin v0.6.18-beta.1`. È il tag che
+   fa partire `release.yml`; `main` da solo non lo fa.
+3. La GitHub Release deve portare come la v0.6.17: i sei file del
+   pacchetto, l'installer, le attestazioni, il flag pre-release e il
+   corpo dal CHANGELOG.
+
+Le due righe che cambiano nel sito (dopo il rilascio, le fa il revisore):
+
+- `nginx/default.conf`, `location = /engramma/install.sh`: la versione
+  del redirect passa a `v0.6.18-beta.1`
+  (`return 302 https://github.com/homun-app/engramma/releases/download/v0.6.18-beta.1/engramma-cli-installer.sh;`);
+- `src/data/engramma.mjs`, `const VERSION = "0.6.18-beta.1";` (il `TAG`
+  deriva da lì, `ENGRAMMA_RELEASE` con lui).
+
+### Il verdetto
+
+Consegnati: F1 (l'anteprima dal classificatore vero), F2 (`--proposed-by`
+con le purgate attribuite), F3 (`StaleTarget`, la proprietà della catena,
+il codice per Homun), F4 (il vettore subito, in CLI e MCP), F5 (l'errore
+d'uso al posto del server che muore, versione, CHANGELOG). Fuori, come
+dichiarato: l'output della CLI in inglese, la fusione a righe e i
+permessi per attore, Windows e macOS Intel, la firma Apple e Homebrew,
+l'aggiornamento del sito (che fa il revisore dopo il rilascio). I test
+della cattura hanno smosso anche il vecchio difetto aperto della v0.6.14
+(il revert di un rifiuto riapre il bersaglio chiuso da un'altra
+decisione): resta dichiarato in `open-defects.txt`, la proprietà nuova
+non lo copre come oracolo e i suoi annullamenti fermano le sole
+accettazioni.
+
 ## v0.6.17 — la prima beta per sviluppatori
 
 Data: 2026-11-25. Base: `main` @ `6ff7400`. Il motore non cambia una riga
