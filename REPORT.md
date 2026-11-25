@@ -57,7 +57,10 @@ La PR in bozza [#1](https://github.com/homun-app/engramma/pull/1)
 (`release-v0.6.17`): **Release** [45588543109](https://github.com/homun-app/engramma/actions/runs/45588543109)
 e **ci** [45588542643](https://github.com/homun-app/engramma/actions/runs/45588542643)
 verdi sul primo spingo (`10ba87b`); l'ultimo commit (`8dffd2d`, solo il
-README e la riga glibc) ha ripetuto le corse verdi. I tre binari,
+README e la riga glibc) ha ripetuto le corse verdi ([Release
+45593676541](https://github.com/homun-app/engramma/actions/runs/45593676541),
+[ci 45593676415](https://github.com/homun-app/engramma/actions/runs/45593676415)).
+I tre binari,
 scaricati dagli artefatti (sha256 verificato), provati uno per uno —
 `--version` (0.6.17-beta.1), `init`, `add`, `search` che trova, `verify`
 pulito, `mcp --cells` che risponde all'`initialize` su stdio (EOF chiude):
@@ -81,8 +84,15 @@ CI lo ha girato comunque, verde su due runner.
 ### La build sul tag
 
 Il tag `fase-v0.6.17`, annotato e solo locale, punta al commit della
-REPORT. `scripts/build-sha.sh` gira col repo sul tag dopo il commit: i
-tre SHA sono nel commit di sola documentazione che segue.
+REPORT (`f5278ed`; `git cat-file -t fase-v0.6.17^{}` dice `commit`).
+`scripts/build-sha.sh` col repo sul tag gira: i tre file dell'aggancio,
+letti dal disco — `engramma.darwin-arm64.node` 51 240 872 B, SHA256
+`07de323b…9eaab6`; `index.js` 36 463 B, `babc97db…a1e8d`; `index.d.ts`
+32 615 B, `7020ae60…0fc2427`. Rispetto alla v0.6.16 cambiano il `.node`
+(090c63d7…, 51 257 480 B) e `index.js` (cd26043e…, 36 239 B): dentro c'è
+la versione nuova; `index.d.ts` è identico, l'API del binding non è
+cambiata. Il contratto JS non è girato in locale: il `src` del binding
+non cambia (regola della fase), solo la versione nel `package.json`.
 
 ### Per il revisore: la sequenza del rilascio
 
