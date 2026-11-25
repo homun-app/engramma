@@ -85,6 +85,17 @@ suite») e niente misure.
   l'update: test di `engramma-mcp` e `crates/engramma-cli/tests/mcp.rs`
   12/12.
 
+### La build sul tag
+
+Il tag `fase-v0.6.16`, annotato e solo locale, punta al commit `c7c1bcc`
+(`git cat-file -t fase-v0.6.16^{}` dice `commit`). `scripts/build-sha.sh`
+col repo sul tag gira: i tre file dell'aggancio, letti dal disco —
+`engramma.darwin-arm64.node` 51 257 480 B, SHA256
+`090c63d7…bee812`; `index.js` 36 239 B, `cd26043e…280e311`; `index.d.ts`
+32 615 B, `7020ae60…0fc2427`. Il `.node` cambia rispetto alla v0.6.15
+(`70b83608…aab57e`, 51 241 080 B): cambiano le dipendenze — `rmcp`
+3.11.0 e i due crate unicode che l'update tira dentro.
+
 ### Il verdetto
 
 Consegnati: F1 (una build per il contratto, la prova a freddo come
