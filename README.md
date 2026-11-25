@@ -62,18 +62,16 @@ each line: [`docs/compatibilita.md`](docs/compatibilita.md).
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/homun-app/engramma/releases/latest/download/engramma-cli-installer.sh | sh
+  https://github.com/homun-app/engramma/releases/download/v0.6.17-beta.1/engramma-cli-installer.sh | sh
 ```
 
 It downloads the right archive for your platform, checks its sha256, and puts
 the `engramma` binary in cargo's bin directory (`$HOME/.cargo/bin`, created if
 missing).
 
-While only `-beta` prereleases exist, GitHub's `latest` link has nothing to
-point at (prereleases are excluded from it): take the installer from the
-[releases page](https://github.com/homun-app/engramma/releases) — the fixed
-URL for this version is
-`https://github.com/homun-app/engramma/releases/download/v0.6.17-beta.1/engramma-cli-installer.sh`.
+The URL names the version on purpose: GitHub's `releases/latest` link skips
+prereleases, so while only `-beta` versions exist it points at nothing. Newer
+versions are on the [releases page](https://github.com/homun-app/engramma/releases).
 
 **macOS, said honestly: the binaries are not signed.** A binary installed with
 the `curl` command above does **not** get the quarantine attribute, so
@@ -99,22 +97,22 @@ cargo build --release -p engramma-cli
 # binary: target/release/engramma
 ```
 
-Everything is offline-friendly: the dependencies are vendored in `Cargo.lock`
-and the tests never touch the network.
+`Cargo.lock` pins every dependency (add `--locked` to build exactly those);
+the first build downloads them from crates.io.
 
 ### Platforms
 
 | Platform | Status |
 |---|---|
-| macOS arm64 (Apple Silicon) | **shipped and proven** — every release build is exercised (`init`, `add`, `search`, `verify`, MCP handshake) before publishing |
-| Linux arm64 (glibc) | **shipped and proven** — built on a native arm runner, exercised the same way |
-| Linux x86_64 (glibc) | **shipped and proven** — exercised in Docker |
+| macOS arm64 (Apple Silicon) | **shipped** — the test suite runs on it in CI; the release binary was exercised by hand (`init`, `add`, `search`, `verify`, MCP handshake) |
+| Linux arm64 (glibc) | **shipped** — built on a native arm runner; test suite in CI; the binary exercised by hand in Docker |
+| Linux x86_64 (glibc) | **shipped** — test suite in CI; the binary exercised by hand in Docker |
 | macOS Intel | not shipped — its CI job is exploratory (non-blocking); it enters when it turns green and blocking |
 | Windows | not shipped — the engine does not compile there yet (Unix-only APIs in the sync and MCP layers) |
 
-The Linux binaries are built on Ubuntu 24.04 and need **glibc ≥ 2.39**
-(Ubuntu 24.04+, Debian 13+, Fedora 40+; Debian 12's 2.36 is not enough —
-found by exercising the release build in Docker).
+The Linux binaries are built on Ubuntu 22.04 and need **glibc ≥ 2.35**
+(Ubuntu 22.04+, Debian 12+, Fedora 36+). RHEL 9 and its rebuilds ship 2.34
+and are not covered: build from source there.
 
 ## The first minute
 

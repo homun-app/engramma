@@ -43,8 +43,10 @@ install-path = "CARGO_HOME"
 # three targets rides the release PR itself
 pr-run-mode = "upload"
 
-# The arm64 Linux target builds on the NATIVE arm runner, not in cross:
-# same compilers, same glibc, what we test is what we ship
+# The arm64 Linux target builds on the NATIVE arm runner, not in cross.
+# Both Linux targets build on Ubuntu 22.04: the binary needs the glibc
+# of the build host or newer, and 22.04's 2.35 opens Ubuntu 22.04+,
+# Debian 12+, Fedora 36+ (24.04 would require 2.39 — review of v0.6.17)
 [dist.github-custom-runners]
-aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
-x86_64-unknown-linux-gnu = "ubuntu-24.04"
+aarch64-unknown-linux-gnu = "ubuntu-22.04-arm"
+x86_64-unknown-linux-gnu = "ubuntu-22.04"
