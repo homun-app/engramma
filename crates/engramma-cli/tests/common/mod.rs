@@ -93,7 +93,18 @@ pub fn fake_embedder_server() -> FakeEmbedder {
         listener.set_nonblocking(true).ok();
         while !stop2.load(Ordering::Relaxed) {
             match listener.accept() {
-                Ok((mut stream, _)) => answer_one(&mut stream),
+                Ok((mut stream, _)) => {
+                    // macOS: a socket accepted from a NON-blocking listener
+                    // inherits the flag — a read before the client's bytes
+                    // arrive would return WouldBlock, which answer_one
+                    // would read as EOF, and the client would see the peer
+                    // disconnect instead of its embeddings
+                    stream.set_nonblocking(false).ok();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .ok();
+                    answer_one(&mut stream);
+                }
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
