@@ -459,6 +459,9 @@ enum ProposalsAction {
         /// Edit the text in $EDITOR before accepting
         #[arg(long)]
         edit: bool,
+        /// Skip the embedding pass (the note stays without vector, like add)
+        #[arg(long)]
+        no_embed: bool,
     },
     /// Reject it: the lapide keeps the text, the revert can undo
     Reject {
@@ -2216,7 +2219,16 @@ fn load_embedder_or_warn(
 /// an embedder is configured and matches the cell's target model. Returns
 /// `(done, remaining)` or None when nothing ran.
 fn embed_after_write(cli: &Cli, cell: &Cell) -> Result<Option<(usize, usize)>, CliError> {
-    let Some(embedder) = load_embedder_or_warn(cli)? else {
+    embed_after_write_with(cell, load_embedder_or_warn(cli)?)
+}
+
+/// The same pass, for a caller that already holds the embedder (`proposals
+/// review` loads it for the reviewer and reuses it here).
+fn embed_after_write_with(
+    cell: &Cell,
+    embedder: Option<std::sync::Arc<dyn engramma_core::embed::Embedder>>,
+) -> Result<Option<(usize, usize)>, CliError> {
+    let Some(embedder) = embedder else {
         return Ok(None);
     };
     // Wrong model (or no target yet): leave the notes pending, silently —
@@ -3189,7 +3201,11 @@ fn run_proposals(
             }
             Ok(())
         }
-        Some(ProposalsAction::Accept { id, edit }) => {
+        Some(ProposalsAction::Accept {
+            id,
+            edit,
+            no_embed,
+        }) => {
             let id = cell.resolve_note_id(id)?;
             let edited = if *edit {
                 let note = cell.get(&id)?;
@@ -3232,7 +3248,41 @@ fn run_proposals(
                 },
                 "user@cli",
             )?;
-            report_ok(cli, "accettata", &id.to_string());
+            // v0.6.18 (F4): the note just became active — its vector goes
+            // NOW, not at the next `engramma embed` (the same behavior as
+            // `add`): a question with no word in common finds it right away
+            let embedded = if *no_embed {
+                None
+            } else {
+                embed_after_write(cli, &cell)?
+            };
+            if cli.json {
+                let mut v = serde_json::json!({ "ok": id.to_string() });
+                match embedded {
+                    Some((done, remaining)) => {
+                        v["embedded"] = done.into();
+                        v["pending"] = remaining.into();
+                    }
+                    // the embedder is missing or the target does not match:
+                    // the accept stands, `engramma embed` says what to do
+                    None if !no_embed => {
+                        v["embedded"] = serde_json::Value::Null;
+                    }
+                    None => {}
+                }
+                print_json(&v);
+            } else {
+                report_ok(cli, "accettata", &id.to_string());
+                match embedded {
+                    Some((done, remaining)) => {
+                        println!("incorporate: {done} (in attesa: {remaining})");
+                    }
+                    None if !no_embed => {
+                        println!("vettori in attesa: la nota si incorpora con `engramma embed`");
+                    }
+                    None => {}
+                }
+            }
             Ok(())
         }
         Some(ProposalsAction::Reject { id, reason }) => {
@@ -3260,12 +3310,27 @@ fn run_proposals(
             let decided = cell
                 .review_failed(&ctx)
                 .map_err(|e| CliError::internal(e.to_string()))?;
+            // v0.6.18 (F4): the notes a retry made ACTIVE get their vector
+            // now — the same pass `add` runs (the embedder is already here)
+            let embedded = if decided > 0 {
+                embed_after_write_with(&cell, embedder)?
+            } else {
+                None
+            };
             if cli.json {
-                print_json(&serde_json::json!({ "decided": decided }));
+                let mut v = serde_json::json!({ "decided": decided });
+                if let Some((done, remaining)) = embedded {
+                    v["embedded"] = done.into();
+                    v["pending"] = remaining.into();
+                }
+                print_json(&v);
             } else {
                 match decided {
                     0 => println!("nulla da ritentare (o niente da decidere per il revisore)"),
                     n => println!("ritentate e decise: {n}"),
+                }
+                if let Some((done, remaining)) = embedded {
+                    println!("incorporate: {done} (in attesa: {remaining})");
                 }
             }
             Ok(())

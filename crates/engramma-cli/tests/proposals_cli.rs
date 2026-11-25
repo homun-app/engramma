@@ -422,6 +422,202 @@ fn revert_by_mcp_actor_is_a_usage_error_and_proposed_by_selects_the_proposals() 
     assert_eq!(f.cell().get(&c).unwrap(/* t */).status, Status::Active);
 }
 
+// v0.6.18 (F3): two accepted corrections of the same note became two
+// active notes (found by the site capture). The second accept refuses
+// with its own exit code, names the note that already corrected the
+// target, and the proposal stays in the queue; once the first correction
+// is reverted, the second goes.
+#[test]
+fn a_second_correction_of_the_same_note_refuses_and_stays_queued() {
+    let f = Fixture::new();
+    // a human note, then two corrections proposed against it
+    let target_note = {
+        let t = At(OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(/* t */));
+        let n = engramma_core::format::Note {
+            id: engramma_core::id::new_ulid().unwrap(/* t */),
+            note_type: NoteType::Fact,
+            title: None,
+            body: "Fabio lavora a Milano.".into(),
+            tags: vec![],
+            scope: None,
+            lang: Some(engramma_core::format::Lang::It),
+            source: "user".into(),
+            confidence: Confidence::Stated,
+            status: Status::Active,
+            valid_from: None,
+            valid_to: None,
+            supersedes: vec![],
+            created_at: t,
+            updated_at: t,
+            extensions: vec![],
+        };
+        f.cell()
+            .put_note(&n, "cli")
+            .unwrap(/* t */);
+        n.id
+    };
+    let propose_against = |f: &Fixture, body: &str| {
+        f.cell()
+            .propose(
+                &ProposalInput {
+                    note: note(body),
+                    mode: ProposalMode::Supersede(target_note),
+                    client: None,
+                    reason: None,
+                },
+                "mcp:claude",
+                &ProposeContext::default(),
+            )
+            .unwrap(/* t */)
+            .id
+            .unwrap(/* t */)
+    };
+    let first = propose_against(&f, "Fabio lavora a Torino.");
+    let out = f.run(&["proposals", "accept", &first.to_string()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let second = propose_against(&f, "Fabio lavora a Genova.");
+
+    // the second accept refuses with its own exit code
+    let out = f.run(&["proposals", "accept", &second.to_string()]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "not a silent second accept: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("corretta"), "who corrected it: {said}");
+    assert!(said.contains("reject"), "what to do: {said}");
+
+    // the proposal stays in the queue, decidable again
+    let json = f.run_json(&["proposals", "--state", "pending", "--json"]);
+    let pending = json["proposals"].as_array().unwrap(/* t */);
+    assert!(
+        pending
+            .iter()
+            .any(|p| p["note"]["body"] == "Fabio lavora a Genova."),
+        "the stale proposal stays queued: {json}"
+    );
+
+    // reverting the first correction reopens the target: the second goes
+    let first_decision = f
+        .cell()
+        .decisions(&Default::default())
+        .unwrap(/* t */)
+        .into_iter()
+        .find(|d| d.proposal == first)
+        .unwrap(/* t */)
+        .op_id
+        .to_string();
+    let out = f.run(&["revert", &first_decision, "--yes"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = f.run(&["proposals", "accept", &second.to_string()]);
+    assert!(
+        out.status.success(),
+        "after the revert the target is active again: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// v0.6.18 (F4): a proposal that was accepted had no vector until
+// `engramma embed` ran (found by the site capture: `copertura vettori:
+// 8/14 note`) — a question with no word in common did not find the note,
+// even though the note was active. `accept` computes the vector now, like
+// `add` does; `--no-embed` skips it.
+#[test]
+fn an_accepted_proposal_has_its_vector_right_away() {
+    // the fake embedder: `impiegato` maps onto `lavora`, so a question
+    // without a word in common still points at the note's meaning
+    let fake = common::fake_embedder_server();
+    let f = Fixture::new();
+    std::fs::write(
+        f.root.join("config.json"),
+        format!(
+            r#"{{"embedder": {{"kind": "http", "model": "fake", "url": "http://127.0.0.1:{}", "dim": 8}}}}"#,
+            fake.port
+        ),
+    )
+    .unwrap(/* t */);
+    f.cell().add_model("http:fake", 8).unwrap(/* t */);
+
+    // a human note: `add` embeds it, the model reaches full coverage
+    let nota = f.dir.path().join("nota.md");
+    std::fs::write(&nota, "Fabio lavora a Torino.").unwrap(/* t */);
+    let out = f.run(&[
+        "add",
+        nota.to_str().unwrap(/* t */),
+        "--source",
+        "cli",
+        "--confidence",
+        "stated",
+    ]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // an assistant proposal, accepted from the CLI
+    let id = {
+        let t = At(OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(/* t */));
+        let cell = f.cell();
+        let out = cell
+            .propose(
+                &ProposalInput {
+                    note: Note {
+                        id: engramma_core::id::new_ulid().unwrap(/* t */),
+                        note_type: NoteType::Fact,
+                        title: None,
+                        body: "Fabio abita a Genova.".into(),
+                        tags: vec![],
+                        scope: None,
+                        lang: Some(Lang::It),
+                        source: "mcp:claude".into(),
+                        confidence: Confidence::Stated,
+                        status: Status::Active,
+                        valid_from: None,
+                        valid_to: None,
+                        supersedes: vec![],
+                        created_at: t,
+                        updated_at: t,
+                        extensions: vec![],
+                    },
+                    mode: ProposalMode::New,
+                    client: None,
+                    reason: None,
+                },
+                "mcp:claude",
+                &ProposeContext::default(),
+            )
+            .unwrap(/* t */);
+        out.id.unwrap(/* t */)
+    };
+    let out = f.run(&["proposals", "accept", &id.to_string()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // the vector coverage includes the accepted note now
+    let verify = f.run_json(&["verify", "--json"]);
+    let coverage = verify["coverage"]
+        .as_array()
+        .unwrap(/* t */)
+        .iter()
+        .find(|c| c["model"] == "http:fake")
+        .unwrap_or_else(|| panic!("no http:fake coverage: {verify}"))
+        .clone();
+    assert_eq!(
+        coverage["covered"], coverage["living"],
+        "the accepted note has its vector: {coverage}"
+    );
+
+    // and the search finds the note with NO word in common: the vector,
+    // not the text, carries the question to it
+    let json = f.run_json(&["search", "chi è impiegato a Genova?", "--json"]);
+    let hits = json["hits"].as_array().unwrap(/* t */);
+    assert!(
+        hits
+            .iter()
+            .any(|h| h["note"]["id"] == id.to_string()),
+        "the accepted note is found by meaning: {json}"
+    );
+}
+
 #[test]
 fn the_policy_reads_and_changes_from_the_cli_only() {
     let f = Fixture::new();

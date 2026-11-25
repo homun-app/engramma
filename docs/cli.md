@@ -370,10 +370,11 @@ exposed over MCP.
 The queue of what the assistants proposed, and its decisions. Without a
 subcommand: the queue (and the decided ones with `--json`). `show <id>`
 is one proposal in full — note, proposer, decision, reviewer metadata.
-`accept <id>` makes the note active (`--edit`: fix the text first),
-`reject <id>` refuses it (the lapide keeps the text, the revert can
-undo), `review` retries the FAILED automatic reviews (never the
-escalated ones).
+`accept <id>` makes the note active and computes its vector right away
+(v0.6.18, like `add` does; `--no-embed` skips it — the note waits for
+`engramma embed`), `reject <id>` refuses it (the lapide keeps the text,
+the revert can undo), `review` retries the FAILED automatic reviews
+(never the escalated ones) and embeds what it makes active.
 
 ### `engramma decisions [--by ACTOR] [--proposed-by ACTOR] [--since DATE] [--until DATE] [--state active|reverted]`
 

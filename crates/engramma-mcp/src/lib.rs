@@ -1002,17 +1002,26 @@ impl MemoryServer {
                 tool_ok(&outcome_json("duplicate", outcome.id, &outcome, None))
                     .map(CallToolResponse::from)
             }
-            ProposalStatus::Accepted | ProposalStatus::Rejected => tool_ok(&outcome_json(
+            ProposalStatus::Accepted | ProposalStatus::Rejected => {
+                // v0.6.18 (F4): the note just became active — its vector
+                // goes now, in this process, after the decision and outside
+                // the write lock; a failure waits for `engramma embed` and
+                // is NOT an error of the decision
                 if outcome.status == ProposalStatus::Accepted {
-                    "accepted"
-                } else {
-                    "rejected"
-                },
-                outcome.id,
-                &outcome,
-                None,
-            ))
-            .map(CallToolResponse::from),
+                    self.embed_after_decision(cell).await;
+                }
+                tool_ok(&outcome_json(
+                    if outcome.status == ProposalStatus::Accepted {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    },
+                    outcome.id,
+                    &outcome,
+                    None,
+                ))
+                .map(CallToolResponse::from)
+            }
             ProposalStatus::Pending => {
                 // `write: confirm`: ask the human through the client's form,
                 // in whichever shape the negotiated protocol allows
@@ -1149,6 +1158,27 @@ impl MemoryServer {
         }
     }
 
+    /// v0.6.18 (F4): the vector of the notes that just became ACTIVE — the
+    /// same pass `add` runs on the CLI, computed in this process after the
+    /// decision and OUTSIDE the write lock. A failure (no model, a wrong
+    /// target, a dead embedder) leaves the note waiting for `engramma
+    /// embed`: it is never an error of the decision.
+    async fn embed_after_decision(&self, cell: &Cell) {
+        let Some(embedder) = self.embedder.clone() else {
+            return;
+        };
+        let engine_cell = cell.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            engine_cell.embed_pending(&*embedder, 512)
+        })
+        .await;
+        match joined {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("engramma-mcp: embed dopo la decisione: {e}"),
+            Err(e) => eprintln!("engramma-mcp: embed dopo la decisione: join {e}"),
+        }
+    }
+
     /// One decision (from a form answer or an MRTR round) and the final
     /// tool result.
     async fn decide_and_report(
@@ -1198,6 +1228,12 @@ impl MemoryServer {
         .map_err(|e| McpError::internal_error(format!("join: {e}"), None))?
         .map_err(err)?;
         let was_edited = decision;
+        // v0.6.18 (F4): the accepted note gets its vector now, outside the
+        // write lock; a failure waits for `engramma embed` — never an
+        // error of the decision
+        if accept {
+            self.embed_after_decision(cell).await;
+        }
         let note = tokio::task::spawn_blocking({
             let cell = cell.clone();
             move || cell.get(&id)

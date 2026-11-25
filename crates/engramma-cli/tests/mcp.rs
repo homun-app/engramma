@@ -103,6 +103,23 @@ fn spawn(root: &std::path::Path, cells: &str) -> Mcp {
     Mcp { child }
 }
 
+/// v0.6.18 (F4): the write surface — `--write <cell> --actor <name>` — for
+/// the tests of the auto reviewer.
+impl Mcp {
+    fn spawn_with_write(root: &std::path::Path, cells: &str, actor: &str) -> Mcp {
+        let child = Command::new(env!("CARGO_BIN_EXE_engramma"))
+            .args(["mcp", "--root"])
+            .arg(root)
+            .args(["--cells", cells, "--write", cells, "--actor", actor])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(/* test-only */);
+        Mcp { child }
+    }
+}
+
 fn cell_root(root: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(root.join("cells")).unwrap(/* t */);
     root.join("cells")
@@ -1014,4 +1031,86 @@ fn compat_chatgpt_over_stdio_is_a_usage_error() {
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("--compat chatgpt` va con `--http"), "{err}");
+}
+
+// v0.6.18 (F4): after the automatic reviewer accepts, `memory_search` finds
+// the note by MEANING, with no word in common — the vector is computed in
+// the same process, after the decision and outside the write lock. Before
+// this the accepted note waited for `engramma embed` (found by the site
+// capture: a question paraphrased answered nothing until that ran).
+#[test]
+fn the_auto_reviewers_acceptance_is_found_by_meaning_right_away() {
+    let fake = common::fake_embedder_server();
+    let dir = common::test_dir();
+    let root = dir.path();
+    let cells = cell_root(root);
+    // an empty cell, its target model, the auto policy and the reviewer
+    {
+        let cell = Cell::create(&cells.join("c.sqlite"), "c", "test").unwrap(/* t */);
+        cell.add_model("http:fake", 8).unwrap(/* t */);
+        cell.set_policy(
+            serde_json::json!({ "write": "auto", "reviewer": "r", "min_confidence": 0.9 }),
+            "test",
+        )
+        .unwrap(/* t */);
+    }
+    std::fs::write(
+        root.join("reviewers.yaml"),
+        "reviewers:\n  r:\n    command:\n      argv: [\"/bin/echo\", \"{\\\"decision\\\":\\\"accept\\\",\\\"reason\\\":\\\"ok\\\",\\\"confidence\\\":0.9}\"]\n      timeout_secs: 10\n",
+    )
+    .unwrap(/* t */);
+    std::fs::write(
+        root.join("config.json"),
+        format!(
+            r#"{{"embedder": {{"kind": "http", "model": "fake", "url": "http://127.0.0.1:{}", "dim": 8}}}}"#,
+            fake.port
+        ),
+    )
+    .unwrap(/* t */);
+
+    let mut mcp = Mcp::spawn_with_write(root, "c", "claude-code");
+    mcp.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0.0"}}}"#);
+    mcp.read_response(1);
+    mcp.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+
+    // the propose: the auto reviewer decides INSIDE the call
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "memory_propose",
+            "arguments": {"cell": "c", "text": "Fabio lavora a Torino."}
+        }
+    });
+    mcp.send(&call.to_string());
+    let res = mcp.read_response(2);
+    let text = res["result"]["content"][0]["text"].as_str().unwrap(/* t */);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap(/* t */);
+    assert_eq!(parsed["status"], "accepted", "the reviewer decided: {parsed}");
+    let note_id = parsed["id"].as_str().unwrap(/* t */).to_string();
+
+    // and the meaning search finds it with no word in common
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "memory_search",
+            "arguments": {"cell": "c", "query": "chi è impiegato?"}
+        }
+    });
+    mcp.send(&call.to_string());
+    let res = mcp.read_response(3);
+    let text = res["result"]["content"][0]["text"].as_str().unwrap(/* t */);
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap(/* t */);
+    assert_eq!(parsed["mode"], "hybrid", "the vector branch joins: {parsed}");
+    assert!(
+        parsed["hits"]
+            .as_array()
+            .unwrap(/* t */)
+            .iter()
+            .any(|h| h["note"]["id"] == note_id),
+        "the accepted note is found by meaning right away: {parsed}"
+    );
 }
