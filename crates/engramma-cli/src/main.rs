@@ -1795,6 +1795,15 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "`--write` needs `--actor <name>`: proposals must be attributable",
                 ));
             }
+            // v0.6.18 (F5): the check moves HERE, among the CLI usage rules —
+            // it used to surface from the server as `mcp: …` (exit 4), and
+            // an MCP client only saw a server that dies
+            if actor.is_some() && write.is_empty() && http.is_none() {
+                return Err(CliError::usage(
+                    "`--actor` goes with `--write <cells>`: an actor without a \
+                     writable cell does nothing",
+                ));
+            }
             for w in write {
                 if !cells.contains(w) {
                     return Err(CliError::usage(format!(
@@ -1814,7 +1823,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             // either: the flag was silently ignored before
             if compat.is_some() && http.is_none() {
                 return Err(CliError::usage(
-                    "`--compat chatgpt` va con `--http`: su stdio non esiste il                      grant (il client ChatGPT) a cui legare gli strumenti di                      compatibilità",
+                    "`--compat chatgpt` va con `--http`: su stdio non esiste il \
+                     grant (il client ChatGPT) a cui legare gli strumenti di \
+                     compatibilità",
                 ));
             }
             if http.is_some() && actor.is_some() {

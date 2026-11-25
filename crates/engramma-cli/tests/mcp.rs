@@ -1114,3 +1114,31 @@ fn the_auto_reviewers_acceptance_is_found_by_meaning_right_away() {
         "the accepted note is found by meaning right away: {parsed}"
     );
 }
+
+// v0.6.18 (F5): `mcp --actor` without `--write` died INSIDE the server —
+// the CLI wrapped it as an internal error (`mcp: …`, exit 4) and the MCP
+// client only saw a server that dies. The check belongs to the CLI usage
+// rules, next to «`--write` needs `--actor`»: exit 2, same message.
+#[test]
+fn actor_without_write_is_a_usage_error_of_the_cli() {
+    let dir = common::test_dir();
+    let cells = cell_root(dir.path());
+    Cell::create(&cells.join("famiglia.sqlite"), "famiglia", "test").unwrap(/* t */);
+    let out = Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .arg("--root")
+        .arg(dir.path())
+        .args(["mcp", "--cells", "famiglia", "--actor", "claude-code"])
+        .output()
+        .unwrap(/* t */);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a usage error, not a dead server: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("`--actor` goes with `--write <cells>`"),
+        "{err}"
+    );
+}
