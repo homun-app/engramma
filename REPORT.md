@@ -3,6 +3,103 @@
 Una pagina per fase (docs/fasi.md). La storia fino alla v0.6.14, fase per
 fase, sta in [docs/storia/REPORT-fino-alla-v0.6.14.md](docs/storia/REPORT-fino-alla-v0.6.14.md).
 
+## v0.6.16 — le pulizie del CI e delle dipendenze
+
+Data: 2026-11-25. Base: `main` @ `d3773d5`. Nessuna riga in
+`crates/engramma-core/src`, `engramma-sync/src`, `engramma-node/src`:
+niente caccia (la regola 4 ora dice «codice coperto da una proprietà della
+suite») e niente misure.
+
+### Cosa cambia
+
+- **Il CI regge anche su `main`.** Il contratto JS compila UNA volta sola,
+  con tutti i core e senza `nice` (prima la CLI, poi l'addon, entrambi
+  release), e il `pretest` resta per l'uso locale: nel CI `npm test
+  --ignore-scripts`. A cache fredda la vecchia sequenza compilava due
+  volte in release (8 min 45 s + 14 min 29 s) e il cap di 25 minuti era
+  finito (prima corsa su `main`, 45482552851).
+- **La prova a freddo è un input.** `workflow_dispatch` con `cold=true`:
+  ogni job salta `rust-cache` e costruisce da target vuoto — la prova di
+  una prima corsa su `main`, che le cache del ramo predefinito non
+  raggiunge.
+- **Il seme fisso al posto dello skip.** `PROPTEST_RNG_SEED=20261124`
+  nell'`env` del workflow (proptest 1.12 lo legge): tutte le proprietà
+  girano nel cancello, `quarantine_exits_only_by_decision` inclusa coi
+  suoi due difetti dichiarati — il ciclo `--skip` che leggeva
+  `open-defects.txt` è via. Il seme è provato in locale: la suite di
+  `engramma-core` a `PROPTEST_CASES=128` è verde col seme (la proprietà
+  della quarantena corsa e passata, 20 ok 0 caduti); il primo seme
+  provato — la data — non ha incontrato i difetti dichiarati, un secondo
+  non è servito. La regola sta nel workflow: il seme cambia solo con un
+  commit, e un rosso col seme fisso è sempre una regressione. La ricerca
+  resta alla caccia, coi semi casuali.
+- **Fuori dai push i job esplorativi.** `macos-15-intel` e
+  `windows-latest` girano solo su `schedule` (lunedì 03:00 UTC) e su
+  `workflow_dispatch`: le loro code chiudevano come «cancelled» corse
+  intere verdi.
+- **Le dipendenze.** `rmcp` 3.8.0 → 3.11.0 (`cargo update -p rmcp`; prova
+  a secco: solo rmcp, rmcp-macros e due crate unicode). RUSTSEC-2026-0462
+  (buffering illimitato nei client HTTP; qui rmcp è solo server) cade.
+  `url` resta 2.5.8 — nessuna correzione pubblicata alla data, `cargo
+  update -p url` non cambia nulla — e va in `ignore` motivato in
+  `deny.toml` (niente `Url::origin` in `crates/*/src`, grep del
+  2026-11-24). `paste` e `chrono` non mantenuti: `ignore` motivato, chi
+  li tira dentro sta nel `cargo tree -i` nel file, la sostituzione è una
+  fase a sé. `advisories` diventa bloccante e gira anche sullo
+  `schedule`; il commento in testa a `deny.toml` dice la cosa vera.
+- **La regola del triage** (regola 6 in `docs/fasi.md`): si corregge in
+  fase solo un difetto raggiungibile dall'API stabile («Cosa Homun può
+  usare» in `docs/node.md`) che perde dati o lascia uno stato che
+  `verify` non vede; gli altri si dichiarano in `open-defects.txt` con
+  chi li raggiunge e la fase va avanti. La regola 4 è precisa: il
+  cancello parte solo su codice coperto da una proprietà della suite
+  (`properties.txt`), il CI è deterministico col seme fisso.
+- **Due lezioni del cancello nuovo**, cadute e corrette nelle corse del
+  ramo: `npm install` sul runner riscrive il `package-lock.json`
+  tracciato, l'albero va sporco tra CLI (pulita) e addon (`-dirty`) e il
+  `bincheck` del contratto rifiuta l'accoppiata — ora `npm ci`, albero
+  pulito, stesso commit su entrambi; i quattro file del contratto giravano
+  in parallelo e la finestra di 5 s di S4 (l'evento arriva alla FINE
+  della sessione) perdeva sui 3 core del runner — ora
+  `--test-concurrency=1`: il cancello non misura il carico del runner.
+
+### I numeri
+
+- **La corsa del ramo** [45517258144](https://github.com/homun-app/engramma/actions/runs/45517258144)
+  sul commit `b45daec`: bloccanti tutti verdi, conclusione verde (gli
+  esplorativi non girano sui push). Tempi: fmt 0,2; clippy 0,5 (arm64) e
+  1,2 (macOS); test 16,3 (arm64), 21,8 (macOS), 18,8 (x86); warm 1,3;
+  contratto JS 4,3 (arm64) e 5,4 (macOS); deny 0,3; advisories 0,3.
+- **La prova a freddo** [45520249203](https://github.com/homun-app/engramma/actions/runs/45520249203)
+  (`cold=true`, stesso commit): bloccanti tutti verdi a target vuoto.
+  Tempi: test 18,3 (arm64), **26,1 (macOS)**, 14,4 (x86); warm 2,6;
+  contratto JS 12,9 (arm64) e 24,2 (macOS); clippy 1,6 e 1,9; fmt 0,2;
+  deny 0,3. Il cap del job `test` è stato alzato a 40 prima della prova
+  (la suite da sola misurava 22–24 con cache calda nella corsa
+  45509102496): il macOS freddo misura 26,1 — sopra 25, sotto 40. La
+  conclusione «cancelled» della corsa viene dal test `macos-15-intel`
+  non bloccante (coda infrastrutturale, com'era nella v0.6.15).
+- **I test locali**: suite del workspace verde col seme fisso ai casi
+  pieni dei sorgenti (708 test, 0 caduti); contratto JS 67/67 in Node e
+  67/67 in Electron; `golden_cell` verde; in `--release`, dopo
+  l'update: test di `engramma-mcp` e `crates/engramma-cli/tests/mcp.rs`
+  12/12.
+
+### Il verdetto
+
+Consegnati: F1 (una build per il contratto, la prova a freddo come
+input, il seme fisso al posto dello skip, gli esplorativi fuori dai
+push, advisories bloccante), le dipendenze (rmcp 3.11.0, gli `ignore`
+motivati), F2 (la regola del triage, la regola 4 precisa). Il CI è ora
+deterministico per progetto: seme fisso, un binario per contratto, i
+quattro file uno alla volta. Il motore non ha cambiato una riga dei tre
+sorgenti toccati: la caccia non è partita, come da regola.
+
+Fuori da questa fase, come dichiarato: il filone della compattazione, il
+difetto a due dispositivi, la sostituzione di `chrono` e `paste`, le
+correzioni Windows, la fusione a righe e i permessi per attore — le
+prossime fasi a tema, scelte dall'utente.
+
 ## v0.6.15 — la release locale, il CI vero, e fasi leggere
 
 Data: 2026-11-24. Base: `main` @ `f2a92d7`. Il motore (`crates/*/src` di
