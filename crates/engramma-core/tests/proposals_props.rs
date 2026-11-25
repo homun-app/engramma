@@ -404,9 +404,12 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
     // the queue: (proposal, its supersede target, when any)
     let mut queue: Vec<(Ulid, Option<Ulid>)> = Vec::new();
     // the live decisions: (proposal, its supersede target, whether THIS
-    // decision had closed it — only an accept does; a reject keeps the
-    // target alive and the proposal keeps pointing at it)
-    let mut decided: Vec<(Ulid, Option<Ulid>, bool)> = Vec::new();
+    // decision had closed it, whether the target stood ACTIVE then). A
+    // reject keeps the target alive and the proposal pointing at it; the
+    // revert of an accept restores the target AS IT WAS — active only if
+    // it was active then (a quarantined proposal in the queue may be
+    // corrected, v0.6.11 K1, and its revert puts it back in the queue)
+    let mut decided: Vec<(Ulid, Option<Ulid>, bool, bool)> = Vec::new();
     let mut purged: std::collections::HashSet<Ulid> = std::collections::HashSet::new();
 
     for step in steps {
@@ -464,14 +467,15 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                         Ok(_) => {
                             queue.remove(i);
                             active.push(id);
-                            let closed = match target {
+                            let (closed, was_active) = match target {
                                 Some(t) if !purged.contains(&t) => {
+                                    let was = active.contains(&t);
                                     active.retain(|x| *x != t);
-                                    true
+                                    (true, was)
                                 }
-                                _ => false,
+                                _ => (false, false),
                             };
-                            decided.push((id, target, closed));
+                            decided.push((id, target, closed, was_active));
                         }
                         Err(_) => {
                             let justified = match target {
@@ -505,7 +509,10 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                         .is_ok()
                     {
                         queue.remove(i);
-                        decided.push((id, target, false));
+                        // a revert had made the proposal live again? the
+                        // reject tombstones it: it is not active either way
+                        active.retain(|x| *x != id);
+                        decided.push((id, target, false, false));
                     }
                 }
             }
@@ -523,20 +530,26 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                         d.reverted_by.is_none()
                             && decided
                                 .iter()
-                                .any(|(p, _, closed)| *closed && *p == d.proposal)
+                                .any(|(p, _, closed, _)| *closed && *p == d.proposal)
                     });
                     if let Some(d) = candidate {
                         let proposal = d.proposal;
-                        let target = decided
+                        let (target, was_active) = decided
                             .iter()
-                            .find(|(p, _, _)| *p == proposal)
-                            .and_then(|(_, t, _)| *t);
+                            .find(|(p, _, _, _)| *p == proposal)
+                            .map(|(_, t, _, was)| (*t, *was))
+                            .unwrap_or((None, false));
                         match cell.revert_decision(&d.op_id, "ripensamento", "user@cli") {
                             Ok(engramma_core::cell::proposals::RevertOutcome::Reverted { .. }) => {
-                                decided.retain(|(p, _, _)| *p != proposal);
+                                decided.retain(|(p, _, _, _)| *p != proposal);
                                 queue.push((proposal, target));
                                 active.retain(|x| *x != proposal);
-                                if let Some(t) = target
+                                // the revert restores the target AS IT WAS:
+                                // active only if it stood active then — a
+                                // proposal the accept had corrected goes
+                                // back to the queue (quarantined), not live
+                                if was_active
+                                    && let Some(t) = target
                                     && !purged.contains(&t)
                                     && !active.contains(&t)
                                 {
@@ -557,13 +570,13 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                     let id = active[i];
                     let closed_target = decided
                         .iter()
-                        .find(|(p, _, _)| *p == id)
-                        .and_then(|(_, t, closed)| closed.then_some(*t).flatten());
+                        .find(|(p, _, _, _)| *p == id)
+                        .and_then(|(_, t, closed, _)| closed.then_some(*t).flatten());
                     cell.purge(&id, "oblio", "cli").unwrap(/* test-only */);
                     active.remove(i);
                     purged.insert(id);
                     queue.retain(|(p, _)| *p != id);
-                    decided.retain(|(p, _, _)| *p != id);
+                    decided.retain(|(p, _, _, _)| *p != id);
                     if let Some(t) = closed_target
                         && !purged.contains(&t)
                         && !active.contains(&t)
