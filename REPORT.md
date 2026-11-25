@@ -111,6 +111,30 @@ difetto a due dispositivi, la sostituzione di `chrono` e `paste`, le
 correzioni Windows, la fusione a righe e i permessi per attore — le
 prossime fasi a tema, scelte dall'utente.
 
+### Verifica (revisore, 2026-11-25)
+
+Rifatto sul tag `c7c1bcc`, a CPU bassa: `build-sha.sh` dà **gli stessi
+tre SHA** (`.node` `090c63d7…bee812`, 51 257 480 B); JS 67/67 in Node e in
+Electron; `compact_gate` 2/2, `mcp` 12/12; workspace col seme del CI
+(`PROPTEST_RNG_SEED=20261124`, 128 casi) verde; `golden_cell` verde; i due
+difetti dichiarati cadono ancora con `--ignored`. Le corse 45517258144
+(verde, anche la conclusione) e 45520249203 (a freddo, bloccanti verdi)
+confermate. Gli hook di privacy passano sui 9 commit. **Verdetto:
+consegnata.** Note, nessuna bloccante:
+
+- **`relay_cli.rs` cade in locale dopo qualche giorno**: tiene la sua build
+  in `$TMPDIR/engramma-cli-relay`, e macOS svuota i file vecchi di `$TMPDIR`
+  uno per uno (qui `bindgen.rs` di `libsqlite3-sys`, del 22/11): cargo crede
+  la cache fresca e la build si rompe. Con un `TMPDIR` pulito 7/7. La cura è
+  `CARGO_TARGET_TMPDIR`, la cartella che cargo dà ai test d'integrazione
+  dentro `target/`.
+- **Il contratto JS su macOS a freddo: 24,2 minuti su 25.** La prima corsa
+  di `main` dopo questo push ha `Cargo.lock` nuovo, quindi cache nuova: il
+  job va portato a 40 minuti come `test`.
+- **`--test-concurrency=1` stabilizza il cancello ma nasconde un fatto**:
+  sotto carico `stop()` della sync supera i 5 s di S4. Per Homun (l'uscita
+  dall'app) la latenza va misurata sotto carico, non tolta dal cancello.
+
 ## v0.6.15 — la release locale, il CI vero, e fasi leggere
 
 Data: 2026-11-24. Base: `main` @ `f2a92d7`. Il motore (`crates/*/src` di
