@@ -26,3 +26,7 @@ tempfile.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+# v0.6.17 (F2): not a distributed package — only engramma-cli ships
+[package.metadata.dist]
+dist = false

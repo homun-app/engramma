@@ -1,0 +1,50 @@
+# v0.6.17 (F2): the public distribution of the `engramma` CLI, with
+# cargo-dist 0.34.0. ONE distributed package (engramma-cli, the `engramma`
+# binary); every other crate of the workspace carries `dist = false` in
+# its own Cargo.toml (libraries, the Node addon, the bench). The
+# generated workflow is `.github/workflows/release.yml`, committed as
+# `dist generate` writes it: hand edits go through this file and
+# `dist generate`, never into the yaml.
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.34.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app: only the shell one. Homebrew
+# needs a tap repository and a token of its own — the user's decision,
+# not this phase's (out of scope, see the phase's REPORT).
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax).
+#
+# Windows and macOS Intel are NOT here on purpose: their ci.yml jobs
+# (`clippy-exotic`, `test-exotic` on macos-15-intel and windows-latest)
+# are non-blocking and only run on the weekly schedule — the engine does
+# not compile on Windows yet (Unix-only APIs in engramma-sync and
+# engramma-mcp). They enter this list when their ci.yml jobs turn green
+# AND blocking.
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+# Where to host releases
+hosting = "github"
+# The repo the workflow publishes to
+github-repository = "homun-app/engramma"
+# The checksum of every artifact
+checksum = "sha256"
+# Signed provenance from GitHub's own attestation service: no secrets of
+# ours in the repo, artifact attestations on every release file
+github-attestations = true
+# The default (the binary lands in cargo's bin, next to `cargo install`)
+install-path = "CARGO_HOME"
+# On pull requests the release workflow builds EVERYTHING and uploads the
+# artifacts to the run, without publishing anything: the proof of the
+# three targets rides the release PR itself
+pr-run-mode = "upload"
+
+# The arm64 Linux target builds on the NATIVE arm runner, not in cross:
+# same compilers, same glibc, what we test is what we ship
+[dist.github-custom-runners]
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+x86_64-unknown-linux-gnu = "ubuntu-24.04"

@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# v0.6.17 (F2): dist wants the repository URL on the distributed package
+repository.workspace = true
 
 [[bin]]
 name = "engramma"

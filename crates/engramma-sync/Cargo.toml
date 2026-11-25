@@ -50,3 +50,7 @@ proptest.workspace = true
 [features]
 # forwards to iroh's test-utils: the local relay of the tests
 test-utils = ["iroh/test-utils"]
+
+# v0.6.17 (F2): not a distributed package — only engramma-cli ships
+[package.metadata.dist]
+dist = false

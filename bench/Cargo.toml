@@ -29,3 +29,7 @@ tempfile.workspace = true
 # the profile_put example arms the REAL device signer (K4): the sync era's
 # Ed25519 cost, not a mock of it
 engramma-sync.workspace = true
+
+# v0.6.17 (F2): not a distributed package — only engramma-cli ships
+[package.metadata.dist]
+dist = false

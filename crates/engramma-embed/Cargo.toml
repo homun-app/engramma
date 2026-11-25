@@ -21,3 +21,7 @@ time.workspace = true
 # v0.4.4 (P1/P2): only the ram_mimalloc example links it; the library
 # stays allocator-neutral.
 mimalloc.workspace = true
+
+# v0.6.17 (F2): not a distributed package — only engramma-cli ships
+[package.metadata.dist]
+dist = false

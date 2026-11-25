@@ -14,6 +14,11 @@ debug = "line-tables-only"
 [profile.release.package.engramma-node]
 strip = "none"
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 [profile.dev.package."*"]
 debug = false
 
