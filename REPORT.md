@@ -3,6 +3,111 @@
 Una pagina per fase (docs/fasi.md). La storia fino alla v0.6.14, fase per
 fase, sta in [docs/storia/REPORT-fino-alla-v0.6.14.md](docs/storia/REPORT-fino-alla-v0.6.14.md).
 
+## v0.6.17 — la prima beta per sviluppatori
+
+Data: 2026-11-25. Base: `main` @ `6ff7400`. Il motore non cambia una riga
+dei tre sorgenti vietati: niente caccia, niente misure.
+
+### Cosa cambia
+
+- **F1 — la versione e la promessa.** Il workspace è `0.6.17-beta.1`
+  (`cargo update -w`: il lock cambia solo nelle otto crate nostre, diff
+  verificato). Test nuovo: `engramma --version` stampa la versione del
+  rilascio. **`docs/compatibilita.md`**: ogni riga col test che la prova —
+  le celle (le golden e `golden_cell.rs`; il rifiuto `SchemaTooNew`:
+  uscita 6, errore leggibile, file identico byte per byte, provato in CLI
+  da `schema_too_new_cli.rs` nuovo), la sync (l'ALPN e l'`hello` rifiutano
+  le versioni diverse prima che un frame si muova; il messaggio dice il
+  dispositivo da aggiornare; `protocol_version.rs`), l'export
+  (`format_version` 0: cosa garantisce e cosa no — non è un backup, e un
+  export futuro non viene piegato in silenzio), il contratto MCP (i nomi
+  stabili per la serie `0.6.x-beta`, `mcp.rs` inchioda la `tools/list`).
+  La golden della beta: **`v0617`** (cut 23, con istantanea), scritta da
+  `make_golden_cell_v0617.rs` — il respiro di oggi in una storia: tipi,
+  quarantena confermata, conflitti aperto e chiuso, proposta d'agente
+  accettata, purge, vettori, vista. `golden_cell.rs` ne apre sei.
+- **F2 — i binari con dist.** `dist` 0.34.0 (l'ultima stabile, ricontrollata
+  il 2026-11-25). `dist-workspace.toml` scritto a mano: un solo pacchetto
+  distribuito (`engramma-cli`), le altre sette crate `dist = false`; tre
+  target (macOS arm64, Linux x86_64, Linux arm64 **su runner nativo**
+  `ubuntu-24.04-arm`, niente cross — verificato nel piano); installer solo
+  `shell` (il tap Homebrew è una decisione dell'utente); `sha256`;
+  `github-attestations = true` (provenienza firmata da GitHub, zero
+  segreti nostri); `install-path = "CARGO_HOME"`; `pr-run-mode = "upload"`.
+  Il `[profile.dist]` di `dist init` non tocca il `strip = "none"` di
+  `engramma-node`. `release.yml` è come lo genera `dist generate`;
+  `dist plan` passa; `ci.yml` non cambia. Windows e macOS Intel restano
+  fuori, scritto nel toml: entrano quando i loro job del CI diventano
+  verdi e bloccanti.
+- **F3 — le pagine.** README riscritto per chi arriva da fuori: stato
+  (developer preview), la promessa, l'installer (e la verità su Gatekeeper:
+  nessuna firma Apple — l'installer da terminale non mette la quarantena,
+  il tarball dal browser sì, `xattr -d` per chi lo sceglie), la tabella
+  delle piattaforme, il primo minuto con output veri, la memoria in Claude
+  Desktop (formato verificato sui documenti MCP attuali; NON provato su
+  Claude vivo — scritto). `CHANGELOG.md` nuovo (Keep a Changelog): `dist
+  plan` ne legge la voce (`announcement_changelog`, titolo
+  `0.6.17-beta.1 - 2026-11-25`, prerelease vero). `docs/cli.md`: i sei
+  sottocomandi che mancavano (proposals, decisions, revert, policy, review,
+  conflicts con show e resolve); nessuna riga in più.
+
+### Le prove sulla PR
+
+La PR in bozza [#1](https://github.com/homun-app/engramma/pull/1)
+(`release-v0.6.17`): **Release** [45588543109](https://github.com/homun-app/engramma/actions/runs/45588543109)
+e **ci** [45588542643](https://github.com/homun-app/engramma/actions/runs/45588542643)
+verdi sul primo spingo (`10ba87b`); l'ultimo commit (`8dffd2d`, solo il
+README e la riga glibc) ha ripetuto le corse verdi. I tre binari,
+scaricati dagli artefatti (sha256 verificato), provati uno per uno —
+`--version` (0.6.17-beta.1), `init`, `add`, `search` che trova, `verify`
+pulito, `mcp --cells` che risponde all'`initialize` su stdio (EOF chiude):
+macOS arm64 direttamente; Linux arm64 e x86_64 in Docker su `ubuntu:24.04`
+(l'x86 emulato). **Scoperta delle prove**: i binari Linux vogliono
+**glibc ≥ 2.39** (bookworm 2.36 rifiuta) — costruiti su ubuntu-24.04,
+scritto nel README. Niente `model pull`: la prova basta alla ricerca
+testuale.
+
+### I test
+
+Suite del workspace in locale, col seme del CI (`PROPTEST_RNG_SEED`,
+casi pieni dei sorgenti): verde — 86 binari, 698 test, 0 caduti, più
+`relay_cli` 7/7 ripetuto a parte: la prima corsa è caduta sulle cache
+del `$TMPDIR` che macOS svuota (la nota del revisore v0.6.16, non una
+regressione; pulite `engramma-cli-{relay,plain}`, rifatto verde).
+`golden_cell` verde con la `v0617`; `--version` e `schema_too_new_cli`
+verdi. Il contratto JS non serve (il `src` del binding non cambia) — il
+CI lo ha girato comunque, verde su due runner.
+
+### La build sul tag
+
+Il tag `fase-v0.6.17`, annotato e solo locale, punta al commit della
+REPORT. `scripts/build-sha.sh` gira col repo sul tag dopo il commit: i
+tre SHA sono nel commit di sola documentazione che segue.
+
+### Per il revisore: la sequenza del rilascio
+
+1. **Push di `main`** (i commit della fase, quello della REPORT in coda).
+2. **Tag `v0.6.17-beta.1`** sullo stesso commit spinto: `git tag -a
+   v0.6.17-beta.1 -m "…" && git push origin v0.6.17-beta.1`. È il tag che
+   fa partire `release.yml` (il push di `main` da solo non lo fa).
+3. **Nella GitHub Release** deve apparire: i sei file
+   (`engramma-cli-{aarch64-apple-darwin,aarch64-unknown-linux-gnu,
+   x86_64-unknown-linux-gnu}.tar.xz` e i loro `.sha256`), l'`engramma-cli-installer.sh`,
+   `sha256.sum`, `source.tar.gz` + `.sha256`; le **attestazioni** sugli
+   artefatti (provenienza firmata, visibili con `gh attestation verify`);
+   il flag **pre-release** acceso (il suffisso `-beta.1` lo decide da
+   solo); il corpo preso dal `CHANGELOG.md`.
+4. Dopo il rilascio la PR #1 si chiude (già chiusa da questa fase, senza
+   fondere) e il ramo remoto `release-v0.6.17` è già cancellato.
+
+### Il verdetto
+
+Consegnati: F1 (versione, promessa riga per riga, golden v0617), F2 (dist
+0.34.0, tre binari provati, attestazioni), F3 (README, CHANGELOG, cli.md).
+Fuori, come dichiarato: firma e notarizzazione Apple, tap Homebrew,
+crates.io, Windows e macOS Intel, la pagina di homun.app, `relay_cli` su
+`CARGO_TARGET_TMPDIR`, la latenza di `stop()` sotto carico.
+
 ## v0.6.16 — le pulizie del CI e delle dipendenze
 
 Data: 2026-11-25. Base: `main` @ `d3773d5`. Nessuna riga in
