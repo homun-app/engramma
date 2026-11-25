@@ -344,6 +344,10 @@ pub struct DecisionsFilter {
     /// Only this actor, exact or PREFIX (`reviewer:` — the bulk cancel of
     /// one reviewer's decisions is a filter, nothing more).
     pub by: Option<String>,
+    /// Only decisions taken on the proposals of this actor, exact or
+    /// prefix (`mcp:`) — v0.6.18 (F2): who PROPOSED is a different person
+    /// than who DECIDED; the selection joins the proposals table.
+    pub proposer: Option<String>,
     /// Decided since (inclusive).
     pub since: Option<OffsetDateTime>,
     /// Decided until (inclusive).
@@ -377,6 +381,11 @@ pub enum RevertOutcome {
 pub struct RevertFilter {
     /// Only decisions of this actor, exact or prefix (`reviewer:x`).
     pub by: Option<String>,
+    /// Only decisions taken on the proposals of this actor, exact or
+    /// prefix (`mcp:`) — v0.6.18 (F2): the undo of what an assistant
+    /// filled the queue with. The selection passes through the proposals
+    /// table; the purged decisions keep counting among the `purged`.
+    pub proposer: Option<String>,
     /// Decided since (inclusive).
     pub since: Option<OffsetDateTime>,
     /// Decided until (inclusive).
@@ -452,13 +461,15 @@ type ProposalRaw = (
     bool,
 );
 
-/// One raw `decisions` row (with the joined proposal target), before parsing.
+/// One raw `decisions` row (with the joined proposal target and proposer),
+/// before parsing.
 type DecisionRaw = (
     String,
     String,
     String,
     String,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -1172,7 +1183,7 @@ impl Cell {
         let until = bound(&filter.until);
         let mut stmt = inner.conn.prepare(
             "SELECT d.op_id, d.proposal, d.decision, d.actor, d.decided_at, d.reason,
-                    d.review_json, d.reverted_by, p.target
+                    d.review_json, d.reverted_by, p.target, p.proposer
              FROM decisions d LEFT JOIN proposals p ON p.note_id = d.proposal
              ORDER BY d.decided_at, d.op_id",
         )?;
@@ -1188,6 +1199,7 @@ impl Cell {
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
+                    r.get(9)?,
                 ))
             })?
             .flatten()
@@ -1204,10 +1216,20 @@ impl Cell {
             review_json,
             reverted_by,
             target,
+            proposer,
         ) in raw
         {
             if let Some(by) = &filter.by
                 && !actor.starts_with(by.as_str())
+            {
+                continue;
+            }
+            // v0.6.18 (F2): who PROPOSED, not who decided — a proposal row
+            // the censor kept survives its purge, so the attribution holds
+            if let Some(want) = &filter.proposer
+                && !proposer
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with(want.as_str()))
             {
                 continue;
             }
@@ -1360,21 +1382,40 @@ impl Cell {
         // decision's rows away does not take its op row, and those decisions
         // are exactly the `purged` the report must count. The date of a
         // redacted decision falls back to its HLC (the envelope survives).
-        let candidates: Vec<(String, String, Option<String>)> = {
+        // v0.6.18 (F2): the proposer rides along — the proposals table, and
+        // for a decision whose proposal the purge took (its queue row went
+        // with it) the propose op's envelope, which the censor keeps with
+        // its actor — so `proposer` selects on WHO PROPOSED and the purged
+        // decisions keep counting among the `purged`.
+        let candidates: Vec<(String, String, Option<String>, Option<String>)> = {
             let inner = self.lock()?;
             let mut stmt = inner.conn.prepare(
-                "SELECT o.op_id, o.actor, p.body FROM ops o
+                "SELECT o.op_id, o.actor, p.body,
+                        COALESCE(pr.proposer, (SELECT po.actor FROM ops po
+                                               WHERE po.kind = 'propose' AND po.note_id = o.note_id
+                                               LIMIT 1))
+                 FROM ops o
                  LEFT JOIN op_payloads p ON p.op_id = o.op_id
+                 LEFT JOIN proposals pr ON pr.note_id = o.note_id
                  WHERE o.kind = 'decide' ORDER BY o.seq",
             )?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .flatten()
-                .collect()
+            stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .flatten()
+            .collect()
         };
         let mut report = RevertReport::default();
-        for (op_id, actor, body) in candidates {
+        for (op_id, actor, body, proposer) in candidates {
             if let Some(by) = &filter.by
                 && !actor.starts_with(by.as_str())
+            {
+                continue;
+            }
+            if let Some(want) = &filter.proposer
+                && !proposer
+                    .as_deref()
+                    .is_some_and(|p| p.starts_with(want.as_str()))
             {
                 continue;
             }

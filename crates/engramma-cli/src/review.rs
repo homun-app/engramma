@@ -760,6 +760,9 @@ async fn bulk(
     };
     let filter = RevertFilter {
         by: (!form.by.is_empty()).then(|| form.by.clone()),
+        // v0.6.18 (F2): the page's bulk form stays actor-based; the
+        // proposer filter is a CLI surface (`revert --proposed-by`)
+        proposer: None,
         since,
         until,
     };

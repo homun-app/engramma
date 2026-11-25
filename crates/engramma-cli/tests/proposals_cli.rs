@@ -343,6 +343,85 @@ fn revert_dry_run_on_a_single_id_writes_nothing() {
     assert_eq!(f.cell().get(&id).unwrap(/* t */).status, Status::Quarantined);
 }
 
+// v0.6.18 (F2): decisions are signed by WHO DECIDES (`user@cli`,
+// `reviewer:<nome>`), never by who proposed — `revert --by mcp:<actor>` was
+// accepted and silently undid nothing (found by the site capture). It is a
+// usage error now; the undo of what an assistant filled the queue with is
+// `--proposed-by`, on `revert` and on `decisions`.
+#[test]
+fn revert_by_mcp_actor_is_a_usage_error_and_proposed_by_selects_the_proposals() {
+    let f = Fixture::new();
+    let a = f.propose("Fabio parla inglese.");
+    let b = f.propose("Fabio parla francese.");
+    // one proposal from another actor, accepted by the same reviewer
+    let c = {
+        let cell = f.cell();
+        let out = cell
+            .propose(
+                &ProposalInput {
+                    note: note("Fabio parla tedesco."),
+                    mode: ProposalMode::New,
+                    client: None,
+                    reason: None,
+                },
+                "mcp:altro",
+                &ProposeContext::default(),
+            )
+            .unwrap(/* t */);
+        out.id.unwrap(/* t */)
+    };
+    f.accept(&a, "reviewer:bravo");
+    f.accept(&b, "user@cli");
+    f.accept(&c, "reviewer:bravo");
+
+    // `--by mcp:…` cannot select anything: decisions never carry that actor
+    let out = f.run(&["revert", "--by", "mcp:claude-code"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a usage error, not silence: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("--proposed-by mcp:claude-code"),
+        "the error suggests the new filter: {said}"
+    );
+
+    // the preview of the undo: every decision taken on mcp:claude-code's
+    // proposals — the reviewer's one on a AND the human's one on b
+    let json = f.run_json(&[
+        "revert",
+        "--proposed-by",
+        "mcp:claude",
+        "--dry-run",
+        "--json",
+    ]);
+    assert_eq!(json["dry_run"], true);
+    assert_eq!(json["reverted"], 2);
+    // the dry run changed nothing
+    let d = f
+        .cell()
+        .decisions(&Default::default())
+        .unwrap(/* t */)
+        .into_iter()
+        .find(|d| d.proposal == a)
+        .unwrap(/* t */);
+    assert!(d.reverted_by.is_none(), "a dry run writes nothing");
+
+    // the registry answers the same question before the undo
+    let json = f.run_json(&["decisions", "--proposed-by", "mcp:claude", "--json"]);
+    let rows = json["decisions"].as_array().unwrap(/* t */);
+    assert_eq!(rows.len(), 2);
+
+    // the real undo: a and b go back to the queue, c stays decided
+    let json = f.run_json(&["revert", "--proposed-by", "mcp:claude", "--yes", "--json"]);
+    assert_eq!(json["reverted"], 2);
+    assert_eq!(f.cell().get(&a).unwrap(/* t */).status, Status::Quarantined);
+    assert_eq!(f.cell().get(&b).unwrap(/* t */).status, Status::Quarantined);
+    assert_eq!(f.cell().get(&c).unwrap(/* t */).status, Status::Active);
+}
+
 #[test]
 fn the_policy_reads_and_changes_from_the_cli_only() {
     let f = Fixture::new();

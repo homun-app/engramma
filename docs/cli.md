@@ -375,17 +375,30 @@ is one proposal in full — note, proposer, decision, reviewer metadata.
 undo), `review` retries the FAILED automatic reviews (never the
 escalated ones).
 
-### `engramma decisions [--by ACTOR] [--since DATE] [--until DATE] [--state active|reverted]`
+### `engramma decisions [--by ACTOR] [--proposed-by ACTOR] [--since DATE] [--until DATE] [--state active|reverted]`
 
 The decisions registry: who, when, what, why. `--by` takes an exact
 actor or a prefix (e.g. `reviewer:`); dates are `YYYY-MM-DD`, `--until`
-inclusive.
+inclusive. `--proposed-by` (v0.6.18) narrows to the decisions taken on
+the proposals of that actor (exact or prefix, e.g. `mcp:claude-code`):
+look before you undo.
 
-### `engramma revert [DECISION] [--by ACTOR] [--since DATE]`
+### `engramma revert [DECISION] [--by ACTOR] [--proposed-by ACTOR] [--since DATE]`
 
 Cancel decisions — the git revert of the registry. By decision op id
 (or its last-8 prefix), or in bulk with `--by` (every decision of that
 actor, prefix) narrowed by `--since`.
+
+Who DECIDES and who PROPOSES are two different people: a decision is
+signed by its decider (`user@cli`, `reviewer:<nome>`), and an `mcp:`
+actor only ever proposes — `--by mcp:…` would select nothing, so it is
+a usage error (v0.6.18). To undo what an assistant filled the queue
+with, `--proposed-by mcp:claude-code` selects every decision taken on
+that actor's proposals (exact or prefix), combining with `--by`,
+`--since` and `--until`; `--dry-run` previews, the `[s/N]` prompt
+confirms (`--yes` skips it). The decisions whose content was purged
+keep counting among the `purged` — cancelled in the log, nothing comes
+back.
 
 ### `engramma policy show|set`
 

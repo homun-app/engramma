@@ -625,6 +625,94 @@ fn bulk_revert_by_actor_with_a_conflict_and_a_purge_in_the_middle() {
     assert_eq!(cell.get(&d).unwrap(/* t */).status, Status::Active);
 }
 
+// v0.6.18 (F2): the undo of what an ASSISTANT proposed. Decisions are
+// signed by who decides, so `proposer` filters through the proposals —
+// exact or prefix — and combines with `by`. A decision whose proposal the
+// purge took is still attributed (the propose op's envelope keeps its
+// actor) and keeps counting among the `purged`.
+#[test]
+fn revert_by_proposer_undoes_the_assistants_decisions() {
+    let (_d, cell) = cell();
+    let propose_as = |body: &str, who: &str| {
+        cell.propose(
+            &ProposalInput {
+                note: note(body),
+                mode: ProposalMode::New,
+                client: None,
+                reason: None,
+            },
+            who,
+            &engramma_core::cell::proposals::ProposeContext::default(),
+        )
+        .unwrap(/* t */)
+        .id
+        .unwrap(/* t */)
+    };
+    let a = propose_as("Fabio parla inglese.", "mcp:claude-code");
+    let b = propose_as("Fabio parla francese.", "mcp:claude-code");
+    let c = propose_as("Fabio parla tedesco.", "mcp:altro");
+    accept(&cell, &a, "reviewer:strict");
+    accept(&cell, &b, "user@cli");
+    accept(&cell, &c, "reviewer:strict");
+    // a's content was purged after its decision: the decision is `purged`
+    cell.purge(&a, "oblio", "cli").unwrap(/* t */);
+
+    // the dry run: the assistant's two — one revertible, one purged
+    let report = cell
+        .revert_decisions(
+            &RevertFilter {
+                proposer: Some("mcp:claude-code".into()),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap(/* t */);
+    assert_eq!(report.reverted, 1, "b is revertible");
+    assert_eq!(
+        report.purged, 1,
+        "a was purged, and still counts — its propose op names the proposer"
+    );
+    assert!(report.conflicts.is_empty());
+
+    // combined with `by`: the reviewer decided a and c; on claude-code's
+    // proposals only a remains, and it is a purge
+    let report = cell
+        .revert_decisions(
+            &RevertFilter {
+                by: Some("reviewer:".into()),
+                proposer: Some("mcp:claude-code".into()),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap(/* t */);
+    assert_eq!(report.reverted, 0);
+    assert_eq!(report.purged, 1);
+
+    // the real run: b goes back to the queue, c stays decided
+    let report = cell
+        .revert_decisions(
+            &RevertFilter {
+                proposer: Some("mcp:claude-code".into()),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap(/* t */);
+    assert_eq!(report.reverted, 1);
+    assert_eq!(cell.get(&b).unwrap(/* t */).status, Status::Quarantined);
+    assert_eq!(cell.get(&c).unwrap(/* t */).status, Status::Active);
+
+    // the registry answers the same question: prefix, not exact only
+    let rows = cell
+        .decisions(&DecisionsFilter {
+            proposer: Some("mcp:".into()),
+            ..Default::default()
+        })
+        .unwrap(/* t */);
+    assert_eq!(rows.len(), 2, "b and c — a's rows are purged away");
+}
+
 // ---------------------------------------------------------------------------
 // the log: replay, verify, purge
 // ---------------------------------------------------------------------------

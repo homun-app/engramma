@@ -242,6 +242,10 @@ enum Command {
         /// Only this actor (exact or prefix, e.g. `reviewer:`)
         #[arg(long)]
         by: Option<String>,
+        /// Only decisions on this proposer's proposals (exact or prefix,
+        /// e.g. `mcp:`) (v0.6.18)
+        #[arg(long)]
+        proposed_by: Option<String>,
         /// Decided since this date (YYYY-MM-DD)
         #[arg(long)]
         since: Option<String>,
@@ -259,6 +263,10 @@ enum Command {
         /// Bulk: every decision of this actor (prefix), e.g. `reviewer:x`
         #[arg(long)]
         by: Option<String>,
+        /// Bulk: every decision taken on this proposer's proposals (exact
+        /// or prefix), e.g. `mcp:claude-code` (v0.6.18)
+        #[arg(long)]
+        proposed_by: Option<String>,
         /// Bulk: only decisions taken since this date (YYYY-MM-DD)
         #[arg(long)]
         since: Option<String>,
@@ -1730,18 +1738,29 @@ fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Conflicts { action } => run_conflicts(cli, action),
         Command::Decisions {
             by,
+            proposed_by,
             since,
             until,
             state,
-        } => run_decisions(cli, by, since, until, state),
+        } => run_decisions(cli, by, proposed_by, since, until, state),
         Command::Revert {
             decision,
             by,
+            proposed_by,
             since,
             until,
             dry_run,
             yes,
-        } => run_revert(cli, decision, by, since, until, *dry_run, *yes),
+        } => run_revert(
+            cli,
+            decision,
+            by,
+            proposed_by,
+            since,
+            until,
+            *dry_run,
+            *yes,
+        ),
         Command::Policy { action } => run_policy(cli, action),
         Command::Review { port, open } => {
             let cell = open_cell(cli)?;
@@ -3273,6 +3292,7 @@ fn parse_proposal_state(
 fn run_decisions(
     cli: &Cli,
     by: &Option<String>,
+    proposed_by: &Option<String>,
     since: &Option<String>,
     until: &Option<String>,
     state: &Option<String>,
@@ -3292,6 +3312,7 @@ fn run_decisions(
     };
     let rows = cell.decisions(&engramma_core::cell::proposals::DecisionsFilter {
         by: by.clone(),
+        proposer: proposed_by.clone(),
         since: since.as_deref().map(|s| parse_day(s, false)).transpose()?,
         until: until.as_deref().map(|s| parse_day(s, true)).transpose()?,
         state,
@@ -3340,16 +3361,29 @@ fn run_revert(
     cli: &Cli,
     decision: &Option<String>,
     by: &Option<String>,
+    proposed_by: &Option<String>,
     since: &Option<String>,
     until: &Option<String>,
     dry_run: bool,
     yes: bool,
 ) -> Result<(), CliError> {
     let cell = open_cell(cli)?;
+    // v0.6.18 (F2): decisions are signed by WHO DECIDES — an `mcp:` actor
+    // proposes and cannot decide, so `--by mcp:…` selects nothing, ever.
+    // The mistake is real (the site capture ran it and undid nothing in
+    // silence): name it, and point at the filter that answers it.
+    if let Some(b) = by
+        && b.starts_with("mcp:")
+    {
+        return Err(CliError::usage(format!(
+            "decisions are signed by who decides; to undo what `{b}` proposed \
+             use `--proposed-by {b}`"
+        )));
+    }
     if let Some(id) = decision {
-        if by.is_some() || since.is_some() || until.is_some() {
+        if by.is_some() || proposed_by.is_some() || since.is_some() || until.is_some() {
             return Err(CliError::usage(
-                "a single revert takes a decision id, not --by/--since/--until",
+                "a single revert takes a decision id, not --by/--proposed-by/--since/--until",
             ));
         }
         let full = resolve_decision_op(&cell, id)?;
@@ -3424,13 +3458,14 @@ fn run_revert(
         }
         return Ok(());
     }
-    if by.is_none() && since.is_none() && until.is_none() {
+    if by.is_none() && proposed_by.is_none() && since.is_none() && until.is_none() {
         return Err(CliError::usage(
-            "either a decision id, or --by/--since/--until for the bulk revert",
+            "either a decision id, or --by/--proposed-by/--since/--until for the bulk revert",
         ));
     }
     let filter = engramma_core::cell::proposals::RevertFilter {
         by: by.clone(),
+        proposer: proposed_by.clone(),
         since: since.as_deref().map(|s| parse_day(s, false)).transpose()?,
         until: until.as_deref().map(|s| parse_day(s, true)).transpose()?,
     };
