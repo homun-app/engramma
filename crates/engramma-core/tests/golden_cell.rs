@@ -23,10 +23,11 @@ fn golden_dir() -> PathBuf {
 
 /// Every golden cell of the suite: the v0.6.8 one, and the v0.6.12 one
 /// (v0.6.13, M1: compacted by the PREVIOUS engine and frozen before the
-/// schema change — the whole-object anchor migration opens it). A new
-/// golden lands here by NAME, and this list growing is the visible part
-/// of the rule.
-const GOLDEN_CELLS: &[&str] = &["v068", "v0612", "v0613", "v0613-indietro", "v0614"];
+/// schema change — the whole-object anchor migration opens it). The
+/// v0.6.17 one is the BETA's golden: the cell the public compatibility
+/// promise leans on (docs/compatibilita.md). A new golden lands here by
+/// NAME, and this list growing is the visible part of the rule.
+const GOLDEN_CELLS: &[&str] = &["v068", "v0612", "v0613", "v0613-indietro", "v0614", "v0617"];
 
 /// The deterministic note id of the golden's note `i`
 /// (`01` + sixteen zeros + eight hex digits).
@@ -87,6 +88,7 @@ fn the_golden_cell_opens_verifies_and_holds_its_facts() {
             "v0613" => v0613_facts(&cell),
             "v0613-indietro" => v0613_indietro_facts(&cell),
             "v0614" => v0614_facts(&cell),
+            "v0617" => v0617_facts(&cell),
             other => panic!("a golden with no facts to check: {other}"),
         }
     }
@@ -544,4 +546,116 @@ fn v0614_facts(cell: &Cell) {
         report.replay
     );
     assert!(report.declared_corners.is_empty(), "no corner on this cell");
+}
+
+/// v0.6.17 (F1): the BETA's golden — the cell of the public promise
+/// (docs/compatibilita.md), written by the schema-24 engine on two
+/// devices. The facts it must keep through every future migration: the
+/// notes of every type, the confirmed external, the supersede, the
+/// lapide, the open conflict copy and the closed one, the agent's
+/// accepted proposal, the purge — and the searches still answering.
+fn v0617_facts(cell: &Cell) {
+    // the notes are there, id-sorted and whole; the purge took its own
+    let ids: Vec<Ulid> = cell.note_ids_all().unwrap(/* t */);
+    for i in 1..=10_u32 {
+        assert!(
+            ids.contains(&nid(i)),
+            "the golden's note {i} is there (v0617)"
+        );
+    }
+    assert!(
+        ids.contains(&nid(12)),
+        "the accepted proposal's note is there (v0617)"
+    );
+    assert!(
+        !ids.contains(&nid(11)),
+        "the purged note is gone from the golden (v0617)"
+    );
+    match cell.get(&nid(11)) {
+        Err(engramma_core::CellError::NoteNotFound(_)) => {}
+        other => panic!("the purged note answers nothing: {other:?}"),
+    }
+
+    // the states: a lapide, a superseded pair, a confirmed external
+    assert_eq!(cell.get(&nid(6)).unwrap(/* t */).status, Status::Deleted);
+    assert_eq!(cell.get(&nid(5)).unwrap(/* t */).status, Status::Superseded);
+    assert_eq!(cell.get(&nid(7)).unwrap(/* t */).status, Status::Active);
+    assert_eq!(cell.get(&nid(8)).unwrap(/* t */).status, Status::Active);
+
+    // the open conflict: the winner's body on the note, the loser's on
+    // the copy; the closed one stays closed
+    assert_eq!(
+        cell.get(&nid(9)).unwrap(/* t */).body,
+        "prima riga\nmanopola smeraldo\nterza"
+    );
+    let open: Vec<_> = cell
+            .conflicts()
+            .unwrap(/* t */)
+            .into_iter()
+            .filter(|c| c.original_id == nid(9))
+            .collect();
+    assert_eq!(open.len(), 1, "one open copy on the fact (v0617)");
+    let copy = open[0].copy_id;
+    assert_eq!(
+        cell.get(&copy).unwrap(/* t */).body,
+        "prima riga\nocchiello turchino verso [[Aldo]]\nterza",
+        "the loser's body lives in its copy (v0617)"
+    );
+    assert!(
+        cell.conflicts()
+                .unwrap(/* t */)
+                .iter()
+                .all(|c| c.original_id != nid(10)),
+        "the resolved conflict stays closed (v0617)"
+    );
+
+    // the agent's accepted proposal: the queue, the registry, the note
+    assert_eq!(
+        cell.get(&nid(12)).unwrap(/* t */).status,
+        Status::Active,
+        "the accepted correction is active"
+    );
+    let queue: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT mode || ' ' || state FROM proposals WHERE note_id = '{}'",
+            nid(12)
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        queue,
+        vec!["new accepted".to_string()],
+        "the queue says the user accepted it (v0617)"
+    );
+    let registry: Vec<String> = cell
+        .debug_column(&format!(
+            "SELECT decision || ' ' || actor FROM decisions WHERE proposal = '{}'",
+            nid(12)
+        ))
+        .unwrap(/* t */);
+    assert_eq!(
+        registry,
+        vec!["accept homun:user".to_string()],
+        "the registry holds it (v0617)"
+    );
+
+    // three searches, three answers: the winner, the copy, a person
+    let hits = |q: &str| -> Vec<Ulid> {
+        cell.search(&Query::text(q).k(10))
+                .unwrap(/* t */)
+                .into_iter()
+                .map(|h| h.note.id)
+                .collect()
+    };
+    assert!(
+        hits("manopola smeraldo").contains(&nid(9)),
+        "the winner's body answers (v0617)"
+    );
+    assert!(
+        hits("occhiello turchino").contains(&copy),
+        "the copy's body answers (v0617)"
+    );
+    assert!(
+        hits("Sofia").contains(&nid(1)),
+        "the person note answers (v0617)"
+    );
 }
