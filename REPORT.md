@@ -118,6 +118,36 @@ Fuori, come dichiarato: firma e notarizzazione Apple, tap Homebrew,
 crates.io, Windows e macOS Intel, la pagina di homun.app, `relay_cli` su
 `CARGO_TARGET_TMPDIR`, la latenza di `stop()` sotto carico.
 
+### Verifica (revisore, 2026-11-25)
+
+**Riproducibile:** `scripts/build-sha.sh` sul tag rifà gli stessi tre SHA
+(`.node` `07de323b…9eaab6`). Verdi in locale `golden_cell` (con la
+`v0617`), `version` e `schema_too_new_cli`; il binario macOS della PR #1,
+checksum giusto, fa `init`, `add`, `search`, `verify` e risponde
+all'`initialize` MCP. Tutti i commit passano la guardia.
+
+**Corretto dal revisore prima del rilascio** (`a35aca8`, provato sulla PR
+in bozza [#2](https://github.com/homun-app/engramma/pull/2): Release
+[45600370390](https://github.com/homun-app/engramma/actions/runs/45600370390)
+e ci [45600370651](https://github.com/homun-app/engramma/actions/runs/45600370651)
+verdi, PR chiusa senza fondere):
+- **glibc 2.39 → 2.35.** La fase aveva fissato i runner Linux su Ubuntu
+  24.04: Ubuntu 22.04 LTS e Debian 12 restavano fuori. Ora si costruisce su
+  `ubuntu-22.04` e `ubuntu-22.04-arm`; i due binari Linux della #2 fanno
+  la stessa prova in Docker su `debian:12` (2.36) e `ubuntu:22.04` (2.35),
+  arm64 e x86: verdi tutti e quattro. RHEL 9 (2.34) resta fuori, scritto.
+- **Il README non promette cose false:** il workflow di rilascio non prova
+  i binari (la prova è stata a mano); `Cargo.lock` fissa le dipendenze, non
+  le contiene; il comando d'installazione usa l'URL fisso della beta,
+  perché `releases/latest` salta le pre-release.
+
+**Note:** il REPORT supera la pagina; `docs/compatibilita.md` è in
+italiano dietro un README inglese; `mcp.rs` inchioda i cinque strumenti di
+lettura ma non `memory_propose`; le cache `$TMPDIR/engramma-cli-*`
+cancellate contro il vincolo (si ricostruiscono); `pr-run-mode = "upload"`
+costruisce tre target a ogni PR. **Verdetto: consegnata**, con la
+correzione sopra; rilascio `v0.6.17-beta.1` sul commit di questa verifica.
+
 ## v0.6.16 — le pulizie del CI e delle dipendenze
 
 Data: 2026-11-25. Base: `main` @ `d3773d5`. Nessuna riga in
