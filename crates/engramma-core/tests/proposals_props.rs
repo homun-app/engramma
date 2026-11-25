@@ -403,8 +403,10 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
     let mut active: Vec<Ulid> = Vec::new();
     // the queue: (proposal, its supersede target, when any)
     let mut queue: Vec<(Ulid, Option<Ulid>)> = Vec::new();
-    // the live decisions: (proposal, the target its accept had closed)
-    let mut decided: Vec<(Ulid, Option<Ulid>)> = Vec::new();
+    // the live decisions: (proposal, its supersede target, whether THIS
+    // decision had closed it — only an accept does; a reject keeps the
+    // target alive and the proposal keeps pointing at it)
+    let mut decided: Vec<(Ulid, Option<Ulid>, bool)> = Vec::new();
     let mut purged: std::collections::HashSet<Ulid> = std::collections::HashSet::new();
 
     for step in steps {
@@ -462,12 +464,14 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                         Ok(_) => {
                             queue.remove(i);
                             active.push(id);
-                            if let Some(t) = target
-                                && !purged.contains(&t)
-                            {
-                                active.retain(|x| *x != t);
-                            }
-                            decided.push((id, target));
+                            let closed = match target {
+                                Some(t) if !purged.contains(&t) => {
+                                    active.retain(|x| *x != t);
+                                    true
+                                }
+                                _ => false,
+                            };
+                            decided.push((id, target, closed));
                         }
                         Err(_) => {
                             let justified = match target {
@@ -483,10 +487,11 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                 }
             }
             4 => {
-                // reject: the lapide, never refused
+                // reject: the lapide, never refused — the proposal keeps
+                // pointing at its target, which never moved
                 if !queue.is_empty() {
                     let i = rng.below(queue.len());
-                    let (id, _) = queue[i];
+                    let (id, target) = queue[i];
                     if cell
                         .decide(
                             &id,
@@ -500,29 +505,35 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                         .is_ok()
                     {
                         queue.remove(i);
-                        decided.push((id, None));
+                        decided.push((id, target, false));
                     }
                 }
             }
             5 => {
-                // revert a live decision: the closed target reopens
+                // revert an ACCEPT decision: the target it had closed
+                // reopens. The revert of a REJECT rides the OPEN DEFECT of
+                // v0.6.14 (open-defects.txt: it reopens the target another
+                // decision had closed) — the declared defect is not this
+                // property's oracle, so the reverts here cancel accepts only
                 if !decided.is_empty() {
                     let ds = cell
                         .decisions(&DecisionsFilter::default())
                         .unwrap(/* test-only */);
                     let candidate = ds.iter().find(|d| {
                         d.reverted_by.is_none()
-                            && decided.iter().any(|(p, _)| *p == d.proposal)
+                            && decided
+                                .iter()
+                                .any(|(p, _, closed)| *closed && *p == d.proposal)
                     });
                     if let Some(d) = candidate {
                         let proposal = d.proposal;
                         let target = decided
                             .iter()
-                            .find(|(p, _)| *p == proposal)
-                            .and_then(|(_, t)| *t);
+                            .find(|(p, _, _)| *p == proposal)
+                            .and_then(|(_, t, _)| *t);
                         match cell.revert_decision(&d.op_id, "ripensamento", "user@cli") {
                             Ok(engramma_core::cell::proposals::RevertOutcome::Reverted { .. }) => {
-                                decided.retain(|(p, _)| *p != proposal);
+                                decided.retain(|(p, _, _)| *p != proposal);
                                 queue.push((proposal, target));
                                 active.retain(|x| *x != proposal);
                                 if let Some(t) = target
@@ -546,13 +557,13 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                     let id = active[i];
                     let closed_target = decided
                         .iter()
-                        .find(|(p, _)| *p == id)
-                        .and_then(|(_, t)| *t);
+                        .find(|(p, _, _)| *p == id)
+                        .and_then(|(_, t, closed)| closed.then_some(*t).flatten());
                     cell.purge(&id, "oblio", "cli").unwrap(/* test-only */);
                     active.remove(i);
                     purged.insert(id);
                     queue.retain(|(p, _)| *p != id);
-                    decided.retain(|(p, _)| *p != id);
+                    decided.retain(|(p, _, _)| *p != id);
                     if let Some(t) = closed_target
                         && !purged.contains(&t)
                         && !active.contains(&t)
