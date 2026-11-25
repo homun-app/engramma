@@ -251,7 +251,7 @@ Notevoli:
 - gli **errori** sono `Error` con `code` stabile: `NOT_FOUND`,
   `QUARANTINED`, `INVALID_NOTE`, **`INVALID_ARGUMENT`** (v0.4.2),
   `CONFLICT`, `CLOSED`, `IO`, `MODEL_MISSING`, `COMPACTED`,
-  **`NOTE_PURGED`** (v0.6.9). I messaggi
+  **`NOTE_PURGED`** (v0.6.9), **`STALE_TARGET`** (v0.6.18). I messaggi
   non rivelano contenuti di note. `INVALID_ARGUMENT` è per gli
   **argomenti della chiamata** (uno `status` sconosciuto in `list`, un
   `limit` di zero, `graphHops` oltre 2, `depth` oltre 4, una `mode` che
@@ -630,6 +630,25 @@ sopra.)
   bersaglio di una correzione accettata portano entrambe quella riga) e
   nomina quelle ancora in stato `superseded`. La stessa regola decide
   il rigioco: l'anticipo non può mentire.
+
+## Una correzione vale contro la versione che correggeva (v0.6.18, F3)
+
+- **`STALE_TARGET`.** Due correzioni proposte sulla stessa nota
+  accettate una dopo l'altra lasciavano **due note attive** per lo
+  stesso fatto (niente copia di conflitto: la seconda accettazione non
+  incontrava nessuno). Come in git, una correzione vale contro la
+  versione che correggeva: se il bersaglio della `supersede` non è più
+  attivo — chiuso da un'altra correzione o da una lapide — la `decide`
+  si rifiuta con `e.code === 'STALE_TARGET'`; il messaggio nomina il
+  bersaglio chiuso e la nota che ora porta il fatto. La proposta resta
+  **in coda**: Homun la mostra ancora, con l'avviso del perché, e
+  l'utente può rifiutarla o proporre di nuovo sulla nota corrente.
+- **Non sono rifiuti:** la `decide` il cui bersaglio è PURGATO resta
+  com'era (v0.6.11, K1: atterra come nota nuova); il revisore
+  automatico continua a scalare all'umano quando il bersaglio non è
+  attivo, come prima. Quando la correzione che ha chiuso il bersaglio
+  viene ANNULLATA (`revertDecision`), il bersaglio torna attivo e la
+  proposta in coda si può accettare di nuovo.
 
 ## Un assistente che ricorda
 

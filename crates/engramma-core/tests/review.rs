@@ -600,6 +600,109 @@ fn a_tombstoned_target_never_passes_automatically() {
     assert!(matches!(out.status, ProposalStatus::Pending));
 }
 
+// v0.6.18 (F3): a target another correction ALREADY closed never passes
+// the machine either — the reviewer escalates, the human decides (and the
+// human's accept is refused with StaleTarget while the target is closed).
+// When the first correction is reverted, the target is active again and
+// the machine may decide as always.
+#[test]
+fn a_superseded_target_never_passes_automatically_until_its_closer_is_reverted() {
+    let (d, cell) = cell();
+    auto_policy(&cell, json!({ "allow_supersede": "any" }));
+    let rev = reviewers_yaml(&command_yaml(
+        &script_reviewer(
+            d.path(),
+            "r",
+            r#"echo '{"decision":"accept","reason":"ok","confidence":0.9}'"#,
+        ),
+        10,
+    ));
+    // the first correction lands: the target is superseded
+    let target = note("Fabio lavora a Milano.");
+    cell.put_note(&target, "cli").unwrap(/* t */);
+    let out = cell
+        .propose(
+            &ProposalInput {
+                note: note("Fabio lavora a Torino."),
+                mode: ProposalMode::Supersede(target.id),
+                client: None,
+                reason: None,
+            },
+            "mcp:claude",
+            &ctx(&rev),
+        )
+        .unwrap(/* t */);
+    assert!(
+        matches!(out.status, ProposalStatus::Accepted),
+        "the active target passes"
+    );
+    let closer = out.id.unwrap(/* t */);
+    assert_eq!(cell.get(&target.id).unwrap(/* t */).status, Status::Superseded);
+
+    // the second correction proposes against the same note: the machine
+    // escalates (the fence refuses to close a non-active target)…
+    let out = cell
+        .propose(
+            &ProposalInput {
+                note: note("Fabio lavora a Genova."),
+                mode: ProposalMode::Supersede(target.id),
+                client: None,
+                reason: None,
+            },
+            "mcp:claude",
+            &ctx(&rev),
+        )
+        .unwrap(/* t */);
+    assert!(
+        matches!(out.status, ProposalStatus::Pending),
+        "a superseded target escalates to the human"
+    );
+    let stale = out.id.unwrap(/* t */);
+    // …and the human's accept is refused while the target stays closed
+    let second = cell.decide(
+        &stale,
+        &engramma_core::cell::proposals::DecisionInput {
+            action: engramma_core::cell::proposals::DecisionAction::Accept { edited: None },
+            reason: Some("corretto".into()),
+            review: None,
+        },
+        "user@cli",
+    );
+    assert!(
+        matches!(second, Err(engramma_core::CellError::StaleTarget { .. })),
+        "{second:?}"
+    );
+
+    // reverting the first correction opens the target again: the machine
+    // may decide as always
+    let decision = cell
+        .decisions(&DecisionsFilter::default())
+        .unwrap(/* t */)
+        .into_iter()
+        .find(|d| d.proposal == closer)
+        .unwrap(/* t */)
+        .op_id;
+    cell.revert_decision(&decision, "ripensamento", "user@cli")
+        .unwrap(/* t */);
+    assert_eq!(cell.get(&target.id).unwrap(/* t */).status, Status::Active);
+    let out = cell
+        .propose(
+            &ProposalInput {
+                note: note("Fabio lavora a Bologna."),
+                mode: ProposalMode::Supersede(target.id),
+                client: None,
+                reason: None,
+            },
+            "mcp:claude",
+            &ctx(&rev),
+        )
+        .unwrap(/* t */);
+    assert!(
+        matches!(out.status, ProposalStatus::Accepted),
+        "the reopened target passes again"
+    );
+}
+
 #[test]
 fn only_the_allowed_kinds_pass_automatically() {
     let (d, cell) = cell();

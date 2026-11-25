@@ -196,6 +196,17 @@ fn cell_error(e: CellError) -> Error {
             ),
         ),
         CellError::Invalid(m) if m.contains("empty patch") => invalid("patch vuota"),
+        // v0.6.18 (F3): the rule of a git merge — a correction is worth
+        // against the version it corrected. Homun shows it on the
+        // proposal's card: the target was already corrected by another
+        // note, the proposal stays queued
+        CellError::StaleTarget { target, closed_by } => transport_err(
+            "STALE_TARGET",
+            format!(
+                "il bersaglio {target} non è più attivo: l'ha già corretta {closed_by} — \
+                 rifiuta la proposta o proponi di nuovo sulla nota corrente"
+            ),
+        ),
         CellError::Invalid(m) => invalid(m),
         CellError::Io(e) => transport_err("IO", e),
         other => transport_err("IO", other),

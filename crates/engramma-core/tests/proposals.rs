@@ -413,6 +413,101 @@ fn revert_returns_the_proposal_to_the_queue_and_reopens_the_target() {
     assert_eq!(cell.get(&id).unwrap(/* t */).status, Status::Active);
 }
 
+// v0.6.18 (F3): two accepted corrections of the SAME note became two
+// active notes — the second accept read the target without checking it
+// was still standing (found by the site capture: two versions of the same
+// fact, and no conflict copy). The rule of a git merge: a correction is
+// worth against the version it corrected. A stale target refuses the
+// accept, the proposal stays in the queue — and when the first correction
+// is reverted, the target is open again and the second goes.
+#[test]
+fn a_second_supersede_on_the_same_note_refuses_until_the_first_is_reverted() {
+    let (_d, cell) = cell();
+    let old = note("Fabio lavora a Milano.");
+    cell.put_note(&old, "cli").unwrap(/* t */);
+    let supersede_of = |body: &str| {
+        cell.propose(
+            &ProposalInput {
+                note: note(body),
+                mode: ProposalMode::Supersede(old.id),
+                client: None,
+                reason: None,
+            },
+            "mcp:claude",
+            &engramma_core::cell::proposals::ProposeContext::default(),
+        )
+        .unwrap(/* t */)
+        .id
+        .unwrap(/* t */)
+    };
+    let p1 = supersede_of("Fabio lavora a Torino.");
+    accept(&cell, &p1, "user@cli");
+    assert_eq!(cell.get(&old.id).unwrap(/* t */).status, Status::Superseded);
+
+    // the second correction was proposed against the same note
+    let p2 = supersede_of("Fabio lavora a Genova.");
+    let second = cell.decide(
+        &p2,
+        &DecisionInput {
+            action: DecisionAction::Accept { edited: None },
+            reason: Some("corretto".into()),
+            review: None,
+        },
+        "user@cli",
+    );
+    // the refusal names the closed target and the note that carries the
+    // fact now — the accept of the first correction
+    match second {
+        Err(CellError::StaleTarget { target, closed_by }) => {
+            assert_eq!(target, old.id.to_string());
+            assert_eq!(closed_by, p1.to_string(), "the first correction closed it");
+        }
+        other => panic!("the second accept must refuse with StaleTarget: {other:?}"),
+    }
+
+    // the refusal leaves the proposal in the queue
+    assert_eq!(cell.get(&p2).unwrap(/* t */).status, Status::Quarantined);
+    assert!(
+        cell
+        .proposals(&ProposalsFilter {
+            state: Some(ProposalState::Pending),
+            ..Default::default()
+        })
+        .unwrap(/* t */)
+        .iter()
+        .any(|p| p.id == p2),
+        "the stale proposal stays decidable"
+    );
+    // and exactly one note carries the fact
+    assert_eq!(cell.get(&p1).unwrap(/* t */).status, Status::Active);
+
+    // reverting the first correction opens the target again: the second goes
+    let d1 = cell
+        .decisions(&DecisionsFilter::default())
+        .unwrap(/* t */)
+        .into_iter()
+        .find(|d| d.proposal == p1)
+        .unwrap(/* t */)
+        .op_id;
+    cell.revert_decision(&d1, "ripensamento", "user@cli")
+        .unwrap(/* t */);
+    assert_eq!(cell.get(&old.id).unwrap(/* t */).status, Status::Active);
+    cell.decide(
+        &p2,
+        &DecisionInput {
+            action: DecisionAction::Accept { edited: None },
+            reason: Some("corretto".into()),
+            review: None,
+        },
+        "user@cli",
+    )
+    .unwrap(/* t */);
+    assert_eq!(cell.get(&p2).unwrap(/* t */).status, Status::Active);
+    assert_eq!(cell.get(&old.id).unwrap(/* t */).status, Status::Superseded);
+    let report = cell.verify().unwrap(/* t */);
+    assert!(report.ok(), "mismatch: {:?}", report.mismatch);
+}
+
 #[test]
 fn revert_of_a_reject_untombstones_the_proposal() {
     let (_d, cell) = cell();

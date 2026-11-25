@@ -104,6 +104,14 @@ proptest! {
     fn proposal_sequences_keep_the_invariants(seed in any::<u64>()) {
         proposal_sequences_keep_the_invariants_body(seed)?;
     }
+
+// v0.6.18 (F3): the invariant the double-accept broke — in every chain of
+// `supersede` (direct or through the queue), at most ONE note stands
+// active: a correction is worth against the version it corrected.
+#[test]
+    fn a_supersede_chain_keeps_at_most_one_active_note(seed in any::<u64>()) {
+        a_supersede_chain_keeps_at_most_one_active_note_body(seed)?;
+    }
 }
 
 /// v0.6.14 (N3): the body of `proposal_sequences_keep_the_invariants` in ONE case — the seed
@@ -361,4 +369,237 @@ fn proposal_sequences_keep_the_invariants_with(
         .len();
     prop_assert_eq!(report.reverted + report.conflicts.len(), active);
     Ok(())
+}
+
+/// v0.6.18 (F3): the body of `a_supersede_chain_keeps_at_most_one_active_note`
+/// in ONE case — the seed derives every input through the same strategies
+/// (`seeded_runner`); a failing seed replays here.
+fn a_supersede_chain_keeps_at_most_one_active_note_body(
+    seed: u64,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let mut runner = seeded_runner(seed);
+    let (seed, steps) = ((any::<u64>()), (proptest::collection::vec(0u8..7, 12..40)))
+        .new_tree(&mut runner)
+        .expect(/* t */ "the strategy builds its tree")
+        .current();
+    a_supersede_chain_keeps_at_most_one_active_note_with(seed, steps)
+}
+
+/// v0.6.14 (N3): the property's story on its inputs EXPLICITLY, for the
+/// cases history records.
+fn a_supersede_chain_keeps_at_most_one_active_note_with(
+    seed: u64,
+    steps: Vec<u8>,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    let dir = test_dir();
+    let cell = Cell::create(&dir.path().join("c.sqlite"), "t", "t").unwrap(/* test-only */);
+    cell.set_policy(serde_json::json!({ "write": "propose" }), "t")
+        .unwrap(/* test-only */);
+    let mut rng = Rng(seed);
+    let mut clock = 0_u64;
+    let mut counter = 0_u64;
+
+    // the model: what the sequence built
+    let mut active: Vec<Ulid> = Vec::new();
+    // the queue: (proposal, its supersede target, when any)
+    let mut queue: Vec<(Ulid, Option<Ulid>)> = Vec::new();
+    // the live decisions: (proposal, the target its accept had closed)
+    let mut decided: Vec<(Ulid, Option<Ulid>)> = Vec::new();
+    let mut purged: std::collections::HashSet<Ulid> = std::collections::HashSet::new();
+
+    for step in steps {
+        counter += 1;
+        clock += 1 + rng.below(3) as u64;
+        let at = t(clock);
+        let marker = format!("catena{counter}");
+        match step {
+            0 | 1 => {
+                let n = base_note(format!("il fatto {marker} detto dall'utente"), at);
+                cell.put_note(&n, "cli").unwrap(/* test-only */);
+                active.push(n.id);
+            }
+            2 => {
+                // propose a supersede against a RANDOM active note: the
+                // same target collects corrections while it stands
+                if !active.is_empty() {
+                    let target = active[rng.below(active.len())];
+                    let note = base_note(format!("la rettifica {marker} dell'assistente"), at);
+                    let id = note.id;
+                    let out = cell
+                        .propose(
+                            &ProposalInput {
+                                note,
+                                mode: ProposalMode::Supersede(target),
+                                client: None,
+                                reason: None,
+                            },
+                            "mcp:test",
+                            &engramma_core::cell::proposals::ProposeContext::default(),
+                        )
+                        .unwrap(/* test-only */);
+                    if let Some(id) = out.id {
+                        queue.push((id, Some(target)));
+                    }
+                }
+            }
+            3 => {
+                // accept: refused ONLY by a closed target (v0.6.18, F3) —
+                // never while the target stands, and never over a purged
+                // one (v0.6.11, K1: that accept lands as a NEW note)
+                if !queue.is_empty() {
+                    let i = rng.below(queue.len());
+                    let (id, target) = queue[i];
+                    let r = cell.decide(
+                        &id,
+                        &DecisionInput {
+                            action: DecisionAction::Accept { edited: None },
+                            reason: Some("perché".into()),
+                            review: None,
+                        },
+                        "user@cli",
+                    );
+                    match r {
+                        Ok(_) => {
+                            queue.remove(i);
+                            active.push(id);
+                            if let Some(t) = target
+                                && !purged.contains(&t)
+                            {
+                                active.retain(|x| *x != t);
+                            }
+                            decided.push((id, target));
+                        }
+                        Err(_) => {
+                            let justified = match target {
+                                Some(t) => !active.contains(&t) && !purged.contains(&t),
+                                None => false,
+                            };
+                            prop_assert!(
+                                justified,
+                                "accept refused while its target stands: {id}"
+                            );
+                        }
+                    }
+                }
+            }
+            4 => {
+                // reject: the lapide, never refused
+                if !queue.is_empty() {
+                    let i = rng.below(queue.len());
+                    let (id, _) = queue[i];
+                    if cell
+                        .decide(
+                            &id,
+                            &DecisionInput {
+                                action: DecisionAction::Reject,
+                                reason: None,
+                                review: None,
+                            },
+                            "user@cli",
+                        )
+                        .is_ok()
+                    {
+                        queue.remove(i);
+                        decided.push((id, None));
+                    }
+                }
+            }
+            5 => {
+                // revert a live decision: the closed target reopens
+                if !decided.is_empty() {
+                    let ds = cell
+                        .decisions(&DecisionsFilter::default())
+                        .unwrap(/* test-only */);
+                    let candidate = ds.iter().find(|d| {
+                        d.reverted_by.is_none()
+                            && decided.iter().any(|(p, _)| *p == d.proposal)
+                    });
+                    if let Some(d) = candidate {
+                        let proposal = d.proposal;
+                        let target = decided
+                            .iter()
+                            .find(|(p, _)| *p == proposal)
+                            .and_then(|(_, t)| *t);
+                        match cell.revert_decision(&d.op_id, "ripensamento", "user@cli") {
+                            Ok(engramma_core::cell::proposals::RevertOutcome::Reverted { .. }) => {
+                                decided.retain(|(p, _)| *p != proposal);
+                                queue.push((proposal, target));
+                                active.retain(|x| *x != proposal);
+                                if let Some(t) = target
+                                    && !purged.contains(&t)
+                                    && !active.contains(&t)
+                                {
+                                    active.push(t);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            6 => {
+                // a purge: the chain loses a member — and when the purged
+                // note was an ACCEPTED supersede, its closing goes with it
+                // and the target is open again (v0.6.10, J1)
+                if !active.is_empty() {
+                    let i = rng.below(active.len());
+                    let id = active[i];
+                    let closed_target = decided
+                        .iter()
+                        .find(|(p, _)| *p == id)
+                        .and_then(|(_, t)| *t);
+                    cell.purge(&id, "oblio", "cli").unwrap(/* test-only */);
+                    active.remove(i);
+                    purged.insert(id);
+                    queue.retain(|(p, _)| *p != id);
+                    decided.retain(|(p, _)| *p != id);
+                    if let Some(t) = closed_target
+                        && !purged.contains(&t)
+                        && !active.contains(&t)
+                    {
+                        active.push(t);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // THE INVARIANT (checked after every step): for every pair of
+        // active notes, neither carries a chain that reaches the other
+        for b in &active {
+            let chain = chain_of(&cell, b);
+            for a in &active {
+                if a != b {
+                    prop_assert!(
+                        !chain.contains(a),
+                        "two active notes in one supersede chain: {b} → {a}"
+                    );
+                }
+            }
+        }
+    }
+
+    let report = cell.verify().unwrap(/* test-only */);
+    prop_assert!(report.ok(), "verify: {:?}", report.mismatch);
+    prop_assert!(matches!(report.replay, engramma_core::cell::Replay::Full));
+    Ok(())
+}
+
+/// The transitive `supersedes` chain of a note, through the living notes —
+/// a purged member ends the walk (its rows are gone, it cannot be active).
+fn chain_of(cell: &Cell, root: &Ulid) -> Vec<Ulid> {
+    let mut seen = vec![*root];
+    let mut i = 0;
+    while i < seen.len() && i < 256 {
+        let Ok(n) = cell.get(&seen[i]) else {
+            break; // purged or unknown: the chain stops here
+        };
+        for old in &n.supersedes {
+            if !seen.contains(old) {
+                seen.push(*old);
+            }
+        }
+        i += 1;
+    }
+    seen
 }

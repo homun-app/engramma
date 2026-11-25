@@ -93,6 +93,21 @@ impl From<CellError> for CliError {
                  this binary supports up to {supported}): the cell was left untouched, \
                  upgrade Engramma first"
             )),
+            // v0.6.18 (F3): a correction is worth against the version it
+            // corrected — the second accept of the same note refuses, and
+            // the message says who already corrected it and what to do
+            CellError::StaleTarget { target, closed_by } if closed_by == target => {
+                CliError::internal(format!(
+                    "rettifica rifiutata: {target} non è più attiva (una lapide l'ha chiusa) — \
+                     rifiuta la proposta (`engramma proposals reject <id>`) \
+                     o proponi di nuovo sulla nota corrente"
+                ))
+            }
+            CellError::StaleTarget { target, closed_by } => CliError::internal(format!(
+                "rettifica rifiutata: {target} non è più attiva — l'ha già corretta \
+                 {closed_by} — rifiuta la proposta (`engramma proposals reject <id>`) \
+                 o proponi di nuovo sulla nota corrente ({closed_by})"
+            )),
             other => CliError::internal(other.to_string()),
         }
     }

@@ -98,6 +98,24 @@ pub enum CellError {
     /// NEW note, with a new id. The message carries the id.
     #[error("note {0} is purged: that id never comes back — write a new note")]
     NotePurged(String),
+    /// v0.6.18 (F3): a supersede acceptance whose target a LATER
+    /// correction (or a delete) already closed — the rule of a git merge:
+    /// a correction is worth against the version it corrected. Two
+    /// accepts of the same note used to leave two active versions of the
+    /// same fact. The proposal stays in the queue: reject it, or propose
+    /// again against the note that now carries the fact.
+    #[error(
+        "the target {target} is no longer active: closed by {closed_by} — \
+         reject this proposal or propose again against {closed_by}"
+    )]
+    StaleTarget {
+        /// The closed target the proposal pointed at.
+        target: String,
+        /// The note that now carries the fact — the active head of the
+        /// target's supersede chain — or the target itself when a
+        /// tombstone closed it.
+        closed_by: String,
+    },
 }
 
 /// Errors returned by import/export.

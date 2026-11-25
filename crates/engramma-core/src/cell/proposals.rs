@@ -1069,6 +1069,24 @@ impl Cell {
                 if !super::ops::note_purged(&inner.conn, &target)? {
                     let row = super::ops::read_note_status(&inner.conn, &target)?
                         .ok_or_else(|| CellError::NoteNotFound(target.to_string()))?;
+                    // v0.6.18 (F3): the rule of a git merge — a correction
+                    // is worth against the version it corrected. A target a
+                    // LATER correction (or a delete) already closed refuses
+                    // the ACCEPT (the machine fence below refuses it the
+                    // same way): two accepts used to leave two active
+                    // versions of the same fact. A purged target stays
+                    // decidable (v0.6.11, K1) — the accept lands as a NEW
+                    // note; a quarantined one is not closed, it waits.
+                    if let DecisionAction::Accept { .. } = input.action
+                        && !matches!(row.0, Status::Active | Status::Quarantined)
+                    {
+                        let closed_by = active_head_of(&inner.conn, &target)?
+                            .unwrap_or(target);
+                        return Err(CellError::StaleTarget {
+                            target: target.to_string(),
+                            closed_by: closed_by.to_string(),
+                        });
+                    }
                     target_before = Some(serde_json::json!({
                         "id": target.to_string(),
                         "status": row.0.as_str(),
@@ -1633,6 +1651,42 @@ impl Cell {
         s.map(|v| serde_json::from_str(&v))
             .transpose()
             .map_err(|e| CellError::Db(format!("bad policy: {e}")))
+    }
+}
+
+/// The note that now carries the fact a closed target used to carry: the
+/// active head of its `supersedes` chain (v0.6.18, F3). `None` when
+/// nothing ACTIVE closes the target — a tombstone closed it, or every
+/// closer was itself closed or forgotten later.
+fn active_head_of(conn: &rusqlite::Connection, target: &Ulid) -> Result<Option<Ulid>, CellError> {
+    let mut current = *target;
+    for _ in 0..256 {
+        // a chain longer than this is not a chain, it is a loop: the log
+        // cannot hold one (the closing always names an OLDER note)
+        let next: Option<String> = conn
+            .query_row(
+                "SELECT s.new_id FROM supersedes s JOIN notes n ON n.id = s.new_id
+                 WHERE s.old_id = ?1 AND n.status = 'active'
+                 ORDER BY s.new_id DESC LIMIT 1",
+                [current.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(next) = next else {
+            break;
+        };
+        let Ok(u) = Ulid::from_string(&next) else {
+            break;
+        };
+        if u == current {
+            break;
+        }
+        current = u;
+    }
+    if current == *target {
+        Ok(None)
+    } else {
+        Ok(Some(current))
     }
 }
 
