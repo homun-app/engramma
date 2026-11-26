@@ -148,11 +148,11 @@ fn invalid_argument(message: impl std::fmt::Display) -> Error {
 
 fn cell_error(e: CellError) -> Error {
     match e {
-        CellError::NoteNotFound(_) => not_found("nota inesistente in questa cella"),
-        CellError::VersionNotFound(..) => not_found("versione inesistente per questa nota"),
+        CellError::NoteNotFound(_) => not_found("no such note in this cell"),
+        CellError::VersionNotFound(..) => not_found("no such version for this note"),
         CellError::Compacted { snapshot_seq } => transport_err(
             "COMPACTED",
-            format!("le operazioni sotto seq {snapshot_seq} sono compattate"),
+            format!("the operations below seq {snapshot_seq} are compacted"),
         ),
         // v0.5 (P0): ONLY the new code, no new methods — an old Homun `.node`
         // must be told the cell is newer, not left to write under tables it
@@ -160,27 +160,27 @@ fn cell_error(e: CellError) -> Error {
         CellError::SchemaTooNew { found, supported } => transport_err(
             "SCHEMA_TOO_NEW",
             format!(
-                "lo schema della cella è più nuovo di questo binario \
-                 (versione {found}, supportata fino a {supported}): aggiorna il binding"
+                "the cell's schema is newer than this binary \
+                 (version {found}, supported up to {supported}): update the binding"
             ),
         ),
         CellError::Invalid(m) if m.contains("can only be `quarantined`") => transport_err(
             "CONFLICT",
-            "una nota external nasce in quarantena: `confirm` la promuove",
+            "an external note is born in quarantine: `confirm` promotes it",
         ),
         CellError::Invalid(m) if m.contains("is a tombstone") => transport_err(
             "CONFLICT",
-            "la nota è una lapide: si ripristina dallo storico, una riscrittura \
-             non la resuscita",
+            "the note is a tombstone: it is restored from the history, a rewrite \
+             does not bring it back",
         ),
         CellError::Invalid(m) if m.contains("a rewrite preserves") => transport_err(
             "CONFLICT",
-            "una riscrittura conserva lo stato della nota: lo cambia \
-             `setStatus`, `confirm` o `delete`",
+            "a rewrite keeps the note's status: `setStatus`, `confirm` or \
+             `delete` change it",
         ),
         CellError::Invalid(m) if m.contains("is not quarantined") => transport_err(
             "QUARANTINED",
-            "la nota non è in quarantena: niente da confermare",
+            "the note is not in quarantine: nothing to confirm",
         ),
         // v0.6.4 (D3): resolving a conflict that is already closed
         CellError::Conflict(m) => transport_err("CONFLICT", m),
@@ -191,11 +191,11 @@ fn cell_error(e: CellError) -> Error {
         CellError::NotePurged(id) => transport_err(
             "NOTE_PURGED",
             format!(
-                "la nota {id} è purgata: quell'id non torna, \
-                 serve una nota nuova"
+                "the note {id} is purged: that id does not come back, \
+                 a new note is needed"
             ),
         ),
-        CellError::Invalid(m) if m.contains("empty patch") => invalid("patch vuota"),
+        CellError::Invalid(m) if m.contains("empty patch") => invalid("empty patch"),
         // v0.6.18 (F3): the rule of a git merge — a correction is worth
         // against the version it corrected. Homun shows it on the
         // proposal's card: the target was already corrected by another
@@ -203,8 +203,8 @@ fn cell_error(e: CellError) -> Error {
         CellError::StaleTarget { target, closed_by } => transport_err(
             "STALE_TARGET",
             format!(
-                "il bersaglio {target} non è più attivo: l'ha già corretta {closed_by} — \
-                 rifiuta la proposta o proponi di nuovo sulla nota corrente"
+                "the target {target} is no longer active: {closed_by} already \
+                 corrected it — reject the proposal or propose again on the current note"
             ),
         ),
         CellError::Invalid(m) => invalid(m),
@@ -525,7 +525,7 @@ pub struct CompactOpts {
 // ---------------------------------------------------------------------------
 
 fn parse_ulid(s: &str) -> Result<Ulid> {
-    Ulid::from_string(s.trim()).map_err(|_| not_found("id non è un ULID valido"))
+    Ulid::from_string(s.trim()).map_err(|_| not_found("the id is not a valid ULID"))
 }
 
 /// Resolve an id (full or 8-char prefix, like the CLI) to a note.
@@ -553,7 +553,7 @@ fn rfc_to_validity(s: &str) -> Result<Option<Validity>> {
     }
     Validity::parse(s)
         .map(Some)
-        .map_err(|e| invalid(format!("data non valida (RFC 3339 o YYYY-MM-DD): {e}")))
+        .map_err(|e| invalid(format!("invalid date (RFC 3339 or YYYY-MM-DD): {e}")))
 }
 
 fn parse_confidence(s: &str) -> Result<Confidence> {
@@ -562,13 +562,13 @@ fn parse_confidence(s: &str) -> Result<Confidence> {
         "inferred" => Ok(Confidence::Inferred),
         "external" => Ok(Confidence::External),
         other => Err(invalid(format!(
-            "confidence non valida: {other:?} (stated|inferred|external)"
+            "invalid confidence: {other:?} (stated|inferred|external)"
         ))),
     }
 }
 
 fn parse_note_type(s: &str) -> Result<NoteType> {
-    NoteType::parse(s).map_err(|e| invalid(format!("tipo non valido: {e}")))
+    NoteType::parse(s).map_err(|e| invalid(format!("invalid type: {e}")))
 }
 
 fn aliases_of(note: &Note) -> Vec<String> {
@@ -659,7 +659,7 @@ fn snippet_of(note: &Note, max: usize) -> String {
 
 fn build_note(input: &NoteInput, id: Ulid) -> Result<Note> {
     if input.source.trim().is_empty() {
-        return Err(invalid("source è obbligatoria"));
+        return Err(invalid("source is required"));
     }
     let confidence = parse_confidence(&input.confidence)?;
     let note_type = match &input.note_type {
@@ -682,7 +682,7 @@ fn build_note(input: &NoteInput, id: Ulid) -> Result<Note> {
         Some("quarantined") => NoteStatus::Quarantined,
         Some(other) => {
             return Err(invalid(format!(
-                "status non valida: {other:?} (active|quarantined)"
+                "invalid status: {other:?} (active|quarantined)"
             )));
         }
     };
@@ -747,7 +747,7 @@ fn build_note(input: &NoteInput, id: Ulid) -> Result<Note> {
 fn parse_import_at(s: &str, field: &str) -> Result<At> {
     OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
         .map(At)
-        .map_err(|e| invalid(format!("{field} non è un istante RFC 3339 valido: {e}")))
+        .map_err(|e| invalid(format!("{field} is not a valid RFC 3339 instant: {e}")))
 }
 
 /// The import dates are for the past: a note the migration brings in was
@@ -761,7 +761,7 @@ fn reject_future_import_dates(input: &NoteInput) -> Result<()> {
         if let Some(s) = v {
             let at = parse_import_at(s, field)?;
             if at.0 > limit {
-                return Err(invalid(format!("{field} non può essere nel futuro: {s}")));
+                return Err(invalid(format!("{field} cannot be in the future: {s}")));
             }
         }
     }
@@ -773,7 +773,7 @@ fn json_to_yaml(v: &serde_json::Value) -> Result<engramma_core::format::yaml::Ya
     // `YamlValue::Map` (v0.4 rode them as pair lists, a YAML list in the
     // file; `yaml_to_json` above still reads both forms)
     engramma_core::format::yaml::YamlValue::from_json(v)
-        .map_err(|e| invalid(format!("valore di estensione non valido: {e}")))
+        .map_err(|e| invalid(format!("invalid extension value: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -793,7 +793,7 @@ fn parse_k(k: Option<u32>) -> Result<usize> {
 
 fn build_query(q: &SearchInput) -> Result<Query> {
     if q.text.trim().is_empty() {
-        return Err(invalid_argument("query senza testo"));
+        return Err(invalid_argument("query without text"));
     }
     let mut query = Query::text(&q.text).k(parse_k(q.k)?);
     // the engine's own range is 0–2: beyond it is the caller's mistake to
@@ -808,9 +808,7 @@ fn build_query(q: &SearchInput) -> Result<Query> {
     if let Some(as_of) = q.as_of.as_deref().filter(|s| !s.trim().is_empty()) {
         let t = OffsetDateTime::parse(as_of, &time::format_description::well_known::Rfc3339)
             .or_else(|_| Validity::parse(as_of).map(|v| v.start()))
-            .map_err(|e| {
-                invalid_argument(format!("asOf non valida (RFC 3339 o YYYY-MM-DD): {e}"))
-            })?;
+            .map_err(|e| invalid_argument(format!("invalid asOf (RFC 3339 or YYYY-MM-DD): {e}")))?;
         query.filters.as_of = Some(t);
     }
     if q.include_quarantined.unwrap_or(false) {
@@ -874,7 +872,7 @@ fn search_cell(
         "hybrid" => Mode::Hybrid,
         other => {
             return Err(invalid_argument(format!(
-                "mode non valida: {other:?} (text|vector|hybrid)"
+                "invalid mode: {other:?} (text|vector|hybrid)"
             )));
         }
     };
@@ -900,7 +898,7 @@ fn search_cell(
         (Mode::Vector, None) => {
             return Err(transport_err(
                 "MODEL_MISSING",
-                "ricerca vettoriale senza modello: `pullModel` prima",
+                "vector search without a model: `pullModel` first",
             ));
         }
         (Mode::Hybrid, None) => {
@@ -941,10 +939,7 @@ pub struct Gate {
 
 impl Default for Gate {
     fn default() -> Self {
-        Self::with_verdict(
-            "CLOSED",
-            "motore chiuso: `Engine.close` è già stato chiamato",
-        )
+        Self::with_verdict("CLOSED", "engine closed: `Engine.close` was already called")
     }
 }
 
@@ -964,7 +959,7 @@ impl Gate {
     fn dropped_cell(name: &str) -> Self {
         Self::with_verdict(
             "NOT_FOUND",
-            format!("cella «{name}» dimenticata da `dropCell`"),
+            format!("cell \"{name}\" forgotten by `dropCell`"),
         )
     }
 
@@ -978,7 +973,7 @@ impl Gate {
             .in_flight
             .0
             .lock()
-            .map_err(|_| transport_err("IO", "lock del gate avvelenato"))?;
+            .map_err(|_| transport_err("IO", "gate lock poisoned"))?;
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             let v = &self.verdict;
             return Err(transport_err(v.code, v.message.clone()));
@@ -996,11 +991,11 @@ impl Gate {
         let (lock, cvar) = &*self.in_flight;
         let mut n = lock
             .lock()
-            .map_err(|_| transport_err("IO", "lock del gate avvelenato"))?;
+            .map_err(|_| transport_err("IO", "gate lock poisoned"))?;
         while *n > 0 {
             n = cvar
                 .wait(n)
-                .map_err(|_| transport_err("IO", "lock del gate avvelenato"))?;
+                .map_err(|_| transport_err("IO", "gate lock poisoned"))?;
         }
         Ok(())
     }
@@ -1046,7 +1041,7 @@ type EmbedderSlot = Arc<std::sync::RwLock<Option<Arc<dyn Embedder>>>>;
 fn embedder_now(slot: &EmbedderSlot) -> Result<Option<Arc<dyn Embedder>>> {
     Ok(slot
         .read()
-        .map_err(|_| transport_err("IO", "lock dell'embedder avvelenato"))?
+        .map_err(|_| transport_err("IO", "embedder lock poisoned"))?
         .clone())
 }
 
@@ -1092,7 +1087,7 @@ impl EngineHandle {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
         if name.is_empty() || !clean {
             return Err(invalid(format!(
-                "nome cella non valido: {name:?} (a-z 0-9 - _)"
+                "invalid cell name: {name:?} (a-z 0-9 - _)"
             )));
         }
         // v0.4.3 (P0.1): the snapshot-shaped name is reserved. A cell called
@@ -1101,8 +1096,8 @@ impl EngineHandle {
         // it. `storia-snap-archivio` stays valid (the suffix is not digits)
         if engramma_core::snapshot_of(&format!("{name}.sqlite")).is_some() {
             return Err(invalid_argument(format!(
-                "nome cella riservato: {name:?} (il formato `-snap-<cifre>` \
-                 è delle istantanee di compattazione)"
+                "reserved cell name: {name:?} (the `-snap-<digits>` form \
+                 belongs to the compaction snapshots)"
             )));
         }
         // v0.4.4 (P2): on Windows `con.sqlite` still resolves to the device:
@@ -1135,7 +1130,7 @@ impl EngineHandle {
                 | "lpt9"
         ) {
             return Err(invalid_argument(format!(
-                "nome cella riservato su Windows: {name:?}"
+                "cell name reserved on Windows: {name:?}"
             )));
         }
         Ok(self.root.join("cells").join(format!("{name}.sqlite")))
@@ -1145,7 +1140,7 @@ impl EngineHandle {
         if let Some(cell) = self
             .cells
             .lock()
-            .map_err(|_| transport_err("IO", "lock delle celle avvelenato"))?
+            .map_err(|_| transport_err("IO", "cells lock poisoned"))?
             .get(name)
         {
             return Ok(cell.clone());
@@ -1161,13 +1156,13 @@ impl EngineHandle {
             }
         } else {
             if !path.exists() {
-                return Err(not_found(format!("cella {name} inesistente")));
+                return Err(not_found(format!("no such cell: {name}")));
             }
             CoreCell::open(&path).map_err(cell_error)?
         };
         self.cells
             .lock()
-            .map_err(|_| transport_err("IO", "lock delle celle avvelenato"))?
+            .map_err(|_| transport_err("IO", "cells lock poisoned"))?
             .insert(name.to_string(), cell.clone());
         Ok(cell)
     }
@@ -1189,7 +1184,7 @@ impl EngineHandle {
         let mut map = self
             .trackers
             .lock()
-            .map_err(|_| transport_err("IO", "lock delle generazioni avvelenato"))?;
+            .map_err(|_| transport_err("IO", "generations lock poisoned"))?;
         let tracker = map
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(Gate::dropped_cell(name)))
@@ -1283,7 +1278,7 @@ impl Task for OpenTask {
         std::fs::create_dir_all(root.join("cells"))
             .map_err(|e| transport_err("IO", format!("{}: {e}", root.display())))?;
         if self.opts.actor.trim().is_empty() {
-            return Err(invalid("actor è obbligatorio (per esempio \"homun\")"));
+            return Err(invalid("actor is required (for example \"homun\")"));
         }
         let model_dir = self.opts.model_dir.as_ref().map(PathBuf::from);
         let want_builtin = self.opts.embedder.as_deref().unwrap_or("builtin") == "builtin";
@@ -1489,12 +1484,12 @@ impl Task for PullModelTask {
             let loaded =
                 engramma_embed::Builtin::load_named(&dir, "granite-embedding-97m-multilingual-r2")
                     .map_err(|e| {
-                        transport_err("IO", format!("il modello scaricato non si carica: {e}"))
+                        transport_err("IO", format!("the downloaded model does not load: {e}"))
                     })?;
             *self
                 .embedder
                 .write()
-                .map_err(|_| transport_err("IO", "lock dell'embedder avvelenato"))? =
+                .map_err(|_| transport_err("IO", "embedder lock poisoned"))? =
                 Some(Arc::new(loaded) as Arc<dyn Embedder>);
         }
         Ok(())
@@ -1520,7 +1515,7 @@ impl Task for EngineSearchTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         if self.cells.is_empty() {
-            return Err(invalid_argument("serve almeno una cella"));
+            return Err(invalid_argument("at least one cell is needed"));
         }
         let k = parse_k(self.q.k)?;
         // v0.4.2 (P1.4): read ONCE — the slot can fill mid-flight (a pull
@@ -1580,7 +1575,7 @@ impl Task for CloseTask {
         if let Some(shared) = self
             .sync
             .lock()
-            .map_err(|_| transport_err("IO", "lock della sync avvelenato"))?
+            .map_err(|_| transport_err("IO", "sync lock poisoned"))?
             .take()
         {
             shared.stop();
@@ -1591,7 +1586,7 @@ impl Task for CloseTask {
         self.gate.seal_and_wait()?;
         self.cells
             .lock()
-            .map_err(|_| transport_err("IO", "lock delle celle avvelenato"))?
+            .map_err(|_| transport_err("IO", "cells lock poisoned"))?
             .clear();
         Ok(())
     }
@@ -1631,7 +1626,7 @@ impl Task for DropCellTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         if self.reason.trim().is_empty() {
-            return Err(invalid_argument("reason è obbligatoria"));
+            return Err(invalid_argument("reason is required"));
         }
         // v0.6.2 (S2): a SHARED cell does not go quietly — the service
         // would keep syncing a deleted file. Say it, refuse it. (One stat
@@ -1644,12 +1639,12 @@ impl Task for DropCellTask {
         {
             return Err(transport_err(
                 "CONFLICT",
-                "la cella è condivisa: `unshare` prima di `dropCell`",
+                "the cell is shared: `unshare` before `dropCell`",
             ));
         }
         let path = self.handle.cell_path(&self.name)?;
         if !path.exists() {
-            return Err(not_found(format!("cella {} inesistente", self.name)));
+            return Err(not_found(format!("no such cell: {}", self.name)));
         }
         // The generations map stays LOCKED for the whole drop. The entry
         // goes first and its gate is SEALED: the operations of that cell
@@ -1662,7 +1657,7 @@ impl Task for DropCellTask {
             .handle
             .trackers
             .lock()
-            .map_err(|_| transport_err("IO", "lock delle generazioni avvelenato"))?;
+            .map_err(|_| transport_err("IO", "generations lock poisoned"))?;
         if let Some(tracker) = generations.remove(&self.name) {
             tracker.seal_and_wait()?;
         }
@@ -1672,7 +1667,7 @@ impl Task for DropCellTask {
         self.handle
             .cells
             .lock()
-            .map_err(|_| transport_err("IO", "lock delle celle avvelenato"))?
+            .map_err(|_| transport_err("IO", "cells lock poisoned"))?
             .remove(&self.name);
         // every view loses the files it holds for this cell's notes, now —
         // an unreachable view is a problem in the report, never a throw
@@ -2206,7 +2201,7 @@ impl Task for ListTask {
                         "superseded" => Ok(NoteStatus::Superseded),
                         "deleted" => Ok(NoteStatus::Deleted),
                         other => Err(invalid_argument(format!(
-                            "status non valida: {other:?} \
+                            "invalid status: {other:?} \
                              (active|quarantined|superseded|deleted)"
                         ))),
                     })
@@ -2397,7 +2392,7 @@ impl Task for SetStatusTask {
             // problem — deleting is `delete`
             other => {
                 return Err(invalid_argument(format!(
-                    "status non valida: {other:?} (active|quarantined|superseded)"
+                    "invalid status: {other:?} (active|quarantined|superseded)"
                 )));
             }
         };
@@ -2837,7 +2832,7 @@ impl Task for ResolveConflictTask {
             "merged" => engramma_core::ResolveKeep::Merged,
             other => {
                 return Err(invalid_argument(format!(
-                    "`keep` vale original | copy | merged, non `{other}`"
+                    "`keep` is original | copy | merged, not `{other}`"
                 )));
             }
         };
@@ -2868,7 +2863,7 @@ impl Task for PurgeTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         if self.reason.trim().is_empty() {
-            return Err(invalid("reason è obbligatoria"));
+            return Err(invalid("reason is required"));
         }
         let id = resolve_id(&self.cell, &self.id)?;
         // v0.4.1 (P0.2): the SAME purge the CLI runs — the views included.
@@ -2919,7 +2914,7 @@ impl Task for EmbedPendingTask {
         let Some(embedder) = embedder_now(&self.embedder)? else {
             return Err(transport_err(
                 "MODEL_MISSING",
-                "embedPending senza modello: `pullModel` prima",
+                "embedPending without a model: `pullModel` first",
             ));
         };
         let model = embedder.model_id().to_string();
@@ -3121,7 +3116,7 @@ impl Task for CompactTask {
             .map_err(cell_error)?
             .first()
             .and_then(|s| s.parse().ok())
-            .ok_or_else(|| transport_err("IO", "testa del registro illeggibile"))?;
+            .ok_or_else(|| transport_err("IO", "the log head is unreadable"))?;
         let cut = (head - self.keep_last).max(1);
         let opts = engramma_core::cell::CompactOptions {
             keep_snapshot: self.keep_snapshot,
@@ -3488,9 +3483,9 @@ impl Cell {
                 env,
                 transport_err(
                     "EXPERIMENTAL",
-                    "la compattazione è sperimentale: i difetti dichiarati del taglio \
-                 (crates/engramma-core/tests/open-defects.txt) sono aperti — \
-                 apri la cella con { experimental: ['compaction'] } per usarla lo stesso",
+                    "compaction is experimental: the declared defects of the cut \
+                 (crates/engramma-core/tests/open-defects.txt) are open — \
+                 open the cell with { experimental: ['compaction'] } to use it all the same",
                 ),
             ));
         }
@@ -3607,13 +3602,13 @@ impl Task for VaultUnbindTask {
                             .map(|v| format!("{} ({})", v.root, &v.view_id[v.view_id.len() - 8..]))
                             .collect::<Vec<_>>()
                             .join(", ");
-                        return Err(invalid(format!("«{arg}» indica {n} viste: {list}")));
+                        return Err(invalid(format!("\"{arg}\" names {n} views: {list}")));
                     }
                 }
             }
         };
         let Some(view) = view else {
-            return Err(not_found(format!("nessuna vista legata a «{arg}»")));
+            return Err(not_found(format!("no view bound to \"{arg}\"")));
         };
         self.cell.vault_unbind(&view.view_id).map_err(cell_error)?;
         Ok(())
@@ -3636,7 +3631,7 @@ impl Task for VaultUnbindTask {
 #[napi(object)]
 pub struct SyncOpts {
     /// This device's name in the list, when it is the first (and the
-    /// name a `join` presents). Default `portatile`.
+    /// name a `join` presents). Default `laptop`.
     pub device_name: Option<String>,
     /// `'default'` (n0's public relays), `'none'` (direct connections
     /// only) or `{ url }` for one's own — like the CLI's flags; the
@@ -3665,7 +3660,7 @@ fn parse_relay(v: Option<serde_json::Value>) -> Result<Option<engramma_sync::rel
             )))
         }
         _ => Err(invalid_argument(
-            "relay non valida: 'default' | 'none' | { url }",
+            "invalid relay: 'default' | 'none' | { url }",
         )),
     }
 }
@@ -3843,7 +3838,7 @@ impl EventHub {
         self.listeners
             .lock()
             .map(|mut ls| ls.push((id, l)))
-            .map_err(|_| transport_err("IO", "lock degli eventi avvelenato"))
+            .map_err(|_| transport_err("IO", "events lock poisoned"))
             .ok();
         id
     }
@@ -4019,12 +4014,12 @@ impl Task for SyncOpenTask {
             .opts
             .device_name
             .clone()
-            .unwrap_or_else(|| "portatile".into());
+            .unwrap_or_else(|| "laptop".into());
         let mut slot = self
             .handle
             .sync
             .lock()
-            .map_err(|_| transport_err("IO", "lock della sync avvelenato"))?;
+            .map_err(|_| transport_err("IO", "sync lock poisoned"))?;
         let shared = match slot.as_ref() {
             Some(shared) => Arc::clone(shared),
             None => {

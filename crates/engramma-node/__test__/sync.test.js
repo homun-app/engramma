@@ -63,7 +63,7 @@ test('share/unshare/status/runOnce: the shapes', async () => {
   // with the default name)
   const devices = await sync.devices();
   assert.equal(devices.length, 1);
-  assert.equal(devices[0].name, 'portatile');
+  assert.equal(devices[0].name, 'laptop');
   assert.equal(devices[0].isSelf, true);
   assert.equal(devices[0].live, true);
   // a pass with no peers: a report, never an error

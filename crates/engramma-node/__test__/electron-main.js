@@ -62,7 +62,7 @@ app.whenReady().then(async () => {
       embedder: 'none',
       actor: 'homun',
     });
-    const sync = await e2.sync({ deviceName: 'portatile', relay: 'none' });
+    const sync = await e2.sync({ deviceName: 'laptop', relay: 'none' });
     const shared = await e2.cell('memoria');
     await shared.put({ body: 'scritta condivisa', source: 'homun', confidence: 'stated' });
     await sync.share('memoria');

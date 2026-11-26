@@ -51,6 +51,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   an unreachable view, an orphan `.conflitto` copy, a file that would
   change a note's status, the guard against a mass deletion. The
   `.conflitto` suffix of the files stays: it is a name on disk.
+- The Node binding's error messages are in English — the `Error` a
+  client catches keeps its `e.code` — and so is the default name of the
+  first device of `sync()` (`laptop`).
 
 ### Fixed
 

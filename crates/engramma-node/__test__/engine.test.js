@@ -286,7 +286,7 @@ test('compact() without the experimental opt-in refuses, and the cell does not c
   // in the async task: the async wrapper is what `await` sees
   await assert.rejects(
     async () => cell.compact(1),
-    (err) => err.code === 'EXPERIMENTAL' && /sperimentale/.test(err.message),
+    (err) => err.code === 'EXPERIMENTAL' && /experimental/.test(err.message),
   );
   // nothing moved: the head is the same, no cut answers below it
   const after = await cell.changesSince(0);
