@@ -53,6 +53,12 @@ pub enum Error {
     /// upgrade (or this device does).
     #[error("peer outdated: {0}")]
     PeerOutdated(String),
+    /// v0.6.19: the human on THIS side said no to the six digits of the
+    /// SAS (`inviter` or `joiner` says who). A variant, not a message to
+    /// read back: the service tells a refused SAS by this alone, whatever
+    /// language the words speak.
+    #[error("the SAS was refused by the {0}")]
+    SasRefused(&'static str),
 }
 
 /// Does this connect failure look like the peer's ALPN refusing ours —

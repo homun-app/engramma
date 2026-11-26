@@ -216,7 +216,7 @@ pub async fn invite<C: SasConfirm>(
     let sas = six_digits(&shared, &transcript);
     if !confirm.confirm(&sas).await {
         // this side said no: close, the peer's next read fails, no add
-        return Err(Error::Malformed(" SAS rifiutata da chi invita".into()));
+        return Err(Error::SasRefused("inviter"));
     }
     send_frame(&conn, &json!({"kind": "confirmed"})).await?;
     // both sides confirmed: theirs arrives too, and only then the identity
@@ -379,7 +379,7 @@ pub async fn join<C: SasConfirm>(
     let (shared, transcript) = pake_turns(&conn, Side::Joiner, &ticket.secret).await?;
     let sas = six_digits(&shared, &transcript);
     if !confirm.confirm(&sas).await {
-        return Err(Error::Malformed(" SAS rifiutata da chi entra".into()));
+        return Err(Error::SasRefused("joiner"));
     }
     send_frame(&conn, &json!({"kind": "confirmed"})).await?;
     // the inviter's confirmation arrives before we say who we are

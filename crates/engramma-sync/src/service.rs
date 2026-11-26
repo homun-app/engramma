@@ -165,7 +165,9 @@ impl ServiceError {
             // other side refused, or vanished right after
             return Self::PairingRejected;
         }
-        if text.contains("rifiutata") {
+        // v0.6.19: this side said no — a variant, never a word to find in
+        // the message (the messages may change language; this does not)
+        if matches!(e, Error::SasRefused(_)) {
             return Self::PairingRejected;
         }
         if text.contains("expired") || text.contains("timed out (ten minutes)") {
@@ -2442,9 +2444,7 @@ async fn code_invite(
     };
     if !inner.confirm_round(&sas).await {
         relay.burn(code.channel).await.ok();
-        return Err(Error::Malformed(
-            " SAS rifiutata da chi invita col codice".into(),
-        ));
+        return Err(Error::SasRefused("inviter"));
     }
     // the sealed confirmation, then the fresh ticket
     let rkey = crate::mailbox_net::relay_key(&shared, &transcript);
@@ -2500,9 +2500,7 @@ async fn join_with_code(
     };
     if !inner.confirm_round(&sas).await {
         relay.burn(code.channel).await.ok();
-        return Err(Error::Malformed(
-            " SAS rifiutata da chi entra col codice".into(),
-        ));
+        return Err(Error::SasRefused("joiner"));
     }
     let rkey = crate::mailbox_net::relay_key(&shared, &transcript);
     let their_blob = relay.recv().await?;
@@ -2518,4 +2516,48 @@ async fn join_with_code(
     relay.burn(code.channel).await.ok();
     // the direct ticket flow (its own SAS round)
     pairing_net::join(&endpoint, &ticket, name, root, inner.as_ref()).await
+}
+
+#[cfg(test)]
+mod sas_tests {
+    use super::*;
+
+    /// v0.6.19: a refused SAS is known by its variant, never by its
+    /// words. The service used to look for «rifiutata» in the message: a
+    /// message in another language would have turned a refusal into an
+    /// internal error.
+    #[test]
+    fn a_refused_sas_is_known_by_its_variant_not_by_its_words() {
+        let (answers, answers_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = PairingHandle::from_parts(answers, answers_rx);
+        let inner = &handle.inner;
+        for side in ["inviter", "joiner"] {
+            assert!(
+                matches!(
+                    ServiceError::from_pairing(inner, &Error::SasRefused(side)),
+                    ServiceError::PairingRejected
+                ),
+                "a refusal by the {side} is PAIRING_REJECTED"
+            );
+        }
+        // the old spelling, alone, convinces nobody
+        let spelled = Error::Malformed(" SAS rifiutata da chi invita".into());
+        assert!(
+            matches!(
+                ServiceError::from_pairing(inner, &spelled),
+                ServiceError::Io(_)
+            ),
+            "no message is read for its words"
+        );
+        // and the other families keep their codes
+        let late = Error::Malformed("the invite timed out (ten minutes)".into());
+        assert!(matches!(
+            ServiceError::from_pairing(inner, &late),
+            ServiceError::PairingExpired
+        ));
+        assert!(matches!(
+            ServiceError::from_pairing(inner, &Error::BadKey),
+            ServiceError::Io(_)
+        ));
+    }
 }
