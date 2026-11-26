@@ -482,8 +482,7 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                             }
                             _ => false,
                         };
-                        let was_active =
-                            target.is_some_and(|t| !purged.contains(&t));
+                        let was_active = target.is_some_and(|t| !purged.contains(&t));
                         decided.push((id, target, closed, was_active));
                     }
                 }
@@ -538,7 +537,9 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                             .map(|(_, t, _, was)| (*t, *was))
                             .unwrap_or((None, false));
                         match cell.revert_decision(&d.op_id, "ripensamento", "user@cli") {
-                            Ok(engramma_core::cell::proposals::RevertOutcome::Reverted { .. }) => {
+                            Ok(engramma_core::cell::proposals::RevertOutcome::Reverted {
+                                ..
+                            }) => {
                                 decided.retain(|(p, _, _, _)| *p != proposal);
                                 queue.push((proposal, target));
                                 active.retain(|x| *x != proposal);
@@ -591,17 +592,38 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
             _ => {}
         }
 
-        // THE INVARIANT (checked after every step): for every pair of
-        // active notes, neither carries a chain that reaches the other
-        for b in &active {
-            let chain = chain_of(&cell, b);
-            for a in &active {
-                if a != b {
-                    prop_assert!(
-                        !chain.contains(a),
-                        "two active notes in one supersede chain: {b} → {a}"
-                    );
-                }
+        // THE INVARIANT (checked after every step, ON THE REAL CELL): the
+        // active notes are read BACK from the cell — the model only picks
+        // the moves, it copies the engine instead of checking it. For
+        // every pair of real active notes the chains are DISJOINT: two
+        // active notes share no ancestor. «A chain reaches the other
+        // note» is only the special case: the defect this property
+        // guards (v0.6.18, F3) leaves two SIBLING corrections active
+        // over the same target — neither chain holds the other note,
+        // both hold the target.
+        let mut chains: Vec<(Ulid, Vec<Ulid>)> = Vec::new();
+        for id in cell.note_ids_all().unwrap(/* test-only */) {
+            if let Ok(n) = cell.get(&id)
+                && n.status == Status::Active
+            {
+                chains.push((id, chain_of(&cell, &id)));
+            }
+        }
+        for i in 0..chains.len() {
+            for j in i + 1..chains.len() {
+                let shared: Vec<Ulid> = chains[i]
+                    .1
+                    .iter()
+                    .filter(|x| chains[j].1.contains(x))
+                    .copied()
+                    .collect();
+                prop_assert!(
+                    shared.is_empty(),
+                    "two active notes in one supersede chain: {} and {} share {:?}",
+                    chains[j].0,
+                    chains[i].0,
+                    shared
+                );
             }
         }
     }
@@ -612,18 +634,29 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
     Ok(())
 }
 
-/// The transitive `supersedes` chain of a note, through the living notes —
-/// a purged member ends the walk (its rows are gone, it cannot be active).
+/// The transitive `supersedes` chain of a note, read where the ENGINE
+/// keeps it — the `supersedes` TABLE, not the note's own field: a
+/// proposal accepted through the queue carries the link in the table
+/// alone (the frontmatter is the caller's, and the accept does not
+/// touch it). The rows are the current ones — a purge or a reverted
+/// decision takes its rows away, so the walk ends on its own where the
+/// chain was.
 fn chain_of(cell: &Cell, root: &Ulid) -> Vec<Ulid> {
     let mut seen = vec![*root];
     let mut i = 0;
     while i < seen.len() && i < 256 {
-        let Ok(n) = cell.get(&seen[i]) else {
-            break; // purged or unknown: the chain stops here
-        };
-        for old in &n.supersedes {
-            if !seen.contains(old) {
-                seen.push(*old);
+        for s in cell
+            .debug_column(&format!(
+                "SELECT old_id FROM supersedes WHERE new_id = '{}'",
+                seen[i]
+            ))
+            .unwrap(/* test-only */)
+        {
+            let Ok(old) = Ulid::from_string(&s) else {
+                continue;
+            };
+            if !seen.contains(&old) {
+                seen.push(old);
             }
         }
         i += 1;
