@@ -252,13 +252,13 @@ pub async fn run_initiator(conn: Connection, ctx: &SessionCtx<'_>) -> Result<Ses
     )
     .await?;
     if trace() {
-        eprintln!("I: hello mandato");
+        eprintln!("I: hello sent");
     }
     // 2. their registry rows (the answerer validates nothing of ours: every
     //    row carries its signature) and their device id
     let answer = recv_frame(&conn).await?;
     if trace() {
-        eprintln!("I: registry ricevuta");
+        eprintln!("I: registry received");
     }
     if answer.get("kind").and_then(Value::as_str) != Some("registry") {
         return Err(Error::Malformed("expected the registry answer".into()));
@@ -270,11 +270,11 @@ pub async fn run_initiator(conn: Connection, ctx: &SessionCtx<'_>) -> Result<Ses
     if let Some(peer) = answer.get("device").and_then(Value::as_str) {
         send_wraps(&conn, ctx, peer).await?;
         if trace() {
-            eprintln!("I: wraps mandati");
+            eprintln!("I: wraps sent");
         }
         recv_wraps(&conn, ctx).await?;
         if trace() {
-            eprintln!("I: wraps ricevuti");
+            eprintln!("I: wraps received");
         }
     }
     // 3. every shared cell: offer, reconcile, exchange envelopes
@@ -357,7 +357,7 @@ pub async fn run_answerer(conn: Connection, ctx: &SessionCtx<'_>) -> Result<Sess
 async fn cell_exchange_initiator(conn: &Connection, cell: &dyn SyncedCell) -> Result<CellReport> {
     let mut_cell = cell; // one exchange, one driver
     if trace() {
-        eprintln!("I: i miei id {}", mut_cell.ids().len());
+        eprintln!("I: my ids {}", mut_cell.ids().len());
     }
     let mut neg = Reconciler::initiator(mut_cell.ids())?;
     let query = neg.initiate()?;
@@ -369,13 +369,13 @@ async fn cell_exchange_initiator(conn: &Connection, cell: &dyn SyncedCell) -> Re
     .await?;
     let answer = recv_frame(conn).await?;
     if trace() {
-        eprintln!("I: cell_answer ricevuta");
+        eprintln!("I: cell_answer received");
     }
     let reply = unb64(answer["reply"].as_str().unwrap_or(""))?;
     let outcome = neg.reconcile_as_initiator(&reply)?;
     if trace() {
         eprintln!(
-            "I: riconciliazione — have {} need {}",
+            "I: reconciliation — have {} need {}",
             outcome.have.len(),
             outcome.need.len()
         );
@@ -422,7 +422,7 @@ async fn finish_initiator_exchange(
         .await?;
         let lot = recv_frame(conn).await?;
         if trace() {
-            eprintln!("I: lotto ricevuto");
+            eprintln!("I: lot received");
         }
         if let Some(envs) = lot["envs"].as_array() {
             for env in envs {

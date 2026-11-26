@@ -239,7 +239,7 @@ impl SyncedCell for SharedCell {
                 self.record_unsent(
                     &crate::device::hex(id32)[..16],
                     "?",
-                    "non trovata in questa copia",
+                    "not found in this copy",
                 );
                 return None;
             }
@@ -247,11 +247,7 @@ impl SyncedCell for SharedCell {
         let epoch = match self.current_epoch() {
             Ok(epoch) => epoch,
             Err(_) => {
-                self.record_unsent(
-                    &op.op_id.to_string()[..16],
-                    op.kind.as_str(),
-                    "nessuna epoca",
-                );
+                self.record_unsent(&op.op_id.to_string()[..16], op.kind.as_str(), "no epoch");
                 return None;
             }
         };
@@ -259,7 +255,7 @@ impl SyncedCell for SharedCell {
             self.record_unsent(
                 &op.op_id.to_string()[..16],
                 op.kind.as_str(),
-                "chiave dell'epoca assente",
+                "epoch key missing",
             );
             return None;
         };
@@ -276,7 +272,7 @@ impl SyncedCell for SharedCell {
                     self.record_unsent(
                         &op.op_id.to_string()[..16],
                         op.kind.as_str(),
-                        "senza firma e fuori dall'albero dell'adopt",
+                        "unsigned and outside the adopt tree",
                     );
                     return None;
                 }
@@ -292,7 +288,7 @@ impl SyncedCell for SharedCell {
                     self.record_unsent(
                         &op.op_id.to_string()[..16],
                         op.kind.as_str(),
-                        "del rimosso, senza prova dell'insieme",
+                        "of a removed device, without the proof of the set",
                     );
                     return None;
                 }
@@ -308,7 +304,7 @@ impl SyncedCell for SharedCell {
                 self.record_unsent(
                     &op.op_id.to_string()[..16],
                     op.kind.as_str(),
-                    "sigillatura fallita",
+                    "sealing failed",
                 );
                 return None;
             }

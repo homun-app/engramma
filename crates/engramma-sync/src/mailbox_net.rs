@@ -392,7 +392,7 @@ impl NodeAddr {
         .await;
         match tried {
             Err(_) => Err(Error::Io(std::io::Error::other(
-                "nessuna strada ha risposto in 10 s",
+                "no path answered within 10 s",
             ))),
             Ok(Ok(conn)) => Ok(conn),
             Ok(Err(e)) => Err(Error::Io(std::io::Error::other(e.to_string()))),
@@ -950,7 +950,7 @@ pub async fn meet_code(
             Some("paired") => return Ok(RelayConnection { conn }),
             Some("burnt") => {
                 return Err(Error::Registry(
-                    "il canale è bruciato: un tentativo per codice".into(),
+                    "the channel is burnt: one attempt per code".into(),
                 ));
             }
             _ => {
@@ -1225,7 +1225,7 @@ async fn wait_pair(
                 .lock()
                 .expect(/* as above */ "node channels")
                 .remove(&channel);
-            return Err(Error::Malformed("nessuno è arrivato sul canale".into()));
+            return Err(Error::Malformed("nobody arrived on the channel".into()));
         }
         let second = channels()
             .lock()
@@ -1242,7 +1242,7 @@ async fn wait_pair(
                 send_frame(conn, &json!({"kind": "paired"})).await?;
                 Ok(Some((conn.clone(), second)))
             }
-            None => Err(Error::Malformed("il canale si è chiuso".into())),
+            None => Err(Error::Malformed("the channel closed".into())),
         }
     }
 }

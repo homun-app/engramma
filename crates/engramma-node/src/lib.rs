@@ -3683,7 +3683,7 @@ pub struct SyncDeviceView {
     pub is_self: bool,
     /// The last session the address book saw (RFC 3339).
     pub last_contact: Option<String>,
-    /// What the book holds: `diretta` or `relay`.
+    /// What the book holds: `direct` or `relay`.
     pub via: Option<String>,
     /// Live, or removed (the row stays for the history).
     pub live: bool,
@@ -3752,7 +3752,7 @@ pub struct PassDeviceView {
     pub device: String,
     pub reached: bool,
     pub why_not: Option<String>,
-    /// `diretta` or `relay` when a session ran.
+    /// `direct` or `relay` when a session ran.
     pub via: Option<String>,
 }
 

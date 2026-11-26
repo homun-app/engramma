@@ -224,7 +224,7 @@ async fn build_endpoint(
         RelayChoice::Own(url) => {
             let parsed: iroh::RelayUrl = url
                 .parse()
-                .map_err(|e| Error::Malformed(format!("relay non valido `{url}`: {e}")))?;
+                .map_err(|e| Error::Malformed(format!("invalid relay `{url}`: {e}")))?;
             iroh::RelayMode::Custom(iroh::RelayMap::from_iter([parsed]))
         }
     };

@@ -112,22 +112,20 @@ impl ServiceError {
     #[must_use]
     pub fn message(&self) -> String {
         match self {
-            Self::Busy => "un altro servizio di sincronizzazione è già \
-                           attivo su questa radice (sync.lock)"
+            Self::Busy => "another sync service is already active on this root \
+                           (sync.lock)"
                 .into(),
-            Self::PairingRejected => "codice di verifica rifiutato".into(),
-            Self::PairingTimeout => "nessuna risposta al codice di verifica in tempo".into(),
-            Self::PairingExpired => "il biglietto è scaduto".into(),
-            Self::NoMailbox => "nessuna casella postale configurata: \
-                                `engramma mailbox add` prima"
-                .into(),
-            Self::NotShared => "la cella non è condivisa da questa radice".into(),
-            Self::LastDevice => "l'ultimo dispositivo non si rimuove".into(),
-            Self::Cancelled => "abbinamento annullato".into(),
-            Self::NotFound(what) => format!("{what} non esiste"),
+            Self::PairingRejected => "verification code refused".into(),
+            Self::PairingTimeout => "no answer to the verification code in time".into(),
+            Self::PairingExpired => "the ticket expired".into(),
+            Self::NoMailbox => "no mailbox configured: `engramma mailbox add` first".into(),
+            Self::NotShared => "the cell is not shared from this root".into(),
+            Self::LastDevice => "the last device is not removed".into(),
+            Self::Cancelled => "pairing cancelled".into(),
+            Self::NotFound(what) => format!("{what} does not exist"),
             Self::Invalid(why) => why.clone(),
             Self::PeerOutdated(who) => format!(
-                "il dispositivo {who} usa regole di materializzazione diverse:                  aggiornalo (o aggiorna questo dispositivo) prima di sincronizzare"
+                "the device {who} uses different materialization rules: update it (or update this device) before syncing"
             ),
             Self::Io(why) => why.clone(),
         }
@@ -143,7 +141,7 @@ impl ServiceError {
         if text.contains("last device") || text.contains("orphan") {
             Self::LastDevice
         } else if text.contains("not a live member") {
-            Self::NotFound("il dispositivo".into())
+            Self::NotFound("the device".into())
         } else {
             Self::io(text)
         }
@@ -205,7 +203,7 @@ pub struct DeviceView {
     pub is_self: bool,
     /// The last session the address book saw (RFC 3339).
     pub last_contact: Option<String>,
-    /// What the book holds: `"diretta"`, `"relay"` or nothing yet.
+    /// What the book holds: `"direct"`, `"relay"` or nothing yet.
     pub via: Option<String>,
     /// Live, or removed (the row stays for the history).
     pub live: bool,
@@ -562,12 +560,12 @@ impl PairingHandle {
             .inner
             .info
             .lock()
-            .map_err(|_| ServiceError::io("lock dell'abbinamento avvelenato"))?;
+            .map_err(|_| ServiceError::io("pairing lock poisoned"))?;
         let (guard, _left) = self
             .inner
             .info_cv
             .wait_timeout_while(guard, deadline, |info| info.is_none())
-            .map_err(|_| ServiceError::io("lock dell'abbinamento avvelenato"))?;
+            .map_err(|_| ServiceError::io("pairing lock poisoned"))?;
         if guard.is_some() {
             return Ok(guard.clone().expect(/* just checked */ "info"));
         }
@@ -581,7 +579,7 @@ impl PairingHandle {
             .inner
             .state
             .lock()
-            .map_err(|_| ServiceError::io("lock dell'abbinamento avvelenato"))?;
+            .map_err(|_| ServiceError::io("pairing lock poisoned"))?;
         let until = std::time::Instant::now() + deadline;
         loop {
             match &*state {
@@ -589,7 +587,7 @@ impl PairingHandle {
                 PairingState::Done(Err(e)) => return Err(e.clone()),
                 PairingState::Done(Ok(_)) => {
                     return Err(ServiceError::Invalid(
-                        "l'abbinamento è già finito: niente altre cifre".into(),
+                        "the pairing is already over: no more digits".into(),
                     ));
                 }
                 _ => {}
@@ -602,7 +600,7 @@ impl PairingHandle {
                 .inner
                 .state_cv
                 .wait_timeout(state, until - now)
-                .map_err(|_| ServiceError::io("lock dell'abbinamento avvelenato"))?;
+                .map_err(|_| ServiceError::io("pairing lock poisoned"))?;
             state = guard;
         }
     }
@@ -615,7 +613,7 @@ impl PairingHandle {
             .inner
             .state
             .lock()
-            .map_err(|_| ServiceError::io("lock dell'abbinamento avvelenato"))?;
+            .map_err(|_| ServiceError::io("pairing lock poisoned"))?;
         match &*state {
             PairingState::SasReady(_) => {
                 *state = PairingState::Answered;
@@ -629,10 +627,10 @@ impl PairingHandle {
             }
             PairingState::Done(Err(e)) => Err(e.clone()),
             PairingState::Done(Ok(_)) => Err(ServiceError::Invalid(
-                "l'abbinamento è già finito: niente da confermare".into(),
+                "the pairing is already over: nothing to confirm".into(),
             )),
             _ => Err(ServiceError::Invalid(
-                "confirm prima delle cifre: `sas()` prima, il confronto non si salta".into(),
+                "confirm before the digits: `sas()` first, the comparison is not skipped".into(),
             )),
         }
     }
@@ -644,7 +642,7 @@ impl PairingHandle {
             .inner
             .state
             .lock()
-            .map_err(|_| ServiceError::io("lock dell'abbinamento avvelenato"))?;
+            .map_err(|_| ServiceError::io("pairing lock poisoned"))?;
         let until = std::time::Instant::now() + deadline;
         loop {
             if let PairingState::Done(out) = &*state {
@@ -658,7 +656,7 @@ impl PairingHandle {
                 .inner
                 .state_cv
                 .wait_timeout(state, until - now)
-                .map_err(|_| ServiceError::io("lock dell'abbinamento avvelenato"))?;
+                .map_err(|_| ServiceError::io("pairing lock poisoned"))?;
             state = guard;
         }
     }
@@ -888,7 +886,7 @@ impl Drop for ServiceInner {
         let sent = self.cmd_tx.send(Command::Shutdown { reply: tx }).is_ok();
         if sent && rx.recv_timeout(SHUTDOWN_REPLY).is_err() {
             eprintln!(
-                "engramma-sync: il servizio di {} non ha risposto alla chiusura entro {SHUTDOWN_REPLY:?} — i suoi fili restano vivi",
+                "engramma-sync: the service of {} did not answer the shutdown within {SHUTDOWN_REPLY:?} — its threads stay alive",
                 self.root.display()
             );
         }
@@ -897,7 +895,7 @@ impl Drop for ServiceInner {
             && !join_bounded(handle, THREAD_CLOSE)
         {
             eprintln!(
-                "engramma-sync: il filo del servizio di {} non si è chiuso entro {THREAD_CLOSE:?}",
+                "engramma-sync: the service thread of {} did not close within {THREAD_CLOSE:?}",
                 self.root.display()
             );
         }
@@ -956,9 +954,9 @@ impl SyncService {
         self.inner
             .cmd_tx
             .send(make(tx))
-            .map_err(|_| ServiceError::Io("il servizio non è più in vita".into()))?;
+            .map_err(|_| ServiceError::Io("the service is no longer alive".into()))?;
         rx.recv_timeout(bound)
-            .map_err(|_| ServiceError::Io("il servizio non ha risposto in tempo".into()))?
+            .map_err(|_| ServiceError::Io("the service did not answer in time".into()))?
     }
 
     /// This device, the service, the relay, the shared cells.
@@ -1211,7 +1209,7 @@ fn close_pairings(core: &Arc<std::sync::Mutex<WorkerCore>>) -> SResult<()> {
     }
     if stuck > 0 {
         return Err(ServiceError::Io(format!(
-            "{stuck} fili di abbinamento non si sono chiusi entro {THREAD_CLOSE:?}"
+            "{stuck} pairing threads did not close within {THREAD_CLOSE:?}"
         )));
     }
     Ok(())
@@ -1361,7 +1359,7 @@ fn book_row(root: &Path, device: &str) -> SResult<(Option<String>, Option<String
             v["addrs"]
                 .as_array()
                 .is_some_and(|a| !a.is_empty())
-                .then(|| "diretta".to_string())
+                .then(|| "direct".to_string())
         });
     Ok((v["seen_at"].as_str().map(str::to_string), via))
 }
@@ -1469,7 +1467,7 @@ fn cell_file(root: &Path, cell: &str) -> PathBuf {
 fn share_cell(root: &Path, cell: &str) -> SResult<ShareView> {
     let path = cell_file(root, cell);
     if !path.exists() {
-        return Err(ServiceError::NotFound(format!("la cella «{cell}»")));
+        return Err(ServiceError::NotFound(format!("the cell \"{cell}\"")));
     }
     let c = engramma_core::Cell::open(&path).map_err(ServiceError::io)?;
     let dk = DeviceKey::load_or_create(root).map_err(ServiceError::io)?;
@@ -1483,7 +1481,7 @@ fn share_cell(root: &Path, cell: &str) -> SResult<ShareView> {
         .map_err(ServiceError::io)?;
     let adopt = c
         .adopt_log("cli")
-        .map_err(|e| ServiceError::io(format!("cella «{cell}»: {e}")))?;
+        .map_err(|e| ServiceError::io(format!("cell \"{cell}\": {e}")))?;
     c.mark_shared().map_err(ServiceError::io)?;
     let sync_id = sharedcell::share_cell(root, cell).map_err(ServiceError::io)?;
     // the epoch-0 key wrapped for every OTHER live device
@@ -1491,7 +1489,7 @@ fn share_cell(root: &Path, cell: &str) -> SResult<ShareView> {
     let epoch0 = ks
         .key_of(&sync_id, 0)
         .map_err(ServiceError::io)?
-        .ok_or_else(|| ServiceError::Io("l'epoca 0 è andata perduta".into()))?;
+        .ok_or_else(|| ServiceError::Io("epoch 0 is lost".into()))?;
     let mut wraps = 0_usize;
     for member in reg.live_members().map_err(ServiceError::io)? {
         if member.device == dk.device_id() {
@@ -1553,7 +1551,7 @@ async fn remove_device(
         .map_err(ServiceError::io)?
         .into_iter()
         .find(|m| m.name == name)
-        .ok_or_else(|| ServiceError::NotFound(format!("nessun dispositivo «{name}»")))?;
+        .ok_or_else(|| ServiceError::NotFound(format!("no device \"{name}\"")))?;
     // the accepted set: every operation of that device this copy holds,
     // across every shared cell
     let mut hashes: Vec<String> = Vec::new();
@@ -1670,7 +1668,7 @@ async fn run_once(
     // await (the serve tasks share this thread)
     let serving_endpoint = core
         .lock()
-        .map_err(|_| ServiceError::Io("lock del servizio avvelenato".into()))?
+        .map_err(|_| ServiceError::Io("service lock poisoned".into()))?
         .serving
         .as_ref()
         .map(|s| s.endpoint.clone());
@@ -1690,7 +1688,7 @@ async fn run_once(
         .lock()
         .ok()
         .map(|g| Arc::clone(&g.pass_lock))
-        .ok_or_else(|| ServiceError::Io("lock del servizio avvelenato".into()))?;
+        .ok_or_else(|| ServiceError::Io("service lock poisoned".into()))?;
     // one pass at a time, the same lock the serve loop's worker obeys
     let _held = pass_lock.lock().await;
     let out = serve::run_pass(root, &endpoint, &[]).await;
@@ -1720,7 +1718,7 @@ async fn serve_start(
     {
         let guard = core
             .lock()
-            .map_err(|_| ServiceError::Io("lock del servizio avvelenato".into()))?;
+            .map_err(|_| ServiceError::Io("service lock poisoned".into()))?;
         if let Some(s) = &guard.serving {
             // starting twice changes nothing
             return Ok(s.info.clone());
@@ -1741,7 +1739,7 @@ async fn serve_start(
     };
     let relay_warning = (wait == relay::RelayWait::TimedOut).then(|| {
         format!(
-            "il relay non si è collegato in {} s: l'indirizzo esce senza relay",
+            "the relay did not connect within {} s: the address goes out without a relay",
             relay::RELAY_WAIT.as_secs()
         )
     });
@@ -1756,7 +1754,7 @@ async fn serve_start(
     {
         let pass_lock = core
             .lock()
-            .map_err(|_| ServiceError::Io("lock del servizio avvelenato".into()))?
+            .map_err(|_| ServiceError::Io("service lock poisoned".into()))?
             .pass_lock
             .clone();
         let core = Arc::clone(core);
@@ -1776,7 +1774,7 @@ async fn serve_start(
         });
     }
     core.lock()
-        .map_err(|_| ServiceError::Io("lock del servizio avvelenato".into()))?
+        .map_err(|_| ServiceError::Io("service lock poisoned".into()))?
         .serving = Some(Serving {
         stop,
         info: info.clone(),
@@ -1796,7 +1794,7 @@ async fn serve_stop(core: &Arc<std::sync::Mutex<WorkerCore>>) -> SResult<()> {
     let serving = {
         let mut guard = core
             .lock()
-            .map_err(|_| ServiceError::Io("lock del servizio avvelenato".into()))?;
+            .map_err(|_| ServiceError::Io("service lock poisoned".into()))?;
         guard.serving.take()
     };
     let Some(mut serving) = serving else {
@@ -1890,7 +1888,7 @@ async fn serve_loop(
                     }
                     Some(serve::PassDecision::Others(skip)) => {
                         if trace() {
-                            eprintln!("watch: tick write (verso gli altri)");
+                            eprintln!("watch: tick write (towards the others)");
                         }
                         tx.send(Tick::Others(skip)).ok();
                     }
@@ -1970,7 +1968,7 @@ async fn serve_loop(
                     let mut received: Vec<(String, i64)> = Vec::new();
                     if run {
                         if trace() {
-                            eprintln!("worker: passo {label}");
+                            eprintln!("worker: pass {label}");
                         }
                         let _held = pass_lock.lock().await;
                         let raced = tokio::select! {
@@ -1981,7 +1979,7 @@ async fn serve_loop(
                                         if trace() {
                                             for p in &report.peers {
                                                 eprintln!(
-                                                    "passo ({label}): {} reached={} via={:?} why={:?}",
+                                                    "pass ({label}): {} reached={} via={:?} why={:?}",
                                                     p.name, p.reached, p.via, p.why_not
                                                 );
                                             }
@@ -2019,7 +2017,7 @@ async fn serve_loop(
                                     }
                                     Err(e) => {
                                         if trace() {
-                                            eprintln!("passo ({label}): errore {e}");
+                                            eprintln!("pass ({label}): error {e}");
                                         }
                                         let _ = events.send(ServiceEvent::Error {
                                             code: "IO".into(),
@@ -2288,7 +2286,7 @@ async fn drive_pairing(
                 expires_ms: minted.ticket.expires_at,
                 relay: minted.relay.clone(),
                 relay_warning: minted.relay_timed_out.then(|| {
-                    "il relay non si è collegato: il biglietto esce senza relay".to_string()
+                    "the relay did not connect: the ticket goes out without a relay".to_string()
                 }),
                 node: Some(hex(serve::node_id_of(&endpoint).as_slice())),
                 addrs: serve::direct_addresses(&endpoint),
@@ -2306,7 +2304,7 @@ async fn drive_pairing(
         PairingKind::Join { text, name } => {
             if text.starts_with("engramma-invite-v1") {
                 let ticket = Ticket::decode(text)
-                    .map_err(|e| ServiceError::Invalid(format!("biglietto non valido: {e}")))?;
+                    .map_err(|e| ServiceError::Invalid(format!("invalid ticket: {e}")))?;
                 let expires = ticket.expires_at;
                 inner.set_info(PairingInfo {
                     ticket: Some(text.clone()),
@@ -2373,7 +2371,7 @@ async fn race_cancel<F: std::future::Future<Output = Result<JoinReport>>>(
     flow: F,
 ) -> Result<JoinReport> {
     tokio::select! {
-        _ = cancel_watcher(inner) => Err(Error::Malformed("annullato".into())),
+        _ = cancel_watcher(inner) => Err(Error::Malformed("cancelled".into())),
         out = flow => out,
     }
 }

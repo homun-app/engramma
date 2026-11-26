@@ -207,12 +207,12 @@ impl Daemon {
     }
 
     /// How many passes of one kind the daemon ran («write» or «clock»):
-    /// the trace's own `worker: passo <kind>` lines, one per pass.
+    /// the trace's own `worker: pass <kind>` lines, one per pass.
     fn passes(&self, kind: &str) -> usize {
         self.err
             .lock()
             .expect(/* test */ "stderr buf")
-            .matches(&format!("worker: passo {kind}"))
+            .matches(&format!("worker: pass {kind}"))
             .count()
     }
 
@@ -1044,7 +1044,7 @@ fn the_short_code_pairs_and_the_second_attempt_burns() {
         );
         let all = format!("{out}{err}");
         assert!(
-            all.contains("bruciato") || all.contains("burnt"),
+            all.contains("burnt"),
             "the refusal names the burnt channel: {all}"
         );
         let (ok, out, _) = run(&a.root, &["--json", "devices", "list"]);

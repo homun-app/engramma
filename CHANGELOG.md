@@ -42,6 +42,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   The waiting page lives at `/pending/<handle>`; the beta's
   `/attesa/<handle>` answers 308, for good. `engramma oauth log` writes
   the `detail` of the events to come in English.
+- The sync service speaks English: its refusals (the pairing, the share,
+  the removal of a device), its warnings, the reasons an operation could
+  not leave, the lines of `ENGRAMMA_TRACE`. In JSON the `why_not` of a
+  device and the `relay_warning` follow; `via` says `direct` (`diretta`
+  before).
 
 ### Fixed
 

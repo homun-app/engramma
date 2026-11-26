@@ -61,7 +61,7 @@ impl PeerAddr {
         .await;
         match tried {
             Err(_) => Err(Error::Io(std::io::Error::other(
-                "nessuna strada ha risposto in 10 s",
+                "no path answered within 10 s",
             ))),
             Ok(Ok(conn)) => Ok(conn),
             // v0.6.4 (D4): the peer's ALPN refused ours — it speaks other
@@ -212,7 +212,7 @@ pub struct PeerOutcome {
     pub reached: bool,
     /// Why not, when it did not (one line, no note text).
     pub why_not: Option<String>,
-    /// Which road the session rode (R2): `"diretta"` or `"relay"`.
+    /// Which road the session rode (R2): `"direct"` or `"relay"`.
     pub via: Option<&'static str>,
 }
 
@@ -266,7 +266,7 @@ pub async fn bind(
 pub struct SessionOutcome {
     /// The protocol's per-cell report.
     pub report: protocol::SessionReport,
-    /// `"diretta"` or `"relay"`.
+    /// `"direct"` or `"relay"`.
     pub via: &'static str,
 }
 
@@ -302,7 +302,7 @@ pub async fn session_with(
     // one-shot run above all — nothing else would ever unblock it)
     let report = tokio::time::timeout(Duration::from_secs(90), run_initiator(conn.clone(), &ctx))
         .await
-        .map_err(|_| Error::Malformed("la sessione non è finita in 90 s".into()))??;
+        .map_err(|_| Error::Malformed("the session did not end within 90 s".into()))??;
     // which road the session rode (the connection outlives the exchange)
     let via = via_of_conn(&conn);
     // the session ended: both sides hold the same sets — the acks move the
@@ -344,12 +344,12 @@ pub async fn answer_session(root: &Path, conn: Connection) -> Result<protocol::S
 pub fn via_of_conn(conn: &Connection) -> &'static str {
     let paths = conn.paths();
     if let Some(path) = paths.iter().find(|p| p.is_selected()) {
-        return if path.is_relay() { "relay" } else { "diretta" };
+        return if path.is_relay() { "relay" } else { "direct" };
     }
     if paths.iter().any(|p| p.is_relay()) {
         "relay"
     } else {
-        "diretta"
+        "direct"
     }
 }
 
@@ -401,7 +401,7 @@ pub async fn run_pass(root: &Path, endpoint: &Endpoint, skip: &[String]) -> Resu
                 name: member.name.clone(),
                 device: member.device.clone(),
                 reached: false,
-                why_not: Some("nessun indirizzo noto: servono un invito o una sessione".into()),
+                why_not: Some("no known address: an invite or a session is needed".into()),
                 via: None,
             });
             continue;

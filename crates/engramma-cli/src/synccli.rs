@@ -22,7 +22,7 @@ const FIRST_NAME: &str = "laptop";
 /// The service's own refusals, in the CLI's terms: `SYNC_BUSY` keeps its
 /// own exit code, everything the caller named is a usage or not-found,
 /// the rest is internal with the original words (a burnt channel's
-/// «bruciato» survives the crossing).
+/// «burnt» survives the crossing).
 fn svc_err(e: ServiceError) -> CliError {
     match e {
         ServiceError::Busy => CliError::busy(e.message()),
