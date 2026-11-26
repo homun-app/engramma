@@ -307,3 +307,64 @@ fn the_purge_prompt_answers_to_one_line() {
         "purged"
     );
 }
+
+/// v0.6.19 (F2.3): the confirmations read `y` and `yes` — the output is
+/// English — and still `s`, for who has scripts or habits with the beta.
+/// Anything else is a no.
+#[test]
+fn the_confirmation_accepts_y_yes_and_still_s() {
+    use std::io::Write as _;
+    for (n, answer, purged) in [
+        (2, "y\n", true),
+        (3, "yes\n", true),
+        (4, "s\n", true),
+        (5, "n\n", false),
+    ] {
+        let fx = Fixture::new(n);
+        let mut child = fx
+            .cmd()
+            .arg("purge")
+            .arg(format!("{n:08}"))
+            .arg("--reason")
+            .arg("oblio")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(/* test-only */);
+        let mut stdin = child.stdin.take().unwrap(/* test-only */);
+        stdin.write_all(answer.as_bytes()).unwrap(/* test-only */);
+        stdin.flush().unwrap(/* test-only */);
+        // the pipe stays OPEN, like a terminal
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap(/* test-only */) {
+                break Some(st);
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        drop(stdin);
+        let status = status.unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("`purge` waits for the end of stdin instead of the answer line")
+        });
+        assert_eq!(status.code(), Some(0), "answer {answer:?}");
+        let stdout =
+            String::from_utf8_lossy(&child.wait_with_output().unwrap(/* t */).stdout).to_string();
+        assert!(stdout.contains("[y/N]"), "the prompt says [y/N]: {stdout}");
+        assert!(
+            !stdout.contains("[s/N]"),
+            "the prompt is not [s/N] anymore: {stdout}"
+        );
+        let cell = Cell::open(&fx.cell_path).unwrap(/* test-only */);
+        assert_eq!(
+            cell.get(&ulid::Ulid::from_string(&format!("01{:024}", n)).unwrap(/* t */))
+                .is_err(),
+            purged,
+            "answer {answer:?}"
+        );
+    }
+}

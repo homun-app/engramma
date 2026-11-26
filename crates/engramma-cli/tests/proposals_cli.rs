@@ -425,6 +425,60 @@ fn revert_by_mcp_actor_is_a_usage_error_and_proposed_by_selects_the_proposals() 
     assert_eq!(f.cell().get(&c).unwrap(/* t */).status, Status::Active);
 }
 
+/// v0.6.19 (F2.3): the bulk revert asks `[y/N]`: `y` and `yes` confirm,
+/// and `s` still does, for who has scripts or habits with the beta.
+#[test]
+fn the_bulk_revert_confirmation_accepts_y() {
+    use std::io::Write as _;
+    let f = Fixture::new();
+    let a = f.propose("Fabio parla inglese.");
+    let b = f.propose("Fabio parla francese.");
+    let c = f.propose("Fabio parla tedesco.");
+    f.accept(&a, "reviewer:bravo");
+    f.accept(&b, "user@cli");
+    f.accept(&c, "reviewer:bravo");
+    let bulk = |by: &str, answer: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_engramma"));
+        cmd.arg("--root")
+            .arg(&f.root)
+            .args(["revert", "--by", by])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap(/* t */);
+        child
+            .stdin
+            .take()
+            .unwrap(/* t */)
+            .write_all(answer.as_bytes())
+            .unwrap(/* t */);
+        let out = child.wait_with_output().unwrap(/* t */);
+        assert!(out.status.success(), "`--by {by}`, answer {answer:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let stdout = bulk("reviewer:", "y\n");
+    assert!(stdout.contains("[y/N]"), "the prompt says [y/N]: {stdout}");
+    assert!(!stdout.contains("[s/N]"), "no more [s/N]: {stdout}");
+    assert_eq!(
+        f.cell().get(&a).unwrap(/* t */).status,
+        Status::Quarantined,
+        "`y` confirms"
+    );
+    bulk("user@cli", "yes\n");
+    assert_eq!(
+        f.cell().get(&b).unwrap(/* t */).status,
+        Status::Quarantined,
+        "`yes` confirms"
+    );
+    bulk("reviewer:", "s\n");
+    assert_eq!(
+        f.cell().get(&c).unwrap(/* t */).status,
+        Status::Quarantined,
+        "`s` still confirms (the beta's scripts)"
+    );
+}
+
 // v0.6.18 (F3): two accepted corrections of the same note became two
 // active notes (found by the site capture). The second accept refuses
 // with its own exit code, names the note that already corrected the

@@ -27,7 +27,7 @@ use engramma_core::format::{At, Lang, Note, NoteType};
 use engramma_core::port::{export, import_cell, import_obsidian};
 use engramma_core::search::Query;
 use engramma_core::{Cell, CellError, Confidence, NotePatch, Status, Validity};
-use output::{CliError, hit_human, hit_json, note_json};
+use output::{CliError, hit_human, hit_json, note_json, said_yes};
 use ulid::Ulid;
 
 /// v0.6.10 (J3): `--version` says WHICH sources built this binary — the
@@ -987,14 +987,14 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 println!(
                     "Le esportazioni fatte prima di ora restano fuori dal controllo del motore."
                 );
-                print!("procedo? [s/N] ");
+                print!("procedo? [y/N] ");
                 use std::io::Write as _;
                 std::io::stdout().flush().ok();
                 let mut answer = String::new();
                 std::io::stdin()
                     .read_line(&mut answer)
                     .map_err(|e| CliError::internal(format!("stdin: {e}")))?;
-                if !answer.trim().eq_ignore_ascii_case("s") {
+                if !said_yes(&answer) {
                     if !cli.json {
                         println!("annullato");
                     }
@@ -2352,13 +2352,13 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
             println!("ambiti chiesti: {}", req.scopes.join(" "));
             if !*yes {
                 use std::io::Write as _;
-                print!("approvo {code} con etichetta `{label}`? [s/N] ");
+                print!("approvo {code} con etichetta `{label}`? [y/N] ");
                 std::io::stdout().flush().ok();
                 let mut answer = String::new();
                 std::io::stdin()
                     .read_line(&mut answer)
                     .map_err(|e| CliError::internal(format!("stdin: {e}")))?;
-                if !answer.trim().eq_ignore_ascii_case("s") {
+                if !said_yes(&answer) {
                     println!("annullato");
                     return Ok(());
                 }
@@ -3562,7 +3562,7 @@ fn run_revert(
     }
     if !yes {
         if !cli.json {
-            print!("procedo? [s/N] ");
+            print!("procedo? [y/N] ");
         }
         use std::io::Write as _;
         std::io::stdout().flush().ok();
@@ -3570,7 +3570,7 @@ fn run_revert(
         std::io::stdin()
             .read_line(&mut answer)
             .map_err(|e| CliError::internal(format!("stdin: {e}")))?;
-        if !answer.trim().eq_ignore_ascii_case("s") {
+        if !said_yes(&answer) {
             if cli.json {
                 print_json(&serde_json::json!({ "aborted": true }));
             } else {

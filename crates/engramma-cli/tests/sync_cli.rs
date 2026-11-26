@@ -176,15 +176,17 @@ fn invite_and_join_share_the_cells() {
     drop(cell);
     let (ok, _, err) = run(&a.root, &["sync", "share", "memoria"], b"");
     assert!(ok, "sync share: {err}");
-    // A invites (waits); B joins with the ticket; both confirm the SAS
-    let (inviter, tickets) = Running::spawn(&a.root, &["devices", "invite", "--no-relay"], b"s\n");
+    // A invites (waits); B joins with the ticket; both confirm the SAS —
+    // `y` on one side and `yes` on the other (v0.6.19: the confirmations
+    // read `y`; `s` still works, the other tests below answer it)
+    let (inviter, tickets) = Running::spawn(&a.root, &["devices", "invite", "--no-relay"], b"y\n");
     let ticket = tickets
         .recv_timeout(std::time::Duration::from_secs(20))
         .expect(/* printed */ "the invite printed its ticket");
     let (ok, out, err) = run(
         &b.root,
         &["devices", "join", "--no-relay", &ticket, "--name", "mac"],
-        b"s\n",
+        b"yes\n",
     );
     assert!(ok, "join: {err} {out}");
     let (ok, out, err) = inviter.wait();

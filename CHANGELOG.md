@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.6.19-beta.1] - 2026-11-26
 
+### Changed
+
+- The interactive confirmations (`purge`, the bulk `revert`, `oauth
+  approve`, the SAS of a pairing) say `[y/N]` and read `y` and `yes`. `s`
+  still confirms, for who has scripts or habits with the beta; the SAS
+  prompt no longer reads `si` or `sì`.
+
 ### Fixed
 
 - The decisions page of `engramma review` no longer renders markup that

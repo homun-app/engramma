@@ -2043,8 +2043,9 @@ fn pending_code(s: &Server, cimd_url: &str) -> String {
 
 #[test]
 fn the_interactive_approval_answers_to_one_line() {
-    // without --yes the CLI asks [s/N]: a human types `s` and Enter, and
+    // without --yes the CLI asks [y/N]: a human types `y` and Enter, and
     // the terminal stays open — the answer is a LINE, not the whole stdin
+    // (v0.6.19: `y` is the answer; `s` still works, see purge.rs)
     use std::io::Write as _;
     let (cimd_url, _cimd) = cimd_server();
     let s = Server::start(|cfg| cfg.allow_loopback_cimd = true);
@@ -2059,7 +2060,7 @@ fn the_interactive_approval_answers_to_one_line() {
         .spawn()
         .unwrap(/* t */);
     let mut stdin = child.stdin.take().unwrap(/* t */);
-    stdin.write_all(b"s\n").unwrap(/* t */);
+    stdin.write_all(b"y\n").unwrap(/* t */);
     stdin.flush().unwrap(/* t */);
     // the pipe stays OPEN, like a terminal
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

@@ -244,3 +244,29 @@ pub fn hit_human(h: &Hit, index: usize) -> String {
     out.push_str(&format!("\n   fonte: {}", h.explain.source));
     out
 }
+
+/// v0.6.19 (F2.3): what a confirmation reads. `y` and `yes` are the answer
+/// since the output is English; `s` stays for who has scripts or habits
+/// with the beta (the CHANGELOG says so). Anything else — an empty line,
+/// a closed stdin — is a no.
+pub fn said_yes(answer: &str) -> bool {
+    matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "s"
+    )
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::said_yes;
+
+    #[test]
+    fn yes_y_and_s_confirm_and_nothing_else_does() {
+        for yes in ["y", "Y", "y\r\n", " yes ", "YES", "s", "S"] {
+            assert!(said_yes(yes), "{yes:?} confirms");
+        }
+        for no in ["", "\n", "n", "no", "si", "sì", "ye", "ys", "yess"] {
+            assert!(!said_yes(no), "{no:?} is a no");
+        }
+    }
+}

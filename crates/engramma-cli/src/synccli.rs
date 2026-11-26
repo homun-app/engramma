@@ -13,6 +13,7 @@ use std::time::Duration;
 use engramma_sync::relay::RelayChoice;
 use engramma_sync::service::{PairingHandle, ServiceError, SyncService};
 
+use crate::output::said_yes;
 use crate::{CliError, print_json};
 
 /// The default first-device name, as it always was.
@@ -34,16 +35,13 @@ fn svc_err(e: ServiceError) -> CliError {
 /// Ask the human one yes line: the SAS confirmation, the same prompt the
 /// service's staged handle asks the UI to answer.
 fn confirm_line(sas: &str) -> bool {
-    print!("codice di verifica: {sas} — confermi che è lo stesso sull'altro schermo? [s/N] ");
+    print!("codice di verifica: {sas} — confermi che è lo stesso sull'altro schermo? [y/N] ");
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     if std::io::stdin().lock().read_line(&mut line).is_err() {
         return false;
     }
-    matches!(
-        line.trim().to_lowercase().as_str(),
-        "s" | "si" | "sì" | "y" | "yes"
-    )
+    said_yes(&line)
 }
 
 /// Drive one SAS round the CLI way: wait for the digits, prompt, read the
