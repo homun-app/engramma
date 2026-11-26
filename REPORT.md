@@ -45,9 +45,10 @@ mezzo: l'inventario e il cancello (F1), poi la traduzione (F2).
   registro sono inglesi per le decisioni nuove.
 - **Core, sync, vault, binding Node**: la prosa che arrivava agli stessi
   lettori — i 17 testi del core, i 62 di sync, i 17 di vault, i 46 del
-  binding, più i messaggi dei lock. «diretta» diventa `direct`: un valore
-  in memoria, mai scritto su disco né confrontato. Il primo dispositivo
-  si chiama `laptop`.
+  binding, più i messaggi dei lock. `via` di sync resta `diretta` nel
+  JSON: è un valore enumerato del contratto e resta italiano per sempre;
+  la riga per umani dice `direct`. Il primo dispositivo si chiama
+  `laptop`.
 - **Documenti**: `docs/cli.md` apre col glossario (l'inglese contro le
   parole dei documenti italiani, che restano tali); citazioni e segnaposto
   seguono l'uscita vera (`<name>`, `<cell>`, `<copy>`: quelli italiani non

@@ -206,7 +206,14 @@ pub fn sync_run_cmd(
             match (&p.why_not, p.reached) {
                 (Some(why), _) => println!("{}: unreachable — {why}", p.name),
                 (None, _) => {
-                    let via = p.via.unwrap_or("direct");
+                    // the JSON keeps `diretta`: a stable value of the
+                    // contract, Italian for good; the human line says it
+                    // in English
+                    let via = match p.via {
+                        Some("diretta") => "direct",
+                        Some(other) => other,
+                        None => "direct",
+                    };
                     println!("{}: session done ({})", p.name, via);
                 }
             }

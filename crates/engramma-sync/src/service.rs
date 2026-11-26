@@ -203,7 +203,8 @@ pub struct DeviceView {
     pub is_self: bool,
     /// The last session the address book saw (RFC 3339).
     pub last_contact: Option<String>,
-    /// What the book holds: `"direct"`, `"relay"` or nothing yet.
+    /// What the book holds: `"diretta"`, `"relay"` or nothing yet —
+    /// stable values of the contract: `diretta` stays Italian.
     pub via: Option<String>,
     /// Live, or removed (the row stays for the history).
     pub live: bool,
@@ -1359,7 +1360,7 @@ fn book_row(root: &Path, device: &str) -> SResult<(Option<String>, Option<String
             v["addrs"]
                 .as_array()
                 .is_some_and(|a| !a.is_empty())
-                .then(|| "direct".to_string())
+                .then(|| "diretta".to_string())
         });
     Ok((v["seen_at"].as_str().map(str::to_string), via))
 }

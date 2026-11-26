@@ -245,6 +245,16 @@ async fn an_unsendable_op_is_a_summary_row_and_an_event_without_note_text() {
                     summary.contains("unsent: 1"),
                     "the summary must count the unsendable op: {summary}"
                 );
+                // v0.6.19: the road is a STABLE VALUE of the contract —
+                // `diretta`, Italian for good (the human line says direct)
+                assert!(
+                    report
+                        .peers
+                        .iter()
+                        .any(|p| p.via == Some("diretta") && p.reached),
+                    "a loopback session rode diretta: {} peers in the summary",
+                    report.peers.len()
+                );
                 // and the EVENT: one row for the cell, op id short, kind,
                 // reason — and nothing of the note's text (read from the
                 // root's own store, as `sync status` will)

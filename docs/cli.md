@@ -55,7 +55,7 @@ Italian.
 | code | codice | the invite's short form, `NUMBER-WORD-WORD` |
 | mailbox | casella postale | the blind node that relays what devices miss |
 | pass | passata | one round of synchronization |
-| direct | diretta | a session that rode no relay (`via: "direct"`) |
+| direct | diretta | a session that rode no relay; in JSON `via` is `"diretta"` or `"relay"` — stable values, Italian for good |
 | epoch | epoca | the generation of a shared cell's key |
 | frontier | frontiera | what every device acknowledged |
 | connection | collegamento | an OAuth link between a client and the memory |
@@ -535,7 +535,7 @@ Un solo servizio per radice (v0.6.2): un lucchetto esclusivo (`<radice>/sync.loc
 
 - `share <cell>` — `adopt` + epoca 0; dopo la conferma la cella viaggia verso tutti i dispositivi
 - `unshare <cell>` — smette da qui; le copie altrove restano (e lo dice)
-- `run [--relay <url>|--no-relay]` — una passata con ogni dispositivo vivo raggiungibile e il nodo cieco configurato, poi esce; il riepilogo JSON dice inviate/ricevute/rifiuti/conflitti/frontiera per cella, e per dispositivo se la sessione è avvenuta e per quale strada (`direct` o `relay`) — un irraggiungibile è una riga, non un errore
+- `run [--relay <url>|--no-relay]` — una passata con ogni dispositivo vivo raggiungibile e il nodo cieco configurato, poi esce; il riepilogo JSON dice inviate/ricevute/rifiuti/conflitti/frontiera per cella, e per dispositivo se la sessione è avvenuta e per quale strada (`diretta` o `relay` in JSON — valori stabili, restano italiani; sulla riga per umani `direct`) — un irraggiungibile è una riga, non un errore
 - `serve [--relay <url>|--no-relay]` — in ascolto (ALPN `engramma/sync/3`), cancello all'accettazione, sincronizza a ogni scrittura locale (rimbalzo 2 s) e ogni 5 minuti; stop pulito su SIGINT/SIGTERM; convive con un altro processo che scrive sulla stessa radice. La scelta del relay si salva nella radice: la si dà una volta, non a ogni avvio (un flag esplicito vince)
 - `status` — per cella: dispositivi, ultima sessione, operazioni in attesa, frontiera stabile, epoca
 

@@ -45,8 +45,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The sync service speaks English: its refusals (the pairing, the share,
   the removal of a device), its warnings, the reasons an operation could
   not leave, the lines of `ENGRAMMA_TRACE`. In JSON the `why_not` of a
-  device and the `relay_warning` follow; `via` says `direct` (`diretta`
-  before).
+  device and the `relay_warning` follow.
 - The reasons `vault sync`, `purge` and `cell drop` report are in English:
   an unreachable view, an orphan `.conflitto` copy, a file that would
   change a note's status, the guard against a mass deletion. The

@@ -212,7 +212,8 @@ pub struct PeerOutcome {
     pub reached: bool,
     /// Why not, when it did not (one line, no note text).
     pub why_not: Option<String>,
-    /// Which road the session rode (R2): `"direct"` or `"relay"`.
+    /// Which road the session rode (R2): `"diretta"` or `"relay"` —
+    /// stable values of the contract: `diretta` stays Italian.
     pub via: Option<&'static str>,
 }
 
@@ -266,7 +267,7 @@ pub async fn bind(
 pub struct SessionOutcome {
     /// The protocol's per-cell report.
     pub report: protocol::SessionReport,
-    /// `"direct"` or `"relay"`.
+    /// `"diretta"` or `"relay"`.
     pub via: &'static str,
 }
 
@@ -344,12 +345,12 @@ pub async fn answer_session(root: &Path, conn: Connection) -> Result<protocol::S
 pub fn via_of_conn(conn: &Connection) -> &'static str {
     let paths = conn.paths();
     if let Some(path) = paths.iter().find(|p| p.is_selected()) {
-        return if path.is_relay() { "relay" } else { "direct" };
+        return if path.is_relay() { "relay" } else { "diretta" };
     }
     if paths.iter().any(|p| p.is_relay()) {
         "relay"
     } else {
-        "direct"
+        "diretta"
     }
 }
 

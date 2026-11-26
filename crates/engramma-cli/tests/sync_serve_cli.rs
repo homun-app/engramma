@@ -464,6 +464,65 @@ fn serve_receives_and_converges_beside_a_second_writer() {
     });
 }
 
+/// v0.6.19: `via` is a stable value of the JSON contract — `"diretta"`
+/// (Italian for good) or `"relay"` — while the human line says `direct`.
+/// A's daemon serves and B's pass rides loopback with no relay: the two
+/// outputs of that pass, one truth.
+#[test]
+fn a_direct_pass_says_diretta_in_json_and_direct_on_the_line() {
+    bounded("via_diretta", 300, || {
+        let a = Root::new("via-a");
+        let b = Root::new("via-b");
+        let cell = Cell::create(&a.cell_path("memoria"), "memoria", "cli").unwrap(/* t */);
+        cell.put_note(&note(1, "la base comune"), "cli").unwrap(/* t */);
+        drop(cell);
+        let (ok, _, err) = run(&a.root, &["sync", "share", "memoria"]);
+        assert!(ok, "share: {err}");
+        pair(&a, &b, "mac");
+        // A serves; its live address reaches B's book (loopback only)
+        let serve = Daemon::spawn(&a.root, &["--json", "sync", "serve", "--no-relay"]);
+        let v = serve.first_json();
+        let addrs: Vec<String> = v["addrs"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let node = v["node"]
+            .as_str()
+            .expect(/* printed */ "the node id")
+            .to_string();
+        remember_all(
+            &b.root,
+            &device_of(&a.root, "laptop"),
+            &node,
+            &to_loopback(&addrs),
+        );
+        // the JSON: the value is the beta's, and it stays
+        let (ok, out, err) = run(&b.root, &["--json", "sync", "run", "--no-relay"]);
+        assert!(ok, "run --json: {err}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap(/* t */);
+        assert_eq!(v["devices"][0]["name"], "laptop", "{out}");
+        assert_eq!(
+            v["devices"][0]["reached"], true,
+            "the pass reached A: {out}"
+        );
+        assert_eq!(v["devices"][0]["via"], "diretta", "a stable value: {out}");
+        // the human line: the same pass, said in English
+        let (ok, out, err) = run(&b.root, &["sync", "run", "--no-relay"]);
+        assert!(ok, "run: {err}");
+        assert!(
+            out.contains("laptop: session done (direct)"),
+            "the human line says direct: {out}"
+        );
+        assert!(!out.contains("diretta"), "no Italian on the line: {out}");
+        drop(serve);
+    });
+}
+
 /// P4: A writes and goes away; B converges from the blind node alone; a
 /// purge on B reaches the node and no byte of those envelopes survives in
 /// the node's file; the node's file never holds note text.
