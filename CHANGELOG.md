@@ -37,6 +37,19 @@ that failed on the previous release first.
   The proposal stays in the queue; when the first correction is
   reverted, the second is decidable again. A purged target stays
   decidable as before (v0.6.11).
+- Reverting a decision that ANOTHER correction stands on went through
+  and left two active versions of the same fact (P corrects T, C
+  corrects P, both accepted: reverting P reopened T under a living C,
+  and accepting P again put P back under C). It was already in
+  0.6.17-beta.1 and `verify` does not flag it. Like a commit in git,
+  that revert is now a conflict naming the correction to revert first;
+  a bulk revert goes newest first, so selecting both undoes both. An
+  accept that would not land on the current version — over a proposal
+  still in the queue, over a target another correction already closed,
+  or of a proposal a standing correction already corrected — refuses
+  with `StaleTarget`. A cell where 0.6.17 already left two active
+  versions is not repaired automatically: reject or revert the extra
+  one (`engramma decisions`, `engramma revert`).
 - A proposal that was accepted had no vector until `engramma embed`
   ran: a question with no word in common did not find the note even
   though it was active (`copertura vettori: 8/14 note` in the capture).

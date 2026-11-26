@@ -1004,6 +1004,9 @@ impl Cell {
     /// # Errors
     /// [`CellError::Invalid`] when the note is not a decidable proposal;
     /// [`CellError::NoteNotFound`] for a missing supersede target;
+    /// [`CellError::StaleTarget`] when the accept would not land on the
+    /// current version: the target closed, still in the queue, or already
+    /// corrected — or the proposal itself already corrected (v0.6.18);
     /// [`CellError::Db`] on SQL failures.
     pub fn decide(&self, id: &Ulid, input: &DecisionInput, actor: &str) -> Result<Ulid, CellError> {
         let _guard = self
@@ -1060,6 +1063,19 @@ impl Cell {
             // closing was the target's half, and the purge took the
             // target). The agent's text, which the user is accepting,
             // is content that survives the purge.
+            // v0.6.18: the proposal ITSELF closed by a standing correction
+            // (a history the v0.6.17 engine wrote: a correction of the
+            // proposal accepted while it waited in the queue) — accepting
+            // it would put it back under its own corrector, two active
+            // versions in one chain. The correction carries the fact now.
+            if let DecisionAction::Accept { .. } = input.action
+                && let Some(head) = current_head_of(&inner.conn, id)?
+            {
+                return Err(CellError::StaleTarget {
+                    target: id.to_string(),
+                    closed_by: head.to_string(),
+                });
+            }
             let mut target_before = None;
             let mut target_closing = None;
             if mode == "supersede" {
@@ -1080,12 +1096,16 @@ impl Cell {
                     if let DecisionAction::Accept { .. } = input.action
                         && !matches!(row.0, Status::Active | Status::Quarantined)
                     {
-                        let closed_by = active_head_of(&inner.conn, &target)?
-                            .unwrap_or(target);
+                        let closed_by = current_head_of(&inner.conn, &target)?.unwrap_or(target);
                         return Err(CellError::StaleTarget {
                             target: target.to_string(),
                             closed_by: closed_by.to_string(),
                         });
+                    }
+                    if let DecisionAction::Accept { .. } = input.action
+                        && row.0 == Status::Quarantined
+                    {
+                        stale_quarantined_target(&inner.conn, id, &target)?;
                     }
                     target_before = Some(serde_json::json!({
                         "id": target.to_string(),
@@ -1297,7 +1317,7 @@ impl Cell {
     /// [`CellError::Db`] on SQL failures.
     pub fn revert_preview(&self, decision_op: &Ulid) -> Result<RevertPreview, CellError> {
         let inner = self.lock()?;
-        Ok(match classify_revert(&inner.conn, decision_op)? {
+        Ok(match classify_revert(&inner.conn, decision_op, &[])? {
             Classified::Revertable { note, .. } => RevertPreview::Revertable { proposal: note },
             Classified::Purged { note } => RevertPreview::Purged { proposal: note },
             Classified::AlreadyReverted => RevertPreview::AlreadyReverted,
@@ -1332,7 +1352,7 @@ impl Cell {
             .lock()
             .map_err(|_| CellError::Db("write lock poisoned".into()))?;
         let mut inner = self.lock()?;
-        match classify_revert(&inner.conn, decision_op)? {
+        match classify_revert(&inner.conn, decision_op, &[])? {
             Classified::Purged { note } => {
                 let payload = serde_json::json!({
                     "decision": decision_op.to_string(),
@@ -1385,7 +1405,8 @@ impl Cell {
     /// or prefix, e.g. `reviewer:x`), optionally bounded by decision dates.
     /// With `dry_run` nothing is written: the report says what WOULD happen.
     /// Every decision is judged on its own — a conflict or a purge stops
-    /// THAT revert, not the run.
+    /// THAT revert, not the run. Newest first (v0.6.18): a correction goes
+    /// before the note it stands on.
     ///
     /// # Errors
     /// [`CellError::Db`] on SQL failures.
@@ -1415,15 +1436,18 @@ impl Cell {
                  FROM ops o
                  LEFT JOIN op_payloads p ON p.op_id = o.op_id
                  LEFT JOIN proposals pr ON pr.note_id = o.note_id
-                 WHERE o.kind = 'decide' ORDER BY o.seq",
+                 WHERE o.kind = 'decide' ORDER BY o.seq DESC",
             )?;
-            stmt.query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })?
-            .flatten()
-            .collect()
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .flatten()
+                .collect()
         };
+        // v0.6.18: NEWEST FIRST — a correction is undone before the note
+        // it stands on, so a run that selects both undoes both; `undone`
+        // carries the proposals this run reverts (or would), so the dry
+        // run classifies exactly like the real one
         let mut report = RevertReport::default();
+        let mut undone: Vec<Ulid> = Vec::new();
         for (op_id, actor, body, proposer) in candidates {
             if let Some(by) = &filter.by
                 && !actor.starts_with(by.as_str())
@@ -1453,7 +1477,7 @@ impl Cell {
             };
             let classified = {
                 let inner = self.lock()?;
-                classify_revert(&inner.conn, &op)?
+                classify_revert(&inner.conn, &op, &undone)?
             };
             match classified {
                 Classified::Purged { .. } => report.purged += 1,
@@ -1461,8 +1485,9 @@ impl Cell {
                 Classified::Conflict(what) => {
                     report.conflicts.push(format!("decision {op_id}: {what}"))
                 }
-                Classified::Revertable { .. } => {
+                Classified::Revertable { note, .. } => {
                     report.reverted += 1;
+                    undone.push(note);
                     if !dry_run {
                         // re-classified inside, under the write lock: between
                         // the two looks nothing changed (this thread owns the
@@ -1654,40 +1679,76 @@ impl Cell {
     }
 }
 
-/// The note that now carries the fact a closed target used to carry: the
-/// active head of its `supersedes` chain (v0.6.18, F3). `None` when
-/// nothing ACTIVE closes the target — a tombstone closed it, or every
-/// closer was itself closed or forgotten later.
-fn active_head_of(conn: &rusqlite::Connection, target: &Ulid) -> Result<Option<Ulid>, CellError> {
-    let mut current = *target;
+/// The note that carries the fact now: the end of the STANDING supersede
+/// chain from `id` (the `supersedes` rows are the standing ones — a revert
+/// or a purge takes its rows away), whatever the members' states. `None`
+/// when nothing corrected `id`. v0.6.18: it used to walk only through
+/// ACTIVE members, and named the closed note itself when a middle link
+/// was closed in turn.
+fn current_head_of(conn: &rusqlite::Connection, id: &Ulid) -> Result<Option<Ulid>, CellError> {
+    let mut current = *id;
     for _ in 0..256 {
         // a chain longer than this is not a chain, it is a loop: the log
         // cannot hold one (the closing always names an OLDER note)
         let next: Option<String> = conn
             .query_row(
-                "SELECT s.new_id FROM supersedes s JOIN notes n ON n.id = s.new_id
-                 WHERE s.old_id = ?1 AND n.status = 'active'
-                 ORDER BY s.new_id DESC LIMIT 1",
+                "SELECT new_id FROM supersedes WHERE old_id = ?1 AND new_id != ?1
+                 ORDER BY new_id DESC LIMIT 1",
                 [current.to_string()],
                 |r| r.get(0),
             )
             .optional()?;
-        let Some(next) = next else {
+        let Some(u) = next.and_then(|n| Ulid::from_string(&n).ok()) else {
             break;
         };
-        let Ok(u) = Ulid::from_string(&next) else {
-            break;
-        };
-        if u == current {
+        if u == *id {
             break;
         }
         current = u;
     }
-    if current == *target {
-        Ok(None)
-    } else {
-        Ok(Some(current))
+    Ok((current != *id).then_some(current))
+}
+
+/// v0.6.18: an accept over a QUARANTINED target is admitted (an imported
+/// note waiting for review can be corrected) — but not when the target is
+/// a proposal still in the queue (it is not the current version: decide
+/// it first), nor when a standing correction already closed it (the
+/// sibling of F3, through the door the quarantine left open). Both refuse
+/// with [`CellError::StaleTarget`], naming the note that carries the fact.
+fn stale_quarantined_target(
+    conn: &rusqlite::Connection,
+    proposal: &Ulid,
+    target: &Ulid,
+) -> Result<(), CellError> {
+    let corrector: Option<String> = conn
+        .query_row(
+            "SELECT new_id FROM supersedes WHERE old_id = ?1 AND new_id != ?2
+             ORDER BY new_id DESC LIMIT 1",
+            rusqlite::params![target.to_string(), proposal.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if corrector.is_some() {
+        let head = current_head_of(conn, target)?.unwrap_or(*target);
+        return Err(CellError::StaleTarget {
+            target: target.to_string(),
+            closed_by: head.to_string(),
+        });
     }
+    if let Some((_, own_target, state)) = super::ops::proposal_meta(conn, target)?
+        && ProposalState::parse(&state)?.in_queue()
+    {
+        // the fact is carried by what the queued proposal would correct
+        let carrier = match own_target {
+            Some(t) => current_head_of(conn, &t)?.unwrap_or(t),
+            None => *target,
+        };
+        return Err(CellError::StaleTarget {
+            target: target.to_string(),
+            closed_by: carrier.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// What a revert would find on the ground, read without writing anything.
@@ -1710,6 +1771,7 @@ enum Classified {
 fn classify_revert(
     conn: &rusqlite::Connection,
     decision_op: &Ulid,
+    assume_reverted: &[Ulid],
 ) -> Result<Classified, CellError> {
     // the decision op itself: seq, note, and (when it survives) its body
     let row: Option<(i64, Option<String>, Option<String>)> = conn
@@ -1773,6 +1835,28 @@ fn classify_revert(
     }
     if matches!(reverted_by, Some(Some(_))) {
         return Ok(Classified::AlreadyReverted);
+    }
+    // v0.6.18: the corrections that STAND on the note — the rule of git, a
+    // commit another one stands on is not reverted before that one. The
+    // decide that closed the note is filed under its corrector's id, so
+    // the scan above cannot see it; the standing `supersedes` rows can (a
+    // revert or a purge takes its rows away). `assume_reverted` are the
+    // correctors a bulk run undoes first: its dry run must say what the
+    // real run does.
+    let correctors: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT new_id FROM supersedes WHERE old_id = ?1 AND new_id != ?1 ORDER BY new_id",
+        )?;
+        stmt.query_map([note.to_string()], |r| r.get::<_, String>(0))?
+            .flatten()
+            .filter(|n| Ulid::from_string(n).map_or(true, |u| !assume_reverted.contains(&u)))
+            .collect()
+    };
+    if !correctors.is_empty() {
+        return Ok(Classified::Conflict(format!(
+            "{} corrects this note: revert that correction first",
+            correctors.join(", ")
+        )));
     }
     let blockers: Vec<String> = later
         .iter()

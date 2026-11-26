@@ -103,7 +103,11 @@ pub enum CellError {
     /// a correction is worth against the version it corrected. Two
     /// accepts of the same note used to leave two active versions of the
     /// same fact. The proposal stays in the queue: reject it, or propose
-    /// again against the note that now carries the fact.
+    /// again against the note that now carries the fact. v0.6.18 (the
+    /// chain family): also an accept over a proposal still in the queue,
+    /// over a quarantined target a standing correction closed, or of a
+    /// proposal a standing correction already corrected — `target` is
+    /// then the note that is not the current version.
     #[error(
         "the target {target} is no longer active: closed by {closed_by} — \
          reject this proposal or propose again against {closed_by}"

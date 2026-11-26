@@ -423,13 +423,12 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                 cell.put_note(&n, "cli").unwrap(/* test-only */);
                 active.push(n.id);
             }
-            2 => {
+            2
                 // propose a supersede against a RANDOM active note: the
                 // same target collects corrections while it stands
-                if !active.is_empty() {
+                if !active.is_empty() => {
                     let target = active[rng.below(active.len())];
                     let note = base_note(format!("la rettifica {marker} dell'assistente"), at);
-                    let id = note.id;
                     let out = cell
                         .propose(
                             &ProposalInput {
@@ -446,8 +445,7 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                         queue.push((id, Some(target)));
                     }
                 }
-            }
-            3 => {
+            3
                 // accept: the engine refuses it only against a closed
                 // target (v0.6.18, F3) and lands it as a NEW note over a
                 // purged one (v0.6.11, K1). WHETHER each refusal is
@@ -458,7 +456,7 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                 // ORACLE is the invariant below, checked on the REAL cell,
                 // which the reopen semantics make exact and the model
                 // cannot chase
-                if !queue.is_empty() {
+                if !queue.is_empty() => {
                     let i = rng.below(queue.len());
                     let (id, target) = queue[i];
                     if cell
@@ -486,11 +484,10 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                         decided.push((id, target, closed, was_active));
                     }
                 }
-            }
-            4 => {
+            4
                 // reject: the lapide, never refused — the proposal keeps
                 // pointing at its target, which never moved
-                if !queue.is_empty() {
+                if !queue.is_empty() => {
                     let i = rng.below(queue.len());
                     let (id, target) = queue[i];
                     if cell
@@ -512,14 +509,13 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                         decided.push((id, target, false, false));
                     }
                 }
-            }
-            5 => {
+            5
                 // revert an ACCEPT decision: the target it had closed
                 // reopens. The revert of a REJECT rides the OPEN DEFECT of
                 // v0.6.14 (open-defects.txt: it reopens the target another
                 // decision had closed) — the declared defect is not this
                 // property's oracle, so the reverts here cancel accepts only
-                if !decided.is_empty() {
+                if !decided.is_empty() => {
                     let ds = cell
                         .decisions(&DecisionsFilter::default())
                         .unwrap(/* test-only */);
@@ -536,31 +532,27 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                             .find(|(p, _, _, _)| *p == proposal)
                             .map(|(_, t, _, was)| (*t, *was))
                             .unwrap_or((None, false));
-                        match cell.revert_decision(&d.op_id, "ripensamento", "user@cli") {
-                            Ok(engramma_core::cell::proposals::RevertOutcome::Reverted {
+                        if let Ok(engramma_core::cell::proposals::RevertOutcome::Reverted {
                                 ..
-                            }) => {
-                                decided.retain(|(p, _, _, _)| *p != proposal);
-                                queue.push((proposal, target));
-                                active.retain(|x| *x != proposal);
-                                // the revert restores the target AS IT WAS:
-                                // active only if it stood active then — a
-                                // proposal the accept had corrected goes
-                                // back to the queue (quarantined), not live
-                                if was_active
-                                    && let Some(t) = target
-                                    && !purged.contains(&t)
-                                    && !active.contains(&t)
-                                {
-                                    active.push(t);
-                                }
+                            }) = cell.revert_decision(&d.op_id, "ripensamento", "user@cli") {
+                            decided.retain(|(p, _, _, _)| *p != proposal);
+                            queue.push((proposal, target));
+                            active.retain(|x| *x != proposal);
+                            // the revert restores the target AS IT WAS:
+                            // active only if it stood active then — a
+                            // proposal the accept had corrected goes
+                            // back to the queue (quarantined), not live
+                            if was_active
+                                && let Some(t) = target
+                                && !purged.contains(&t)
+                                && !active.contains(&t)
+                            {
+                                active.push(t);
                             }
-                            _ => {}
                         }
                     }
                 }
-            }
-            6 => {
+            6
                 // a purge: the chain loses a member — and when the purged
                 // note was an ACCEPTED supersede, its closing goes with it
                 // and the target goes back to WHAT IT WAS when it was
@@ -568,7 +560,7 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                 // a quarantined proposal the accept had corrected goes
                 // back to the queue, and a proposal rejected after the
                 // closing stays a tombstone (the lapide wins)
-                if !active.is_empty() {
+                if !active.is_empty() => {
                     let i = rng.below(active.len());
                     let id = active[i];
                     let reopen = decided
@@ -588,7 +580,6 @@ fn a_supersede_chain_keeps_at_most_one_active_note_with(
                         active.push(t);
                     }
                 }
-            }
             _ => {}
         }
 
@@ -662,4 +653,40 @@ fn chain_of(cell: &Cell, root: &Ulid) -> Vec<Ulid> {
         i += 1;
     }
     seen
+}
+
+/// v0.6.18: the seeds of the family the chain property found once it read
+/// the active notes back from the cell — 140 reds out of 20 000 seeds, on
+/// the v0.6.17 engine too, in three forms (A1: a revert under a standing
+/// correction; A2: a correction of a proposal still in the queue; B:
+/// sibling corrections through a reverted, quarantined target), plus the
+/// seed of the bite proof (the `StaleTarget` check removed). The defect was
+/// declared, then fixed in the same phase (`classify_revert` sees the
+/// corrections standing on the note; `decide` refuses an accept that would
+/// not land on the current version): every seed replays green here, in one
+/// case each, at every suite run.
+#[test]
+fn the_chain_family_seeds_stay_green() {
+    for seed in [
+        // A1
+        3_947_296_525_277_540_812_u64,
+        2_986_572_370_845_811_598,
+        10_766_017_063_976_047_421,
+        10_766_017_063_976_046_824,
+        2_426_661_642_484_339_979,
+        // A2
+        12_979_232_715_024_206_461,
+        13_029_835_729_340_708_323,
+        // B
+        13_161_956_497_586_561_035,
+        5_319_042_461_598_333_499,
+        15_364_813_098_224_471_638,
+        17_690_185_594_283_806_716,
+        // the bite proof
+        7_557_450_884_972_762_385,
+    ] {
+        if let Err(e) = a_supersede_chain_keeps_at_most_one_active_note_body(seed) {
+            panic!("seed {seed}: {e}");
+        }
+    }
 }

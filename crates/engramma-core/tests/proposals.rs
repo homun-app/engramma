@@ -899,3 +899,200 @@ fn purging_an_accepted_supersede_reopens_the_target_and_stays_verifiable() {
     let report = cell.verify().unwrap(/* t */);
     assert!(report.ok(), "mismatch: {:?}", report.mismatch);
 }
+
+// ---------------------------------------------------------------------------
+// v0.6.18: no revert under a correction that stands on it
+// ---------------------------------------------------------------------------
+//
+// The chain property (proposals_props.rs), once it read the active notes
+// back from the cell, found one family in three forms — 140 reds out of
+// 20 000 seeds, all on the v0.6.17 engine too, all green to `verify`: two
+// active versions of the same fact. The rule of git: a commit another one
+// stands on is not reverted before that one; a correction is worth against
+// the CURRENT version. Each test below pins one form by hand.
+
+fn supersede(cell: &Cell, target: &Ulid, body: &str) -> Ulid {
+    cell.propose(
+        &ProposalInput {
+            note: note(body),
+            mode: ProposalMode::Supersede(*target),
+            client: None,
+            reason: None,
+        },
+        "mcp:claude",
+        &engramma_core::cell::proposals::ProposeContext::default(),
+    )
+    .unwrap(/* t */)
+    .id
+    .unwrap(/* t */)
+}
+
+fn try_accept(cell: &Cell, id: &Ulid) -> Result<Ulid, CellError> {
+    cell.decide(
+        id,
+        &DecisionInput {
+            action: DecisionAction::Accept { edited: None },
+            reason: Some("corretto".into()),
+            review: None,
+        },
+        "user@cli",
+    )
+}
+
+fn decision_of(cell: &Cell, proposal: &Ulid) -> Ulid {
+    cell.decisions(&DecisionsFilter::default())
+        .unwrap(/* t */)
+        .into_iter()
+        .rfind(|d| d.proposal == *proposal && d.state() == DecisionState::Active)
+        .unwrap(/* t */)
+        .op_id
+}
+
+fn active_of(cell: &Cell, ids: &[Ulid]) -> Vec<Ulid> {
+    ids.iter()
+        .copied()
+        .filter(|id| cell.get(id).is_ok_and(|n| n.status == Status::Active))
+        .collect()
+}
+
+// A1: P corrects T, C corrects P, both accepted. Reverting P used to pass
+// (the conflict check looked for later ops on P or T, and the decide that
+// closed P is filed under C): T reopened, P back in the queue under a live
+// C → P, and accepting P again left P and C active in one chain.
+#[test]
+fn a_revert_refuses_while_a_later_correction_stands_on_the_note() {
+    let (_d, cell) = cell();
+    let t0 = note("Fabio lavora a Milano.");
+    cell.put_note(&t0, "cli").unwrap(/* t */);
+    let p = supersede(&cell, &t0.id, "Fabio lavora a Torino.");
+    accept(&cell, &p, "user@cli");
+    let c = supersede(&cell, &p, "Fabio lavora a Genova.");
+    accept(&cell, &c, "user@cli");
+    let dp = decision_of(&cell, &p);
+
+    // the preview and the revert say the same: C stands on P
+    match cell.revert_preview(&dp).unwrap(/* t */) {
+        engramma_core::cell::proposals::RevertPreview::Conflict(what) => {
+            assert!(
+                what.contains(&c.to_string()),
+                "names the correction: {what}"
+            );
+        }
+        other => panic!("the preview must see the correction on P: {other:?}"),
+    }
+    match cell.revert_decision(&dp, "ripensamento", "user@cli") {
+        Err(CellError::Conflict(what)) => {
+            assert!(
+                what.contains(&c.to_string()),
+                "names the correction: {what}"
+            );
+        }
+        other => panic!("the revert must refuse while C stands on P: {other:?}"),
+    }
+    assert_eq!(active_of(&cell, &[t0.id, p, c]), vec![c], "nothing moved");
+
+    // in the right order both go: first C, then P — and T is back
+    cell.revert_decision(&decision_of(&cell, &c), "ripensamento", "user@cli")
+        .unwrap(/* t */);
+    cell.revert_decision(&dp, "ripensamento", "user@cli")
+        .unwrap(/* t */);
+    assert_eq!(active_of(&cell, &[t0.id, p, c]), vec![t0.id]);
+    let report = cell.verify().unwrap(/* t */);
+    assert!(report.ok(), "mismatch: {:?}", report.mismatch);
+}
+
+// A1 in bulk: when the filter selects both decisions, the run undoes the
+// newest first, so both go — and the dry run says exactly that.
+#[test]
+fn a_bulk_revert_undoes_the_correction_before_the_note_it_stands_on() {
+    let (_d, cell) = cell();
+    let t0 = note("Fabio lavora a Milano.");
+    cell.put_note(&t0, "cli").unwrap(/* t */);
+    let p = supersede(&cell, &t0.id, "Fabio lavora a Torino.");
+    accept(&cell, &p, "reviewer:strict");
+    let c = supersede(&cell, &p, "Fabio lavora a Genova.");
+    accept(&cell, &c, "reviewer:strict");
+
+    let filter = RevertFilter {
+        by: Some("reviewer:".into()),
+        ..Default::default()
+    };
+    let dry = cell.revert_decisions(&filter, true).unwrap(/* t */);
+    assert_eq!(
+        (dry.reverted, dry.conflicts.len()),
+        (2, 0),
+        "{:?}",
+        dry.conflicts
+    );
+    let real = cell.revert_decisions(&filter, false).unwrap(/* t */);
+    assert_eq!(
+        (real.reverted, real.conflicts.len()),
+        (2, 0),
+        "{:?}",
+        real.conflicts
+    );
+    assert_eq!(active_of(&cell, &[t0.id, p, c]), vec![t0.id]);
+    let report = cell.verify().unwrap(/* t */);
+    assert!(report.ok(), "mismatch: {:?}", report.mismatch);
+}
+
+// A2: P accepted over T; C proposed on P and left in the queue; P's
+// decision reverted (lawful: nothing stood on P yet). Accepting C then
+// corrected a version that was no longer the current one — a proposal in
+// the queue — and accepting P again put P back over T with C on top.
+#[test]
+fn an_accept_refuses_a_correction_of_a_proposal_still_in_the_queue() {
+    let (_d, cell) = cell();
+    let t0 = note("Fabio lavora a Milano.");
+    cell.put_note(&t0, "cli").unwrap(/* t */);
+    let p = supersede(&cell, &t0.id, "Fabio lavora a Torino.");
+    accept(&cell, &p, "user@cli");
+    let c = supersede(&cell, &p, "Fabio lavora a Genova.");
+    cell.revert_decision(&decision_of(&cell, &p), "ripensamento", "user@cli")
+        .unwrap(/* t */);
+
+    match try_accept(&cell, &c) {
+        Err(CellError::StaleTarget { target, .. }) => assert_eq!(target, p.to_string()),
+        other => panic!("C corrects a proposal in the queue: {other:?}"),
+    }
+    // P goes, and C is left to reject or propose again
+    try_accept(&cell, &p).unwrap(/* t */);
+    assert_eq!(active_of(&cell, &[t0.id, p, c]), vec![p]);
+    let report = cell.verify().unwrap(/* t */);
+    assert!(report.ok(), "mismatch: {:?}", report.mismatch);
+}
+
+// B: C accepted; G corrects C and is accepted; F corrects C too. Reverting
+// C's decision used to pass with G standing, leaving C quarantined — an
+// admitted target — so F's accept went through: F and G active, siblings
+// over C. The revert refuses now; and an accept over a target a standing
+// correction already closed refuses too, quarantined or not.
+#[test]
+fn sibling_corrections_cannot_come_back_through_a_revert() {
+    let (_d, cell) = cell();
+    let t0 = note("Fabio lavora a Milano.");
+    cell.put_note(&t0, "cli").unwrap(/* t */);
+    let c = supersede(&cell, &t0.id, "Fabio lavora a Torino.");
+    accept(&cell, &c, "user@cli");
+    let f = supersede(&cell, &c, "Fabio lavora a Genova.");
+    let g = supersede(&cell, &c, "Fabio lavora a Bologna.");
+    accept(&cell, &g, "user@cli");
+
+    assert!(
+        matches!(
+            cell.revert_decision(&decision_of(&cell, &c), "ripensamento", "user@cli"),
+            Err(CellError::Conflict(_))
+        ),
+        "G stands on C"
+    );
+    match try_accept(&cell, &f) {
+        Err(CellError::StaleTarget { target, closed_by }) => {
+            assert_eq!(target, c.to_string());
+            assert_eq!(closed_by, g.to_string(), "G carries the fact now");
+        }
+        other => panic!("G already corrected C: {other:?}"),
+    }
+    assert_eq!(active_of(&cell, &[t0.id, c, f, g]), vec![g]);
+    let report = cell.verify().unwrap(/* t */);
+    assert!(report.ok(), "mismatch: {:?}", report.mismatch);
+}

@@ -401,6 +401,12 @@ confirms (`--yes` skips it). The decisions whose content was purged
 keep counting among the `purged` — cancelled in the log, nothing comes
 back.
 
+A decision another correction stands on is not reverted before that
+one (v0.6.18), like a commit in git: if C corrects the note P made
+current, reverting P's decision is a conflict that names C — revert C
+first. In bulk the run goes newest first, so a filter that selects
+both undoes both, and `--dry-run` says so.
+
 ### `engramma policy show|set`
 
 The cell's policy: who may propose, how far the machine may go.

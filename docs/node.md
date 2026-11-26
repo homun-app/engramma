@@ -649,6 +649,14 @@ sopra.)
   attivo, come prima. Quando la correzione che ha chiuso il bersaglio
   viene ANNULLATA (`revertDecision`), il bersaglio torna attivo e la
   proposta in coda si può accettare di nuovo.
+- **Gli altri casi di `STALE_TARGET` (v0.6.18, ritocco).** Lo stesso
+  codice arriva quando l'accettazione non cadrebbe sulla versione
+  corrente: il bersaglio è una **proposta ancora in coda** (si decide
+  prima quella), il bersaglio in quarantena ha **già un correttore** in
+  piedi, oppure la **proposta stessa** è già stata corretta da un'altra
+  nota (una storia scritta dalla v0.6.17). Il messaggio nomina la nota
+  ferma e quella che porta il fatto; la proposta resta in coda. Nessun
+  codice nuovo: la scheda della proposta è la stessa.
 
 ## Un assistente che ricorda
 

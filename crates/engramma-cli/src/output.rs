@@ -98,13 +98,14 @@ impl From<CellError> for CliError {
             // the message says who already corrected it and what to do
             CellError::StaleTarget { target, closed_by } if closed_by == target => {
                 CliError::internal(format!(
-                    "rettifica rifiutata: {target} non è più attiva (una lapide l'ha chiusa) — \
+                    "rettifica rifiutata: {target} non è la versione corrente (chiusa da una \
+                     lapide, o ancora in coda) — \
                      rifiuta la proposta (`engramma proposals reject <id>`) \
                      o proponi di nuovo sulla nota corrente"
                 ))
             }
             CellError::StaleTarget { target, closed_by } => CliError::internal(format!(
-                "rettifica rifiutata: {target} non è più attiva — l'ha già corretta \
+                "rettifica rifiutata: {target} non è la versione corrente — l'ha già corretta \
                  {closed_by} — rifiuta la proposta (`engramma proposals reject <id>`) \
                  o proponi di nuovo sulla nota corrente ({closed_by})"
             )),
