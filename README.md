@@ -116,28 +116,29 @@ and are not covered: build from source there.
 
 ## The first minute
 
-Real output from a run (the CLI speaks Italian):
+Real output from a run (the CLI speaks English since v0.6.19; your notes
+stay in your own language):
 
 ```console
 $ export ENGRAMMA_ROOT=~/engramma-demo
 $ engramma init
-inizializzato: /home/you/engramma-demo
+initialized: /home/you/engramma-demo
 $ printf 'Fabio ha traslocato a [[Milano]] con [[Giulia]] a settembre 2026.\n' > body.md
 $ engramma add body.md --source user --confidence stated \
     --title "Fabio abita a Milano" --type fact --tag casa/milano --valid-from 2026-09-01
-aggiunta: 01M891B6NXMB3TQKK2DRNF99RG
+added: 01M8CMRGZGX0EW10R1WRRW65S0
 $ engramma search "traslocato"
-1. [active] Fabio abita a Milano (DRNF99RG)
-   punteggio 1.0000 (grezzo 0.6500)
-   liste: text
-   termini: trasloc
-   rango BM25: 1
-   supporto: strong
-   peso grafo: 0.35 (stacco 0.00)
-   validità: sempre → ora
-   fonte:
+1. [active] Fabio abita a Milano (WRRW65S0)
+   score 1.0000 (raw 0.6500)
+   lists: text
+   terms: trasloc
+   BM25 rank: 1
+   support: strong
+   graph weight: 0.35 (gap 0.00)
+   validity: always → now
+   source:
 $ engramma verify
-registro verificato: 2 operazioni, catena hash, ricostruzione e indice FTS a posto
+log verified: 2 operations, hash chain, reconstruction and FTS index in place
 ```
 
 `[[Milano]]` and `[[Giulia]]` are entities: the graph grows with your notes.

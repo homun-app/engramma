@@ -14,6 +14,59 @@ Short ids shown by the CLI and used in export file names are the **last 8**
 characters of the ULID — its random part: the first 8 are a timestamp and
 collide in bulk imports.
 
+## Glossary (v0.6.19)
+
+From v0.6.19 everything a user, a client or a developer reads is in English:
+the CLI's human output, the review page, the MCP server, the OAuth pages,
+the refusals of sync, the Node binding's errors. The Italian documents
+(`DESIGN.md`, `sync.md`, `node.md`, `mcp.md`) keep their own words: this
+table is the bridge. `--json` did not change — who parsed the textual
+output switches to it. The same words are the ones the beta printed in
+Italian.
+
+| The CLI says | The Italian docs say | What it is |
+|---|---|---|
+| note | nota | the unit of memory |
+| cell | cella | one memory: `<root>/cells/<name>.sqlite` |
+| queue | coda | where the assistants' proposals wait |
+| proposal | proposta | what an assistant asks to store |
+| decision | decisione | accept or reject, signed by who decides |
+| correction | rettifica | a `supersede` proposal |
+| revert | annullamento | undoing a decision, the `git revert` of the registry |
+| tombstone | lapide | a deleted note: the text stays, search hides it |
+| purge | oblio, purga | the right to be forgotten: the content goes |
+| incomplete forgetting | oblio incompleto | a purge that could not reach every copy (exit 5) |
+| quarantine | quarantena | written, not yet confirmed: search never shows it |
+| conflict copy | copia di conflitto | the losing body of a concurrent edit, kept as a note |
+| phantom | fantasma | a living row on a purged id |
+| log | registro | the hash-chained operations log |
+| snapshot | istantanea | the compaction's file copy of the cell |
+| cut | taglio | where the compaction stopped keeping payloads |
+| view | vista | a Markdown folder bound to the cell (`vault`) |
+| embed | incorporare | give a note its vector |
+| coverage | copertura | how many living notes have their vector |
+| support | supporto | `strong` (text agrees) or `weak` (vector alone) |
+| graph off | grafo spento | the question named no entity: the walk never starts |
+| device | dispositivo | one of the paired copies |
+| laptop | portatile | the default name of the first device |
+| pairing | abbinamento | `invite`, `code`, `join` |
+| verification code | codice di verifica | the six digits compared on both screens (SAS) |
+| ticket | biglietto | the invite's text, `engramma-invite-v1.…` |
+| code | codice | the invite's short form, `NUMBER-WORD-WORD` |
+| mailbox | casella postale | the blind node that relays what devices miss |
+| pass | passata | one round of synchronization |
+| direct | diretta | a session that rode no relay (`via: "direct"`) |
+| epoch | epoca | the generation of a shared cell's key |
+| frontier | frontiera | what every device acknowledged |
+| connection | collegamento | an OAuth link between a client and the memory |
+| request | richiesta | an authorization waiting for the human |
+| label | etichetta | the actor of a connection's proposals, `mcp:<label>` |
+| scopes | ambiti | `memory:read`, `memory:propose` |
+| policy | politica | who may propose, how far the machine may go |
+| reviewer | revisore | the automatic review of a proposal |
+| breaker | interruptore | `max_auto_per_hour` tripped: a human decides |
+| experimental | sperimentale | `--experimental` (the beta's `--sperimentale` still answers) |
+
 ## Commands
 
 ### `init`
@@ -32,7 +85,7 @@ JSON: `{"id": "<ulid>"}`.
 
 ### `get ID`
 Human: the canonical note file (quarantined and deleted notes get a
-`⚠ stato: …` warning line first — the CLI may show them, the MCP server may
+`⚠ status: quarantined|deleted` warning line first — the CLI may show them, the MCP server may
 not). JSON: the complete note object:
 `{id, type, title, body, tags, lang, source, confidence, status, valid_from,
 valid_to, supersedes, created_at, updated_at, x}`.
@@ -146,7 +199,7 @@ with no copy file to rebuild some objects from); the human output prints
 one line each — `coverage` lists the vector coverage per
 model (`{model, state, covered, living}`; embeddings are derived data,
 their absence is never a verification failure). The human output prints one
-`copertura vettori` line per model. **(v0.6.10, J2) verify is read-only**:
+`vector coverage` line per model. **(v0.6.10, J2) verify is read-only**:
 it runs inside a deferred transaction that always rolls back, and when the
 cell holds «phantom» notes — a living row on a purged id, written by the
 v0.6.7/v0.6.8 engines — it NAMES them (`phantom_purged`), the outcome says
@@ -280,10 +333,10 @@ id. Moving the folder and syncing from the new place UPDATES the root —
 one view, not two — and a purge reaches the view at its new place. An
 unreachable view keeps the purge pending (exit **5**,
 `pending: ["vault"]`) **only while it still holds something of the note**
-(a bound file or a conflict copy); the message names the view and offers
-both ways out — `vault sync` to reach it again, `vault unbind` to detach
-it. A cell whose views cannot even be read is not a completed forgetting
-either.
+(a bound file or a conflict copy); the message says a view was
+unreachable and offers both ways out — `vault sync` to reach it again,
+`vault unbind` to detach it. A cell whose views cannot even be read is not
+a completed forgetting either.
 
 The WAL is truncated after the vacuum (`wal_checkpoint(TRUNCATE)`). When
 another process holds a read transaction open, the truncation cannot
@@ -292,10 +345,11 @@ happen: the purge says so and exits with code **5** (`scrubbed: false`,
 cell close, and `--json` carries the same fields. A failed `VACUUM` or
 PRAGMA is an error, never a silent success.
 
-### `engramma compact [--sperimentale] [--keep-last N] [--keep-snapshot]`
+### `engramma compact [--experimental] [--keep-last N] [--keep-snapshot]`
 
 **(v0.6.15, F2) Sperimentale, dietro un interruttore esplicito.** Senza
-`--sperimentale` il comando rifiuta (exit 2) e dice perché: i difetti
+`--experimental` (v0.6.19: la beta lo chiamava `--sperimentale`, che
+risponde ancora) il comando rifiuta (exit 2) e dice perché: i difetti
 dichiarati del taglio sono aperti
 (`crates/engramma-core/tests/open-defects.txt`). La compattazione è
 un'ottimizzazione — la manutenzione di una memoria che cresce — e finché
@@ -310,12 +364,12 @@ cell already is the durable state, and a second copy of it (the v0.3.1
 snapshot) only served the full audit. The skeletons and the hash chain
 stay whole; the last `keep-last` operations stay replayable;
 `changes_since` below the cut answers `Compacted`. `verify` says what it
-could check (`rigioco: solo catena da seq N (compattata senza
-istantanea)` in `replay`): the whole chain, every surviving payload's
+could check (`replay: chain only from seq N (compacted without a
+snapshot)` in `replay`): the whole chain, every surviving payload's
 digest, the derived indexes — but no from-zero replay is possible.
 
 With `--keep-snapshot` the v0.3.1 behavior: `VACUUM INTO
-<cella>-snap-<seq>.sqlite`, stripped to the **logical state** (payloads
+<cell>-snap-<seq>.sqlite`, stripped to the **logical state** (payloads
 up to the cut, vectors, model registry, vault bindings and FTS content
 go). Only the **last** row stays, with or without a file: the latest
 compaction replaces the previous one, and a compaction without the flag
@@ -326,7 +380,7 @@ state that contained the purged note).
 
 **(v0.6.14, N1) The cut only goes forward.** A compaction asking a cut
 BELOW the one already made does nothing: it prints
-`nessun taglio nuovo: il taglio resta a seq N` (JSON `"compacted": false`
+`no new cut: the cut stays at seq N` (JSON `"compacted": false`
 with the true `cut_seq`) — not an error, so an automatic caller that
 raises `keep-last` never fails. The same cut asked again keeps the
 behavior it always had: the restart point is registered again, in the
@@ -343,7 +397,7 @@ The markdown view: `init` exports the cell into the folder; `sync` runs
 one scan-based reconciliation and prints the report (new notes from
 files, notes updated from files, files rewritten from the cell,
 conflicts — the cell wins and the file's version becomes a
-`<nome>.conflitto-<ts>.md` copy — deletions, moves); `watch` reconciles
+`<name>.conflitto-<ts>.md` copy — deletions, moves); `watch` reconciles
 on filesystem events (500 ms debounce) and every 60 s, Ctrl-C exits. A
 file is bound to its note by the `id` in the header, never by its path:
 renaming or moving a file moves the note's binding. More than 20 files
@@ -372,7 +426,7 @@ subcommand: the queue (and the decided ones with `--json`). `show <id>`
 is one proposal in full — note, proposer, decision, reviewer metadata.
 `accept <id>` makes the note active and computes its vector right away
 (v0.6.18, like `add` does; `--no-embed` skips it — the note waits for
-`engramma embed`), `reject <id>` refuses it (the lapide keeps the text,
+`engramma embed`), `reject <id>` refuses it (the tombstone keeps the text,
 the revert can undo), `review` retries the FAILED automatic reviews
 (never the escalated ones) and embeds what it makes active.
 
@@ -391,12 +445,12 @@ Cancel decisions — the git revert of the registry. By decision op id
 actor, prefix) narrowed by `--since`.
 
 Who DECIDES and who PROPOSES are two different people: a decision is
-signed by its decider (`user@cli`, `reviewer:<nome>`), and an `mcp:`
+signed by its decider (`user@cli`, `reviewer:<name>`), and an `mcp:`
 actor only ever proposes — `--by mcp:…` would select nothing, so it is
 a usage error (v0.6.18). To undo what an assistant filled the queue
 with, `--proposed-by mcp:claude-code` selects every decision taken on
 that actor's proposals (exact or prefix), combining with `--by`,
-`--since` and `--until`; `--dry-run` previews, the `[s/N]` prompt
+`--since` and `--until`; `--dry-run` previews, the `[y/N]` prompt
 confirms (`--yes` skips it). The decisions whose content was purged
 keep counting among the `purged` — cancelled in the log, nothing comes
 back.
@@ -429,7 +483,7 @@ mandatory and only loopback is accepted; `--public-url` (https, no query,
 no fragment) is the address the tunnel publishes and every OAuth URL is
 derived from it. `--write` names the cells that accept proposals (a
 subset of `--cells`) — but there is **no `--actor`** here: over HTTP the
-proposing actor is the grant's label (`mcp:<etichetta>`), chosen when you
+proposing actor is the grant's label (`mcp:<label>`), chosen when you
 approve the connection. `--allow-dcr` turns on RFC 7591 dynamic
 registration (deprecated by the spec; off by default), `--compat chatgpt`
 adds the fixed-schema `search`/`fetch` wrappers. Every request to `/mcp`
@@ -467,11 +521,11 @@ The human surface of the HTTP authorization flow (state in
 ## `engramma devices` (v0.6.1)
 
 - `init` — crea `device.key` (o mostra l'esistente) e il primo dispositivo dell'elenco
-- `invite [--name <nome>] [--relay <url>|--no-relay]` — lega l'endpoint, stampa il biglietto con l'indirizzo vero e resta in attesa (10 minuti, un uso); SPAKE2 sul segreto, conferma di chiave RFC 9382, sei cifre su entrambi gli schermi. `--name` (predefinito `portatile`) nomina questo dispositivo quando l'elenco nasce qui (v0.6.2)
-- `code [--name <nome>] [--relay <url>|--no-relay]` — apre il canale sul nodo cieco e stampa il codice breve (`7-tigre-lago`); dopo le sei cifre un biglietto fresco passa sigillato nel relay e l'ingresso corre in diretta. `--name` come sopra (v0.6.2)
-- `join <biglietto-o-codice> --name <nome> [--relay <url>|--no-relay]` — l'ingresso (biglietto in diretta, codice tramite il nodo); le sei cifre si confermano su entrambi
+- `invite [--name <name>] [--relay <url>|--no-relay]` — lega l'endpoint, stampa il biglietto con l'indirizzo vero e resta in attesa (10 minuti, un uso); SPAKE2 sul segreto, conferma di chiave RFC 9382, sei cifre su entrambi gli schermi. `--name` (predefinito `laptop`) nomina questo dispositivo quando l'elenco nasce qui (v0.6.2)
+- `code [--name <name>] [--relay <url>|--no-relay]` — apre il canale sul nodo cieco e stampa il codice breve (`7-tigre-lago`); dopo le sei cifre un biglietto fresco passa sigillato nel relay e l'ingresso corre in diretta. `--name` come sopra (v0.6.2)
+- `join <ticket-or-code> --name <name> [--relay <url>|--no-relay]` — l'ingresso (biglietto in diretta, codice tramite il nodo); le sei cifre si confermano su entrambi
 - `list` — nome, id corto, chiave di trasporto
-- `remove <nome>` — la `remove` firmata con la radice e il conto dell'insieme accettato, l'epoca nuova di ogni cella condivisa, le chiavi avvolte per i rimasti; tutto raggiunge gli altri alla sessione successiva. Ciò che il rimosso aveva lo tiene
+- `remove <name>` — la `remove` firmata con la radice e il conto dell'insieme accettato, l'epoca nuova di ogni cella condivisa, le chiavi avvolte per i rimasti; tutto raggiunge gli altri alla sessione successiva. Ciò che il rimosso aveva lo tiene
 - `log` — il registro dell'elenco, con le firme
 
 ## `engramma sync` (v0.6.1)
@@ -479,9 +533,9 @@ The human surface of the HTTP authorization flow (state in
 Un solo servizio per radice (v0.6.2): un lucchetto esclusivo (`<radice>/sync.lock`) copre `serve` e ogni `run`; un secondo rifiuta con una riga dedicata e uscita 7.
 
 
-- `share <cella>` — `adopt` + epoca 0; dopo la conferma la cella viaggia verso tutti i dispositivi
-- `unshare <cella>` — smette da qui; le copie altrove restano (e lo dice)
-- `run [--relay <url>|--no-relay]` — una passata con ogni dispositivo vivo raggiungibile e il nodo cieco configurato, poi esce; il riepilogo JSON dice inviate/ricevute/rifiuti/conflitti/frontiera per cella, e per dispositivo se la sessione è avvenuta e per quale strada (diretta o via relay) — un irraggiungibile è una riga, non un errore
+- `share <cell>` — `adopt` + epoca 0; dopo la conferma la cella viaggia verso tutti i dispositivi
+- `unshare <cell>` — smette da qui; le copie altrove restano (e lo dice)
+- `run [--relay <url>|--no-relay]` — una passata con ogni dispositivo vivo raggiungibile e il nodo cieco configurato, poi esce; il riepilogo JSON dice inviate/ricevute/rifiuti/conflitti/frontiera per cella, e per dispositivo se la sessione è avvenuta e per quale strada (`direct` o `relay`) — un irraggiungibile è una riga, non un errore
 - `serve [--relay <url>|--no-relay]` — in ascolto (ALPN `engramma/sync/3`), cancello all'accettazione, sincronizza a ogni scrittura locale (rimbalzo 2 s) e ogni 5 minuti; stop pulito su SIGINT/SIGTERM; convive con un altro processo che scrive sulla stessa radice. La scelta del relay si salva nella radice: la si dà una volta, non a ogni avvio (un flag esplicito vince)
 - `status` — per cella: dispositivi, ultima sessione, operazioni in attesa, frontiera stabile, epoca
 
@@ -490,11 +544,11 @@ Un solo servizio per radice (v0.6.2): un lucchetto esclusivo (`<radice>/sync.loc
 The conflict copies to resolve: who lost, when, in quarantine or not —
 the copy is a note, read it with `get`.
 
-- `show <cella> <copia>` (v0.6.5) — una copia per intero: il corpo
+- `show <cell> <copy>` (v0.6.5) — una copia per intero: il corpo
   dell'originale, il corpo alla biforcazione e il corpo della copia —
   anche per una copia in quarantena, che `get` non mostra mai; una copia
-  inesistente o chiusa risponde «non è una copia di conflitto aperta»
-- `resolve <copia> --keep original|copy|merged [--body-file <f>]` — la
+  inesistente o chiusa risponde «is not an open conflict copy»
+- `resolve <copy> --keep original|copy|merged [--body-file <f>]` — la
   risoluzione: `original` tiene l'originale (la copia va via), `copy` fa
   vincere il corpo della copia, `merged` prende la fusione a mano da un
   file (`-` = stdin)
@@ -502,7 +556,7 @@ the copy is a note, read it with `get`.
 ## `engramma mailbox` (v0.6.1)
 
 - `serve --root <dir> [--relay <url>|--no-relay]` — il nodo cieco in esecuzione (ALPN `engramma/mailbox/3`, ritenzione 180 giorni): stampa il proprio biglietto, deposito/enumerazione/consegna, purge firmata, incontro dei codici
-- `add <biglietto del nodo>` — registra il nodo e gli consegna l'elenco firmato
+- `add <node-ticket>` — registra il nodo e gli consegna l'elenco firmato
 - `status` — ultimo contatto, buste conservate (conteggio e byte, chiesti al nodo), ritenzione
 - `remove` — la radice lo dimentica
 
