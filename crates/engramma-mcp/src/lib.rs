@@ -1168,10 +1168,8 @@ impl MemoryServer {
             return;
         };
         let engine_cell = cell.clone();
-        let joined = tokio::task::spawn_blocking(move || {
-            engine_cell.embed_pending(&*embedder, 512)
-        })
-        .await;
+        let joined =
+            tokio::task::spawn_blocking(move || engine_cell.embed_pending(&*embedder, 512)).await;
         match joined {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => eprintln!("engramma-mcp: embed dopo la decisione: {e}"),

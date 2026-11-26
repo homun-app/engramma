@@ -1087,7 +1087,10 @@ fn the_auto_reviewers_acceptance_is_found_by_meaning_right_away() {
     let res = mcp.read_response(2);
     let text = res["result"]["content"][0]["text"].as_str().unwrap(/* t */);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap(/* t */);
-    assert_eq!(parsed["status"], "accepted", "the reviewer decided: {parsed}");
+    assert_eq!(
+        parsed["status"], "accepted",
+        "the reviewer decided: {parsed}"
+    );
     let note_id = parsed["id"].as_str().unwrap(/* t */).to_string();
 
     // and the meaning search finds it with no word in common
@@ -1104,7 +1107,10 @@ fn the_auto_reviewers_acceptance_is_found_by_meaning_right_away() {
     let res = mcp.read_response(3);
     let text = res["result"]["content"][0]["text"].as_str().unwrap(/* t */);
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap(/* t */);
-    assert_eq!(parsed["mode"], "hybrid", "the vector branch joins: {parsed}");
+    assert_eq!(
+        parsed["mode"], "hybrid",
+        "the vector branch joins: {parsed}"
+    );
     assert!(
         parsed["hits"]
             .as_array()

@@ -1754,16 +1754,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             until,
             dry_run,
             yes,
-        } => run_revert(
-            cli,
-            decision,
-            by,
-            proposed_by,
-            since,
-            until,
-            *dry_run,
-            *yes,
-        ),
+        } => run_revert(cli, decision, by, proposed_by, since, until, *dry_run, *yes),
         Command::Policy { action } => run_policy(cli, action),
         Command::Review { port, open } => {
             let cell = open_cell(cli)?;
@@ -3212,11 +3203,7 @@ fn run_proposals(
             }
             Ok(())
         }
-        Some(ProposalsAction::Accept {
-            id,
-            edit,
-            no_embed,
-        }) => {
+        Some(ProposalsAction::Accept { id, edit, no_embed }) => {
             let id = cell.resolve_note_id(id)?;
             let edited = if *edit {
                 let note = cell.get(&id)?;
@@ -3433,6 +3420,8 @@ fn run_decisions(
     Ok(())
 }
 
+// the clap fields of `revert`, one per flag (v0.6.18 added `--proposed-by`)
+#[allow(clippy::too_many_arguments)]
 fn run_revert(
     cli: &Cli,
     decision: &Option<String>,

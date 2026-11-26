@@ -340,7 +340,10 @@ fn revert_dry_run_on_a_single_id_writes_nothing() {
     // a revert right after undoes it for real
     let json = f.run_json(&["revert", &decision, "--json"]);
     assert_eq!(json["outcome"]["reverted"], true);
-    assert_eq!(f.cell().get(&id).unwrap(/* t */).status, Status::Quarantined);
+    assert_eq!(
+        f.cell().get(&id).unwrap(/* t */).status,
+        Status::Quarantined
+    );
 }
 
 // v0.6.18 (F2): decisions are signed by WHO DECIDES (`user@cli`,
@@ -474,7 +477,11 @@ fn a_second_correction_of_the_same_note_refuses_and_stays_queued() {
     };
     let first = propose_against(&f, "Fabio lavora a Torino.");
     let out = f.run(&["proposals", "accept", &first.to_string()]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let second = propose_against(&f, "Fabio lavora a Genova.");
 
@@ -511,7 +518,11 @@ fn a_second_correction_of_the_same_note_refuses_and_stays_queued() {
         .op_id
         .to_string();
     let out = f.run(&["revert", &first_decision, "--yes"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = f.run(&["proposals", "accept", &second.to_string()]);
     assert!(
         out.status.success(),
@@ -552,7 +563,11 @@ fn an_accepted_proposal_has_its_vector_right_away() {
         "--confidence",
         "stated",
     ]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // an assistant proposal, accepted from the CLI
     let id = {
@@ -590,7 +605,11 @@ fn an_accepted_proposal_has_its_vector_right_away() {
         out.id.unwrap(/* t */)
     };
     let out = f.run(&["proposals", "accept", &id.to_string()]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // the vector coverage includes the accepted note now
     let verify = f.run_json(&["verify", "--json"]);
@@ -611,9 +630,7 @@ fn an_accepted_proposal_has_its_vector_right_away() {
     let json = f.run_json(&["search", "chi è impiegato a Genova?", "--json"]);
     let hits = json["hits"].as_array().unwrap(/* t */);
     assert!(
-        hits
-            .iter()
-            .any(|h| h["note"]["id"] == id.to_string()),
+        hits.iter().any(|h| h["note"]["id"] == id.to_string()),
         "the accepted note is found by meaning: {json}"
     );
 }

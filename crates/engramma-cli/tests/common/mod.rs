@@ -51,17 +51,6 @@ pub fn sweep_stale_test_dirs() -> usize {
     swept
 }
 
-#[cfg(test)]
-mod sweep_gate {
-    /// v0.6.13 (M4): the sweeper rides at the start of the suite —
-    /// whatever a killed run left behind goes, before the new folders
-    /// multiply.
-    #[test]
-    fn stale_test_dirs_are_swept_at_suite_start() {
-        super::sweep_stale_test_dirs();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // v0.6.18 (F4): a fake OpenAI-compatible embeddings endpoint
 // ---------------------------------------------------------------------------
@@ -78,8 +67,7 @@ pub struct FakeEmbedder {
 
 impl Drop for FakeEmbedder {
     fn drop(&mut self) {
-        self.stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -203,5 +191,16 @@ fn synonym(word: &str) -> &str {
         "lavora"
     } else {
         word
+    }
+}
+
+#[cfg(test)]
+mod sweep_gate {
+    /// v0.6.13 (M4): the sweeper rides at the start of the suite —
+    /// whatever a killed run left behind goes, before the new folders
+    /// multiply.
+    #[test]
+    fn stale_test_dirs_are_swept_at_suite_start() {
+        super::sweep_stale_test_dirs();
     }
 }

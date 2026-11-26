@@ -637,7 +637,10 @@ fn a_superseded_target_never_passes_automatically_until_its_closer_is_reverted()
         "the active target passes"
     );
     let closer = out.id.unwrap(/* t */);
-    assert_eq!(cell.get(&target.id).unwrap(/* t */).status, Status::Superseded);
+    assert_eq!(
+        cell.get(&target.id).unwrap(/* t */).status,
+        Status::Superseded
+    );
 
     // the second correction proposes against the same note: the machine
     // escalates (the fence refuses to close a non-active target)…
