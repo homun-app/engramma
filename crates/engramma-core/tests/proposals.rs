@@ -1096,3 +1096,53 @@ fn sibling_corrections_cannot_come_back_through_a_revert() {
     let report = cell.verify().unwrap(/* t */);
     assert!(report.ok(), "mismatch: {:?}", report.mismatch);
 }
+
+// v0.6.19: a REJECT never touched its target, so its revert must not
+// touch it either. The revert of a reject used to restore the target «as
+// the decision photographed it»: P1 and P2 correct T, P1 accepted (T
+// superseded), P2 rejected (the photo says superseded), P1 purged (T
+// reopens) — and the revert of P2's reject put T back to superseded with
+// nothing standing on it. With a quarantined T, the note left the
+// quarantine with no decision (seed 4586480981517075520 of
+// `quarantine_exits_only_by_decision`, reachable since 0.6.18).
+#[test]
+fn the_revert_of_a_reject_leaves_the_target_as_it_is() {
+    let (_d, cell) = cell();
+    let t0 = note("Fabio lavora a Milano.");
+    cell.put_note(&t0, "cli").unwrap(/* t */);
+    let p1 = supersede(&cell, &t0.id, "Fabio lavora a Torino.");
+    let p2 = supersede(&cell, &t0.id, "Fabio lavora a Genova.");
+    accept(&cell, &p1, "user@cli");
+    cell.decide(
+        &p2,
+        &DecisionInput {
+            action: DecisionAction::Reject,
+            reason: None,
+            review: None,
+        },
+        "user@cli",
+    )
+    .unwrap(/* t */);
+    let d2 = decision_of(&cell, &p2);
+    cell.purge(&p1, "via", "user@cli").unwrap(/* t */);
+    assert_eq!(
+        cell.get(&t0.id).unwrap(/* t */).status,
+        Status::Active,
+        "the purge reopens T"
+    );
+
+    cell.revert_decision(&d2, "ripensamento", "user@cli")
+        .unwrap(/* t */);
+    assert_eq!(
+        cell.get(&t0.id).unwrap(/* t */).status,
+        Status::Active,
+        "the revert of a reject must not close T again"
+    );
+    assert_eq!(
+        cell.get(&p2).unwrap(/* t */).status,
+        Status::Quarantined,
+        "P2 is back in the queue"
+    );
+    let report = cell.verify().unwrap(/* t */);
+    assert!(report.ok(), "mismatch: {:?}", report.mismatch);
+}

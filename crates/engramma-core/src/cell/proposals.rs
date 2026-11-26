@@ -1872,8 +1872,18 @@ fn classify_revert(
     // what the decision's own payload recorded: the target's state before it
     // closed — the only honest way to reopen it. Without the payload (a
     // compaction forgot it) the revert is refused rather than guessed.
+    // v0.6.19: only an ACCEPT closed the target, so only its revert reopens
+    // it. A reject never touched the target: restoring its photo would put
+    // back a state that later operations (a purge of the closer, filed
+    // under another note) already changed — a quarantined note left the
+    // quarantine with no decision. Old reverts replay as they were written.
+    let accepted = body
+        .as_ref()
+        .and_then(|b| b.get("decision"))
+        .and_then(Value::as_str)
+        == Some("accept");
     let restore_target: Option<Value> = match target {
-        Some(_) => {
+        Some(_) if accepted => {
             let before = body
                 .as_ref()
                 .and_then(|b| b.get("target_before"))
@@ -1889,7 +1899,7 @@ fn classify_revert(
                 }
             }
         }
-        None => None,
+        _ => None,
     };
     Ok(Classified::Revertable {
         note,

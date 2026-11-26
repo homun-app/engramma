@@ -301,13 +301,12 @@ test('compact() without the experimental opt-in refuses, and the cell does not c
   await e.close();
 });
 
-// v0.6.15 (F2.4): the two-device defect (open-defects.txt, the seeds
-// 1835111131785192683 and 2472647288214113510) needs decision REVERTS, and
-// Homun cannot reach it because `revertDecision` is not in the binding —
-// the CLI's `revert` is the only road, and only who runs the CLI on a
-// synced cell walks it. The same field check anchor_tables.rs does on the
-// schema, on the declared API: if `revertDecision` enters index.d.ts while
-// that line is open, THIS fails — review the line first.
+// v0.6.15 (F2.4): the two-device defect (the seeds 1835111131785192683
+// and 2472647288214113510) needed decision REVERTS, and Homun could not
+// reach it because `revertDecision` is not in the binding. v0.6.19 closed
+// it (the revert of a reject no longer reopens the target); the guard
+// stays: `revertDecision` enters index.d.ts only by a phase that decides
+// it, and THIS fails until that phase reviews the line.
 test('index.d.ts declares no revertDecision while the two-device defect is open', () => {
   const dts = fs.readFileSync(path.join(__dirname, '..', 'index.d.ts'), 'utf8');
   const cell = dts.match(/export declare class Cell \{[\s\S]*?\n\}/);
