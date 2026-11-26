@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.6.19-beta.1] - 2026-11-26
+## [0.6.19-beta.1] - 2026-11-27
 
 For the beta developers — everything a user, a client or a developer
 reads is in English: the CLI's human output, the review page, the MCP

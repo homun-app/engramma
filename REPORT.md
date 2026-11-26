@@ -5,62 +5,16 @@ fase, sta in [docs/storia/REPORT-fino-alla-v0.6.14.md](docs/storia/REPORT-fino-a
 
 ## v0.6.19 — la CLI parla inglese
 
-Data: 2026-11-26. Base: `main` @ `a5a61f2` (la `0.6.18-beta.1`). Tema: tutto
-quello che un utente, un client o uno sviluppatore legge è in inglese — la
-CLI, la pagina di revisione, il server MCP e le pagine OAuth, la prosa del
-core, i rifiuti di sync e di vault, gli errori del binding Node. I codici
-restano identici: `e.code`, gli exit code, le chiavi e i valori enumerati
-del JSON, i codici OAuth. Niente bump di versione, niente tag, niente
-push: i 13 commit stanno sul `main` locale. Due tappe col revisore in
-mezzo: l'inventario e il cancello (F1), poi la traduzione (F2).
+Data: 2026-11-27. Base: `main` @ `a5a61f2` (la `0.6.18-beta.1`). Esce come
+`0.6.19-beta.1`. Tema: tutto quello che un utente, un client o uno
+sviluppatore legge è in inglese — la CLI, la pagina di revisione, il server
+MCP e le pagine OAuth, la prosa del core, i rifiuti di sync e di vault, gli
+errori del binding Node. Il motore non cambia e non ci sono misure
+(docs/fasi.md). Tre tappe col revisore in mezzo: l'inventario e il cancello,
+la traduzione, la chiusura. I codici restano identici: `e.code`, gli exit
+code, le chiavi e i valori enumerati del JSON, i codici OAuth.
 
-### Cosa cambia
-
-- **Il cancello** (`crates/engramma-cli/tests/english.rs`): una sessione
-  che passa per ogni sottocomando della CLI, striscia ogni pagina della
-  revisione, parla con `mcp` su stdio (con e senza modulo di conferma) e
-  su HTTP (OAuth compreso) e legge tutto quello che esce — 105 voci
-  italiane, più tre promesse che le parole non portano (le route nuove
-  rispondono 200 e le vecchie 308, le pagine dichiarano `lang="en"`, le
-  conferme dicono `[y/N]` e leggono `y`, con `s` che resta). Sulla base:
-  **130 superfici su 159 in italiano**. Oggi verde: **132 superfici
-  lette** — il totale cala perché una pagina con la lingua sbagliata
-  contava doppio; e il verde ora dice quante ne ha lette, prima taceva.
-- **La CLI**: l'uscita umana è in inglese, `about` di clap compreso; per
-  ogni errore d'uso cosa fare. Le conferme (`purge`, il revert in blocco,
-  `oauth approve`, il SAS) dicono `[y/N]` e leggono `y` e `yes`; `s`
-  conferma ancora, per gli script e le abitudini della beta; `si` e `sì`
-  non rispondono più. `--sperimentale` diventa `--experimental` e resta
-  come alias.
-- **La pagina di revisione**: inglese, `lang="en"`, indirizzi `/queue`,
-  `/notes`, `/notes/<id>`, `/decisions`, `/policy`, `/enter`,
-  `/style.css`. Quelli della beta rispondono **308** per sempre — il
-  token dell'entrata e l'id della nota viaggiano nel reindirizzamento — e
-  i moduli cambiano route e campi (`text`, `reason`, `version`, `since`,
-  `until`, `confirm`); le vecchie route POST non esistono più.
-- **Il server MCP e OAuth**: il modulo di conferma, i campi di prosa
-  `note` e `reason`, le pagine di `/authorize`, la pagina d'attesa (ora
-  `/pending/<handle>`; `/attesa/<handle>` risponde 308), le descrizioni
-  di `/token` e del registro OAuth. I `reason` che il modulo scrive nel
-  registro sono inglesi per le decisioni nuove.
-- **Core, sync, vault, binding Node**: la prosa che arrivava agli stessi
-  lettori — i 17 testi del core, i 62 di sync, i 17 di vault, i 46 del
-  binding, più i messaggi dei lock. `via` di sync resta `diretta` nel
-  JSON: è un valore enumerato del contratto e resta italiano per sempre;
-  la riga per umani dice `direct`. Il primo dispositivo si chiama
-  `laptop`.
-- **Documenti**: `docs/cli.md` apre col glossario (l'inglese contro le
-  parole dei documenti italiani, che restano tali); citazioni e segnaposto
-  seguono l'uscita vera (`<name>`, `<cell>`, `<copy>`: quelli italiani non
-  erano mai stati i segnaposto reali); il README mostra l'uscita reale.
-- **`--json`** non cambia nelle chiavi né nei valori enumerati; cambia
-  lingua la **prosa** dentro: i `reason` di `decisions` e `proposals`
-  (quelli nuovi: le celle vecchie tengono l'italiano), `detail` di
-  `oauth log` e di `consolidate`, `relay_warning`, `why_not` e `via` di
-  sync (`direct`), `note` e `reason` di MCP, `declared_corners` e
-  `mismatch` di `verify`, `explain.graph.off` e `explain.via` di `search`.
-
-### I numeri
+### L'inventario e i conteggi
 
 | Dove | L'inventario | Tradotti |
 |---|---:|---:|
@@ -73,58 +27,166 @@ mezzo: l'inventario e il cancello (F1), poi la traduzione (F2).
 | messaggi dei lock (sync, binding) | 25 | 27 |
 | **In tutto** | **552** | **560** |
 
-Le differenze: cinque descrizioni fuori inventario nell'OAuth (tre
-`server_error` e due 500 di `/register` dicevano `oauth.db` al posto di una
-frase), un esempio di schema, due righe di traccia di sync, due messaggi di
-lock non contati; le due voci di vault che mancano sono il suffisso
-`.conflitto`, che resta.
+Fuori inventario, tradotti lo stesso: cinque descrizioni OAuth (`oauth.db`
+al posto di una frase), un esempio di schema, due righe di traccia, due
+messaggi di lock; le due voci di vault che mancano sono il suffisso
+`.conflitto`, che resta. I test: 22 file cambiati (il cancello, 12 della
+CLI, 3 del core, 1 di sync, 2 di vault, 3 JS); ogni asserzione segue la
+parola inglese equivalente, nessuna indebolita.
 
-I test: **20 file cambiati** (il cancello, 11 file della CLI, 3 del core,
-2 di vault, 3 JS); ogni asserzione segue la parola inglese equivalente,
-nessuna indebolita. Fra i test nuovi: le route della beta rispondono 308
-(revisione e pagina d'attesa), la pagina delle decisioni non rende markup
-da un URL, il rifiuto SAS si riconosce dalla variante, le conferme leggono
-`y` e `yes`.
+Il cancello (`crates/engramma-cli/tests/english.rs`): sulla base **130
+superfici su 159 in italiano** («inizializzato: …», «aggiunta: …»), verde
+ora, **132 lette** — il totale cala perché una pagina con la lingua
+sbagliata contava doppio, e il verde ora dice quante ne ha lette.
+
+### Le decisioni del revisore, e i difetti
+
+- La prosa che diventa dato (le ragioni nel registro) è inglese per le
+  decisioni nuove; le celle vecchie tengono l'italiano e `decisions` lo
+  mostra. Il primo dispositivo si chiama `laptop`.
+- La pagina: `lang="en"`, le route inglesi, le vecchie GET in 308, le POST
+  e i campi solo rinominati; i dati di prova in inglese; le tre promesse
+  nel cancello; i tre testi che il cancello non vede, a mano.
+- **`via` è un valore enumerato del contratto** (`sync run --json`, `sync
+  status --json`, `via?: string` del binding), non prosa: la traduzione
+  l'aveva fatto diventare `direct`. Ora il JSON e il binding tengono
+  `"diretta"` per sempre, la riga per umani dice `direct`, e due test lo
+  fissano (nella CLI e in `unsent.rs`). Il CHANGELOG non lo nomina: non
+  cambia.
+- **I tre difetti dell'inventario (§11), corretti.** §11.7: la pagina delle
+  decisioni rendeva il markup di un URL — il blocco ora nasce nel server
+  (`Review::flash`), mostrato una volta, con il test del `<b>` escapato.
+  §11.9: il servizio sync riconosceva il rifiuto SAS dalla parola
+  «rifiutata» — variante tipata `Error::SasRefused`, con test. §11.6:
+  `/token` rispondeva `oauth.db` come codice — `server_error`. Di
+  passaggio: i 43 spazi (§11.8) e 18 in `service.rs`; due commenti del
+  binding che finivano nell'`index.d.ts` in italiano.
 
 ### Cosa resta italiano, e perché
 
-- **Dati salvati**: `conflitto` (il tag della copia, la relazione nel
-  grafo, il motivo nel registro delle proposte) e il suffisso
-  `.conflitto` dei file: tradurli sarebbe una migrazione.
-- **Dello stemmer e dei codici**: le stopword di `text.rs` e le parole
-  dei codici di abbinamento (`words.rs`): cambiarle cambia il protocollo.
+- **Dati salvati**: `conflitto` (tag, relazione del grafo, motivo nel
+  registro) e il suffisso `.conflitto`: tradurli sarebbe una migrazione.
+- **Valori enumerati del contratto**: `via` vale `diretta` o `relay`.
+- **Dello stemmer e dei codici**: le stopword di `text.rs` e le parole dei
+  codici di abbinamento (`words.rs`): cambiarle cambia il protocollo.
 - **Le ragioni che la beta ha già scritto** nei registri delle celle
-  vecchie: `engramma decisions` le mostra come sono.
-- **Il nome dell'utente** (note, celle, dispositivi, etichette) e **i
-  documenti italiani** (`DESIGN.md`, `sync.md`, `node.md`, `mcp.md`): il
-  glossario di `docs/cli.md` fa da ponte.
-
-### Scelte prese da chi ha tradotto, da confermare
-
-- `--sperimentale` resta come alias: gli script della beta non si rompono.
-- `si` e `sì` non rispondono più a una conferma (`y`, `yes` e `s` sì);
-  «interruptore» è *breaker*, «annullamento in blocco» è *bulk revert*.
-- Il cancello legge la pagina d'attesa su `/pending/0`, promette il 308
-  di `/attesa/<handle>` e stampa il riepilogo anche da verde.
-
-### Difetto trovato e dichiarato
-
-`explain.source` esce **vuoto** nel percorso di ricerca testuale, in JSON
-come nella riga umana (`source:` senza valore), mentre la nota ha
-`source: "user"`. C'era già nella beta: il vecchio campione del README
-mostrava `fonte:` vuota. Non perde dati e non lascia uno stato che
-`verify` non vede: per `docs/fasi.md` si dichiara e non si insegue (la
-causa nel core non è stata cercata). `docs/cli.md` lo documenta come se
-fosse pieno.
+  vecchie; **il nome dell'utente** (note, celle, dispositivi, etichette).
+- **I documenti italiani** (`DESIGN.md`, `sync.md`, `node.md`, `mcp.md`):
+  il glossario di `docs/cli.md` fa da ponte.
 
 ### Le prove
 
 Suite del workspace col seme del CI (`PROPTEST_RNG_SEED=20261124`):
-**verde — 88 binari, 723 test, 0 caduti** (13 ignorati, tra cui il
-difetto dichiarato della v0.6.14). Il cancello: verde, 132 superfici.
-Contratto JS del binding, sull'addon ricostruito: **67 pass, 0 falliti**.
-`cargo fmt --all --check` e `cargo clippy --all-targets -- -D warnings`
-puliti.
+**verde — 88 binari, 724 test, 0 caduti** (13 ignorati, tra cui il difetto
+dichiarato della v0.6.14); in essa il cancello verde (132 superfici) e
+`golden_cell` verde. Contratto JS del binding, sull'addon ricostruito:
+**67 pass, 0 falliti**. `cargo fmt --all --check` e `cargo clippy
+--all-targets --locked -- -D warnings` puliti.
+
+**La prova sul binario** (release, cartella temporanea, dati sintetici
+inglesi: Dijkstra, Liskov, Thompson; le proposte le fa l'assistente, la
+CLI non propone). Le scene delle catture del sito, uscita accorciata:
+
+```console
+$ engramma search shortest
+1. [active] Dijkstra and shortest paths (XBG084V2)
+   score 1.0000 (raw 0.6500)
+   lists: text
+   terms: shortest
+   BM25 rank: 1
+   support: strong
+   graph weight: 0.35 (gap 0.00)
+   validity: always → now
+   source:
+$ engramma verify
+log verified: 4 operations, hash chain, reconstruction and FTS index in place
+$ engramma proposals
+[queued] B04M2TDB mcp:claude-code — Rob Pike co-wrote the Go book with Ken Thompson.
+      reason: the user said so in this chat
+$ engramma proposals accept 01M8D07A4614ATFQBRB04M2TDB
+accepted: 01M8D07A4614ATFQBRB04M2TDB
+vectors pending: the note is embedded by `engramma embed`
+$ engramma decisions
+WHNJC57E  accept  user@cli  2026-11-26T22:39:37Z
+      proposal B04M2TDB
+      why: accepted from the CLI
+$ engramma revert 01M8D07A5DRZHWJAXHWHNJC57E --dry-run
+would revert: the proposal goes back to the queue: B04M2TDB
+$ engramma verify
+log verified: 7 operations, hash chain, reconstruction and FTS index in place
+$ engramma revert 01M8D07A5DRZHWJAXHWHNJC57E
+reverted: the proposal goes back to the queue: B04M2TDB
+$ engramma proposals accept 01M8D07A8CDYK9KQNQAVDATKD4
+engramma: correction rejected: 01M8D07A2A34PNM1ZQPFTAPRMA is not the current version — already corrected by 01M8D07A88RDJME78Q588SDE64 — reject the proposal (`engramma proposals reject <id>`) or propose again on the current note (01M8D07A88RDJME78Q588SDE64)
+   (exit 4)
+$ engramma revert 01M8D07A8QSCZEZZQ9XY8HPW46 --yes
+reverted: the proposal goes back to the queue: 588SDE64
+$ engramma proposals accept 01M8D07A8CDYK9KQNQAVDATKD4
+accepted: 01M8D07A8CDYK9KQNQAVDATKD4
+```
+
+Il dry-run risponde e `verify` conta 7 operazioni prima e dopo; il revert
+subito dopo riporta la proposta in coda; la seconda correzione esce 4 e
+resta in coda; annullata la prima, la seconda accetta. **Difetto trovato e
+dichiarato** (CHANGELOG, Known issues): `explain.source` esce vuoto nella
+ricerca senza modello — la riga `source:` qui sopra — mentre `note.source`
+vale `user`. C'era già nella beta; la causa nel core non è stata cercata.
+
+### La caccia
+
+`scripts/caccia.sh`, `CACCIABASE=a5a61f2`, budget di default
+(`target/caccia/20261126-211001`, 86 minuti): 30 proprietà, 16 toccate,
+**29 verdi** (da 1 434 a 20 029 casi). Tre rossi, tutti e tre smistati con
+i tre passi di `docs/caccia.md` e **tutti e tre già sul tag
+`fase-v0.6.18`** (`scripts/seme-sul-tag.sh`, motore verificato), in
+`quarantine_exits_only_by_decision` — la proprietà che ha già due difetti
+dichiarati dalla v0.6.14 e cade circa una volta ogni 2 000–4 000 casi:
+
+- `5883740581019706580`, dalla proprietà (2 321 casi): «[due/finale] la
+  decisione annullata … non basta» — la famiglia dichiarata; la suite a
+  2 048, nella stessa corsa, è caduta rigiocando questo seme.
+- `4586480981517075520`, dalla suite rifatta: «[singolo] la nota … è
+  `superseded` senza una decisione che la spieghi» — terza forma, riga
+  nuova.
+- `2220529349810690032`, dalla terza corsa della suite (`--no-fail-fast`,
+  tutta giudicata: 394 verdi, 9 ignorati): «state differs around» — la
+  famiglia del taglio.
+
+I tre semi sono in `open-defects.txt`, fuori dalle regressioni. Due
+correzioni agli strumenti: il limite della suite viene solo da una suite
+verde (F3), e `seme-sul-tag.sh` toglie il `CARGO_TARGET_DIR` dell'ambiente
+(un primo verdetto, valido per i due controlli, era stato preso con la
+build finita nella cache condivisa: rifatto).
+
+### Per il revisore: la sequenza del rilascio
+
+1. **Push di `main`** (i commit della fase, quello della REPORT in coda).
+2. **Tag `v0.6.19-beta.1`** sullo stesso commit spinto: `git tag -a
+   v0.6.19-beta.1 -m "…" && git push origin v0.6.19-beta.1`. È il tag che
+   fa partire `release.yml`.
+3. La GitHub Release come le due prima: i sei file del pacchetto,
+   l'installer, le attestazioni, il flag pre-release, il corpo dal
+   CHANGELOG.
+
+Le due righe che cambiano nel sito (le fa il revisore dopo il rilascio):
+`nginx/default.conf`, `location = /engramma/install.sh`, il redirect a
+`v0.6.19-beta.1`; `src/data/engramma.mjs`, `const VERSION = "0.6.19-beta.1";`
+(e con lui `CAPTURED_WITH`).
+
+**Le catture da rifare**, sul binario rilasciato (sono tutte uscite
+italiane): l'hero (`search "where does Gaia live now?"` con la spiegazione
+e `verify`: `punteggio`, `grezzo`, `liste`, `termini`, `validità … ora`,
+`fonte`, `registro verificato: … operazioni`); le tre scene dell'hub
+(«accettata dalla CLI», «confidenza 0.9», «in coda · status: quarantined»);
+il cammino del grafo («(nota …)»); il tempo («→ ora»); la coda
+(«da mcp:claude-code · in coda», «decisa da user@cli»). Con loro il
+commento in testa al file: «the CLI prints Italian labels today».
+
+### La build sul tag
+
+Il tag `fase-v0.6.19`, annotato e solo locale, punta al commit della
+REPORT. `scripts/build-sha.sh` col repo sul tag: i tre SHA arrivano col
+commit di sola documentazione che segue il tag.
 
 ## v0.6.18 — la revisione mantiene le promesse
 
