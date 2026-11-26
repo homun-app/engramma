@@ -97,7 +97,7 @@ uscito col test rosso prima, sull'uscita del binario della base.
 Suite del workspace col seme del CI (`PROPTEST_RNG_SEED=20261124`):
 **verde — 87 binari, 714 test, 0 caduti** (13 ignorati, tra cui il
 difetto dichiarato della v0.6.14). `golden_cell` verde. Contratto JS del
-binding: in «La build sul tag», sul `.node` del tag. `cargo fmt --check` e `cargo clippy -D warnings` puliti
+binding, sul `.node` del tag: **67 pass, 0 falliti**. `cargo fmt --check` e `cargo clippy -D warnings` puliti
 (i commit della fase non lo erano: 29 differenze di rustfmt e tre
 avvisi, sistemati in `5d7610b` senza cambiare il comportamento — il CI
 sarebbe stato rosso al push).
@@ -202,7 +202,13 @@ Le due righe che cambiano nel sito (dopo il rilascio, le fa il revisore):
 
 Il tag `fase-v0.6.18`, annotato e solo locale, punta al commit della
 REPORT. La correzione cambia il motore, quindi la build si rifà:
-`scripts/build-sha.sh` col repo sul tag; i numeri seguono in un commit di sola documentazione.
+`scripts/build-sha.sh` col repo sul tag (costruisce su `acf48f6`): `engramma.darwin-arm64.node`
+51 259 304 B, SHA256 `1884125b…ef872abb`; `index.js` 36 463 B,
+`ac259d8b…8c48f`; `index.d.ts` 32 615 B, `7020ae60…0fc2427`. Rispetto
+alla build di prima della correzione cambia solo il `.node`
+(`b4a8ceba…`, 51 258 376 B), perché cambia il motore. `index.js` e
+`index.d.ts` sono identici byte per byte: l'API e i codici di errore del
+binding non cambiano.
 
 ### Il verdetto
 
