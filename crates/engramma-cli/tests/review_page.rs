@@ -635,6 +635,55 @@ fn the_decisions_page_reverts_single_and_bulk() {
     assert_eq!(cell.get(&b).unwrap(/* t */).status, Status::Quarantined);
 }
 
+// v0.6.19 (the site capture, S13): the decisions page copied the
+// `anteprima` query parameter into its HTML as it came — whatever markup
+// a URL carried became part of the page. The page now shows only what the
+// server built itself (a block left by a POST, its values escaped where
+// it was built): markup in a URL shows nothing, markup typed in a form
+// comes out escaped.
+#[test]
+fn the_decisions_page_never_renders_markup_from_a_url() {
+    let s = start();
+    let client = s.client();
+
+    // the old way in: markup in the URL. Nothing of it shows.
+    let html = client.body("/decisioni?anteprima=%3Cb%3Ebold%3C%2Fb%3E");
+    assert!(!html.contains("<b>"), "no live tag from a URL: {html}");
+    assert!(!html.contains("bold"), "nothing from a URL shows: {html}");
+
+    // the way a visitor goes: the bulk form, with markup in its fields.
+    // The preview comes back with the value escaped, and shows once.
+    let html = client.body("/decisioni");
+    let csrf = csrf_of_form(&html, "/decisioni/blocco");
+    let r = client
+        .post(
+            "/decisioni/blocco",
+            &[
+                ("csrf", csrf.as_str()),
+                ("by", "<b>bold</b>"),
+                ("dal", ""),
+                ("al", ""),
+            ],
+        )
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 303);
+    let html = client.body("/decisioni");
+    assert!(
+        html.contains("value=\"&lt;b&gt;bold&lt;/b&gt;\""),
+        "the value comes out escaped: {html}"
+    );
+    assert!(!html.contains("<b>"), "never a live tag: {html}");
+    assert!(
+        html.contains("<h3>Anteprima</h3>"),
+        "the server's own block still renders as markup: {html}"
+    );
+    let again = client.body("/decisioni");
+    assert!(
+        !again.contains("<h3>Anteprima</h3>"),
+        "the block shows once: {again}"
+    );
+}
+
 fn urldecode(s: &str) -> String {
     let mut out = Vec::new();
     let bytes = s.as_bytes();

@@ -34,6 +34,12 @@ struct Review {
     token: String,
     /// The port we actually bound (the Host check needs it).
     port: u16,
+    /// v0.6.19 (the site capture, S13): what the decisions page shows
+    /// ONCE after a POST — the preview of a bulk revert, or how a revert
+    /// went. It is HTML this server built itself, every dynamic value
+    /// escaped where it was built: the page renders nothing that arrived
+    /// in a URL.
+    flash: std::sync::Mutex<Option<String>>,
 }
 
 /// One query string.
@@ -199,6 +205,19 @@ impl Review {
             }
         }
         Ok(())
+    }
+
+    /// Leave a block for the next decisions page: the one the POST that
+    /// carries it redirects to.
+    fn flash(&self, html: String) {
+        if let Ok(mut slot) = self.flash.lock() {
+            *slot = Some(html);
+        }
+    }
+
+    /// The block, once: a reload shows the plain page.
+    fn take_flash(&self) -> Option<String> {
+        self.flash.lock().ok().and_then(|mut slot| slot.take())
     }
 }
 
@@ -699,8 +718,8 @@ async fn decisions(
         esc(&since),
         esc(&until)
     ));
-    if let Some(prev) = q.get("anteprima") {
-        body.push_str(prev);
+    if let Some(prev) = review.take_flash() {
+        body.push_str(&prev);
     }
     page("Decisioni", &body)
 }
@@ -797,40 +816,23 @@ async fn bulk(
             esc(&form.dal),
             esc(&form.al),
         );
-        return see_other(&format!(
-            "/decisioni?by={}&dal={}&al={}&anteprima={}",
-            urlencode(&form.by),
-            urlencode(&form.dal),
-            urlencode(&form.al),
-            urlencode(&prev)
-        ));
+        // the block goes to the next page through the server, not the URL
+        review.flash(prev);
+        return see_other("/decisioni");
     }
     // confirmed: apply
     match review.cell.revert_decisions(&filter, false) {
-        Ok(report) => see_other(&format!(
-            "/decisioni?anteprima={}",
-            urlencode(&format!(
+        Ok(report) => {
+            review.flash(format!(
                 "<p class=\"meta\">annullate {}, conflitti {}, purgate {}</p>",
                 report.reverted,
                 report.conflicts.len(),
                 report.purged
-            ))
-        )),
+            ));
+            see_other("/decisioni")
+        }
         Err(e) => engine_error(e),
     }
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
 }
 
 async fn revert_one(
@@ -855,7 +857,9 @@ async fn revert_one(
     {
         Ok(RevertOutcome::Reverted { .. }) => see_other("/decisioni"),
         Ok(RevertOutcome::Purged { .. }) => {
-            see_other("/decisioni?anteprima=annullata%2C%20ma%20il%20contenuto%20era%20purgato")
+            review
+                .flash("<p class=\"meta\">annullata, ma il contenuto era purgato</p>".to_string());
+            see_other("/decisioni")
         }
         Err(e) => engine_error(e),
     }
@@ -937,6 +941,7 @@ pub async fn run(cell: Cell, port: Option<u16>, open: bool) -> std::io::Result<(
         cell,
         token,
         port: bound.port(),
+        flash: std::sync::Mutex::new(None),
     });
     let app = Router::new()
         .route("/", get(|| async { see_other("/coda") }))
