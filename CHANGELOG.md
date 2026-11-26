@@ -6,22 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.6.19-beta.1] - 2026-11-26
 
+For the beta developers — everything a user, a client or a developer
+reads is in English: the CLI's human output, the review page, the MCP
+server, the OAuth pages, the errors of the Node binding. The engine does
+not change.
+
 ### Changed
 
+- **The human output and the messages are in English.** Who parsed the
+  textual output must switch to `--json`. `--json` does not change: same
+  keys, same enumerated values, same exit codes; the OAuth `error` codes
+  and the binding's `e.code` are the same too. Only **prose fields**
+  change language:
+  - `decisions[].reason` and `proposals[].reason`, for the decisions to
+    come: `accepted from the CLI`, `reverted from the CLI`, `accepted
+    from the review page`, `reverted from the review page`, `bulk
+    revert`, `confirmed from the client's form` when the MCP form
+    decides, and the reason of a proposal the automatic reviewer hands
+    over to a human. Cells created before keep the Italian reasons they
+    hold, and `engramma decisions` shows them.
+  - The MCP tool answers: the `reason` of a decision taken on the form
+    (`confirmed from the form`, `confirmed (with an edit) from the
+    form`, `rejected from the form`) and the prose `note` of a proposal
+    that stays `pending`.
+  - `engramma verify`: `declared_corners` and `mismatch`.
+  - `engramma search`: `explain.graph.off` and `explain.via`.
+  - `engramma consolidate`: `detail`.
+  - Sync: `why_not`, `relay_warning`, and the `reason` of the operations
+    that could not leave (`engramma sync status`).
+  - `vault sync --json` and `import --json`: `warnings` and `errors`.
+  - `engramma oauth log`: `detail`; and the `error_description` of every
+    OAuth answer.
+  - The `message` of every error, on stderr and in `--json`.
+- The first device of a new data root is called `laptop` (`portatile`
+  before).
+- The `.conflitto` suffix of the conflict files stays: it is a name on
+  disk, not a message.
 - The interactive confirmations (`purge`, the bulk `revert`, `oauth
   approve`, the SAS of a pairing) say `[y/N]` and read `y` and `yes`. `s`
   still confirms, for who has scripts or habits with the beta; the SAS
   prompt no longer reads `si` or `sì`.
-- The human output of the CLI, the review page, the MCP server and the
-  OAuth pages is in English. Who parsed the textual output must switch
-  to `--json`, which does not change — except for the prose fields listed
-  in the REPORT. Exit codes, JSON keys and enumerated values, OAuth
-  error codes and `e.code` in the Node binding are the same.
-- The prose the CLI writes INTO the registry is in English too (the
-  reason of a decision, of a revert). Cells created before keep the
-  Italian reasons they already hold, and `engramma decisions` shows
-  them. The first device of a new data root is called `laptop`
-  (`portatile` before).
 - `engramma compact` takes `--experimental`; `--sperimentale`, the
   beta's name, still answers.
 - The review page moved to English addresses: `/queue`, `/notes`,
@@ -33,26 +57,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `version`, `since`, `until`, `confirm`); the old POST routes are gone,
   so a tab left open on the beta's page gets a 404 instead of a decision.
 - The MCP server speaks English: the confirmation form (its message and
-  the description of its field), the prose fields `note` and `reason` of
-  the tool answers, the lines it writes on stderr, the examples in the
-  tool schemas. The reason a form writes into the registry is English
-  for the decisions to come (`confirmed from the client's form`).
-- The OAuth pages and the token endpoint speak English, the
-  `error_description` values included (the `error` codes do not change).
-  The waiting page lives at `/pending/<handle>`; the beta's
-  `/attesa/<handle>` answers 308, for good. `engramma oauth log` writes
-  the `detail` of the events to come in English.
+  the description of its field), the lines it writes on stderr, the
+  examples in the tool schemas.
+- The OAuth pages speak English. The waiting page lives at
+  `/pending/<handle>`; the beta's `/attesa/<handle>` answers 308, for
+  good.
 - The sync service speaks English: its refusals (the pairing, the share,
   the removal of a device), its warnings, the reasons an operation could
-  not leave, the lines of `ENGRAMMA_TRACE`. In JSON the `why_not` of a
-  device and the `relay_warning` follow.
+  not leave, the lines of `ENGRAMMA_TRACE`.
 - The reasons `vault sync`, `purge` and `cell drop` report are in English:
   an unreachable view, an orphan `.conflitto` copy, a file that would
-  change a note's status, the guard against a mass deletion. The
-  `.conflitto` suffix of the files stays: it is a name on disk.
-- The Node binding's error messages are in English — the `Error` a
-  client catches keeps its `e.code` — and so is the default name of the
-  first device of `sync()` (`laptop`).
+  change a note's status, the guard against a mass deletion.
+- The error messages of the Node binding are in English; the `Error` a
+  client catches keeps its `e.code`.
 - `docs/cli.md` opens with a glossary, the English words against the
   Italian ones the other documents keep; what it quotes, its placeholders
   and its flags follow the CLI. The README's sample is the real output.
@@ -65,6 +82,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `/token` answers `server_error` (RFC 6749 §5.2) when the authorization
   store cannot be read. It used to answer with the file's name,
   `oauth.db`, which is not an error code.
+- The sync service told a refused SAS by the word «rifiutata» inside the
+  message: it is a typed variant now, whatever language the words speak.
+
+### Known issues
+
+- `engramma search` prints `source:` with nothing after it, and answers
+  `"source": ""` inside `explain`, when no embedding model is configured
+  (`mode: "text"`): the note's source is in `note.source`. It was already
+  in 0.6.18-beta.1.
 
 ## [0.6.18-beta.1] - 2026-11-25
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! v0.6.17 (F1): the released version is a promise — the installer, the
-//! GitHub Release and the docs all say `0.6.18-beta.1`, and the binary
+//! GitHub Release and the docs all say `0.6.19-beta.1`, and the binary
 //! must say the same. The test hardcodes the string on purpose: a bump
 //! that forgets a manifest turns the suite red instead of shipping a
 //! binary that answers with the workspace's old placeholder.
@@ -19,7 +19,7 @@ fn version_prints_the_released_number() {
     // v0.6.10 (J3): the long version keeps going with the commit and the
     // supported schema — the promise is the FIRST line's beginning.
     assert!(
-        said.starts_with("engramma 0.6.18-beta.1"),
+        said.starts_with("engramma 0.6.19-beta.1"),
         "the binary says who it is: {said}"
     );
 }

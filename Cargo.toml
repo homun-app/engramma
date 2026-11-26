@@ -27,17 +27,17 @@ resolver = "2"
 members = ["crates/engramma-core", "crates/engramma-embed", "crates/engramma-vault", "crates/engramma-cli", "crates/engramma-mcp", "crates/engramma-node", "crates/engramma-sync", "bench"]
 
 [workspace.package]
-version = "0.6.18-beta.1"
+version = "0.6.19-beta.1"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.95"
 repository = "https://github.com/homun-app/engramma"
 
 [workspace.dependencies]
-engramma-core = { path = "crates/engramma-core", version = "0.6.18-beta.1" }
-engramma-embed = { path = "crates/engramma-embed", version = "0.6.18-beta.1" }
-engramma-vault = { path = "crates/engramma-vault", version = "0.6.18-beta.1" }
-engramma-sync = { path = "crates/engramma-sync", version = "0.6.18-beta.1" }
+engramma-core = { path = "crates/engramma-core", version = "0.6.19-beta.1" }
+engramma-embed = { path = "crates/engramma-embed", version = "0.6.19-beta.1" }
+engramma-vault = { path = "crates/engramma-vault", version = "0.6.19-beta.1" }
+engramma-sync = { path = "crates/engramma-sync", version = "0.6.19-beta.1" }
 # `hooks`: query-progress callback, used by the bounded-walk tests; `backup`:
 # the compaction verify restores a snapshot into memory (no new crates: the
 # features only compile more of rusqlite itself).
