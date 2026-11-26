@@ -158,7 +158,11 @@ echo "build nella cartella del worktree ($WT/target): intera, pochi minuti"
 inizio=$(date +%s)
 (
   cd "$WT" || exit 2
-  # nessuna CARGO_TARGET_DIR: la cartella di build è quella del worktree
+  # nessuna CARGO_TARGET_DIR: la cartella di build è quella del worktree.
+  # v0.6.19: anche quella dell'AMBIENTE va via — una cache condivisa ereditata
+  # dalla sessione portava la build fuori dal worktree, che è la trappola
+  # descritta in testa
+  unset CARGO_TARGET_DIR
   CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 \
     PROPTEST_DISABLE_FAILURE_PERSISTENCE=1 \
     nice -n 19 cargo test -p "$pacchetto" --test "$bersaglio" zz_seme_sul_tag \

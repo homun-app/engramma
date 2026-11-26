@@ -103,7 +103,9 @@ spetta alla fase che lo trova: la fa la fase che lo chiude.
    tag non risulta compilata in quella corsa dal worktree (cargo,
    `--message-format=json`) e se lo **schema** di una cella nuova non è
    quello che il tag dichiara nel suo `schema.rs`. Costa una build intera
-   a corsa: è il prezzo di un verdetto che significa quel che dice.
+   a corsa: è il prezzo di un verdetto che significa quel che dice. E
+    (v0.6.19) toglie un `CARGO_TARGET_DIR` ereditato dall'ambiente: una
+    cache condivisa portava la build fuori dalla cartella del worktree.
 3. **Il giudizio.** Se il difetto **nasce da questa fase**, si corregge.
    Se **c'era già**, si **dichiara** aperto in `open-defects.txt` col seme
    e il verdetto dello script, e si va avanti.
