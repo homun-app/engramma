@@ -905,7 +905,9 @@ async fn token_code(state: &HttpState, f: &Q, now: i64) -> Response {
         return token_error("invalid_request", "manca redirect_uri");
     };
     match state.store.code_consume(code, now) {
-        Err(_) => token_error("oauth.db", "non leggibile"),
+        // v0.6.19: a store that cannot be read is a server error — `oauth.db`
+        // (the file's name) is not one of RFC 6749 §5.2's codes
+        Err(_) => token_error("server_error", "non leggibile"),
         Ok(Err(CodeUse::Unknown)) => token_error("invalid_grant", "codice sconosciuto"),
         Ok(Err(CodeUse::Expired)) => token_error("invalid_grant", "codice scaduto"),
         Ok(Err(CodeUse::Reused { family })) => {

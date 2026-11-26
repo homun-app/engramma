@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.19-beta.1] - 2026-11-26
+
+### Fixed
+
+- The decisions page of `engramma review` no longer renders markup that
+  arrives in a URL: what it shows after a POST is built by the server
+  itself, every value escaped where it is built.
+- `/token` answers `server_error` (RFC 6749 §5.2) when the authorization
+  store cannot be read. It used to answer with the file's name,
+  `oauth.db`, which is not an error code.
+
 ## [0.6.18-beta.1] - 2026-11-25
 
 For the beta developers — the propose/review/accept/revert loop is what
