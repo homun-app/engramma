@@ -718,7 +718,7 @@ fn lost_rows_v24(
             |r| r.get(0),
         )?;
         if row == 0 && forgotten("propose")? > 0 {
-            lost.push("la riga di coda");
+            lost.push("the queue row");
         }
         let orphan: i64 = tx.query_row(
             "SELECT COUNT(*) FROM ops o
@@ -729,7 +729,7 @@ fn lost_rows_v24(
             |r| r.get(0),
         )?;
         if orphan > 0 {
-            lost.push("la riga del registro");
+            lost.push("the log row");
         }
         // the note as the NEW side of a supersede the cut forgot: the old
         // side is the operation's own note (the index keeps both)
@@ -757,14 +757,14 @@ fn lost_rows_v24(
                 |r| r.get(0),
             )?;
             if purged == 0 && row == 0 {
-                lost.push("la riga supersedes");
+                lost.push("the supersedes row");
                 break;
             }
         }
         // the queue row is there but a decision the cut forgot has no
         // registry row: the row's state is the wrong cut's word
         if row > 0 && orphan > 0 {
-            lost.push("lo stato della riga di coda");
+            lost.push("the queue row's state");
         }
     } else if let Some(edge_id) = object.strip_prefix("edge:") {
         // a link the cut forgot, closed by nothing above it
@@ -785,7 +785,7 @@ fn lost_rows_v24(
                 r.get(0)
             })?;
         if newest_is_link > 0 && row == 0 {
-            lost.push("la riga dell'arco");
+            lost.push("the edge row");
         }
     }
     Ok(lost)

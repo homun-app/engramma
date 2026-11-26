@@ -319,7 +319,7 @@ pub struct SearchInput {
 pub struct GraphSay {
     /// The weight the graph list weighed with (0 when gated off).
     pub weight: f64,
-    /// Why the graph stayed off («grafo spento: nessuna entità nominata»).
+    /// Why the graph stayed off («graph off: no entity named»).
     pub off: Option<String>,
     /// First-to-second gap of the fused list.
     pub gap: Option<f64>,

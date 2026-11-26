@@ -372,9 +372,9 @@ fn declared_corners(conn: &Connection) -> Result<Vec<String>, CellError> {
         })
         .unwrap_or_default();
     Ok(vec![format!(
-        "angolo dichiarato: il taglio di compattazione tornò indietro (da {} a {}) \
-         con un motore prima della v0.6.14, e senza file di copia la migrazione non ha \
-         potuto ricostruire {} oggetto/i: {} — le righe restano come le ha trovate",
+        "declared corner: the compaction cut went backwards (from {} to {}) \
+         with an engine before v0.6.14, and without a copy file the migration could not \
+         rebuild {} object(s): {} — the rows stay as it found them",
         from.unwrap_or(0),
         to.unwrap_or(0),
         unserved.len(),
@@ -1364,9 +1364,9 @@ impl Cell {
                         .optional()?;
                     if inside.is_some() {
                         return Err(CellError::Invalid(format!(
-                            "op {}: arriva sotto il taglio di compattazione ({cut}) di una \
-                             cella condivisa: il prefisso congelato non si rigioca — il \
-                             dispositivo si riallinea dall'istantanea",
+                            "op {}: it lands under the compaction cut ({cut}) of a shared \
+                             cell: the frozen prefix is not replayed — the device realigns \
+                             from the snapshot",
                             op.op_id
                         )));
                     }
@@ -2201,7 +2201,7 @@ impl Cell {
                 None => return Err(CellError::NoteNotFound(copy_id.to_string())),
                 Some((_, 0)) => {
                     return Err(CellError::Conflict(
-                        "la copia di conflitto è già chiusa".into(),
+                        "the conflict copy is already closed".into(),
                     ));
                 }
                 Some((original, _)) => Ulid::from_string(&original)
@@ -2218,7 +2218,7 @@ impl Cell {
                     (ResolveKeep::Copy, _) => self.conflict_copy_body(copy_id)?.unwrap_or_default(),
                     (ResolveKeep::Merged, None) => {
                         return Err(CellError::Invalid(
-                            "resolveConflict: serve il corpo per `merged`".into(),
+                            "resolveConflict: the body is needed for `merged`".into(),
                         ));
                     }
                     (ResolveKeep::Original, _) => unreachable!(/* matched above */),

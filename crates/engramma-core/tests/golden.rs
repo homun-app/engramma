@@ -136,10 +136,10 @@ fn golden_queries() {
         .unwrap(/* t */)
         .into_iter()
         .collect();
-    // `(nota <id8>)` fragments resolve to one note only: when that note is
+    // `(note <id8>)` fragments resolve to one note only: when that note is
     // hidden, the path crossed quarantined ground.
     let via_crosses_hidden = |via: &str| -> bool {
-        via.split("(nota ")
+        via.split("(note ")
             .skip(1)
             .filter_map(|rest| rest.split(')').next())
             .any(|frag| {

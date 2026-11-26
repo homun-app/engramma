@@ -190,7 +190,7 @@ impl Cell {
                     kind: CandidateKind::NearDuplicate,
                     a,
                     b,
-                    detail: format!("coseno {cos:.3}, entità in comune {jac:.2}"),
+                    detail: format!("cosine {cos:.3}, entities in common {jac:.2}"),
                 });
                 if out.len() >= limit {
                     return Ok(out);
@@ -268,7 +268,7 @@ impl Cell {
                         a,
                         b,
                         detail: format!(
-                            "{src} {rel} {dst_a} ({}) e {rel} {dst_b} ({})",
+                            "{src} {rel} {dst_a} ({}) and {rel} {dst_b} ({})",
                             validity_of(from_a, to_a),
                             validity_of(from_b, to_b),
                         ),
@@ -344,7 +344,7 @@ fn overlaps(
 fn validity_of(from: &Option<String>, to: &Option<String>) -> String {
     format!(
         "from {} to {}",
-        from.as_deref().unwrap_or("sempre"),
-        to.as_deref().unwrap_or("ora")
+        from.as_deref().unwrap_or("always"),
+        to.as_deref().unwrap_or("now")
     )
 }

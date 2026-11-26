@@ -494,7 +494,7 @@ fn a_shared_cell_refuses_an_arrival_under_the_cut() {
         panic!("an arrival under the cut of a shared cell must be refused");
     };
     assert!(
-        e.to_string().contains("taglio"),
+        e.to_string().contains("under the compaction cut"),
         "the refusal must say what it refused and the way out: {e}"
     );
     // and the prefix is what it was: the note reads the frontier's body

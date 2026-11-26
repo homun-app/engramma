@@ -785,8 +785,8 @@ impl Cell {
                 possible_duplicates: possible,
                 decided_by: None,
                 decision_reason: Some(format!(
-                    "interruptore: max_auto_per_hour ({}) raggiunto mentre la revisione \
-                     era in corso; decide un umano",
+                    "breaker: max_auto_per_hour ({}) reached while the review was \
+                     running; a human decides",
                     policy.max_auto_per_hour
                 )),
             });
@@ -1492,7 +1492,7 @@ impl Cell {
                         // re-classified inside, under the write lock: between
                         // the two looks nothing changed (this thread owns the
                         // loop), and the single-decision path IS the check
-                        self.revert_decision(&op, "annullamento in blocco", "user@bulk-revert")?;
+                        self.revert_decision(&op, "bulk revert", "user@bulk-revert")?;
                     }
                 }
             }

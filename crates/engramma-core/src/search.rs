@@ -284,8 +284,8 @@ pub struct GraphExplain {
     /// The weight the graph list ended up with in the fusion (`0.0` when
     /// the gate closed).
     pub weight: f64,
-    /// Why the graph stayed off, when it did («grafo spento: nessuna
-    /// entità nominata», P1.4).
+    /// Why the graph stayed off, when it did («graph off: no entity
+    /// named», P1.4).
     pub off: Option<&'static str>,
     /// The first-to-second gap of the fused list, on its [0, 1] scale
     /// (P1.5's first signal; `None` when the graph never ran).
@@ -1800,7 +1800,7 @@ const GRAPH_SEEDS: usize = 3;
 
 /// What the gate says when it closes (P1.4): the question named no entity
 /// of the graph, so the walk never starts.
-const GRAPH_OFF_NO_ENTITY: &str = "grafo spento: nessuna entità nominata";
+const GRAPH_OFF_NO_ENTITY: &str = "graph off: no entity named";
 
 /// The reference first-to-second gap on the fused, [0, 1]-scaled list: at
 /// or above it the first result is "clear" (P1.5). The fused scale is
@@ -2074,7 +2074,7 @@ fn graph_list(
 
 /// Reconstruct the walk that carried mass to `node`: follow the predecessor
 /// of maximum mass back to a seed, then render it as
-/// `[[Fabio]] -partner_of-> [[Giulia]] -works_at-> (nota 00000082)`.
+/// `[[Fabio]] -partner_of-> [[Giulia]] -works_at-> (note 00000082)`.
 fn render_path(gi: &GraphIndex, pred: &HashMap<u32, (u32, u32, f64)>, node: u32) -> Option<String> {
     let mut chain: Vec<(u32, u32, u32)> = Vec::new(); // (from, rel, to)
     let mut cur = node;
@@ -2092,7 +2092,7 @@ fn render_path(gi: &GraphIndex, pred: &HashMap<u32, (u32, u32, f64)>, node: u32)
     let mut out = format!("[[{}]]", gi.display_of(chain[0].0));
     for (from, rel, to) in chain {
         let dest = match gi.note_of_node(to) {
-            Some(id) => format!("(nota {})", crate::id::id8(&id)),
+            Some(id) => format!("(note {})", crate::id::id8(&id)),
             None => format!("[[{}]]", gi.display_of(to)),
         };
         let _ = from;
@@ -3901,12 +3901,7 @@ mod tests {
                 .as_ref()
                 .expect(/* test-only */ "the graph ran");
             assert_eq!(say.weight, 0.0);
-            assert_eq!(
-                say.off,
-                Some("grafo spento: nessuna entità nominata"),
-                "{:?}",
-                say.off
-            );
+            assert_eq!(say.off, Some("graph off: no entity named"), "{:?}", say.off);
         }
         // …while the v0.3.2 seeding (Fused) still walks from the candidates
         let mut legacy = Query::text("traslocato a settembre").k(10).graph_hops(2);
