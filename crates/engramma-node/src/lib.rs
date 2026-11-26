@@ -3191,7 +3191,7 @@ impl Cell {
     }
 
     /// v0.6.4 (D3): every open conflict copy of the cell — the
-    /// «conflitti da risolvere» list. No text in the answer: the copy is
+    /// "conflicts to resolve" list. No text in the answer: the copy is
     /// a note, read it with `get`.
     #[napi(ts_return_type = "Promise<ConflictEntry[]>")]
     pub fn conflicts(&self, env: Env) -> Result<AsyncTask<ConflictsTask>> {
@@ -3346,7 +3346,7 @@ impl Cell {
     /// asked BEFORE the purge — read-only, nothing moves. Today it names
     /// the REOPENINGS: the notes whose closing was this note's work (the
     /// old side of a supersede, the target of an accepted correction).
-    /// Homun warns the user before forgetting: «tornerà valido: …».
+    /// Homun warns the user before forgetting: "it will be valid again: …".
     #[napi(ts_return_type = "Promise<PurgePreview>")]
     pub fn purge_preview(&self, env: Env, id: String) -> Result<AsyncTask<PurgePreviewTask>> {
         Ok(AsyncTask::new(PurgePreviewTask {
