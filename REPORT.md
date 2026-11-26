@@ -101,22 +101,41 @@ binding (il `.node` ricompilato e la CLI release, come il CI):
 
 La caccia col cancello sulle sole proprietà che coprono `proposals.rs`
 (7, `CACCIABASE=1bfc611 CACCIASOLO=…`): le sei esistenti verdi a budget
-pieno; la proprietà nuova è ROSSA al primo cancello (seme
-`12374479119677056745`) — **falso rosso dell'oracolo, non del motore**:
-il model della proprietà perdeva il bersaglio di un rifiuto e
-riattivava i bersagli riaperti senza leggere lo stato fotografato.
-Smistato (riproduzione del seme, il motore rifiutava giustamente,
-misurato a mano con la sequenza P/Q/R: il purge di R lascia la lapide
-di P e la decide successiva rifiuta con `StaleTarget`), corretto nel
-model due volte; il terzo rosso (seme `7557450892011188894`, ancora sul
-contro-oracolo dei rifiuti) chiude la questione: la semantica delle
-riaperture non si ricostruisce esatta senza un secondo motore, quindi
-l'invariante si verifica **sul reale** dopo ogni passo e la giustizia
-dei rifiuti resta ai test unitari, che pinnano le traiettorie una per
-una. Il cancello finale sulle due proprietà di `proposals_props.rs`
-(`CACCIABASE=01e3bb5`): **verdi — 13181 e 17203 casi**. Nessun difetto
-reale nuovo dalla caccia; i tre rossi sono tutti falsi dell'oracolo
-nuovo, documentati nei commit.
+pieno; la proprietà nuova è caduta tre volte (semi `12374479119677056745`,
+`7926852668091710635`, `7557450892011188894`) — **falsi rossi
+dell'oracolo, non del motore**: il model ricostruiva male i rifiuti e le
+riaperture (le riproduzioni a mano stanno nei commit). Scelta: la
+giustizia dei rifiuti resta ai test unitari, che pinnano le traiettorie
+una per una, e l'invariante della catena si legge sul reale — col
+ritocco qui sotto. Il cancello finale di allora (`CACCIABASE=01e3bb5`:
+verdi, 13181 e 17203 casi) aveva però un oracolo cieco: quel verde non
+misurava F3.
+
+**Il ritocco dell'oracolo** (il punto del revisore: la lista del model e
+il solo controllo della raggiungibilità lasciavano passare le sorelle di
+F3). Ora gli attivi tornano dalla cella dopo ogni passo (`note_ids_all`
++ `get` sullo stato `Active`; il model sceglie solo le mosse), per ogni
+coppia le catene sono **disgiunte** — nessun antenato condiviso — e
+`chain_of` cammina sulla tabella `supersedes`, non sul campo della nota
+(che una proposta accettata dalla coda non porta: lì il controllo era
+cieco su ogni accettata). **La prova che morde:** col controllo
+`StaleTarget` tolto in un worktree (non committato),
+`PROPTEST_RNG_SEED=20261124 PROPTEST_CASES=2048` dà ROSSO — seme
+`7557450884972762385`, «two active notes in one supersede chain: … and
+… share [Ulid(…)]».
+
+**Lo stesso comando sul motore corretto è rosso lo stesso** (seme
+`3947296525277540812`): un difetto vero, che l'oracolo cieco copriva.
+Smistato coi tre passi di `docs/caccia.md`: i semi **cadono anche sulla
+base `1bfc611`** — c'era già — e su 20 000 semi danno **140 rossi d'una
+famiglia sola, nessuno fuori**: un'accettazione che passa su una nota
+che un'altra decisione in piede aveva già chiusa (`decide` guarda lo
+stato del bersaglio, mai quello della nota della proposta). Ogni storia
+vuole un annullamento e `verify` resta verde: **dichiarato in
+`open-defects.txt`** con semi, le due forme e la raggiungibilità (regola
+del triage). Finché è aperto **il cancello `caccia.sh` è rosso per
+costruzione**; il CI a 128 casi col seme fisso resta verde (suite di
+`engramma-core`: 40 binari, 391 test, 0 caduti).
 
 La prova sul binario (cartella temporanea dello scratchpad, dati
 sintetici del sito, uscita accorciata): il dry-run risponde «annullerei:
@@ -150,7 +169,9 @@ Le due righe che cambiano nel sito (dopo il rilascio, le fa il revisore):
 ### La build sul tag
 
 Il tag `fase-v0.6.18`, annotato e solo locale, punta al commit della
-REPORT (`e9bd3d4`; `git cat-file -t fase-v0.6.18^{}` dice `commit`).
+REPORT (`git cat-file -t fase-v0.6.18^{}` dice `commit`; il ritocco
+dell'oracolo l'ha spostato da `e9bd3d4`, ma non rifà la build: tocca solo
+il file di test della proprietà e gli SHA qui sotto restano i suoi).
 `scripts/build-sha.sh` col repo sul tag: i tre file dell'aggancio, letti
 dal disco — `engramma.darwin-arm64.node` 51 258 376 B, SHA256
 `b4a8ceba…c87de`; `index.js` 36 463 B, `ac259d8b…8c48f`; `index.d.ts`
@@ -167,12 +188,12 @@ il codice per Homun), F4 (il vettore subito, in CLI e MCP), F5 (l'errore
 d'uso al posto del server che muore, versione, CHANGELOG). Fuori, come
 dichiarato: l'output della CLI in inglese, la fusione a righe e i
 permessi per attore, Windows e macOS Intel, la firma Apple e Homebrew,
-l'aggiornamento del sito (che fa il revisore dopo il rilascio). I test
-della cattura hanno smosso anche il vecchio difetto aperto della v0.6.14
-(il revert di un rifiuto riapre il bersaglio chiuso da un'altra
-decisione): resta dichiarato in `open-defects.txt`, la proprietà nuova
-non lo copre come oracolo e i suoi annullamenti fermano le sole
-accettazioni.
+l'aggiornamento del sito (che fa il revisore dopo il rilascio). In
+`open-defects.txt` restano dichiarati due difetti che la fase non
+chiude: il vecchio della v0.6.14 (il revert di un rifiuto riapre il
+bersaglio chiuso da un'altra decisione — la proprietà nuova non lo
+copre: i suoi annullamenti fermano le sole accettazioni) e quello che
+il ritocco dell'oracolo ha trovato, c'era già («Le prove»).
 
 ## v0.6.17 — la prima beta per sviluppatori
 
