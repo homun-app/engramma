@@ -24,6 +24,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`portatile` before).
 - `engramma compact` takes `--experimental`; `--sperimentale`, the
   beta's name, still answers.
+- The review page moved to English addresses: `/queue`, `/notes`,
+  `/notes/<id>`, `/decisions`, `/policy`, `/enter`, `/style.css`. The
+  beta's addresses (`/coda`, `/note`, `/note/<id>`, `/decisioni`,
+  `/politica`, `/stile.css`, `/entra`) answer 308, for good: a bookmark
+  lands on the new page, and the entry's token and a note's id ride
+  along. The forms are renamed with their routes (`text`, `reason`,
+  `version`, `since`, `until`, `confirm`); the old POST routes are gone,
+  so a tab left open on the beta's page gets a 404 instead of a decision.
 
 ### Fixed
 

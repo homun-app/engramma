@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 
 use engramma_core::cell::proposals::{
-    DecisionAction, DecisionInput, ProposalInput, ProposalMode, ProposeContext,
+    DecisionAction, DecisionInput, ProposalInput, ProposalMode, ProposalsFilter, ProposeContext,
 };
 use engramma_core::format::{At, Lang, Note, NoteType};
 use engramma_core::{Cell, Confidence, Status};
@@ -106,7 +106,7 @@ fn start_at(root: &std::path::Path, port: Option<u16>) -> Server {
     };
     let url = line
         .trim()
-        .strip_prefix("revisione: ")
+        .strip_prefix("review: ")
         .unwrap_or_else(|| panic!("unexpected banner: {line}"))
         .to_string();
     let token = url.split("token=").nth(1).unwrap_or_default().to_string();
@@ -159,7 +159,7 @@ impl Server {
             .build()
             .new_agent();
         let r = agent
-            .get(&format!("http://127.0.0.1:{}/entra?token={}", self.port, self.token))
+            .get(&format!("http://127.0.0.1:{}/enter?token={}", self.port, self.token))
             .call()
             .unwrap(/* t */);
         assert_eq!(r.status().as_u16(), 303);
@@ -212,7 +212,7 @@ fn the_address_is_loopback_and_the_token_gates_everything() {
     assert_eq!(s.token.len(), 64, "256 random bits, hex");
 
     // without the cookie: 401, on every page
-    for path in ["/coda", "/note", "/decisioni", "/politica"] {
+    for path in ["/queue", "/notes", "/decisions", "/policy"] {
         let r = still()
             .get(&format!("http://127.0.0.1:{}{path}", s.port))
             .call()
@@ -222,7 +222,7 @@ fn the_address_is_loopback_and_the_token_gates_everything() {
     // a wrong token does not enter
     let r = still()
         .get(&format!(
-            "http://127.0.0.1:{}/entra?token={}",
+            "http://127.0.0.1:{}/enter?token={}",
             s.port,
             "0".repeat(64)
         ))
@@ -232,7 +232,7 @@ fn the_address_is_loopback_and_the_token_gates_everything() {
 
     // the right token: 303 to a clean address, HttpOnly SameSite=Strict cookie
     let r = still()
-        .get(&format!("http://127.0.0.1:{}/entra?token={}", s.port, s.token))
+        .get(&format!("http://127.0.0.1:{}/enter?token={}", s.port, s.token))
         .call()
         .unwrap(/* t */);
     assert_eq!(r.status().as_u16(), 303);
@@ -248,12 +248,12 @@ fn the_address_is_loopback_and_the_token_gates_everything() {
     );
     assert_eq!(
         r.headers().get("location").and_then(|v| v.to_str().ok()),
-        Some("/coda")
+        Some("/queue")
     );
 
     // with the cookie, the pages answer
     let client = s.client();
-    let r = client.get("/coda").unwrap(/* t */);
+    let r = client.get("/queue").unwrap(/* t */);
     assert_eq!(r.status().as_u16(), 200);
 }
 
@@ -279,7 +279,7 @@ fn the_session_token_is_compared_in_constant_time() {
     let s = start();
     let r = still()
         .get(&format!(
-            "http://127.0.0.1:{}/entra?token={}",
+            "http://127.0.0.1:{}/enter?token={}",
             s.port,
             "0".repeat(64)
         ))
@@ -287,7 +287,7 @@ fn the_session_token_is_compared_in_constant_time() {
         .unwrap(/* t */);
     assert_eq!(r.status().as_u16(), 401);
     let client = s.client();
-    assert_eq!(client.get("/coda").unwrap(/* t */).status().as_u16(), 200);
+    assert_eq!(client.get("/queue").unwrap(/* t */).status().as_u16(), 200);
 }
 
 #[test]
@@ -304,7 +304,7 @@ fn two_review_servers_on_different_ports_never_share_the_cookie() {
 
     // entering A sets a cookie named after A's port
     let r = still()
-        .get(&format!("http://127.0.0.1:{}/entra?token={}", a.port, a.token))
+        .get(&format!("http://127.0.0.1:{}/enter?token={}", a.port, a.token))
         .call()
         .unwrap(/* t */);
     let set = r
@@ -321,14 +321,14 @@ fn two_review_servers_on_different_ports_never_share_the_cookie() {
     // A's token under B's cookie name does not enter B: the two sessions
     // are separate secrets on separate names
     let r = still()
-        .get(&format!("http://127.0.0.1:{}/coda", b.port))
+        .get(&format!("http://127.0.0.1:{}/queue", b.port))
         .header("Cookie", format!("engramma_review_{}={}", b.port, a.token))
         .call()
         .unwrap(/* t */);
     assert_eq!(r.status().as_u16(), 401, "B does not know A's token");
     // and the old, port-less name is simply ignored
     let r = still()
-        .get(&format!("http://127.0.0.1:{}/coda", b.port))
+        .get(&format!("http://127.0.0.1:{}/queue", b.port))
         .header("Cookie", format!("engramma_review={}", b.token))
         .call()
         .unwrap(/* t */);
@@ -347,7 +347,7 @@ fn a_lying_host_is_refused() {
     let (status, _, _) = raw(
         s.port,
         &format!(
-            "GET /coda HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n",
+            "GET /queue HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n",
             port = s.port
         ),
     );
@@ -357,7 +357,7 @@ fn a_lying_host_is_refused() {
     let (status, _, _) = raw(
         s.port,
         &format!(
-            "GET /coda HTTP/1.1\r\nHost: evil.example:{port}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n",
+            "GET /queue HTTP/1.1\r\nHost: evil.example:{port}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n",
             port = s.port
         ),
     );
@@ -371,14 +371,14 @@ fn every_post_wants_the_origin_and_the_csrf_token() {
     let client = s.client();
 
     // scrape the REAL token of the form under test (every form has its own)
-    let queue_html = client.body("/coda");
-    let csrf = csrf_of_form(&queue_html, &format!("/coda/{id}/rifiuta"));
+    let queue_html = client.body("/queue");
+    let csrf = csrf_of_form(&queue_html, &format!("/queue/{id}/reject"));
     assert!(!csrf.is_empty(), "the form carries its token");
 
-    let no_origin = format!("http://127.0.0.1:{}/coda/{id}/rifiuta", s.port);
+    let no_origin = format!("http://127.0.0.1:{}/queue/{id}/reject", s.port);
     let bad_csrf = "0".repeat(32);
     let cases: [(&str, &str, &str, u16, &str); 4] = [
-        // (origin, csrf, motivo, expected, why)
+        // (origin, csrf, reason, expected, why)
         ("", csrf.as_str(), "no", 403, "without Origin"),
         (
             "https://evil.example",
@@ -391,12 +391,12 @@ fn every_post_wants_the_origin_and_the_csrf_token() {
         (
             "mine",
             csrf.as_str(),
-            "non è vero",
+            "not true",
             303,
             "the page's own token",
         ),
     ];
-    for (origin, token, motivo, want, why) in cases {
+    for (origin, token, reason, want, why) in cases {
         let mut req = client
             .agent
             .post(&no_origin)
@@ -408,7 +408,8 @@ fn every_post_wants_the_origin_and_the_csrf_token() {
         } else {
             req.header("Origin", origin)
         };
-        let r = req.send_form(vec![("csrf", token), ("motivo", motivo)]).unwrap(/* t */);
+        let r = req.send_form(vec![("csrf", token), ("reason", reason)])
+                .unwrap(/* t */);
         assert_eq!(r.status().as_u16(), want, "{why}");
     }
     assert_eq!(s.cell().get(&id).unwrap(/* t */).status, Status::Deleted);
@@ -418,7 +419,7 @@ fn every_post_wants_the_origin_and_the_csrf_token() {
 fn the_headers_close_the_page() {
     let s = start();
     let client = s.client();
-    for path in ["/coda", "/note", "/decisioni", "/politica", "/stile.css"] {
+    for path in ["/queue", "/notes", "/decisions", "/policy", "/style.css"] {
         let r = client.get(path).unwrap(/* t */);
         assert!(
             r.headers().contains_key("content-security-policy"),
@@ -455,7 +456,7 @@ fn hostile_proposal_text_is_shown_as_text() {
                    [click](javascript:alert(3)) e Fabio nuota.";
     let id = s.propose(hostile);
     let client = s.client();
-    let html = client.body("/coda");
+    let html = client.body("/queue");
     assert!(
         html.contains("&lt;script&gt;"),
         "escaped: no raw script tag"
@@ -466,7 +467,7 @@ fn hostile_proposal_text_is_shown_as_text() {
     // the text is all there, readable
     assert!(html.contains("alert(3)"), "the content is visible as text");
     // the note page escapes too
-    let html = client.body(&format!("/note/{id}"));
+    let html = client.body(&format!("/notes/{id}"));
     assert!(html.contains("&lt;script&gt;"));
 }
 
@@ -514,12 +515,12 @@ fn the_queue_flows_accept_with_edit_and_reject() {
     let client = s.client();
 
     // accept with an edited text
-    let html = client.body("/coda");
-    let csrf = csrf_of_form(&html, &format!("/coda/{a}/accetta"));
+    let html = client.body("/queue");
+    let csrf = csrf_of_form(&html, &format!("/queue/{a}/accept"));
     let r = client
         .post(
-            &format!("/coda/{a}/accetta"),
-            &[("csrf", csrf.as_str()), ("testo", "Fabio sciaga in Dolomiti.")],
+            &format!("/queue/{a}/accept"),
+            &[("csrf", csrf.as_str()), ("text", "Fabio sciaga in Dolomiti.")],
         )
         .unwrap(/* t */);
     assert_eq!(r.status().as_u16(), 303);
@@ -527,13 +528,13 @@ fn the_queue_flows_accept_with_edit_and_reject() {
     assert_eq!(n.status, Status::Active);
     assert_eq!(n.body, "Fabio sciaga in Dolomiti.");
 
-    // reject keeps the text under the lapide, and the queue empties
-    let html = client.body("/coda");
-    let csrf = csrf_of_form(&html, &format!("/coda/{b}/rifiuta"));
+    // reject keeps the text under the tombstone, and the queue empties
+    let html = client.body("/queue");
+    let csrf = csrf_of_form(&html, &format!("/queue/{b}/reject"));
     let r = client
         .post(
-            &format!("/coda/{b}/rifiuta"),
-            &[("csrf", csrf.as_str()), ("motivo", "falso")],
+            &format!("/queue/{b}/reject"),
+            &[("csrf", csrf.as_str()), ("reason", "falso")],
         )
         .unwrap(/* t */);
     assert_eq!(r.status().as_u16(), 303);
@@ -563,7 +564,7 @@ fn the_decisions_page_reverts_single_and_bulk() {
     let client = s.client();
 
     // the registry names the reviewer and the metadata
-    let html = client.body("/decisioni");
+    let html = client.body("/decisions");
     assert!(html.contains("reviewer:bravo"), "{html}");
 
     // the single revert (the route takes the DECISION op id)
@@ -575,10 +576,10 @@ fn the_decisions_page_reverts_single_and_bulk() {
         .unwrap(/* t */)
         .op_id
         .to_string();
-    let csrf = csrf_of_form(&html, &format!("/decisioni/annulla/{decision_a}"));
+    let csrf = csrf_of_form(&html, &format!("/decisions/revert/{decision_a}"));
     let r = client
         .post(
-            &format!("/decisioni/annulla/{decision_a}"),
+            &format!("/decisions/revert/{decision_a}"),
             &[("csrf", csrf.as_str()), ("", "")],
         )
         .unwrap(/* t */);
@@ -586,13 +587,13 @@ fn the_decisions_page_reverts_single_and_bulk() {
     assert_eq!(cell.get(&a).unwrap(/* t */).status, Status::Quarantined);
 
     // the bulk: preview first (dry), then the confirmation applies
-    let html = client.body("/decisioni");
-    let csrf = csrf_of_form(&html, "/decisioni/blocco");
-    // step 1: the preview lands on the decisions page as an anteprima
+    let html = client.body("/decisions");
+    let csrf = csrf_of_form(&html, "/decisions/bulk");
+    // step 1: the preview lands on the decisions page as a block
     let r = client
         .post(
-            "/decisioni/blocco",
-            &[("csrf", csrf.as_str()), ("by", "reviewer:bravo"), ("dal", ""), ("al", "")],
+            "/decisions/bulk",
+            &[("csrf", csrf.as_str()), ("by", "reviewer:bravo"), ("since", ""), ("until", "")],
         )
         .unwrap(/* t */);
     assert_eq!(r.status().as_u16(), 303);
@@ -602,15 +603,16 @@ fn the_decisions_page_reverts_single_and_bulk() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let html = client.body(&to); // the location is already percent-encoded
-    assert!(html.contains("Anteprima"), "{}", urldecode(&html));
-    assert!(html.contains("Confermo"), "{html}");
+    // the block travels in the server: the address carries nothing
+    let html = client.body(&to);
+    assert!(html.contains("Preview"), "{html}");
+    assert!(html.contains("Confirm: revert"), "{html}");
     // nothing applied yet
     assert_eq!(cell.get(&b).unwrap(/* t */).status, Status::Active);
-    // step 2: the confirmation (its form is the one carrying `conferma`)
+    // step 2: the confirmation (its form is the one carrying `confirm`)
     let csrf = html
         .split("<form")
-        .find(|f| f.contains("/decisioni/blocco") && f.contains("conferma"))
+        .find(|f| f.contains("/decisions/bulk") && f.contains("confirm"))
         .and_then(|f| {
             f.split("name=\"csrf\" value=\"")
                 .nth(1)
@@ -621,13 +623,13 @@ fn the_decisions_page_reverts_single_and_bulk() {
     assert!(!csrf.is_empty(), "the confirmation form carries its token");
     let r = client
         .post(
-            "/decisioni/blocco",
+            "/decisions/bulk",
             &[
                 ("csrf", csrf.as_str()),
                 ("by", "reviewer:bravo"),
-                ("dal", ""),
-                ("al", ""),
-                ("conferma", "1"),
+                ("since", ""),
+                ("until", ""),
+                ("confirm", "1"),
             ],
         )
         .unwrap(/* t */);
@@ -647,61 +649,128 @@ fn the_decisions_page_never_renders_markup_from_a_url() {
     let client = s.client();
 
     // the old way in: markup in the URL. Nothing of it shows.
-    let html = client.body("/decisioni?anteprima=%3Cb%3Ebold%3C%2Fb%3E");
+    let html = client.body("/decisions?anteprima=%3Cb%3Ebold%3C%2Fb%3E");
     assert!(!html.contains("<b>"), "no live tag from a URL: {html}");
     assert!(!html.contains("bold"), "nothing from a URL shows: {html}");
 
     // the way a visitor goes: the bulk form, with markup in its fields.
     // The preview comes back with the value escaped, and shows once.
-    let html = client.body("/decisioni");
-    let csrf = csrf_of_form(&html, "/decisioni/blocco");
+    let html = client.body("/decisions");
+    let csrf = csrf_of_form(&html, "/decisions/bulk");
     let r = client
         .post(
-            "/decisioni/blocco",
+            "/decisions/bulk",
             &[
                 ("csrf", csrf.as_str()),
                 ("by", "<b>bold</b>"),
-                ("dal", ""),
-                ("al", ""),
+                ("since", ""),
+                ("until", ""),
             ],
         )
         .unwrap(/* t */);
     assert_eq!(r.status().as_u16(), 303);
-    let html = client.body("/decisioni");
+    let html = client.body("/decisions");
     assert!(
         html.contains("value=\"&lt;b&gt;bold&lt;/b&gt;\""),
         "the value comes out escaped: {html}"
     );
     assert!(!html.contains("<b>"), "never a live tag: {html}");
     assert!(
-        html.contains("<h3>Anteprima</h3>"),
+        html.contains("<h3>Preview</h3>"),
         "the server's own block still renders as markup: {html}"
     );
-    let again = client.body("/decisioni");
+    let again = client.body("/decisions");
     assert!(
-        !again.contains("<h3>Anteprima</h3>"),
+        !again.contains("<h3>Preview</h3>"),
         "the block shows once: {again}"
     );
 }
 
-fn urldecode(s: &str) -> String {
-    let mut out = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or_default();
-                out.push(u8::from_str_radix(hex, 16).unwrap_or(b'%'));
-                i += 3;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
+// v0.6.19: the page's addresses are in English. The beta's ones answer 308
+// — for good, a bookmark must not break — and carry what the new address
+// needs: the id of a note, the token of the entry. The beta's form routes
+// are gone instead: the forms are served by this same binary, in English,
+// and a stale tab must get a 404, never a silent accept.
+#[test]
+fn the_beta_addresses_redirect_for_good() {
+    let s = start();
+    let location = |r: &ureq::http::Response<ureq::Body>| {
+        r.headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    // no cookie: the redirect does not ask who is asking (the page it
+    // lands on does)
+    for (old, new) in [
+        ("/coda", "/queue"),
+        ("/note", "/notes"),
+        ("/decisioni", "/decisions"),
+        ("/politica", "/policy"),
+        ("/stile.css", "/style.css"),
+    ] {
+        let r = still()
+            .get(&format!("http://127.0.0.1:{}{old}", s.port))
+            .call()
+            .unwrap(/* t */);
+        assert_eq!(r.status().as_u16(), 308, "{old}");
+        assert_eq!(location(&r).as_deref(), Some(new), "{old}");
     }
-    String::from_utf8_lossy(&out).to_string()
+    // a note keeps its address, under the new route
+    let id = s.propose("A proposal at the old address.");
+    let r = still()
+        .get(&format!("http://127.0.0.1:{}/note/{id}", s.port))
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 308, "the old note route");
+    assert_eq!(
+        location(&r).as_deref(),
+        Some(format!("/notes/{id}").as_str())
+    );
+    // the entry: the token rides along to the new address
+    let r = still()
+        .get(&format!(
+            "http://127.0.0.1:{}/entra?token={}",
+            s.port, s.token
+        ))
+        .call()
+        .unwrap(/* t */);
+    assert_eq!(r.status().as_u16(), 308, "the old entry");
+    assert_eq!(
+        location(&r).as_deref(),
+        Some(format!("/enter?token={}", s.token).as_str())
+    );
+
+    // the beta's forms: no route listens any more
+    let client = s.client();
+    for path in [
+        format!("/coda/{id}/accetta"),
+        format!("/coda/{id}/rifiuta"),
+        format!("/note/{id}/ripristina"),
+        "/decisioni/blocco".to_string(),
+        "/decisioni/annulla/01AAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+    ] {
+        let r = client
+            .post(
+                &path,
+                &[("csrf", "x"), ("testo", "edited"), ("motivo", "why")],
+            )
+            .unwrap(/* t */);
+        assert_eq!(r.status().as_u16(), 404, "{path}");
+    }
+    let rows = s
+        .cell()
+        .proposals(&ProposalsFilter::default())
+        .unwrap(/* t */);
+    assert!(
+        rows.iter().any(|r| r.id == id && r.state.in_queue()),
+        "the proposal still waits: nothing went through an old form"
+    );
+
+    // and what the redirect lands on is the English page
+    let html = client.body("/queue");
+    assert!(html.contains("<html lang=\"en\">"), "{html}");
+    assert!(html.contains("<h1>Queue</h1>"), "{html}");
 }
 
 #[test]
@@ -730,16 +799,16 @@ fn the_note_page_shows_history_diff_and_restores() {
     .unwrap(/* t */);
 
     let client = s.client();
-    let html = client.body(&format!("/note/{id}"));
+    let html = client.body(&format!("/notes/{id}"));
     // the story and the diff
-    assert!(html.contains("proposta da mcp:claude"), "{html}");
-    assert!(html.contains("decisa da"), "{html}");
+    assert!(html.contains("proposed by mcp:claude"), "{html}");
+    assert!(html.contains("decided by"), "{html}");
     assert!(html.contains("diff-del"), "{html}");
     assert!(html.contains("Fabio corre la maratona."), "{html}");
     assert!(html.contains("Fabio corre la mezza maratona."), "{html}");
 
     // restore the first version
-    let csrf = csrf_of_form(&html, &format!("/note/{id}/ripristina"));
+    let csrf = csrf_of_form(&html, &format!("/notes/{id}/restore"));
     // the first restore form on the page belongs to v1
     let version = html
         .split("<h3>v")
@@ -749,8 +818,8 @@ fn the_note_page_shows_history_diff_and_restores() {
         .to_string();
     let r = client
         .post(
-            &format!("/note/{id}/ripristina"),
-            &[("csrf", csrf.as_str()), ("versione", version.as_str())],
+            &format!("/notes/{id}/restore"),
+            &[("csrf", csrf.as_str()), ("version", version.as_str())],
         )
         .unwrap(/* t */);
     assert_eq!(r.status().as_u16(), 303);
@@ -767,12 +836,12 @@ fn the_policy_page_is_read_only() {
         .set_policy(serde_json::json!({ "write": "propose" }), "test")
         .unwrap(/* t */);
     let client = s.client();
-    let html = client.body("/politica");
+    let html = client.body("/policy");
     assert!(html.contains("write"), "{html}");
-    assert!(html.contains("sola lettura"), "{html}");
+    assert!(html.contains("read-only"), "{html}");
     assert!(!html.contains("<form"), "no forms on the policy page");
     // and there is no POST route to it
-    let r = client.post("/politica", &[("write", "auto")]).unwrap(/* t */);
+    let r = client.post("/policy", &[("write", "auto")]).unwrap(/* t */);
     let code = r.status().as_u16();
     assert!(
         code == 404 || code == 405,

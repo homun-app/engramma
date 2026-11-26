@@ -88,11 +88,11 @@ fn same_secret(a: &str, b: &str) -> bool {
 
 fn page(title: &str, body: &str) -> Response {
     Html(format!(
-        "<!doctype html>\n<html lang=\"it\"><head><meta charset=\"utf-8\">\
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>{}</title><link rel=\"stylesheet\" href=\"/stile.css\"></head>\
-<body><nav><a href=\"/coda\">Coda</a> <a href=\"/note\">Note</a> \
-<a href=\"/decisioni\">Decisioni</a> <a href=\"/politica\">Politica</a></nav>\
+<title>{}</title><link rel=\"stylesheet\" href=\"/style.css\"></head>\
+<body><nav><a href=\"/queue\">Queue</a> <a href=\"/notes\">Notes</a> \
+<a href=\"/decisions\">Decisions</a> <a href=\"/policy\">Policy</a></nav>\
 <main>{body}</main></body></html>",
         esc(title)
     ))
@@ -107,7 +107,7 @@ fn forbidden(why: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
         Html(format!(
-            "<!doctype html><html lang=\"it\"><meta charset=\"utf-8\">\
+            "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">\
 <title>403</title><body><h1>403</h1><p>{}</p></body></html>",
             esc(why)
         )),
@@ -119,9 +119,9 @@ fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Html(
-            "<!doctype html><html lang=\"it\"><meta charset=\"utf-8\">\
-<title>401</title><body><h1>401</h1><p>servirebbe il token: riparti dal \
-comando che ha stampato l'indirizzo</p></body></html>"
+            "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">\
+<title>401</title><body><h1>401</h1><p>the token is needed: start again from the command \
+that printed the address</p></body></html>"
                 .to_string(),
         ),
     )
@@ -132,7 +132,7 @@ fn not_found(what: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
         Html(format!(
-            "<!doctype html><html lang=\"it\"><meta charset=\"utf-8\">\
+            "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">\
 <title>404</title><body><h1>404</h1><p>{}</p></body></html>",
             esc(what)
         )),
@@ -144,8 +144,8 @@ fn engine_error(e: CellError) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Html(format!(
-            "<!doctype html><html lang=\"it\"><meta charset=\"utf-8\">\
-<title>errore</title><body><h1>errore del motore</h1><pre>{}</pre></body></html>",
+            "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">\
+<title>error</title><body><h1>engine error</h1><pre>{}</pre></body></html>",
             esc(&e.to_string())
         )),
     )
@@ -171,7 +171,7 @@ impl Review {
                 h == format!("127.0.0.1:{}", self.port) || h == format!("localhost:{}", self.port)
             });
         if !host_ok {
-            return Err(Box::new(forbidden("Host non accettabile")));
+            return Err(Box::new(forbidden("Unacceptable Host")));
         }
         // 2. the session cookie
         let Some(cookies) = cookies else {
@@ -198,10 +198,10 @@ impl Review {
                         || o == format!("http://localhost:{}", self.port)
                 });
             if !origin_ok {
-                return Err(Box::new(forbidden("Origin mancante o estraneo")));
+                return Err(Box::new(forbidden("Missing or foreign Origin")));
             }
             if form_csrf != Some(csrf_of(self, form_name).as_str()) {
-                return Err(Box::new(forbidden("token CSRF non valido")));
+                return Err(Box::new(forbidden("Invalid CSRF token")));
             }
         }
         Ok(())
@@ -249,14 +249,14 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;pad
 
 /// The entry: the token lands in the URL exactly once, is exchanged for
 /// the cookie, and the address is rewritten clean.
-async fn entra(State(review): State<Arc<Review>>, Query(q): Query<Q>) -> Response {
+async fn enter(State(review): State<Arc<Review>>, Query(q): Query<Q>) -> Response {
     let Some(token) = q.get("token") else {
         return unauthorized();
     };
     if !same_secret(token, &review.token) {
         return unauthorized();
     }
-    let mut r = see_other("/coda");
+    let mut r = see_other("/queue");
     r.headers_mut().append(
         axum::http::header::SET_COOKIE,
         HeaderValue::from_str(&format!(
@@ -279,71 +279,71 @@ async fn queue(State(review): State<Arc<Review>>, headers: HeaderMap) -> Respons
         Ok(r) => r,
         Err(e) => return engine_error(e),
     };
-    let mut body = String::from("<h1>La coda</h1>");
+    let mut body = String::from("<h1>Queue</h1>");
     let queue: Vec<_> = rows.iter().filter(|r| r.state.in_queue()).collect();
     if queue.is_empty() {
-        body.push_str("<p>La coda è vuota.</p>");
+        body.push_str("<p>The queue is empty.</p>");
     }
     for r in &queue {
         let id = r.id.to_string();
         let mut card = format!(
             "<section class=\"proposal\"><h2>{}</h2><pre class=\"body\">{}</pre>\
-<p class=\"meta\">proposta da {} il {} — {}",
+<p class=\"meta\">proposed by {} at {} — {}",
             esc(r.note.display_title()),
             esc(&r.note.body),
             esc(&r.proposer),
             esc(&r.proposed_at),
-            esc(r.reason.as_deref().unwrap_or("senza motivo dichiarato"))
+            esc(r.reason.as_deref().unwrap_or("no reason given"))
         );
         if let ProposalMode::Supersede(t) = &r.mode {
             card.push_str(&format!(
-                " · rettifica di <a href=\"/note/{}\">{}</a>",
+                " · correction of <a href=\"/notes/{}\">{}</a>",
                 t,
                 esc(&engramma_core::id::id8(t))
             ));
         }
         if let Some(c) = &r.client {
-            card.push_str(&format!(" · client dichiarato: {}", esc(c)));
+            card.push_str(&format!(" · declared client: {}", esc(c)));
         }
         card.push_str("</p>");
         if r.auto_failed {
-            card.push_str("<p class=\"meta\">revisione automatica fallita: decidi tu</p>");
+            card.push_str("<p class=\"meta\">automatic review failed: your call</p>");
         }
         // accept (possibly with an edited text), reject
         card.push_str(&format!(
-            "<form method=\"post\" action=\"/coda/{id}/accetta\">\
+            "<form method=\"post\" action=\"/queue/{id}/accept\">\
 <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-<textarea name=\"testo\" placeholder=\"modifica il testo prima di accettare (opzionale)\">{}</textarea>\
-<button class=\"ok\">Accetta</button></form> ",
-            csrf_of(&review, &format!("accetta-{id}")),
+<textarea name=\"text\" placeholder=\"edit the text before accepting (optional)\">{}</textarea>\
+<button class=\"ok\">Accept</button></form> ",
+            csrf_of(&review, &format!("accept-{id}")),
             esc(&r.note.body)
         ));
         card.push_str(&format!(
-            "<form method=\"post\" action=\"/coda/{id}/rifiuta\">\
+            "<form method=\"post\" action=\"/queue/{id}/reject\">\
 <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-<input name=\"motivo\" placeholder=\"perché (opzionale)\">\
-<button class=\"no\">Rifiuta</button></form>",
-            csrf_of(&review, &format!("rifiuta-{id}")),
+<input name=\"reason\" placeholder=\"why (optional)\">\
+<button class=\"no\">Reject</button></form>",
+            csrf_of(&review, &format!("reject-{id}")),
         ));
         card.push_str("</section>");
         body.push_str(&card);
     }
     if rows.len() > queue.len() {
         body.push_str(&format!(
-            "<p class=\"meta\">{} proposte già decise (vedi Decisioni).</p>",
+            "<p class=\"meta\">{} proposals already decided (see Decisions).</p>",
             rows.len() - queue.len()
         ));
     }
-    page("Coda", &body)
+    page("Queue", &body)
 }
 
 #[derive(serde::Deserialize)]
 struct CsrfForm {
     csrf: String,
     #[serde(default)]
-    testo: String,
+    text: String,
     #[serde(default)]
-    motivo: String,
+    reason: String,
 }
 
 async fn accept(
@@ -355,21 +355,21 @@ async fn accept(
     let cookies = headers
         .get(axum::http::header::COOKIE)
         .and_then(|c| c.to_str().ok());
-    let form_name = format!("accetta-{id}");
+    let form_name = format!("accept-{id}");
     if let Err(r) = review.guard(true, &headers, cookies, Some(&form.csrf), &form_name) {
         return *r;
     }
     let Ok(note_id) = Ulid::from_string(&id) else {
-        return not_found(" proposta inesistente");
+        return not_found("no such proposal");
     };
     // accept-with-edit when the textarea came back different
-    let edited = if !form.testo.trim().is_empty() {
+    let edited = if !form.text.trim().is_empty() {
         let mut current = match review.cell.get(&note_id) {
             Ok(n) => n,
             Err(e) => return engine_error(e),
         };
-        if form.testo != current.body {
-            current.body = form.testo;
+        if form.text != current.body {
+            current.body = form.text;
             Some(current)
         } else {
             None
@@ -381,13 +381,13 @@ async fn accept(
         &note_id,
         &DecisionInput {
             action: DecisionAction::Accept { edited },
-            reason: Some("accettata dalla pagina di revisione".into()),
+            reason: Some("accepted from the review page".into()),
             review: None,
         },
         "user@review",
     );
     match outcome {
-        Ok(_) => see_other("/coda"),
+        Ok(_) => see_other("/queue"),
         Err(e) => engine_error(e),
     }
 }
@@ -401,24 +401,24 @@ async fn reject(
     let cookies = headers
         .get(axum::http::header::COOKIE)
         .and_then(|c| c.to_str().ok());
-    let form_name = format!("rifiuta-{id}");
+    let form_name = format!("reject-{id}");
     if let Err(r) = review.guard(true, &headers, cookies, Some(&form.csrf), &form_name) {
         return *r;
     }
     let Ok(note_id) = Ulid::from_string(&id) else {
-        return not_found("proposta inesistente");
+        return not_found("no such proposal");
     };
     let outcome = review.cell.decide(
         &note_id,
         &DecisionInput {
             action: DecisionAction::Reject,
-            reason: (!form.motivo.is_empty()).then(|| form.motivo.clone()),
+            reason: (!form.reason.is_empty()).then(|| form.reason.clone()),
             review: None,
         },
         "user@review",
     );
     match outcome {
-        Ok(_) => see_other("/coda"),
+        Ok(_) => see_other("/queue"),
         Err(e) => engine_error(e),
     }
 }
@@ -435,10 +435,10 @@ async fn notes(
         return *r;
     }
     let mut body = String::from(
-        "<h1>Le note</h1>\
-<form method=\"get\" action=\"/note\">\
-<input name=\"q\" placeholder=\"cerca nel testo\" value=\"{}\">\
-<button>Cerca</button></form>",
+        "<h1>Notes</h1>\
+<form method=\"get\" action=\"/notes\">\
+<input name=\"q\" placeholder=\"search the text\" value=\"{}\">\
+<button>Search</button></form>",
     );
     let query = q.get("q").cloned().unwrap_or_default();
     body = body.replacen("{}", &esc(&query), 1);
@@ -447,7 +447,7 @@ async fn notes(
             Ok(i) => i,
             Err(e) => return engine_error(e),
         };
-        body.push_str(&format!("<p class=\"meta\">{} note vive</p>", ids.len()));
+        body.push_str(&format!("<p class=\"meta\">{} living notes</p>", ids.len()));
     } else {
         let hits = review
             .cell
@@ -457,7 +457,7 @@ async fn notes(
         body.push_str("<ul>");
         for h in &hits {
             body.push_str(&format!(
-                "<li><a href=\"/note/{}\">{}</a> <span class=\"meta\">{}</span></li>",
+                "<li><a href=\"/notes/{}\">{}</a> <span class=\"meta\">{}</span></li>",
                 h.note.id,
                 esc(h.note.display_title()),
                 esc(h.note.status.as_str())
@@ -465,7 +465,7 @@ async fn notes(
         }
         body.push_str("</ul>");
     }
-    page("Note", &body)
+    page("Notes", &body)
 }
 
 async fn note_detail(
@@ -485,11 +485,11 @@ async fn note_detail(
         .or_else(|_| Ulid::from_string(&id))
         .ok();
     let Some(note_id) = note_id else {
-        return not_found("nota inesistente");
+        return not_found("no such note");
     };
     let note = match review.cell.get(&note_id) {
         Ok(n) => n,
-        Err(_) => return not_found("nota inesistente"),
+        Err(_) => return not_found("no such note"),
     };
     let hist = match review.cell.history(&note_id) {
         Ok(h) => h,
@@ -523,34 +523,34 @@ async fn note_detail(
     );
     if let Some(p) = &proposal {
         body.push_str(&format!(
-            " · <span class=\"badge\">proposta {}</span>",
+            " · <span class=\"badge\">proposal {}</span>",
             p.state.as_str()
         ));
     }
     body.push_str("</p>");
     body.push_str(&format!("<pre class=\"body\">{}</pre>", esc(&note.body)));
     if matches!(note.status, Status::Quarantined) {
-        body.push_str("<p class=\"meta\">in quarantena: invisibile alla ricerca</p>");
+        body.push_str("<p class=\"meta\">in quarantine: invisible to search</p>");
     }
     if let Some(p) = &proposal {
         body.push_str(&format!(
-            "<p class=\"meta\">proposta da {} il {} — {}</p>",
+            "<p class=\"meta\">proposed by {} at {} — {}</p>",
             esc(&p.proposer),
             esc(&p.proposed_at),
-            esc(p.reason.as_deref().unwrap_or("senza motivo dichiarato"))
+            esc(p.reason.as_deref().unwrap_or("no reason given"))
         ));
         if let (Some(who), Some(at)) = (&p.decided_by, &p.decided_at) {
             body.push_str(&format!(
-                "<p class=\"meta\">decisa da {} il {}</p>",
+                "<p class=\"meta\">decided by {} at {}</p>",
                 esc(who),
                 esc(at)
             ));
         }
     }
     // the versions, with the diff against the previous one and the restore
-    body.push_str("<h2>Versioni</h2>");
+    body.push_str("<h2>Versions</h2>");
     if hist.is_empty() {
-        body.push_str("<p class=\"meta\">nessuna versione precedente</p>");
+        body.push_str("<p class=\"meta\">no earlier version</p>");
     }
     let current = note.body.clone();
     let mut prev_body: Option<String> = None;
@@ -574,23 +574,20 @@ async fn note_detail(
             }
         }
         prev_body = Some(v.note.body.clone());
-        let restore_action = format!("/note/{}/ripristina", note_id);
+        let restore_action = format!("/notes/{}/restore", note_id);
         body.push_str(&format!(
             "<form method=\"post\" action=\"{restore_action}\">\
 <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-<input type=\"hidden\" name=\"versione\" value=\"{}\">\
-<button>Ripristina questa versione</button></form>",
-            csrf_of(
-                &review,
-                &format!("ripristina-{}-{restore_action}", v.version)
-            ),
+<input type=\"hidden\" name=\"version\" value=\"{}\">\
+<button>Restore this version</button></form>",
+            csrf_of(&review, &format!("restore-{}-{restore_action}", v.version)),
             v.version
         ));
     }
     if let Some(prev) = prev_body
         && prev != current
     {
-        body.push_str("<h3>ora</h3>");
+        body.push_str("<h3>now</h3>");
         for line in super::line_diff(&prev, &current) {
             let (class, text) = if let Some(t) = line.strip_prefix("- ") {
                 ("diff-del", t)
@@ -608,7 +605,7 @@ async fn note_detail(
 #[derive(serde::Deserialize)]
 struct RestoreForm {
     csrf: String,
-    versione: i64,
+    version: i64,
 }
 
 async fn restore(
@@ -620,7 +617,7 @@ async fn restore(
     let cookies = headers
         .get(axum::http::header::COOKIE)
         .and_then(|c| c.to_str().ok());
-    let form_name = format!("ripristina-{}-/note/{}/ripristina", form.versione, id);
+    let form_name = format!("restore-{}-/notes/{}/restore", form.version, id);
     if let Err(r) = review.guard(true, &headers, cookies, Some(&form.csrf), &form_name) {
         return *r;
     }
@@ -630,10 +627,10 @@ async fn restore(
         .or_else(|_| Ulid::from_string(&id))
         .ok();
     let Some(note_id) = note_id else {
-        return not_found("nota inesistente");
+        return not_found("no such note");
     };
-    match review.cell.restore(&note_id, form.versione, "user@review") {
-        Ok(()) => see_other(&format!("/note/{note_id}")),
+    match review.cell.restore(&note_id, form.version, "user@review") {
+        Ok(()) => see_other(&format!("/notes/{note_id}")),
         Err(e) => engine_error(e),
     }
 }
@@ -654,22 +651,22 @@ async fn decisions(
         Err(e) => return engine_error(e),
     };
     let mut body = String::from(
-        "<h1>Le decisioni</h1><table><tr>\
-<th>quando</th><th>chi</th><th>cosa</th><th>perché</th><th></th></tr>",
+        "<h1>Decisions</h1><table><tr>\
+<th>when</th><th>who</th><th>what</th><th>why</th><th></th></tr>",
     );
     for r in &rows {
         let op8 = engramma_core::id::id8(&r.op_id);
         body.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{} {} <a href=\"/note/{}\">{}</a></td><td>{}</td>",
+            "<tr><td>{}</td><td>{}</td><td>{} {} <a href=\"/notes/{}\">{}</a></td><td>{}</td>",
             esc(&r.decided_at),
             esc(&r.actor),
             if r.decision == "accept" {
-                "accetta"
+                "accept"
             } else {
-                "rifiuta"
+                "reject"
             },
             if r.reverted_by.is_some() {
-                "<span class=\"badge\">annullata</span>"
+                "<span class=\"badge\">reverted</span>"
             } else {
                 ""
             },
@@ -679,7 +676,7 @@ async fn decisions(
         ));
         if let Some(review_json) = &r.review {
             body.push_str(&format!(
-                "<div class=\"meta\">revisore {} · modello {} · confidenza {} · prompt {}</div>",
+                "<div class=\"meta\">reviewer {} · model {} · confidence {} · prompt {}</div>",
                 esc(review_json["name"].as_str().unwrap_or("?")),
                 esc(review_json["model"].as_str().unwrap_or("?")),
                 esc(&review_json["confidence"].to_string()),
@@ -688,11 +685,11 @@ async fn decisions(
         }
         if r.reverted_by.is_none() {
             body.push_str(&format!(
-                "<td><form method=\"post\" action=\"/decisioni/annulla/{}\">\
+                "<td><form method=\"post\" action=\"/decisions/revert/{}\">\
 <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-<button>Annulla</button></form></td>",
+<button>Revert</button></form></td>",
                 r.op_id,
-                csrf_of(&review, &format!("annulla-{}", r.op_id))
+                csrf_of(&review, &format!("revert-{}", r.op_id))
             ));
         } else {
             body.push_str("<td></td>");
@@ -703,17 +700,17 @@ async fn decisions(
 
     // the bulk revert: by (prefix) and dates, preview first, then confirm
     let by = q.get("by").cloned().unwrap_or_default();
-    let since = q.get("dal").cloned().unwrap_or_default();
-    let until = q.get("al").cloned().unwrap_or_default();
+    let since = q.get("since").cloned().unwrap_or_default();
+    let until = q.get("until").cloned().unwrap_or_default();
     body.push_str(&format!(
-        "<h2>Annullamento in blocco</h2>\
-<form method=\"post\" action=\"/decisioni/blocco\">\
+        "<h2>Bulk revert</h2>\
+<form method=\"post\" action=\"/decisions/bulk\">\
 <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
-<label>attore (o prefisso) <input name=\"by\" value=\"{}\"></label>\
-<label>dal <input name=\"dal\" placeholder=\"AAAA-MM-GG\" value=\"{}\"></label>\
-<label>al <input name=\"al\" placeholder=\"AAAA-MM-GG\" value=\"{}\"></label>\
-<button>Anteprima</button></form>",
-        csrf_of(&review, "blocco"),
+<label>actor (or prefix) <input name=\"by\" value=\"{}\"></label>\
+<label>since <input name=\"since\" placeholder=\"YYYY-MM-DD\" value=\"{}\"></label>\
+<label>until <input name=\"until\" placeholder=\"YYYY-MM-DD\" value=\"{}\"></label>\
+<button>Preview</button></form>",
+        csrf_of(&review, "bulk"),
         esc(&by),
         esc(&since),
         esc(&until)
@@ -721,7 +718,7 @@ async fn decisions(
     if let Some(prev) = review.take_flash() {
         body.push_str(&prev);
     }
-    page("Decisioni", &body)
+    page("Decisions", &body)
 }
 
 #[derive(serde::Deserialize)]
@@ -730,11 +727,11 @@ struct BulkForm {
     #[serde(default)]
     by: String,
     #[serde(default)]
-    dal: String,
+    since: String,
     #[serde(default)]
-    al: String,
+    until: String,
     #[serde(default)]
-    conferma: String,
+    confirm: String,
 }
 
 fn parse_day_param(s: &str, end: bool) -> Result<Option<time::OffsetDateTime>, String> {
@@ -760,22 +757,22 @@ async fn bulk(
         .get(axum::http::header::COOKIE)
         .and_then(|c| c.to_str().ok());
     // the preview and the confirmation share the form (the confirmation
-    // carries the same fields back plus `conferma`)
-    let form_name = if form.conferma.is_empty() {
-        "blocco"
+    // carries the same fields back plus `confirm`)
+    let form_name = if form.confirm.is_empty() {
+        "bulk"
     } else {
-        "blocco-conferma"
+        "bulk-confirm"
     };
     if let Err(r) = review.guard(true, &headers, cookies, Some(&form.csrf), form_name) {
         return *r;
     }
-    let since = match parse_day_param(&form.dal, false) {
+    let since = match parse_day_param(&form.since, false) {
         Ok(v) => v,
-        Err(e) => return forbidden(&format!("dal: {e}")),
+        Err(e) => return forbidden(&format!("since: {e}")),
     };
-    let until = match parse_day_param(&form.al, true) {
+    let until = match parse_day_param(&form.until, true) {
         Ok(v) => v,
-        Err(e) => return forbidden(&format!("al: {e}")),
+        Err(e) => return forbidden(&format!("until: {e}")),
     };
     let filter = RevertFilter {
         by: (!form.by.is_empty()).then(|| form.by.clone()),
@@ -785,23 +782,23 @@ async fn bulk(
         since,
         until,
     };
-    if form.conferma.is_empty() {
+    if form.confirm.is_empty() {
         // the preview
         let report = match review.cell.revert_decisions(&filter, true) {
             Ok(r) => r,
             Err(e) => return engine_error(e),
         };
         let prev = format!(
-            "<div class=\"proposal\"><h3>Anteprima</h3>\
-<p>annullerò <strong>{}</strong> decisioni · conflitti {} (non toccati) · purgate {} \
-(annullate nel registro, il contenuto non torna)</p><ul>{}</ul>\
-<form method=\"post\" action=\"/decisioni/blocco\">\
+            "<div class=\"proposal\"><h3>Preview</h3>\
+<p>would revert <strong>{}</strong> decisions · {} conflicts (left alone) · {} purged \
+(reverted in the registry, the content does not come back)</p><ul>{}</ul>\
+<form method=\"post\" action=\"/decisions/bulk\">\
 <input type=\"hidden\" name=\"csrf\" value=\"{}\">\
 <input type=\"hidden\" name=\"by\" value=\"{}\">\
-<input type=\"hidden\" name=\"dal\" value=\"{}\">\
-<input type=\"hidden\" name=\"al\" value=\"{}\">\
-<input type=\"hidden\" name=\"conferma\" value=\"1\">\
-<button class=\"no\">Confermo: annulla</button></form></div>",
+<input type=\"hidden\" name=\"since\" value=\"{}\">\
+<input type=\"hidden\" name=\"until\" value=\"{}\">\
+<input type=\"hidden\" name=\"confirm\" value=\"1\">\
+<button class=\"no\">Confirm: revert</button></form></div>",
             report.reverted,
             report.conflicts.len(),
             report.purged,
@@ -811,25 +808,25 @@ async fn bulk(
                 .map(|c| format!("<li>{}</li>", esc(c)))
                 .collect::<Vec<_>>()
                 .join(""),
-            csrf_of(&review, "blocco-conferma"),
+            csrf_of(&review, "bulk-confirm"),
             esc(&form.by),
-            esc(&form.dal),
-            esc(&form.al),
+            esc(&form.since),
+            esc(&form.until),
         );
         // the block goes to the next page through the server, not the URL
         review.flash(prev);
-        return see_other("/decisioni");
+        return see_other("/decisions");
     }
     // confirmed: apply
     match review.cell.revert_decisions(&filter, false) {
         Ok(report) => {
             review.flash(format!(
-                "<p class=\"meta\">annullate {}, conflitti {}, purgate {}</p>",
+                "<p class=\"meta\">reverted {}, conflicts {}, purged {}</p>",
                 report.reverted,
                 report.conflicts.len(),
                 report.purged
             ));
-            see_other("/decisioni")
+            see_other("/decisions")
         }
         Err(e) => engine_error(e),
     }
@@ -844,22 +841,25 @@ async fn revert_one(
     let cookies = headers
         .get(axum::http::header::COOKIE)
         .and_then(|c| c.to_str().ok());
-    let form_name = format!("annulla-{op}");
+    let form_name = format!("revert-{op}");
     if let Err(r) = review.guard(true, &headers, cookies, Some(&form.csrf), &form_name) {
         return *r;
     }
     let Ok(op_id) = Ulid::from_string(&op) else {
-        return not_found("decisione inesistente");
+        return not_found("no such decision");
     };
     match review
         .cell
-        .revert_decision(&op_id, "annullata dalla pagina di revisione", "user@review")
+        .revert_decision(&op_id, "reverted from the review page", "user@review")
     {
-        Ok(RevertOutcome::Reverted { .. }) => see_other("/decisioni"),
+        Ok(RevertOutcome::Reverted { .. }) => see_other("/decisions"),
         Ok(RevertOutcome::Purged { .. }) => {
-            review
-                .flash("<p class=\"meta\">annullata, ma il contenuto era purgato</p>".to_string());
-            see_other("/decisioni")
+            review.flash(
+                "<p class=\"meta\">reverted, but the content was purged: it does not come \
+                 back</p>"
+                    .to_string(),
+            );
+            see_other("/decisions")
         }
         Err(e) => engine_error(e),
     }
@@ -878,7 +878,7 @@ async fn policy(State(review): State<Arc<Review>>, headers: HeaderMap) -> Respon
         Err(e) => return engine_error(e),
     };
     let body = format!(
-        "<h1>La politica della cella</h1>\
+        "<h1>The cell's policy</h1>\
 <table>\
 <tr><th>write</th><td>{}</td></tr>\
 <tr><th>reviewer</th><td>{}</td></tr>\
@@ -887,12 +887,12 @@ async fn policy(State(review): State<Arc<Review>>, headers: HeaderMap) -> Respon
 <tr><th>allow_supersede</th><td>{}</td></tr>\
 <tr><th>max_auto_per_hour</th><td>{}</td></tr>\
 </table>\
-<p class=\"meta\">in sola lettura: si cambia solo con <code>engramma policy set</code></p>",
+<p class=\"meta\">read-only: it changes only with <code>engramma policy set</code></p>",
         esc(policy.write.as_str()),
         esc(policy.reviewer.as_deref().unwrap_or("—")),
         policy.min_confidence,
         esc(&if policy.kinds.is_empty() {
-            "tutti".to_string()
+            "all".to_string()
         } else {
             policy
                 .kinds
@@ -904,11 +904,31 @@ async fn policy(State(review): State<Arc<Review>>, headers: HeaderMap) -> Respon
         esc(policy.allow_supersede.as_str()),
         policy.max_auto_per_hour,
     );
-    page("Politica", &body)
+    page("Policy", &body)
 }
 
 async fn not_found_route() -> Response {
-    not_found("pagina inesistente")
+    not_found("no such page")
+}
+
+/// v0.6.19 (F2.4): the beta's routes stay as redirects — 308, for good:
+/// a bookmark must not break. The forms' routes and their fields are
+/// renamed instead: the forms are served by this same binary.
+fn moved_permanently(to: String) -> Response {
+    Redirect::permanent(&to).into_response()
+}
+
+/// `/entra?token=…`, the beta's entry: the token rides along.
+async fn old_entry(uri: axum::http::Uri) -> Response {
+    moved_permanently(match uri.query() {
+        Some(query) => format!("/enter?{query}"),
+        None => "/enter".to_string(),
+    })
+}
+
+/// `/note/<id>`: the note keeps its address under the new route.
+async fn old_note(Path(id): Path<String>) -> Response {
+    moved_permanently(format!("/notes/{id}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -931,8 +951,8 @@ pub async fn run(cell: Cell, port: Option<u16>, open: bool) -> std::io::Result<(
         .fill(&mut bytes)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let url = format!("http://127.0.0.1:{}/entra?token={token}", bound.port());
-    println!("revisione: {url}");
+    let url = format!("http://127.0.0.1:{}/enter?token={token}", bound.port());
+    println!("review: {url}");
     if open {
         // best effort: the address is already on stdout
         let _ = std::process::Command::new("open").arg(&url).spawn();
@@ -944,19 +964,42 @@ pub async fn run(cell: Cell, port: Option<u16>, open: bool) -> std::io::Result<(
         flash: std::sync::Mutex::new(None),
     });
     let app = Router::new()
-        .route("/", get(|| async { see_other("/coda") }))
-        .route("/entra", get(entra))
-        .route("/stile.css", get(style))
-        .route("/coda", get(queue))
-        .route("/coda/{id}/accetta", post(accept))
-        .route("/coda/{id}/rifiuta", post(reject))
-        .route("/note", get(notes))
-        .route("/note/{id}", get(note_detail))
-        .route("/note/{id}/ripristina", post(restore))
-        .route("/decisioni", get(decisions))
-        .route("/decisioni/blocco", post(bulk))
-        .route("/decisioni/annulla/{op}", post(revert_one))
-        .route("/politica", get(policy))
+        .route("/", get(|| async { see_other("/queue") }))
+        .route("/enter", get(enter))
+        .route("/style.css", get(style))
+        .route("/queue", get(queue))
+        .route("/queue/{id}/accept", post(accept))
+        .route("/queue/{id}/reject", post(reject))
+        .route("/notes", get(notes))
+        .route("/notes/{id}", get(note_detail))
+        .route("/notes/{id}/restore", post(restore))
+        .route("/decisions", get(decisions))
+        .route("/decisions/bulk", post(bulk))
+        .route("/decisions/revert/{op}", post(revert_one))
+        .route("/policy", get(policy))
+        // the beta's routes: 308 to the new ones, the bookmarks live on
+        .route("/entra", get(old_entry))
+        .route(
+            "/coda",
+            get(|| async { moved_permanently("/queue".to_string()) }),
+        )
+        .route(
+            "/note",
+            get(|| async { moved_permanently("/notes".to_string()) }),
+        )
+        .route("/note/{id}", get(old_note))
+        .route(
+            "/decisioni",
+            get(|| async { moved_permanently("/decisions".to_string()) }),
+        )
+        .route(
+            "/politica",
+            get(|| async { moved_permanently("/policy".to_string()) }),
+        )
+        .route(
+            "/stile.css",
+            get(|| async { moved_permanently("/style.css".to_string()) }),
+        )
         .fallback(not_found_route)
         .with_state(review)
         // the closed CSP and friends ride on EVERY response
