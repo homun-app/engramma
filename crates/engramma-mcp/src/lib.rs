@@ -621,7 +621,7 @@ struct NeighborsParams {
 struct TagsParams {
     /// Cell to query. May be omitted when the server exposes exactly one.
     cell: Option<String>,
-    /// Tag prefix; children are included (e.g. "casa" matches "casa/milano").
+    /// Tag prefix; children are included (e.g. "home" matches "home/milan").
     #[serde(default)]
     prefix: Option<String>,
 }
@@ -764,7 +764,7 @@ impl MemoryServer {
 
     #[tool(name = "memory_tags", annotations(read_only_hint = true))]
     /// Tags used in the memory with their note counts. A prefix includes its
-    /// children ("casa" also counts "casa/milano"). Use it to explore how
+    /// children ("home" also counts "home/milan"). Use it to explore how
     /// the memory is organised before filtering searches.
     async fn memory_tags(
         &self,
@@ -828,8 +828,8 @@ struct ProposeParams {
     /// memory_get/memory_search). Omit for a new fact.
     #[serde(default)]
     supersedes: Option<String>,
-    /// Why you propose it, in one line («l'utente l'ha detto durante la
-    /// chat»). Kept with the proposal for the human who will decide.
+    /// Why you propose it, in one line ("the user said so during the
+    /// chat"). Kept with the proposal for the human who will decide.
     #[serde(default)]
     reason: Option<String>,
 }
@@ -1142,17 +1142,17 @@ impl MemoryServer {
                 self.decide_and_report(cell, id, true, edited, &decision_actor)
                     .await
             }
-            // the form's RIFIUTA button: a decision, kept with its reasons
+            // the form's DECLINE button: a decision, kept with its reasons
             ElicitationAction::Decline => {
                 self.decide_and_report(cell, id, false, None, &decision_actor)
                     .await
             }
-            // ANNULLA, or a future action we do not know: the proposal
+            // CANCEL, or a future action we do not know: the proposal
             // stays in the queue — silence never decides
             ElicitationAction::Cancel | _ => Ok(tool_ok(&serde_json::json!({
                 "status": "pending",
                 "id": id.to_string(),
-                "note": "annullato: la proposta resta in coda, la decidi dalla CLI o dalla pagina di revisione",
+                "note": "cancelled: the proposal stays in the queue; decide it from the CLI or the review page",
             }))?
             .into()),
         }
@@ -1172,8 +1172,8 @@ impl MemoryServer {
             tokio::task::spawn_blocking(move || engine_cell.embed_pending(&*embedder, 512)).await;
         match joined {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => eprintln!("engramma-mcp: embed dopo la decisione: {e}"),
-            Err(e) => eprintln!("engramma-mcp: embed dopo la decisione: join {e}"),
+            Ok(Err(e)) => eprintln!("engramma-mcp: embed after the decision: {e}"),
+            Err(e) => eprintln!("engramma-mcp: embed after the decision: join {e}"),
         }
     }
 
@@ -1215,7 +1215,7 @@ impl MemoryServer {
                         } else {
                             DecisionAction::Reject
                         },
-                        reason: Some("confermato dal modulo del client".into()),
+                        reason: Some("confirmed from the client's form".into()),
                         review: None,
                     },
                     &owned_actor,
@@ -1244,9 +1244,9 @@ impl MemoryServer {
             "id": id.to_string(),
             "decided_by": actor,
             "reason": if accept {
-                if was_edited { "confermato (con modifica) dal modulo" } else { "confermato dal modulo" }
+                if was_edited { "confirmed (with an edit) from the form" } else { "confirmed from the form" }
             } else {
-                "rifiutato dal modulo"
+                "rejected from the form"
             },
             "note_status": note.status.as_str(),
         }))
@@ -1352,7 +1352,7 @@ fn confirm_request(text: &str, reason: &str) -> Result<rmcp::model::ElicitReques
     let schema = ElicitationSchemaBuilder::new()
         .required_string_property("text", |s| {
             // pre-filled with the proposal: the human edits, never retypes
-            s.description("Il testo della nota: puoi correggerlo prima di salvare")
+            s.description("The text of the note: you can correct it before saving")
                 .with_default(text)
         })
         .build()
@@ -1361,11 +1361,11 @@ fn confirm_request(text: &str, reason: &str) -> Result<rmcp::model::ElicitReques
         ElicitRequestParams::FormElicitationParams {
             meta: None,
             message: format!(
-                "Salvare questa proposta sulla memoria?\n«{text}»{}",
+                "Save this proposal to the memory?\n\"{text}\"{}",
                 if reason.is_empty() {
                     String::new()
                 } else {
-                    format!("\n(motivo: {reason})")
+                    format!("\n(reason: {reason})")
                 }
             ),
             requested_schema: schema,
@@ -1574,7 +1574,7 @@ fn outcome_json(
 fn pending_result(outcome: ProposalOutcome, confirm: bool) -> Result<CallToolResponse, McpError> {
     let where_to = if confirm {
         Some(
-            "il client non supporta il modulo di conferma: la decidi con `engramma proposals` o dalla pagina locale `engramma review`",
+            "this client does not support the confirmation form: decide it with `engramma proposals` or on the local page `engramma review`",
         )
     } else {
         None
@@ -1709,7 +1709,7 @@ impl ServerHandler for MemoryServer {
                             match &w.actor {
                                 Some(a) => format!("`mcp:{a}`"),
                                 // over HTTP the label is the human's choice, grant by grant
-                                None => "the label the human approved (`mcp:<etichetta>`)".into(),
+                                None => "the label the human approved (`mcp:<label>`)".into(),
                             }
                         )
                     })

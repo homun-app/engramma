@@ -32,6 +32,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   along. The forms are renamed with their routes (`text`, `reason`,
   `version`, `since`, `until`, `confirm`); the old POST routes are gone,
   so a tab left open on the beta's page gets a 404 instead of a decision.
+- The MCP server speaks English: the confirmation form (its message and
+  the description of its field), the prose fields `note` and `reason` of
+  the tool answers, the lines it writes on stderr, the examples in the
+  tool schemas. The reason a form writes into the registry is English
+  for the decisions to come (`confirmed from the client's form`).
+- The OAuth pages and the token endpoint speak English, the
+  `error_description` values included (the `error` codes do not change).
+  The waiting page lives at `/pending/<handle>`; the beta's
+  `/attesa/<handle>` answers 308, for good. `engramma oauth log` writes
+  the `detail` of the events to come in English.
 
 ### Fixed
 

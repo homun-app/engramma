@@ -807,7 +807,7 @@ fn confirm_with_the_server_requested_form_accepts_rejects_and_cancels() {
     let payload = tool_payload(&res);
     assert_eq!(payload["status"], "accepted");
     // the unchanged text is a plain accept, not an accept-with-edit
-    assert_eq!(payload["reason"], "confermato dal modulo", "{payload}");
+    assert_eq!(payload["reason"], "confirmed from the form", "{payload}");
 
     // the RIFIUTA button rejects: the lapide keeps the text
     mcp.send(&propose_call(4, "mem", "Fabio vende la casa.").to_string());

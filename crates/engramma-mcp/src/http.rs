@@ -480,7 +480,7 @@ type Q = HashMap<String, String>;
 /// The waiting page: hard headers on every page this phase serves.
 fn page(title: &str, body: &str) -> Response {
     let mut r = Html(format!(
-        "<!doctype html>\n<html lang=\"it\"><head><meta charset=\"utf-8\">\
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
 <title>{}</title></head><body><main>{body}</main></body></html>",
         esc(title)
@@ -511,11 +511,11 @@ fn page(title: &str, body: &str) -> Response {
 /// open-redirect bug.
 fn error_page(why: &str) -> Response {
     page(
-        "Non riesco",
+        "Cannot connect",
         &format!(
-            "<h1>Non posso avviare il collegamento</h1><p>{}</p>\
-             <p>Torna all'app da cui hai cliccato e riprova; se continua, \
-             il client non è compatibile con questo server.</p>",
+            "<h1>Cannot start the connection</h1><p>{}</p>\
+             <p>Go back to the app you clicked from and try again; if it keeps \
+             failing, the client is not compatible with this server.</p>",
             esc(why)
         ),
     )
@@ -592,8 +592,8 @@ async fn authorize(State(state): State<Arc<HttpState>>, Query(q): Query<Q>) -> R
     // busy. A page, with Retry-After, exactly like /token's 429.
     if !state.authorize_rate_tick() {
         let mut r = page(
-            "Troppe richieste",
-            "<h1>Troppe richieste</h1><p>aspetta un minuto e riprova.</p>",
+            "Too many requests",
+            "<h1>Too many requests</h1><p>wait a minute and try again.</p>",
         );
         *r.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         r.headers_mut().insert(
@@ -607,15 +607,15 @@ async fn authorize(State(state): State<Arc<HttpState>>, Query(q): Query<Q>) -> R
     // client or a bad redirect answers with a PAGE, never a redirect —
     // that is the open-redirect defense.
     let Some(client_id) = q.get("client_id").cloned() else {
-        return error_page("manca il client_id");
+        return error_page("client_id is missing");
     };
     let Some(client) = state.client_of(&client_id).await else {
         return error_page(
-            "il client non è noto a questo server (documento client irraggiungibile o non valido)",
+            "the client is not known to this server (its client metadata document is unreachable or not valid)",
         );
     };
     let Some(redirect) = q.get("redirect_uri").cloned() else {
-        return error_page("manca il redirect_uri");
+        return error_page("redirect_uri is missing");
     };
     let registered = client
         .redirect_uris
@@ -627,7 +627,7 @@ async fn authorize(State(state): State<Arc<HttpState>>, Query(q): Query<Q>) -> R
             "client_rejected",
             &format!("{client_id}: redirect_uri not registered"),
         );
-        return error_page("il redirect_uri non è registrato da questo client");
+        return error_page("the redirect_uri is not registered for this client");
     }
 
     // 2. everything else answers at the redirect, with `iss` and `state`
@@ -699,14 +699,14 @@ async fn authorize(State(state): State<Arc<HttpState>>, Query(q): Query<Q>) -> R
                 .store
                 .event(now, "authorize_flood", &format!("{client_id}: per-client"));
             return page(
-                "Troppe richieste",
-                "<h1>Troppe richieste in attesa per questo client</h1>\
-                 <p>ci sono già due collegamenti di questo client da decidere: approvali o \
-                 rifiutali (`engramma oauth pending`) e riprova.</p>",
+                "Too many requests",
+                "<h1>Too many requests waiting for this client</h1>\
+                 <p>two connections of this client already wait for a decision: approve \
+                 or deny them (`engramma oauth pending`) and try again.</p>",
             );
         }
         Ok(_) => {}
-        Err(_) => return error_page("oauth.db non è leggibile"),
+        Err(_) => return error_page("oauth.db cannot be read"),
     }
     match state.store.pending_count(now) {
         Ok(n) if n >= 10 => {
@@ -714,21 +714,21 @@ async fn authorize(State(state): State<Arc<HttpState>>, Query(q): Query<Q>) -> R
                 .store
                 .event(now, "authorize_flood", &format!("{client_id}: global"));
             return page(
-                "Troppe richieste",
-                "<h1>Troppe richieste in attesa</h1>\
-                 <p>ci sono già dieci collegamenti da decidere: approvali o rifiutali \
-                 (`engramma oauth pending`, oppure `engramma oauth deny --all`) e riprova.</p>",
+                "Too many requests",
+                "<h1>Too many requests waiting</h1>\
+                 <p>ten connections already wait for a decision: approve or deny them \
+                 (`engramma oauth pending`, or `engramma oauth deny --all`) and try again.</p>",
             );
         }
         Ok(_) => {}
-        Err(_) => return error_page("oauth.db non è leggibile"),
+        Err(_) => return error_page("oauth.db cannot be read"),
     }
 
     // 4. record and send the browser to the waiting page
     let handle = mint::handle().unwrap_or_default();
     let code = mint::approval_code().unwrap_or_default();
     if handle.is_empty() || code.is_empty() {
-        return error_page("il generatore casuale non risponde");
+        return error_page("the random generator does not answer");
     }
     let req = AuthRequest {
         handle: handle.clone(),
@@ -748,22 +748,22 @@ async fn authorize(State(state): State<Arc<HttpState>>, Query(q): Query<Q>) -> R
         expires_at: now + 600,
     };
     if state.store.request_insert(&req).is_err() {
-        return error_page("oauth.db non è scrivibile");
+        return error_page("oauth.db cannot be written");
     }
     state.store.event(
         now,
         "request_created",
         &format!("code={code} client={client_id}"),
     );
-    axum::response::Redirect::to(&format!("/attesa/{handle}")).into_response()
+    axum::response::Redirect::to(&format!("/pending/{handle}")).into_response()
 }
 
-/// `GET /attesa/<handle>`: the page the browser refreshes until the human
+/// `GET /pending/<handle>`: the page the browser refreshes until the human
 /// decides on the computer where engramma runs.
-async fn attesa(State(state): State<Arc<HttpState>>, Path(handle): Path<String>) -> Response {
+async fn pending(State(state): State<Arc<HttpState>>, Path(handle): Path<String>) -> Response {
     let now = HttpState::now();
     let Ok(Some(req)) = state.store.request_by_handle(&handle) else {
-        return page("Sconosciuto", "<h1>Richiesta sconosciuta</h1>");
+        return page("Unknown", "<h1>Unknown request</h1>");
     };
     let issuer = state.cfg.issuer();
     match req.status {
@@ -773,45 +773,45 @@ async fn attesa(State(state): State<Arc<HttpState>>, Path(handle): Path<String>)
             let loopback_note = if parse_redirect_uri(&req.redirect_uri).is_some_and(|u| {
                 u.scheme == "http" && (u.host == "127.0.0.1" || u.host == "localhost")
             }) {
-                "<p class=\"avviso\">Attenzione: il client riceverà la risposta su un \
-                 indirizzo locale del TUO computer (redirect http su loopback).</p>"
+                "<p class=\"warning\">Warning: the client will receive the answer on a \
+                 local address of YOUR computer (http redirect to loopback).</p>"
             } else {
                 ""
             };
             let body = format!(
                 "<meta http-equiv=\"refresh\" content=\"3\">\
-<h1>Collegamento in attesa</h1>\
-<p><strong>{}</strong> chiede di leggere la tua memoria.</p>\
+<h1>Connection waiting</h1>\
+<p><strong>{}</strong> asks to read your memory.</p>\
 <table>\
 <tr><th>client</th><td><code>{}</code></td></tr>\
-<tr><th>riceverà la risposta su</th><td><code>{}</code></td></tr>\
-<tr><th>ambiti</th><td>{}</td></tr>\
+<tr><th>will receive the answer at</th><td><code>{}</code></td></tr>\
+<tr><th>scopes</th><td>{}</td></tr>\
 </table>\
 {loopback_note}\
-<p>Se i nomi sopra sono quelli che ti aspetti, approva sul computer dove \
- gira Engramma:</p>\
+<p>If the names above are the ones you expect, approve on the computer where \
+ Engramma runs:</p>\
 <pre>engramma oauth approve {}</pre>\
-<p class=\"meta\">Questa pagina si aggiorna da sola; il codice scade con la \
- richiesta (10 minuti).</p>",
-                esc(req.client_name.as_deref().unwrap_or("Un client")),
+<p class=\"meta\">This page refreshes itself; the code expires with the \
+ request (10 minutes).</p>",
+                esc(req.client_name.as_deref().unwrap_or("A client")),
                 esc(client_host),
                 esc(redirect_host),
                 esc(&req.scopes.join(" ")),
                 esc(&req.approval_code),
             );
-            page("In attesa", &body)
+            page("Waiting", &body)
         }
         RequestStatus::Pending => error_redirect(
             &req.redirect_uri,
             "access_denied",
-            "la richiesta è scaduta",
+            "the request expired",
             &req.state,
             &issuer,
         ),
         RequestStatus::Denied => error_redirect(
             &req.redirect_uri,
             "access_denied",
-            "rifiutata sul computer dove gira engramma",
+            "denied on the computer where engramma runs",
             &req.state,
             &issuer,
         ),
@@ -821,9 +821,9 @@ async fn attesa(State(state): State<Arc<HttpState>>, Path(handle): Path<String>)
             // actually pick it up
             if state.store.code_already_minted(&handle).unwrap_or(false) {
                 return page(
-                    "Completato",
-                    "<h1>Collegamento già completato</h1>\
-                     <p>il codice d'autorizzazione è già stato emesso: torna all'app.</p>",
+                    "Done",
+                    "<h1>Connection already completed</h1>\
+                     <p>the authorization code was already issued: go back to the app.</p>",
                 );
             }
             match state.store.code_mint(&handle, &state.cfg.resource(), now) {
@@ -838,13 +838,20 @@ async fn attesa(State(state): State<Arc<HttpState>>, Path(handle): Path<String>)
                 _ => error_redirect(
                     &req.redirect_uri,
                     "access_denied",
-                    "la richiesta non è più valida",
+                    "the request is no longer valid",
                     &req.state,
                     &issuer,
                 ),
             }
         }
     }
+}
+
+/// v0.6.19: `/attesa/<handle>`, the beta's address of the waiting page —
+/// 308, for good: a browser already waiting lands on the new page (the
+/// request outlives the server: it waits ten minutes in the store).
+async fn old_pending(Path(handle): Path<String>) -> Response {
+    axum::response::Redirect::permanent(&format!("/pending/{handle}")).into_response()
 }
 
 /// A token-endpoint JSON answer (always `Cache-Control: no-store`).
@@ -871,7 +878,7 @@ fn token_error(error: &str, description: &str) -> Response {
 /// `POST /token`: authorization_code (with PKCE) and refresh_token.
 async fn token(State(state): State<Arc<HttpState>>, Form(f): Form<Q>) -> Response {
     if !state.token_rate_tick() {
-        let mut r = token_error("slow_down", "troppo: riprova tra poco");
+        let mut r = token_error("slow_down", "too many: try again in a little while");
         *r.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         r.headers_mut().insert(
             axum::http::header::RETRY_AFTER,
@@ -885,31 +892,31 @@ async fn token(State(state): State<Arc<HttpState>>, Form(f): Form<Q>) -> Respons
         Some("refresh_token") => token_refresh(&state, &f, now),
         Some(_) => token_error(
             "unsupported_grant_type",
-            "authorization_code o refresh_token",
+            "authorization_code or refresh_token",
         ),
-        None => token_error("invalid_request", "manca grant_type"),
+        None => token_error("invalid_request", "grant_type is missing"),
     }
 }
 
 async fn token_code(state: &HttpState, f: &Q, now: i64) -> Response {
     let Some(code) = f.get("code") else {
-        return token_error("invalid_request", "manca code");
+        return token_error("invalid_request", "code is missing");
     };
     let Some(verifier) = f.get("code_verifier") else {
-        return token_error("invalid_request", "manca code_verifier (PKCE)");
+        return token_error("invalid_request", "code_verifier is missing (PKCE)");
     };
     let Some(client_id) = f.get("client_id") else {
-        return token_error("invalid_request", "manca client_id");
+        return token_error("invalid_request", "client_id is missing");
     };
     let Some(redirect) = f.get("redirect_uri") else {
-        return token_error("invalid_request", "manca redirect_uri");
+        return token_error("invalid_request", "redirect_uri is missing");
     };
     match state.store.code_consume(code, now) {
         // v0.6.19: a store that cannot be read is a server error — `oauth.db`
         // (the file's name) is not one of RFC 6749 §5.2's codes
-        Err(_) => token_error("server_error", "non leggibile"),
-        Ok(Err(CodeUse::Unknown)) => token_error("invalid_grant", "codice sconosciuto"),
-        Ok(Err(CodeUse::Expired)) => token_error("invalid_grant", "codice scaduto"),
+        Err(_) => token_error("server_error", "the authorization store cannot be read"),
+        Ok(Err(CodeUse::Unknown)) => token_error("invalid_grant", "unknown code"),
+        Ok(Err(CodeUse::Expired)) => token_error("invalid_grant", "expired code"),
         Ok(Err(CodeUse::Reused { family })) => {
             // a code answers twice: assume theft, kill the whole chain
             let _ = state.store.revoke_family(&family, now);
@@ -918,7 +925,7 @@ async fn token_code(state: &HttpState, f: &Q, now: i64) -> Response {
                 .event(now, "code_reused", &format!("family={family}"));
             token_error(
                 "invalid_grant",
-                "il codice era già stato usato: tutto ciò che ne era nato è revocato",
+                "the code was already used: everything born of it is revoked",
             )
         }
         Ok(Ok(rec)) => {
@@ -926,21 +933,21 @@ async fn token_code(state: &HttpState, f: &Q, now: i64) -> Response {
             // (no `return`), so any client with the verifier could redeem
             // a code issued to another client or redirect
             if rec.client_id != *client_id {
-                return token_error("invalid_grant", "il codice è di un altro client");
+                return token_error("invalid_grant", "the code belongs to another client");
             }
             if !redirect_matches(&rec.redirect_uri, redirect) {
-                return token_error("invalid_grant", "redirect_uri non corrispondente");
+                return token_error("invalid_grant", "redirect_uri does not match");
             }
             if let Some(want) = f.get("resource")
                 && Some(want.as_str()) != rec.resource.as_deref()
             {
-                return token_error("invalid_target", "resource non corrispondente");
+                return token_error("invalid_target", "resource does not match");
             }
             if !mint::pkce_verify(&rec.code_challenge, verifier) {
-                return token_error("invalid_grant", "PKCE non verificato");
+                return token_error("invalid_grant", "PKCE not verified");
             }
             let Some(grant) = state.store.grant(&rec.grant_id, now).ok().flatten() else {
-                return token_error("invalid_grant", "il grant non vive più");
+                return token_error("invalid_grant", "the grant is gone");
             };
             // the grant can only NARROW what the code asked
             let scopes: Vec<String> = rec
@@ -956,7 +963,12 @@ async fn token_code(state: &HttpState, f: &Q, now: i64) -> Response {
                     .access_issue(&grant, &scopes, &audience, &rec.family, now)
                 {
                     Ok(v) => v,
-                    Err(_) => return token_error("server_error", "oauth.db"),
+                    Err(_) => {
+                        return token_error(
+                            "server_error",
+                            "the authorization store is unavailable",
+                        );
+                    }
                 };
             let (refresh, _refresh_exp) =
                 match state
@@ -964,7 +976,12 @@ async fn token_code(state: &HttpState, f: &Q, now: i64) -> Response {
                     .refresh_issue(&grant, &scopes, &audience, &rec.family, now)
                 {
                     Ok(v) => v,
-                    Err(_) => return token_error("server_error", "oauth.db"),
+                    Err(_) => {
+                        return token_error(
+                            "server_error",
+                            "the authorization store is unavailable",
+                        );
+                    }
                 };
             state.store.event(
                 now,
@@ -988,7 +1005,7 @@ async fn token_code(state: &HttpState, f: &Q, now: i64) -> Response {
 
 fn token_refresh(state: &HttpState, f: &Q, now: i64) -> Response {
     let Some(refresh) = f.get("refresh_token") else {
-        return token_error("invalid_request", "manca refresh_token");
+        return token_error("invalid_request", "refresh_token is missing");
     };
     let audience = state.cfg.resource();
     let wanted: Vec<String> = f
@@ -1001,15 +1018,16 @@ fn token_refresh(state: &HttpState, f: &Q, now: i64) -> Response {
         })
         .unwrap_or_default();
     match state.store.refresh_rotate(refresh, &wanted, &audience, now) {
-        Err(_) => token_error("server_error", "oauth.db"),
+        Err(_) => token_error("server_error", "the authorization store is unavailable"),
         Ok(Err(RefreshUse::Reused)) => token_error(
             "invalid_grant",
-            "il refresh era già stato ruotato: il grant è revocato, ricollega il client",
+            "the refresh token was already rotated: the grant is revoked, reconnect the client",
         ),
-        Ok(Err(RefreshUse::Unknown)) => token_error("invalid_grant", "refresh sconosciuto"),
-        Ok(Err(RefreshUse::Expired)) => {
-            token_error("invalid_grant", "refresh scaduto: ricollega il client")
-        }
+        Ok(Err(RefreshUse::Unknown)) => token_error("invalid_grant", "unknown refresh token"),
+        Ok(Err(RefreshUse::Expired)) => token_error(
+            "invalid_grant",
+            "expired refresh token: reconnect the client",
+        ),
         Ok(Ok(rot)) => token_json(serde_json::json!({
             "access_token": rot.access,
             "token_type": "Bearer",
@@ -1042,7 +1060,7 @@ async fn register(
     if !state.cfg.allow_dcr {
         return (
             StatusCode::NOT_FOUND,
-            "il server non accetta registrazioni dinamiche",
+            "the server does not accept dynamic client registrations",
         )
             .into_response();
     }
@@ -1109,7 +1127,13 @@ async fn register(
             return r;
         }
         Ok(_) => {}
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "oauth.db").into_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the authorization store is unavailable",
+            )
+                .into_response();
+        }
     }
     let client_id = mint::opaque_token("eng_client_").unwrap_or_default();
     let rec = ClientRecord {
@@ -1123,7 +1147,11 @@ async fn register(
         created_at: now,
     };
     if state.store.dcr_put(&rec).is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "oauth.db").into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the authorization store is unavailable",
+        )
+            .into_response();
     }
     state
         .store
@@ -1184,7 +1212,9 @@ fn router_inner(state: Arc<HttpState>, ct: Option<tokio_util::sync::Cancellation
             get(authorization_server),
         )
         .route("/authorize", get(authorize))
-        .route("/attesa/{handle}", get(attesa))
+        .route("/pending/{handle}", get(pending))
+        // the beta's address of the waiting page: 308, for good
+        .route("/attesa/{handle}", get(old_pending))
         .route("/token", post(token))
         .route("/revoke", post(revoke))
         .route("/register", post(register))

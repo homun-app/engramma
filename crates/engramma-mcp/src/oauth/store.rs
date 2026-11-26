@@ -918,7 +918,12 @@ impl OAuthStore {
             .map_err(db)?
         };
         if n > 0 {
-            self.event(now, "request_denied", &format!("--all: {n} richieste"));
+            let what = if n == 1 {
+                "--all: 1 request".to_string()
+            } else {
+                format!("--all: {n} requests")
+            };
+            self.event(now, "request_denied", &what);
         }
         Ok(n)
     }
@@ -1320,7 +1325,7 @@ impl OAuthStore {
             let what = if kind == "refresh" {
                 format!("by /revoke: refresh → family ({n} token)")
             } else {
-                "by /revoke: access (solo lui)".to_string()
+                "by /revoke: access (that one only)".to_string()
             };
             self.event(now, "token_revoked", &what);
         }

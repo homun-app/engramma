@@ -292,6 +292,11 @@ impl Gate {
                 self.red.join("\n  ")
             );
         }
+        // the green run says what it read: a silence could hide an empty walk
+        println!(
+            "{} surfaces read: English, and the promises of F2 kept",
+            self.read
+        );
     }
 }
 
@@ -1730,7 +1735,17 @@ fn http_denial(gate: &mut Gate, root: &Path, http: &Http) {
             3,
         );
     }
-    let (_, _, body) = http.get("/attesa/0");
+    // v0.6.19: the waiting page lives at `/pending/<handle>`; the beta's
+    // `/attesa/<handle>` answers 308, for good — a browser already waiting
+    // lands on the new page
+    let (status, to, _) = http.get("/attesa/0");
+    if status != 308 || to.as_deref() != Some("/pending/0") {
+        gate.promise(
+            "mcp --http · the beta's waiting address",
+            "it must answer 308 to /pending/0 (F2.4)",
+        );
+    }
+    let (_, _, body) = http.get("/pending/0");
     gate.html("mcp --http · an unknown request", &body);
 }
 

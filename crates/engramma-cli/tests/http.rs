@@ -659,7 +659,7 @@ fn the_third_pending_of_one_client_is_refused_with_a_page() {
     let mut r = s.get(&q);
     assert_eq!(r.status().as_u16(), 200, "a page, not a redirect");
     let html = body(&mut r);
-    assert!(html.contains("Troppe richieste"), "{html}");
+    assert!(html.contains("Too many requests"), "{html}");
     assert!(location(&r).is_none());
 }
 
@@ -2559,13 +2559,16 @@ fn authorize_has_a_global_ceiling_of_30_per_minute() {
     for _ in 0..30 {
         let mut r = s.get("/authorize");
         assert_eq!(r.status().as_u16(), 200, "the error page is a page");
-        assert!(body(&mut r).contains("client_id"), "manca il client_id");
+        assert!(
+            body(&mut r).contains("client_id"),
+            "the page names what is missing"
+        );
     }
     // the 31st within the minute: 429 with Retry-After, like /token
     let mut r = s.get("/authorize");
     assert_eq!(r.status().as_u16(), 429);
     assert_eq!(r.headers().get("retry-after").unwrap(), "60");
-    assert!(body(&mut r).contains("Troppe richieste"));
+    assert!(body(&mut r).contains("Too many requests"));
 }
 
 /// v0.5.3 (P3.1): a document refused once is not fetched again for five
@@ -2584,7 +2587,7 @@ fn a_refused_cimd_is_not_refetched_for_five_minutes() {
         let mut r = s.get(&q);
         assert_eq!(r.status().as_u16(), 200, "the refusal is a page");
         assert!(
-            body(&mut r).contains("client non è noto"),
+            body(&mut r).contains("client is not known"),
             "the generic refusal, no details"
         );
     }
@@ -2630,7 +2633,7 @@ fn authorize_waits_at_two_per_client_and_ten_in_all() {
     assert_eq!(r.status().as_u16(), 200);
     let page = body(&mut r);
     assert!(
-        page.contains("due collegamenti di questo client"),
+        page.contains("two connections of this client"),
         "the per-client ceiling: {page}"
     );
     // FOUR more clients × 2 each: 2 + 8 = 10 waiting in all, the eleventh
@@ -2647,8 +2650,37 @@ fn authorize_waits_at_two_per_client_and_ten_in_all() {
     assert_eq!(r.status().as_u16(), 200);
     let page = body(&mut r);
     assert!(
-        page.contains("dieci collegamenti"),
+        page.contains("ten connections"),
         "the global ceiling: {page}"
+    );
+}
+
+/// v0.6.19: the waiting page lives at `/pending/<handle>`; the beta's
+/// `/attesa/<handle>` answers 308, for good — a browser already waiting
+/// when the server was updated lands on the new page and keeps waiting.
+#[test]
+fn the_beta_waiting_address_redirects_for_good() {
+    let (cimd_url, _cimd) = cimd_server();
+    let s = Server::start(|cfg| {
+        cfg.allow_loopback_cimd = true;
+    });
+    let (_v, challenge) = pkce();
+    let r = s.get(&authorize_query(&cimd_url, &challenge, ""));
+    let waiting = location(&r).expect(/* 303 */ "to the waiting page");
+    assert!(
+        waiting.starts_with("/pending/"),
+        "the new address: {waiting}"
+    );
+    let old = waiting.replacen("/pending/", "/attesa/", 1);
+    let r = s.get(&old);
+    assert_eq!(r.status().as_u16(), 308, "the beta's address, for good");
+    assert_eq!(location(&r).as_deref(), Some(waiting.as_str()));
+    // and it lands on the page that carries the approval code
+    let mut r = s.get(&waiting);
+    assert_eq!(r.status().as_u16(), 200);
+    assert!(
+        body(&mut r).contains("engramma oauth approve "),
+        "the waiting page"
     );
 }
 
