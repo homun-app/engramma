@@ -134,9 +134,14 @@ for d in $(ls -dt target/caccia/*/ 2>/dev/null | grep -v "^$LOGDIR/"); do
   [ -f "${d}misura.tsv" ] || continue
   awk -F'\t' '$1=="prop" && $7!="" && $7!="0" {print $2 "\t" $7}' "${d}misura.tsv"
 done | awk -F'\t' '!v[$1]++' >"$COSTI"
+# v0.6.19 (F3.1): il limite della suite lo misura solo una suite VERDE
+# (l'ottava colonna del registro). Una suite rossa si ferma al primo
+# fallimento ed è breve — nella v0.6.18 557 s davano un limite di 1135 s,
+# e la suite verde dopo ne ha chiesti 1652: uno stop per tempo che non
+# era un difetto — e una ferma (TEMPO) non ha misurato nulla.
 SUITE_MISURATA=$(for d in $(ls -dt target/caccia/*/ 2>/dev/null | grep -v "^$LOGDIR/"); do
   [ -f "${d}misura.tsv" ] || continue
-  awk -F'\t' '$1=="suite" && $6!="" {print $6; exit}' "${d}misura.tsv"
+  awk -F'\t' '$1=="suite" && $8=="verde" && $6!="" {print $6; exit}' "${d}misura.tsv"
 done | head -n 1)
 [ -n "$SUITE_MISURATA" ] || SUITE_MISURATA=$SUITE_RISERVA
 

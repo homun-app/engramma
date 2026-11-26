@@ -41,6 +41,12 @@ altre. Una proprietà che raggiunge i 20 000 casi senza esaurire il suo
 budget non si riduce: il massimo dei casi costa quello che costa.
 
 **Una corsa sola della suite a 2048** (`SUITE_CASI`; `0` per saltarla).
+Il suo limite di tempo si stima dall'ultima corsa della suite **verde**
+nei registri (l'ottava colonna di `misura.tsv`): una suite rossa si ferma
+al primo fallimento ed è breve — nella v0.6.18 557 s davano un limite di
+1135 s, e la suite verde dopo ne ha chiesti 1652 — e una fermata (`TEMPO`)
+non ha misurato nulla. Senza una misura verde restano 1500 s
+(`SUITE_RISERVA`) (v0.6.19).
 
 **La regola del commit finale**, più leggera: un commit dopo il cancello
 che tocca `crates/*/src`, o l'oracolo di una proprietà, obbliga a rifare
