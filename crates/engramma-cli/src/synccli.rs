@@ -17,7 +17,7 @@ use crate::output::said_yes;
 use crate::{CliError, print_json};
 
 /// The default first-device name, as it always was.
-const FIRST_NAME: &str = "portatile";
+const FIRST_NAME: &str = "laptop";
 
 /// The service's own refusals, in the CLI's terms: `SYNC_BUSY` keeps its
 /// own exit code, everything the caller named is a usage or not-found,
@@ -35,7 +35,7 @@ fn svc_err(e: ServiceError) -> CliError {
 /// Ask the human one yes line: the SAS confirmation, the same prompt the
 /// service's staged handle asks the UI to answer.
 fn confirm_line(sas: &str) -> bool {
-    print!("codice di verifica: {sas} — confermi che è lo stesso sull'altro schermo? [y/N] ");
+    print!("verification code: {sas} — is it the same on the other screen? [y/N] ");
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     if std::io::stdin().lock().read_line(&mut line).is_err() {
@@ -52,7 +52,7 @@ fn confirm_round(p: &PairingHandle) -> Result<(), CliError> {
     p.confirm(yes).map_err(svc_err)
 }
 
-/// `engramma devices invite [--name <nome>] [--relay <url>|--no-relay]`:
+/// `engramma devices invite [--name <name>] [--relay <url>|--no-relay]`:
 /// bind the pairing endpoint, print the ticket with the REAL address,
 /// wait (ten minutes, one use) for the device that enters.
 pub fn devices_invite(
@@ -66,7 +66,7 @@ pub fn devices_invite(
     let p = svc.invite(&name, flag).map_err(svc_err)?;
     let info = p.info(Duration::from_secs(60)).map_err(svc_err)?;
     if let Some(warning) = &info.relay_warning {
-        eprintln!("avviso: {warning}");
+        eprintln!("warning: {warning}");
     }
     if json {
         let mut out = serde_json::json!({
@@ -81,25 +81,25 @@ pub fn devices_invite(
         }
         print_json(&out);
     } else {
-        println!("biglietto (dieci minuti, un uso):");
+        println!("ticket (ten minutes, one use):");
         println!("{}", info.ticket.clone().unwrap_or_default());
         if let Some(relay) = &info.relay {
             println!("relay: {relay}");
         }
-        println!("in attesa del dispositivo che entra…");
+        println!("waiting for the device to join…");
     }
     confirm_round(&p)?;
     let report = p.done(Duration::from_secs(120)).map_err(svc_err)?;
     if !json {
         for cell in &report.cells {
-            println!("cella «{}»: {} operazioni consegnate", cell.name, cell.ops);
+            println!("cell \"{}\": {} operations delivered", cell.name, cell.ops);
         }
-        println!("dispositivo aggiunto all'elenco");
+        println!("device added to the list");
     }
     Ok(())
 }
 
-/// `engramma devices join <ticket|codice> --name <nome>`: the ticket way
+/// `engramma devices join <ticket|code> --name <name>`: the ticket way
 /// in (both textual forms) or the code's meeting at the blind node —
 /// SPAKE2, the key confirmation, the SAS on both screens, then the
 /// registry, the keys and the cells.
@@ -136,14 +136,14 @@ pub fn devices_join(
         }));
     } else {
         for cell in &report.cells {
-            println!("cella «{}» ricevuta: {} operazioni", cell.name, cell.ops);
+            println!("cell \"{}\" received: {} operations", cell.name, cell.ops);
         }
-        println!("dentro: `engramma sync run` per la prima passata");
+        println!("in: `engramma sync run` for the first pass");
     }
     Ok(())
 }
 
-/// `engramma devices code [--name <nome>]`: the short code, printed at
+/// `engramma devices code [--name <name>]`: the short code, printed at
 /// once, then the meeting at the blind node — TWO SAS rounds (the code's
 /// and the ticket flow's).
 pub fn devices_code(
@@ -157,12 +157,12 @@ pub fn devices_code(
     let p = svc.code(&name, flag).map_err(svc_err)?;
     let info = p.info(Duration::from_secs(60)).map_err(svc_err)?;
     if let Some(warning) = &info.relay_warning {
-        eprintln!("avviso: {warning}");
+        eprintln!("warning: {warning}");
     }
     if json {
         print_json(&serde_json::json!({ "code": info.code.unwrap_or_default() }));
     } else {
-        println!("codice breve (dieci minuti, un tentativo):");
+        println!("short code (ten minutes, one attempt):");
         println!("{}", info.code.unwrap_or_default());
     }
     for _ in 0..2 {
@@ -171,7 +171,7 @@ pub fn devices_code(
     let report = p.done(Duration::from_secs(180)).map_err(svc_err)?;
     if !json {
         for cell in &report.cells {
-            println!("cella «{}»: {} operazioni consegnate", cell.name, cell.ops);
+            println!("cell \"{}\": {} operations delivered", cell.name, cell.ops);
         }
     }
     Ok(())
@@ -204,16 +204,16 @@ pub fn sync_run_cmd(
     } else {
         for p in &report.peers {
             match (&p.why_not, p.reached) {
-                (Some(why), _) => println!("{}: non raggiunto — {why}", p.name),
+                (Some(why), _) => println!("{}: unreachable — {why}", p.name),
                 (None, _) => {
-                    let via = p.via.unwrap_or("diretta");
-                    println!("{}: sessione fatta ({})", p.name, via);
+                    let via = p.via.unwrap_or("direct");
+                    println!("{}: session done ({})", p.name, via);
                 }
             }
         }
         for c in &report.cells {
             println!(
-                "cella «{}»: {} inviate, {} ricevute, {} rifiuti, {} conflitti, {} non speditibili, frontiera {}",
+                "cell \"{}\": {} sent, {} received, {} refused, {} conflicts, {} unsent, frontier {}",
                 c.name, c.sent, c.received, c.refused, c.conflicts, c.unsent, c.frontier
             );
         }
@@ -232,7 +232,7 @@ pub fn sync_serve_cmd(
     let svc = SyncService::start(root).map_err(svc_err)?;
     let info = svc.serve_start(flag).map_err(svc_err)?;
     if let Some(warning) = &info.relay_warning {
-        eprintln!("avviso: {warning}");
+        eprintln!("warning: {warning}");
     }
     if json {
         let mut out = serde_json::json!({
@@ -247,7 +247,7 @@ pub fn sync_serve_cmd(
         print_json(&out);
     } else {
         println!(
-            "sync serve in ascolto ({})",
+            "sync serve listening ({})",
             info.addrs.first().cloned().unwrap_or_default()
         );
     }
@@ -274,7 +274,7 @@ pub fn sync_serve_cmd(
     });
     svc.serve_stop().map_err(svc_err)?;
     if !json {
-        println!("sync serve: stop pulito");
+        println!("sync serve: clean stop");
     }
     Ok(())
 }
@@ -296,7 +296,7 @@ pub fn sync_share_cmd(
         }));
     } else {
         println!(
-            "cella «{}» condivisa: adopt {}, epoca 0, chiave {}, {} dispositivi avvolti",
+            "cell \"{}\" shared: adopt {}, epoch 0, key {}, {} devices wrapped",
             view.cell, view.adopt, view.key, view.wraps
         );
     }
@@ -311,7 +311,7 @@ pub fn sync_unshare_cmd(root: &std::path::Path, json: bool, cell: &str) -> Resul
     if json {
         print_json(&serde_json::json!({ "cell": cell }));
     } else {
-        println!("«{cell}» non si sincronizza più da qui; le copie altrove restano");
+        println!("\"{cell}\" no longer syncs from here; the copies elsewhere stay");
     }
     Ok(())
 }
@@ -333,15 +333,15 @@ pub fn devices_remove_cmd(root: &std::path::Path, json: bool, name: &str) -> Res
         }));
     } else {
         println!(
-            "rimosso {}: {} operazioni accettate, root {}",
+            "removed {}: {} operations accepted, root {}",
             view.removed,
             view.accepted_count,
             &view.accepted_root[..16.min(view.accepted_root.len())]
         );
         for (cell, epoch) in &view.rotated {
-            println!("cella «{cell}»: epoca nuova {epoch}");
+            println!("cell \"{cell}\": new epoch {epoch}");
         }
-        println!("la rotazione raggiunge gli altri alla sessione successiva");
+        println!("the rotation reaches the others at the next session");
     }
     Ok(())
 }

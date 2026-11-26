@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! v0.6.15 (F2): `engramma compact` is behind `--sperimentale`. Without
-//! the flag it is a USAGE refusal (exit 2) that says why — the declared
-//! defects of the cut are open — and the cell does not change: no
-//! checkpoint row, verify green. With the flag it compacts as it always
-//! did (the cut only goes forward, v0.6.14).
+//! v0.6.15 (F2): `engramma compact` is behind `--experimental` (the
+//! beta knew it as `--sperimentale`, still accepted). Without the flag
+//! it is a USAGE refusal (exit 2) that says why — the declared defects
+//! of the cut are open — and the cell does not change: no checkpoint
+//! row, verify green. With the flag it compacts as it always did (the
+//! cut only goes forward, v0.6.14).
 
 mod common;
 
@@ -47,7 +48,7 @@ fn cut_of(path: &std::path::Path) -> i64 {
 }
 
 #[test]
-fn compact_without_sperimentale_refuses_and_moves_nothing() {
+fn compact_without_the_switch_refuses_and_moves_nothing() {
     let dir = common::test_dir();
     let cells = dir.path().join("cells");
     std::fs::create_dir_all(&cells).unwrap(/* t */);
@@ -74,7 +75,7 @@ fn compact_without_sperimentale_refuses_and_moves_nothing() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("sperimentale"),
+        stderr.contains("--experimental"),
         "the message names the switch: {stderr}"
     );
     assert!(
@@ -106,7 +107,7 @@ fn compact_without_sperimentale_refuses_and_moves_nothing() {
         .arg("--cell")
         .arg("gate")
         .arg("compact")
-        .arg("--sperimentale")
+        .arg("--experimental")
         .arg("--keep-last")
         .arg("1")
         .output()
@@ -118,4 +119,22 @@ fn compact_without_sperimentale_refuses_and_moves_nothing() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(cut_of(&db) >= 1, "the cut landed");
+
+    // v0.6.19: the beta's name of the switch still answers (the scripts
+    // that use it must not break) — it is accepted, not a usage error
+    let out = Command::new(env!("CARGO_BIN_EXE_engramma"))
+        .arg("--root")
+        .arg(dir.path())
+        .arg("--cell")
+        .arg("gate")
+        .arg("compact")
+        .arg("--sperimentale")
+        .output()
+        .unwrap(/* t */);
+    assert!(
+        out.status.success(),
+        "the beta's `--sperimentale` is still the switch: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

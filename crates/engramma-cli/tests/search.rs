@@ -67,5 +67,5 @@ fn strict_flag_and_support_field_travel_the_cli() {
         "{plain}"
     );
     let human = run(&["search", "Fabio Milano", "--strict"]);
-    assert!(human.contains("supporto: strong"), "{human}");
+    assert!(human.contains("support: strong"), "{human}");
 }

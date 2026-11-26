@@ -230,7 +230,7 @@ fn a_refused_sas_leaves_no_add() {
     assert!(!out.contains("mac"), "no add landed: {out}");
     let (ok, out, _) = run(&b.root, &["--json", "devices", "list"], b"");
     assert!(ok);
-    assert!(!out.contains("portatile"), "B learned nothing: {out}");
+    assert!(!out.contains("laptop"), "B learned nothing: {out}");
 }
 
 /// An EXPIRED ticket is refused at the door.

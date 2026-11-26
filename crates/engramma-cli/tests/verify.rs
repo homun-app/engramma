@@ -79,10 +79,7 @@ fn verify_reports_coverage_per_model() {
     }
     // no model yet: coverage is empty and the verify still passes
     let (human, _) = run(&root, false);
-    assert!(
-        human.contains("registro verificato"),
-        "human output: {human}"
-    );
+    assert!(human.contains("log verified"), "human output: {human}");
     let (json, _) = run(&root, true);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap(/* test-only */);
     assert_eq!(
@@ -97,7 +94,7 @@ fn verify_reports_coverage_per_model() {
     cell.embed_pending(&e, 2).unwrap(/* test-only */);
     let (human, _) = run(&root, false);
     assert!(
-        human.contains("copertura") && human.contains("fake@1"),
+        human.contains("vector coverage") && human.contains("fake@1"),
         "one line per model: {human}"
     );
     assert!(human.contains("2/3"), "two of three notes covered: {human}");
@@ -166,8 +163,8 @@ fn cli_purge_reaches_the_view_or_exits_five() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("purgata"));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("vista"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("purged"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("view"));
 
     // back in place: the purge completes (exit 0) and takes the file
     std::fs::rename(&away, &view).unwrap(/* test-only */);

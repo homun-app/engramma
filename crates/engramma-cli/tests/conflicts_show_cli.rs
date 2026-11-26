@@ -182,7 +182,7 @@ fn conflicts_show_reads_the_quarantined_copy() {
     );
     assert!(!ok, "an unknown copy must not be found: {out}");
     assert!(
-        err.contains("non è una copia di conflitto"),
+        err.contains("is not an open conflict copy"),
         "the error says not-found: {err}"
     );
 
@@ -198,7 +198,7 @@ fn conflicts_show_reads_the_quarantined_copy() {
     let (ok, out, err) = run(root.path(), &["--json", "conflicts", "show", "a", &copy_id]);
     assert!(!ok, "a closed copy must not be found: {out}");
     assert!(
-        err.contains("non è una copia di conflitto"),
+        err.contains("is not an open conflict copy"),
         "the error says not-found: {err}"
     );
 }

@@ -1030,7 +1030,7 @@ fn compat_chatgpt_over_stdio_is_a_usage_error() {
         "--compat chatgpt over stdio must fail, it did not"
     );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--compat chatgpt` va con `--http"), "{err}");
+    assert!(err.contains("--compat chatgpt` goes with `--http"), "{err}");
 }
 
 // v0.6.18 (F4): after the automatic reviewer accepts, `memory_search` finds

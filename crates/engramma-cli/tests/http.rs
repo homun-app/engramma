@@ -2681,7 +2681,7 @@ fn oauth_deny_all_refuses_every_waiting_request() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("rifiutate 3 richieste"), "{stdout}");
+    assert!(stdout.contains("denied 3 requests"), "{stdout}");
     // nothing pending anymore
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     assert_eq!(s.state.store.pending_count(now).unwrap(/* t */), 0);

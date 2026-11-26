@@ -12,6 +12,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   approve`, the SAS of a pairing) say `[y/N]` and read `y` and `yes`. `s`
   still confirms, for who has scripts or habits with the beta; the SAS
   prompt no longer reads `si` or `sì`.
+- The human output of the CLI, the review page, the MCP server and the
+  OAuth pages is in English. Who parsed the textual output must switch
+  to `--json`, which does not change — except for the prose fields listed
+  in the REPORT. Exit codes, JSON keys and enumerated values, OAuth
+  error codes and `e.code` in the Node binding are the same.
+- The prose the CLI writes INTO the registry is in English too (the
+  reason of a decision, of a revert). Cells created before keep the
+  Italian reasons they already hold, and `engramma decisions` shows
+  them. The first device of a new data root is called `laptop`
+  (`portatile` before).
+- `engramma compact` takes `--experimental`; `--sperimentale`, the
+  beta's name, still answers.
 
 ### Fixed
 

@@ -98,16 +98,16 @@ impl From<CellError> for CliError {
             // the message says who already corrected it and what to do
             CellError::StaleTarget { target, closed_by } if closed_by == target => {
                 CliError::internal(format!(
-                    "rettifica rifiutata: {target} non è la versione corrente (chiusa da una \
-                     lapide, o ancora in coda) — \
-                     rifiuta la proposta (`engramma proposals reject <id>`) \
-                     o proponi di nuovo sulla nota corrente"
+                    "correction rejected: {target} is not the current version (closed by a \
+                     tombstone, or still in the queue) — \
+                     reject the proposal (`engramma proposals reject <id>`) \
+                     or propose again on the current note"
                 ))
             }
             CellError::StaleTarget { target, closed_by } => CliError::internal(format!(
-                "rettifica rifiutata: {target} non è la versione corrente — l'ha già corretta \
-                 {closed_by} — rifiuta la proposta (`engramma proposals reject <id>`) \
-                 o proponi di nuovo sulla nota corrente ({closed_by})"
+                "correction rejected: {target} is not the current version — already corrected \
+                 by {closed_by} — reject the proposal (`engramma proposals reject <id>`) \
+                 or propose again on the current note ({closed_by})"
             )),
             other => CliError::internal(other.to_string()),
         }
@@ -187,61 +187,61 @@ pub fn hit_human(h: &Hit, index: usize) -> String {
         engramma_core::id::id8(&h.note.id),
     );
     out.push_str(&format!(
-        "\n   punteggio {:.4} (grezzo {:.4})",
+        "\n   score {:.4} (raw {:.4})",
         h.score, h.raw_score
     ));
     if !h.explain.lists.is_empty() {
-        out.push_str(&format!("\n   liste: {}", h.explain.lists.join(", ")));
+        out.push_str(&format!("\n   lists: {}", h.explain.lists.join(", ")));
     }
     if !h.explain.matched_terms.is_empty() {
         out.push_str(&format!(
-            "\n   termini: {}",
+            "\n   terms: {}",
             h.explain.matched_terms.join(", ")
         ));
     }
     if let Some(r) = h.explain.bm25_rank {
-        out.push_str(&format!("\n   rango BM25: {r}"));
+        out.push_str(&format!("\n   BM25 rank: {r}"));
     }
     if let Some(r) = h.explain.semantic_rank {
-        out.push_str(&format!("\n   rango semantico: {r}"));
+        out.push_str(&format!("\n   semantic rank: {r}"));
     }
     if let Some(r) = h.explain.graph_rank {
-        out.push_str(&format!("\n   rango grafo: {r}"));
+        out.push_str(&format!("\n   graph rank: {r}"));
     }
     if let Some(c) = h.explain.cosine {
-        out.push_str(&format!("\n   coseno: {c:.4}"));
+        out.push_str(&format!("\n   cosine: {c:.4}"));
     }
     if let Some(sup) = h.explain.support {
-        out.push_str(&format!("\n   supporto: {sup}"));
+        out.push_str(&format!("\n   support: {sup}"));
     }
     if let Some(chunk) = h.explain.winning_chunk {
-        out.push_str(&format!("\n   blocco vincente: {chunk}"));
+        out.push_str(&format!("\n   winning chunk: {chunk}"));
     }
     if let Some(via) = &h.explain.via {
         out.push_str(&format!("\n   via: {via}"));
     }
     if let Some(g) = &h.explain.graph {
         match g.off {
-            Some(why) => out.push_str(&format!("\n   grafo: {why}")),
+            Some(why) => out.push_str(&format!("\n   graph: {why}")),
             None => {
                 let signals = match (g.gap, g.agreement) {
                     (Some(gap), Some(a)) => format!(
-                        "stacco {gap:.2}, liste {}",
-                        if a { "concordi" } else { "discordi" }
+                        "gap {gap:.2}, lists {}",
+                        if a { "agreeing" } else { "disagreeing" }
                     ),
-                    (Some(gap), None) => format!("stacco {gap:.2}"),
+                    (Some(gap), None) => format!("gap {gap:.2}"),
                     _ => "—".into(),
                 };
-                out.push_str(&format!("\n   peso grafo: {:.2} ({signals})", g.weight));
+                out.push_str(&format!("\n   graph weight: {:.2} ({signals})", g.weight));
             }
         }
     }
     out.push_str(&format!(
-        "\n   validità: {} → {}",
-        h.explain.valid_from.as_deref().unwrap_or("sempre"),
-        h.explain.valid_to.as_deref().unwrap_or("ora")
+        "\n   validity: {} → {}",
+        h.explain.valid_from.as_deref().unwrap_or("always"),
+        h.explain.valid_to.as_deref().unwrap_or("now")
     ));
-    out.push_str(&format!("\n   fonte: {}", h.explain.source));
+    out.push_str(&format!("\n   source: {}", h.explain.source));
     out
 }
 

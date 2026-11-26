@@ -149,7 +149,7 @@ fn the_queue_lists_filters_and_decides() {
     let out = f.run(&["proposals"]);
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("in coda"), "{text}");
+    assert!(text.contains("[queued]"), "{text}");
     assert!(text.contains("mcp:claude"), "{text}");
     assert!(text.contains("l'utente l'ha detto"), "{text}");
 
@@ -548,7 +548,7 @@ fn a_second_correction_of_the_same_note_refuses_and_stays_queued() {
         String::from_utf8_lossy(&out.stderr)
     );
     let said = String::from_utf8_lossy(&out.stderr);
-    assert!(said.contains("corretta"), "who corrected it: {said}");
+    assert!(said.contains("corrected by"), "who corrected it: {said}");
     assert!(said.contains("reject"), "what to do: {said}");
 
     // the proposal stays in the queue, decidable again
@@ -741,8 +741,8 @@ fn history_shows_the_story_and_the_diff() {
     // the human history tells the story: who proposed, who decided
     let out = f.run(&["history", &id.to_string()]);
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("proposta da mcp:claude"), "{text}");
-    assert!(text.contains("decisa da user@cli"), "{text}");
+    assert!(text.contains("proposed by mcp:claude"), "{text}");
+    assert!(text.contains("decided by user@cli"), "{text}");
     assert!(text.contains("[decide"), "{text}");
     assert!(text.contains("[patch_note"), "{text}");
 

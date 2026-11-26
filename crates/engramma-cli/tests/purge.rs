@@ -181,7 +181,7 @@ fn purge_after_unbind_exits_zero() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("sganciata"),
+        String::from_utf8_lossy(&out.stdout).contains("unbound:"),
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
@@ -239,7 +239,7 @@ fn unreachable_view_holding_the_note_exits_five_and_names_itself() {
         String::from_utf8_lossy(&out.stderr)
     );
     let err = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(err.contains("vista"), "names the view: {err}");
+    assert!(err.contains("view"), "says it is a view: {err}");
     assert!(err.contains("vault sync"), "suggests the sync: {err}");
     assert!(err.contains("unbind"), "suggests the unbind: {err}");
 

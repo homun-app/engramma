@@ -39,8 +39,9 @@ pub fn serve(json: bool, dir: &Path, flag: Option<RelayChoice>) -> Result<(), Cl
                 let minted = mailbox_net::node_ticket(&endpoint, &choice).await;
                 if minted.relay_timed_out {
                     eprintln!(
-                        "avviso: il relay non si è collegato in {} s — il \
-                         biglietto esce senza relay (chi è dietro NAT non troverà il nodo)",
+                        "warning: the relay did not connect within {} s — the \
+                         ticket goes out without a relay (whoever is behind NAT \
+                         will not find the node)",
                         engramma_sync::relay::RELAY_WAIT.as_secs()
                     );
                 }
@@ -56,23 +57,23 @@ pub fn serve(json: bool, dir: &Path, flag: Option<RelayChoice>) -> Result<(), Cl
                     });
                     if minted.relay_timed_out {
                         out["relay_warning"] = serde_json::json!(
-                            "il relay non si è collegato: il biglietto esce senza relay"
+                            "the relay did not connect: the ticket goes out without a relay"
                         );
                     }
                     print_json(&out);
                 } else {
                     println!(
-                        "casella postale cieca in {} (ALPN engramma/mailbox/3, \
-                         conserva {} giorni)",
+                        "blind mailbox in {} (ALPN engramma/mailbox/3, \
+                         keeps {} days)",
                         dir.display(),
                         engramma_sync::mailbox::RETENTION_DAYS
                     );
-                    println!("biglietto del nodo:");
+                    println!("node ticket:");
                     println!("{ticket}");
                     if let Some(relay) = &minted.relay {
                         println!("relay: {relay}");
                     }
-                    println!("in ascolto…");
+                    println!("listening…");
                 }
                 let stop = tokio_util::sync::CancellationToken::new();
                 // the accept loop: one task per connection — the code
@@ -136,7 +137,7 @@ pub fn serve(json: bool, dir: &Path, flag: Option<RelayChoice>) -> Result<(), Cl
                 }
                 stop.cancelled().await;
                 if !json {
-                    println!("casella postale: stop pulito");
+                    println!("mailbox: clean stop");
                 }
                 Ok::<(), CliError>(())
             })
@@ -155,7 +156,7 @@ pub fn add(root: &Path, json: bool, ticket: &str) -> Result<(), CliError> {
         .map_err(|e| CliError::internal(e.to_string()))?
         .is_empty()
     {
-        reg.create_first(&dk, "portatile")
+        reg.create_first(&dk, "laptop")
             .map_err(|e| CliError::internal(e.to_string()))?;
     }
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -177,11 +178,11 @@ pub fn add(root: &Path, json: bool, ticket: &str) -> Result<(), CliError> {
                 })
                 .await
         })
-        .map_err(|e| CliError::internal(format!("casella postale: {e}")))?;
+        .map_err(|e| CliError::internal(format!("mailbox: {e}")))?;
     if json {
         print_json(&serde_json::json!({ "owner": owner }));
     } else {
-        println!("casella postale registrata (elenco {owner})");
+        println!("mailbox registered (list {owner})");
     }
     Ok(())
 }
@@ -192,7 +193,7 @@ pub fn remove(root: &Path, json: bool) -> Result<(), CliError> {
     if json {
         print_json(&serde_json::json!({ "removed": true }));
     } else {
-        println!("casella postale dimenticata");
+        println!("mailbox forgotten");
     }
     Ok(())
 }
@@ -206,7 +207,7 @@ pub fn status(root: &Path, json: bool) -> Result<(), CliError> {
         if json {
             print_json(&serde_json::json!({ "mailbox": false }));
         } else {
-            println!("nessuna casella postale configurata");
+            println!("no mailbox configured");
         }
         return Ok(());
     };
@@ -230,7 +231,7 @@ pub fn status(root: &Path, json: bool) -> Result<(), CliError> {
                 })
                 .await
         })
-        .map_err(|e| CliError::internal(format!("casella postale: {e}")))?;
+        .map_err(|e| CliError::internal(format!("mailbox: {e}")))?;
     let last = mailbox_net::last_contact(&root).map_err(|e| CliError::internal(e.to_string()))?;
     if json {
         print_json(&serde_json::json!({
@@ -243,10 +244,10 @@ pub fn status(root: &Path, json: bool) -> Result<(), CliError> {
         }));
     } else {
         println!(
-            "casella postale {} · ultimo contatto {} · {} buste ({} byte) · \
-             conserva {} giorni",
+            "mailbox {} · last contact {} · {} envelopes ({} bytes) · \
+             keeps {} days",
             &engramma_sync::device::hex(&node.node_id)[..8],
-            last.as_deref().unwrap_or("mai"),
+            last.as_deref().unwrap_or("never"),
             stats.0,
             stats.1,
             engramma_sync::mailbox::RETENTION_DAYS

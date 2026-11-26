@@ -48,7 +48,7 @@ const LONG_VERSION: &str = concat!(
 #[command(
     name = "engramma",
     version = LONG_VERSION,
-    about = "Motore di memoria personale: note, grafo, tempo, ricerca",
+    about = "Personal memory engine: notes, graph, time, search",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -352,9 +352,10 @@ enum Command {
         keep_snapshot: bool,
         /// v0.6.15 (F2): the compaction is experimental — without this flag
         /// the command refuses and says why (the declared defects of the
-        /// cut are open: crates/engramma-core/tests/open-defects.txt)
-        #[arg(long)]
-        sperimentale: bool,
+        /// cut are open: crates/engramma-core/tests/open-defects.txt).
+        /// v0.6.19: `--sperimentale`, the beta's name, still answers.
+        #[arg(long, alias = "sperimentale")]
+        experimental: bool,
     },
     /// Consolidation candidates: near duplicates and probable
     /// contradictions — the engine proposes, the application decides (v0.3)
@@ -828,7 +829,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             if cli.json {
                 print_json(&serde_json::json!({ "root": r.display().to_string() }));
             } else {
-                println!("inizializzato: {}", r.display());
+                println!("initialized: {}", r.display());
             }
             Ok(())
         }
@@ -879,9 +880,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 }
                 print_json(&v);
             } else {
-                println!("aggiunta: {}", note.id);
+                println!("added: {}", note.id);
                 if let Some((done, remaining)) = embedded {
-                    println!("incorporate: {done} (in attesa: {remaining})");
+                    println!("embedded: {done} (pending: {remaining})");
                 }
             }
             Ok(())
@@ -894,7 +895,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 print_json(&note_json(&note));
             } else {
                 if matches!(note.status, Status::Quarantined | Status::Deleted) {
-                    println!("⚠ stato: {}", note.status.as_str());
+                    println!("⚠ status: {}", note.status.as_str());
                 }
                 println!(
                     "{}",
@@ -934,7 +935,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             n.created_at = note.created_at; // not editable
             if n == note {
                 if !cli.json {
-                    println!("nessuna modifica");
+                    println!("no changes");
                 }
                 return Ok(());
             }
@@ -954,7 +955,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             if cli.json {
                 print_json(&serde_json::json!({ "id": id.to_string(), "patched": true }));
             } else {
-                println!("aggiornata: {}", id);
+                println!("updated: {}", id);
             }
             Ok(())
         }
@@ -962,14 +963,14 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             let cell = open_cell(cli)?;
             let id = cell.resolve_note_id(id)?;
             cell.delete_note(&id, "cli")?;
-            report_ok(cli, "cancellata (lapide)", &id.to_string());
+            report_ok(cli, "deleted (tombstone)", &id.to_string());
             Ok(())
         }
         Command::Confirm { id } => {
             let cell = open_cell(cli)?;
             let id = cell.resolve_note_id(id)?;
             cell.confirm(&id, "cli-user")?;
-            report_ok(cli, "confermata", &id.to_string());
+            report_ok(cli, "confirmed", &id.to_string());
             Ok(())
         }
         Command::Purge { id, reason, yes } => {
@@ -978,16 +979,14 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             let note = cell.get(&note_id)?;
             if !*yes {
                 println!(
-                    "stai per purgare «{}» ({}) IRREVERSIBILMENTE:",
+                    "about to purge \"{}\" ({}) for good:",
                     note.display_title(),
                     engramma_core::id::id8(&note_id)
                 );
-                println!("  la nota, le sue versioni, gli archi che dichiara, i vettori");
-                println!("  e i payload delle sue operazioni spariranno dal registro.");
-                println!(
-                    "Le esportazioni fatte prima di ora restano fuori dal controllo del motore."
-                );
-                print!("procedo? [y/N] ");
+                println!("  the note, its versions, the edges it declares and its vectors");
+                println!("  go, with the payloads of its operations in the log.");
+                println!("Exports made before now are outside the engine's control.");
+                print!("proceed? [y/N] ");
                 use std::io::Write as _;
                 std::io::stdout().flush().ok();
                 let mut answer = String::new();
@@ -996,7 +995,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     .map_err(|e| CliError::internal(format!("stdin: {e}")))?;
                 if !said_yes(&answer) {
                     if !cli.json {
-                        println!("annullato");
+                        println!("aborted");
                     }
                     return Ok(());
                 }
@@ -1024,7 +1023,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 }));
             } else {
                 println!(
-                    "purgata: {} ({} payload dimenticati)",
+                    "purged: {} ({} payloads forgotten)",
                     note_id, report.forgotten_payloads
                 );
             }
@@ -1034,22 +1033,23 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     .pending
                     .iter()
                     .map(|p| match p.as_str() {
-                        "wal" => "il WAL non è stato troncato (un lettore teneva \
-                                  la cella aperta; verrà ritentato alla prossima \
-                                  scrittura)"
+                        "wal" => "the WAL was not truncated (a reader held \
+                                  the cell open; retried at the next write)"
                             .to_string(),
-                        "vault" => "una vista markdown non era raggiungibile \
-                                    (la `vault sync` finisce il lavoro, o \
-                                    `vault unbind` la sgancia)"
+                        "vault" => "a markdown view was unreachable \
+                                    (`vault sync` finishes the job, or \
+                                    `vault unbind` detaches it)"
                             .to_string(),
                         // v0.6.7 (G3): a snapshot the scrub left something
                         // in — the file is named, the words say the rest
-                        other => format!("{other}: l'istantanea tiene ancora                                           righe della famiglia purgata"),
+                        other => {
+                            format!("{other}: the snapshot still holds rows of the purged family")
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
                 return Err(CliError::incomplete_forgetting(format!(
-                    "oblio incompleto ({}): {why}",
+                    "incomplete forgetting ({}): {why}",
                     report.pending.join(", ")
                 )));
             }
@@ -1089,7 +1089,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "new": new.id.to_string(),
                 }));
             } else {
-                println!("sostituita: {} → {}", old_id, new.id);
+                println!("superseded: {} → {}", old_id, new.id);
             }
             Ok(())
         }
@@ -1207,7 +1207,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     println!("{}", hit_human(h, i + 1));
                 }
                 if hits.is_empty() {
-                    println!("nessun risultato sopra soglia");
+                    println!("no result above the threshold");
                 }
             }
             Ok(())
@@ -1239,7 +1239,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                         .note_id
                         .as_deref()
                         .filter(|id| id.len() >= 8)
-                        .map(|id| format!(" (nota {})", &id[id.len() - 8..]))
+                        .map(|id| format!(" (note {})", &id[id.len() - 8..]))
                         .unwrap_or_default();
                     println!(
                         "{}{} {} {}{}",
@@ -1279,7 +1279,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     if cli.json {
                         print_json(&serde_json::json!({ "from": a, "to": b, "steps": null }));
                     } else {
-                        println!("nessun percorso entro 4 passi");
+                        println!("no path within 4 steps");
                     }
                 }
             }
@@ -1337,8 +1337,8 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 for h in &tl {
                     println!(
                         "{} → {}  {} ({})",
-                        h.explain.valid_from.as_deref().unwrap_or("sempre"),
-                        h.explain.valid_to.as_deref().unwrap_or("ora"),
+                        h.explain.valid_from.as_deref().unwrap_or("always"),
+                        h.explain.valid_to.as_deref().unwrap_or("now"),
                         h.note.display_title(),
                         engramma_core::id::id8(&h.note.id),
                     );
@@ -1355,7 +1355,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             let cell = open_cell(cli)?;
             let id = cell.resolve_note_id(id)?;
             cell.restore(&id, *version, "cli")?;
-            report_ok(cli, "ripristinata", &id.to_string());
+            report_ok(cli, "restored", &id.to_string());
             Ok(())
         }
         Command::Import {
@@ -1392,20 +1392,20 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 print_json(&v);
             } else {
                 if let Some((done, remaining)) = embedded {
-                    println!("incorporate: {done} (in attesa: {remaining})");
+                    println!("embedded: {done} (pending: {remaining})");
                 }
-                println!("importate: {}", summary.imported);
-                println!("saltate: {}", summary.skipped.len());
+                println!("imported: {}", summary.imported);
+                println!("skipped: {}", summary.skipped.len());
                 for s in &summary.skipped {
                     println!("  - {s}");
                 }
                 if !summary.skipped_purged.is_empty() {
-                    println!("purgate (id dimenticato per sempre):");
+                    println!("purged (ids gone for good):");
                     for id in &summary.skipped_purged {
                         println!("  ⌫ {id}");
                     }
                 }
-                println!("errori: {}", summary.errors.len());
+                println!("errors: {}", summary.errors.len());
                 for e in &summary.errors {
                     println!("  ! {e}");
                 }
@@ -1425,9 +1425,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "errors": s.errors,
                 }));
             } else {
-                println!("esportate: {} note in {}", s.written, dir.display());
+                println!("exported: {} notes to {}", s.written, dir.display());
                 if !s.errors.is_empty() {
-                    println!("errori: {}", s.errors.len());
+                    println!("errors: {}", s.errors.len());
                 }
             }
             Ok(())
@@ -1465,9 +1465,9 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 }
                 print_json(&v);
             } else {
-                println!("incorporate: {done_total} note");
+                println!("embedded: {done_total} notes");
                 if let Some(p) = promoted {
-                    println!("modello pronto: {p}");
+                    println!("model ready: {p}");
                 }
             }
             Ok(())
@@ -1475,15 +1475,15 @@ fn run(cli: &Cli) -> Result<(), CliError> {
         Command::Compact {
             keep_last,
             keep_snapshot,
-            sperimentale,
+            experimental,
         } => {
             // v0.6.15 (F2): behind an explicit switch, like the binding's
             // `experimental: ['compaction']` — same reason, same refusal
-            if !sperimentale {
+            if !experimental {
                 return Err(CliError::usage(
-                    "la compattazione è sperimentale: i difetti dichiarati del taglio \
-                     (crates/engramma-core/tests/open-defects.txt) sono aperti — \
-                     aggiungi --sperimentale per usarla lo stesso",
+                    "compaction is experimental: the declared defects of the cut \
+                     (crates/engramma-core/tests/open-defects.txt) are open — \
+                     add --experimental to use it anyway",
                 ));
             }
             let cell = open_cell(cli)?;
@@ -1518,14 +1518,14 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 } else if !report.compacted {
                     // v0.6.14 (N1): the cut only goes forward
                     println!(
-                        "nessun taglio nuovo: il taglio resta a seq {} (testa {}) — \
-                         la compattazione va solo avanti (cella+WAL+istantanee: {} byte)",
+                        "no new cut: the cut stays at seq {} (head {}) — compaction \
+                         only moves forward (cell+WAL+snapshots: {} bytes)",
                         report.cut_seq, report.head_seq, report.bytes_after
                     );
                 } else if let Some(snap) = &report.snapshot {
                     println!(
-                        "compattata fino a seq {} (testa {}): {} \
-                         (cella+WAL+istantanee: {} → {} byte)",
+                        "compacted up to seq {} (head {}): {} \
+                         (cell+WAL+snapshots: {} → {} bytes)",
                         report.cut_seq,
                         report.head_seq,
                         snap.display(),
@@ -1534,8 +1534,8 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     );
                 } else {
                     println!(
-                        "compattata fino a seq {} (testa {}): punto di controllo \
-                         senza file (cella+WAL+istantanee: {} → {} byte)",
+                        "compacted up to seq {} (head {}): a checkpoint without \
+                         a file (cell+WAL+snapshots: {} → {} bytes)",
                         report.cut_seq, report.head_seq, report.bytes_before, report.bytes_after
                     );
                 }
@@ -1543,7 +1543,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 print_json(&serde_json::json!({ "compacted": false, "seq": head }));
             } else {
                 println!(
-                    "niente da compattare: {} operazioni, ne tengo {keep_last}",
+                    "nothing to compact: {} operations, keeping the last {keep_last}",
                     head
                 );
             }
@@ -1600,49 +1600,45 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 // the repair is an explicit step, and the user is told
                 // which command takes it
                 println!(
-                    "la cella contiene {} note fantasma (una riga viva su un id purgato,",
+                    "the cell holds {} phantom notes (a living row under a purged id,",
                     report.phantom_purged.len()
                 );
-                println!("scritta dai motori v0.6.7/v0.6.8):");
+                println!("written by the v0.6.7/v0.6.8 engines):");
                 for id in &report.phantom_purged {
                     println!(
                         "  {}",
                         engramma_core::id::id8(&Ulid::from_string(id).unwrap_or_default())
                     );
                 }
-                println!(
-                    "verify non tocca niente: «engramma repair» sposta il contenuto su id nuovi"
-                );
-                return Err(CliError::internal(
-                    "la cella ha bisogno di repair".to_string(),
-                ));
+                println!("verify changes nothing: `engramma repair` moves the content to new ids");
+                return Err(CliError::internal("the cell needs repair".to_string()));
             } else if report.ok() {
                 match &report.replay {
                     engramma_core::cell::Replay::Full => println!(
-                        "registro verificato: {} operazioni, catena hash, ricostruzione e indice FTS a posto",
+                        "log verified: {} operations, hash chain, reconstruction and FTS index in place",
                         report.ops
                     ),
                     engramma_core::cell::Replay::FromSnapshot { seq } => {
                         println!(
-                            "registro verificato: {} operazioni, catena hash, ricostruzione \
-                             (coda da istantanea di seq {seq}) e indice FTS a posto",
+                            "log verified: {} operations, hash chain, reconstruction \
+                             (the tail from the snapshot at seq {seq}) and FTS index in place",
                             report.ops
                         );
                     }
                     engramma_core::cell::Replay::ChainOnly { since_seq } => {
                         println!(
-                            "registro verificato: {} operazioni, catena hash e indici \
-                             derivati a posto",
+                            "log verified: {} operations, hash chain and derived \
+                             indexes in place",
                             report.ops
                         );
                         println!(
-                            "rigioco: solo catena da seq {since_seq} (compattata senza istantanea)"
+                            "replay: chain only from seq {since_seq} (compacted without a snapshot)"
                         );
                     }
                 }
                 for c in &report.coverage {
                     println!(
-                        "copertura vettori: {} [{}] {}/{} note",
+                        "vector coverage: {} [{}] {}/{} notes",
                         c.model,
                         c.state.as_str(),
                         c.covered,
@@ -1655,7 +1651,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 }
             } else {
                 return Err(CliError::internal(format!(
-                    "verifica fallita: chain={} replay={} {}",
+                    "verification failed: chain={} replay={} {}",
                     report.hash_chain_ok,
                     report.replay_ok,
                     report.mismatch.unwrap_or_default()
@@ -1679,10 +1675,10 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     "verify_ok": cell.verify().map(|r| r.ok()).unwrap_or(false),
                 }));
             } else if report.moved.is_empty() {
-                println!("niente da riparare: nessun fantasma");
+                println!("nothing to repair: no phantoms");
             } else {
                 println!(
-                    "riparate {} note fantasma (il contenuto vive sotto id nuovi):",
+                    "repaired {} phantom notes (the content lives under new ids):",
                     report.moved.len()
                 );
                 for (old, new) in &report.moved {
@@ -1692,7 +1688,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                         engramma_core::id::id8(&Ulid::from_string(new).unwrap_or_default())
                     );
                 }
-                println!("la mappa vecchio → nuovo non si salva da nessuna parte: tienila ora");
+                println!("the old → new map is saved nowhere: keep it now");
             }
             Ok(())
         }
@@ -1732,7 +1728,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                     );
                 }
                 if out.is_empty() {
-                    println!("nessun candidato");
+                    println!("no candidates");
                 }
             }
             Ok(())
@@ -1806,7 +1802,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
                 && spec != "chatgpt"
             {
                 return Err(CliError::usage(format!(
-                    "`--compat {spec}` non esiste (per ora solo `chatgpt`)"
+                    "`--compat {spec}` does not exist (only `chatgpt` for now)"
                 )));
             }
             // v0.5.3 (P2): the wrappers are a per-grant HTTP matter — over
@@ -1814,15 +1810,14 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             // either: the flag was silently ignored before
             if compat.is_some() && http.is_none() {
                 return Err(CliError::usage(
-                    "`--compat chatgpt` va con `--http`: su stdio non esiste il \
-                     grant (il client ChatGPT) a cui legare gli strumenti di \
-                     compatibilità",
+                    "`--compat chatgpt` goes with `--http`: over stdio there is no \
+                     grant (the ChatGPT client) to bind the compatibility tools to",
                 ));
             }
             if http.is_some() && actor.is_some() {
                 return Err(CliError::usage(
-                    "`--actor` va con lo stdio: su HTTP l'attore nasce dal grant \
-                     (mcp:<etichetta>, scelto con `engramma oauth approve --label`)",
+                    "`--actor` goes with stdio: over HTTP the actor comes from the \
+                     grant (`mcp:<label>`, chosen with `engramma oauth approve --label`)",
                 ));
             }
             if let Some(addr) = http {
@@ -1862,7 +1857,7 @@ fn run_vault(cli: &Cli, action: &VaultAction) -> Result<(), CliError> {
                     "warnings": report.warnings,
                 }));
             } else {
-                println!("vault inizializzato: {}", vault.root().display());
+                println!("vault initialized: {}", vault.root().display());
             }
             Ok(())
         }
@@ -1897,7 +1892,7 @@ fn run_vault(cli: &Cli, action: &VaultAction) -> Result<(), CliError> {
                 .map_err(|e| CliError::internal(format!("vault watch: {e}")))?;
             if !cli.json {
                 println!(
-                    "in ascolto su {} (debounce 500 ms, scansione ogni 60 s, Ctrl-C per uscire)",
+                    "watching {} (500 ms debounce, a scan every 60 s, Ctrl-C to stop)",
                     vault.root().display()
                 );
             }
@@ -1916,7 +1911,7 @@ fn run_vault(cli: &Cli, action: &VaultAction) -> Result<(), CliError> {
                 let _ = tokio::signal::ctrl_c().await;
             });
             if !cli.json {
-                println!("chiudo");
+                println!("shutting down");
             }
             handle
                 .stop()
@@ -1958,7 +1953,7 @@ fn run_vault(cli: &Cli, action: &VaultAction) -> Result<(), CliError> {
                                 .collect::<Vec<_>>()
                                 .join(", ");
                             return Err(CliError::usage(format!(
-                                "«{arg}» indica {} viste: {list}",
+                                "\"{arg}\" names {} views: {list}",
                                 hits.len()
                             )));
                         }
@@ -1966,9 +1961,7 @@ fn run_vault(cli: &Cli, action: &VaultAction) -> Result<(), CliError> {
                 }
             };
             let Some(view) = view else {
-                return Err(CliError::not_found(format!(
-                    "nessuna vista legata a «{arg}»"
-                )));
+                return Err(CliError::not_found(format!("no view bound to \"{arg}\"")));
             };
             let (files, conflicts) = cell.vault_unbind(&view.view_id)?;
             if cli.json {
@@ -1980,8 +1973,8 @@ fn run_vault(cli: &Cli, action: &VaultAction) -> Result<(), CliError> {
                 }));
             } else {
                 println!(
-                    "sganciata: {} ({}) — {} file e {} copie di conflitto \
-                     dimenticati dalla cella; i file restano dove sono",
+                    "unbound: {} ({}) — {} files and {} conflict copies \
+                     forgotten by the cell; the files stay where they are",
                     view.root,
                     short_of(&view.view_id),
                     files,
@@ -2002,19 +1995,19 @@ fn print_sync_report(report: &engramma_vault::SyncReport) {
             }
         }
     };
-    line("nuove note da file", &report.created);
-    line("note aggiornate da file", &report.updated_from_file);
-    line("file riscritti dalla cella", &report.updated_files);
+    line("new notes from files", &report.created);
+    line("notes updated from files", &report.updated_from_file);
+    line("files rewritten by the cell", &report.updated_files);
     line(
-        "conflitti (vince la cella, copia .conflitto)",
+        "conflicts (the cell wins, a .conflitto copy)",
         &report.conflicts,
     );
-    line("note cancellate (file spariti)", &report.deleted);
-    line("file spostati o rinominati", &report.moved);
-    line("errori", &report.errors);
-    line("avvisi", &report.warnings);
+    line("notes deleted (files gone)", &report.deleted);
+    line("files moved or renamed", &report.moved);
+    line("errors", &report.errors);
+    line("warnings", &report.warnings);
     if report.is_noop() {
-        println!("nulla da fare");
+        println!("nothing to do");
     }
 }
 
@@ -2100,12 +2093,12 @@ fn run_cell(cli: &Cli, action: &CellAction) -> Result<(), CliError> {
             }
             let path = cell_path(cli, name)?;
             Cell::create(&path, name, "cli")?;
-            report_ok(cli, "creata", name);
+            report_ok(cli, "created", name);
             Ok(())
         }
         CellAction::Drop { name, reason } => {
             if reason.trim().is_empty() {
-                return Err(CliError::usage("--reason è obbligatoria"));
+                return Err(CliError::usage("--reason is required"));
             }
             let path = cell_path(cli, name)?;
             if !path.exists() {
@@ -2163,13 +2156,13 @@ fn run_cell(cli: &Cli, action: &CellAction) -> Result<(), CliError> {
                 }));
             } else {
                 println!(
-                    "dimenticata: {name} — {reason} ({} note, {} file di viste)",
+                    "forgotten: {name} — {reason} ({} notes, {} view files)",
                     report.notes, report.files
                 );
                 if !report.pending.is_empty() {
                     println!(
-                        "ATTENZIONE: l'oblio non è completo ({}): una vista \
-                         irraggiungibile tiene ancora i file delle note",
+                        "WARNING: forgetting is incomplete ({}): an unreachable \
+                         view still holds the note files",
                         report.pending.join(", ")
                     );
                 }
@@ -2211,7 +2204,7 @@ fn load_embedder_or_warn(
         Ok(Some(e)) => Ok(Some(e)),
         Ok(None) => Ok(None),
         Err(e) => {
-            eprintln!("engramma: embedder configurato ma non utilizzabile: {e}");
+            eprintln!("engramma: an embedder is configured but unusable: {e}");
             Ok(None)
         }
     }
@@ -2293,13 +2286,13 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                 print_json(&serde_json::json!({ "pending": arr }));
             } else {
                 if pending.is_empty() {
-                    println!("nessuna richiesta in attesa");
+                    println!("no pending request");
                 }
                 for r in &pending {
                     println!(
                         "{}  {} (client {}) → {} — {} — {} s",
                         r.approval_code,
-                        r.client_name.as_deref().unwrap_or("client senza nome"),
+                        r.client_name.as_deref().unwrap_or("unnamed client"),
                         oauth_host(&r.client_id),
                         oauth_host(&r.redirect_uri),
                         r.scopes.join(" "),
@@ -2323,7 +2316,7 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                 || label.len() > 32
             {
                 return Err(CliError::usage(format!(
-                    "`--label {label}` non va: servono 1-32 caratteri fra a-z, 0-9 e -"
+                    "`--label {label}` is not valid: it takes 1-32 characters among a-z, 0-9 and -"
                 )));
             }
             let code = &engramma_mcp::oauth::normalize_approval_code(code);
@@ -2332,34 +2325,32 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                 .request_by_code(code)
                 .map_err(|e| CliError::internal(format!("{e}")))?
             else {
-                return Err(CliError::not_found(format!(
-                    "nessuna richiesta con codice {code}"
-                )));
+                return Err(CliError::not_found(format!("no request with code {code}")));
             };
             if req.status != RequestStatus::Pending || req.expires_at <= now {
                 return Err(CliError::usage(format!(
-                    "la richiesta {code} non è più decidibile (scaduta o già decisa)"
+                    "request {code} can no longer be decided (expired, or already decided)"
                 )));
             }
             // the phishing fence: SHOW whose client and whose redirect,
             // then let the human say yes
             println!(
                 "client: {} ({})",
-                req.client_name.as_deref().unwrap_or("senza nome"),
+                req.client_name.as_deref().unwrap_or("unnamed"),
                 oauth_host(&req.client_id)
             );
             println!("redirect: {}", oauth_host(&req.redirect_uri));
-            println!("ambiti chiesti: {}", req.scopes.join(" "));
+            println!("scopes requested: {}", req.scopes.join(" "));
             if !*yes {
                 use std::io::Write as _;
-                print!("approvo {code} con etichetta `{label}`? [y/N] ");
+                print!("approve {code} with the label `{label}`? [y/N] ");
                 std::io::stdout().flush().ok();
                 let mut answer = String::new();
                 std::io::stdin()
                     .read_line(&mut answer)
                     .map_err(|e| CliError::internal(format!("stdin: {e}")))?;
                 if !said_yes(&answer) {
-                    println!("annullato");
+                    println!("aborted");
                     return Ok(());
                 }
             }
@@ -2372,15 +2363,15 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                 .any(|g| &g.label == label && g.revoked_at.is_none() && g.absolute_expiry > now);
             if label_taken {
                 return Err(CliError::usage(format!(
-                    "l'etichetta `{label}` è già di un collegamento vivo: revocalo \
-                     (`engramma oauth revoke {label}`) o scegline un'altra"
+                    "the label `{label}` already belongs to a live connection: revoke \
+                     it (`engramma oauth revoke {label}`) or choose another"
                 )));
             }
             // the grant can only RESTRICT what the server offered: a name
             // outside the offer is a typo, said before anything is written
             if let Some(stray) = cells.iter().find(|c| !req.offered_cells.contains(c)) {
                 return Err(CliError::usage(format!(
-                    "`--cells {stray}`: il server offre solo {}",
+                    "`--cells {stray}`: the server offers only {}",
                     req.offered_cells.join(", ")
                 )));
             }
@@ -2407,7 +2398,7 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
             store
                 .request_approve(code, label, &cells, &scopes, now)
                 .map_err(|e| CliError::internal(format!("{e}")))?
-                .ok_or_else(|| CliError::usage("l'approvazione non è andata: riprova"))?;
+                .ok_or_else(|| CliError::usage("the approval did not go through: try again"))?;
             if cli.json {
                 print_json(&serde_json::json!({
                     "approved": code,
@@ -2417,7 +2408,7 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                 }));
             } else {
                 println!(
-                    "approvato: {label} (celle: {}, ambiti: {})",
+                    "approved: {label} (cells: {}, scopes: {})",
                     cells.join(", "),
                     scopes.join(" ")
                 );
@@ -2433,10 +2424,10 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                         .request_deny(code, now)
                         .map_err(|e| CliError::internal(format!("{e}")))?;
                     if denied {
-                        report_ok(cli, "rifiutata", code);
+                        report_ok(cli, "denied", code);
                     } else {
                         return Err(CliError::not_found(format!(
-                            "nessuna richiesta in attesa con codice {code}"
+                            "no pending request with code {code}"
                         )));
                     }
                 }
@@ -2447,16 +2438,16 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                     if cli.json {
                         print_json(&serde_json::json!({ "denied_all": n }));
                     } else if n == 0 {
-                        println!("nessuna richiesta in attesa");
+                        println!("no pending request");
                     } else {
                         println!(
-                            "rifiutate {n} richieste: le pagine in attesa redirigono i client con access_denied"
+                            "denied {n} requests: the waiting pages send the clients back with access_denied"
                         );
                     }
                 }
                 _ => {
                     return Err(CliError::usage(
-                        "serve un codice, o --all per rifiutarle tutte",
+                        "a code is needed, or --all to deny them all",
                     ));
                 }
             }
@@ -2485,20 +2476,20 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                 print_json(&serde_json::json!({ "grants": arr }));
             } else {
                 if grants.is_empty() {
-                    println!("nessun grant");
+                    println!("no grants");
                 }
                 for g in &grants {
                     println!(
-                        "{}  {}  celle: {}  ambiti: {}  creato {}  {}",
+                        "{}  {}  cells: {}  scopes: {}  created {}  {}",
                         g.label,
                         oauth_host(&g.client_id),
                         g.cells.join(","),
                         g.scopes.join(" "),
                         g.created_at,
                         if g.revoked_at.is_some() {
-                            "REVOCATO"
+                            "REVOKED"
                         } else {
-                            "vivo"
+                            "live"
                         }
                     );
                 }
@@ -2520,7 +2511,7 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                         Some(g) => (Some(g.id.clone()), label.clone()),
                         None => {
                             return Err(CliError::not_found(format!(
-                                "nessun grant con etichetta `{label}`"
+                                "no grant with the label `{label}`"
                             )));
                         }
                     }
@@ -2528,7 +2519,7 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                 (None, true) => (None, "*".to_string()),
                 _ => {
                     return Err(CliError::usage(
-                        "serve un'etichetta, o --all per revocare tutto",
+                        "a label is needed, or --all to revoke them all",
                     ));
                 }
             };
@@ -2539,9 +2530,7 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
             if cli.json {
                 print_json(&serde_json::json!({ "revoked": label, "grants": n }));
             } else {
-                println!(
-                    "revocati {n} grant ({label}): i loro token muoiono alla prossima richiesta"
-                );
+                println!("revoked {n} grants ({label}): their tokens die at the next request");
             }
             Ok(())
         }
@@ -2559,7 +2548,7 @@ fn run_oauth(cli: &Cli, action: &OauthAction) -> Result<(), CliError> {
                 print_json(&serde_json::json!({ "events": arr }));
             } else {
                 if events.is_empty() {
-                    println!("nessun evento");
+                    println!("no events");
                 }
                 for (at, kind, detail) in &events {
                     println!("{at}  {kind}  {detail}");
@@ -2615,8 +2604,8 @@ fn run_mcp_http(
             .map_err(|e| CliError::internal(format!("mcp --http: {e}")))?;
         let bound = cfg_bind_of(&state);
         println!(
-            "mcp-http: in ascolto su http://{bound} — pubblico: {public} \
-             (approva i collegamenti con `engramma oauth pending`)"
+            "mcp-http: listening on http://{bound} — public: {public} \
+             (approve the connections with `engramma oauth pending`)"
         );
         let ct = tokio_util_shim::token();
         let server = tokio::spawn(engramma_mcp::http::serve_until(
@@ -2639,7 +2628,7 @@ fn run_mcp_http(
         {
             let _ = tokio::signal::ctrl_c().await;
         }
-        eprintln!("mcp-http: chiudo");
+        eprintln!("mcp-http: shutting down");
         ct.cancel();
         server
             .await
@@ -2725,21 +2714,21 @@ fn run_model(cli: &Cli, action: &ModelAction) -> Result<(), CliError> {
                     &serde_json::json!({ "model_root": model_root.display().to_string(), "models": lines }),
                 );
             } else {
-                println!("modelli in {}", model_root.display());
+                println!("models in {}", model_root.display());
                 for l in &lines {
                     let state = l["state"]
                         .as_str()
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "—".into());
                     println!(
-                        "{}  {} dim, {} MB, {}, stato: {}",
+                        "{}  {} dim, {} MB, {}, state: {}",
                         l["id"].as_str().unwrap_or("?"),
                         l["dim"],
                         l["bytes"].as_u64().unwrap_or(0) / 1_000_000,
                         if l["downloaded"].as_bool().unwrap_or(false) {
-                            "scaricato"
+                            "downloaded"
                         } else {
-                            "da scaricare"
+                            "to download"
                         },
                         state,
                     );
@@ -2771,7 +2760,11 @@ fn run_model(cli: &Cli, action: &ModelAction) -> Result<(), CliError> {
                     "skipped": report.skipped,
                 }));
             } else {
-                println!("scaricato: {} in {}", spec.model_id(), model_root.display());
+                println!(
+                    "downloaded: {} in {}",
+                    spec.model_id(),
+                    model_root.display()
+                );
             }
             Ok(())
         }
@@ -2805,8 +2798,8 @@ fn run_model(cli: &Cli, action: &ModelAction) -> Result<(), CliError> {
                 }));
             } else {
                 println!(
-                    "modello {} in costruzione (config in {}): `engramma embed` lo riempie, \
-                     la ricerca continua con il modello attuale",
+                    "model {} is building (config in {}): `engramma embed` fills it, \
+                     the search goes on with the current model",
                     spec.model_id(),
                     cfg_path.display()
                 );
@@ -2830,7 +2823,7 @@ fn parse_graph_env(spec: &str) -> Result<engramma_core::search::GraphOverride, C
         let w: f64 = w
             .replace(',', ".")
             .parse()
-            .map_err(|_| CliError::usage(format!("ENGRAMMA_GRAPH: fixed:<peso> — {spec:?}")))?;
+            .map_err(|_| CliError::usage(format!("ENGRAMMA_GRAPH: fixed:<weight> — {spec:?}")))?;
         return Ok(GraphOverride {
             policy: GraphPolicy::Fixed,
             weight: w,
@@ -2839,24 +2832,24 @@ fn parse_graph_env(spec: &str) -> Result<engramma_core::search::GraphOverride, C
     }
     let Some(rest) = spec.strip_prefix("adaptive:") else {
         return Err(CliError::usage(
-            "ENGRAMMA_GRAPH: adaptive:<w_max>,<u_min>,<spw> | fixed:<peso>",
+            "ENGRAMMA_GRAPH: adaptive:<w_max>,<u_min>,<spw> | fixed:<weight>",
         ));
     };
     let nums: Vec<&str> = rest.split(',').map(str::trim).collect();
     if nums.len() != 3 {
         return Err(CliError::usage(
-            "ENGRAMMA_GRAPH: adaptive:<w_max>,<u_min>,<spw> (tre numeri col punto decimale)",
+            "ENGRAMMA_GRAPH: adaptive:<w_max>,<u_min>,<spw> (three numbers with a decimal point)",
         ));
     }
     let parse = |v: &str| -> Result<f64, CliError> {
         v.parse::<f64>()
-            .map_err(|_| CliError::usage(format!("ENGRAMMA_GRAPH: numero non valido {v:?}")))
+            .map_err(|_| CliError::usage(format!("ENGRAMMA_GRAPH: invalid number {v:?}")))
     };
     let in_unit = |v: f64, name: &str| -> Result<f64, CliError> {
         (0.0..=1.0)
             .contains(&v)
             .then_some(v)
-            .ok_or_else(|| CliError::usage(format!("ENGRAMMA_GRAPH: {name}={v} fuori da [0, 1]")))
+            .ok_or_else(|| CliError::usage(format!("ENGRAMMA_GRAPH: {name}={v} outside [0, 1]")))
     };
     let w_max = in_unit(parse(nums[0])?, "w_max")?;
     let u_min = in_unit(parse(nums[1])?, "u_min")?;
@@ -2972,25 +2965,25 @@ fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliE
                 print_json(&serde_json::json!({ "cell": cli.cell, "conflicts": arr }));
             } else {
                 if rows.is_empty() {
-                    println!("nessuna copia di conflitto");
+                    println!("no conflict copies");
                 }
                 for r in &rows {
                     println!(
                         "{}  {}  {}  {}{}",
                         &r.copy_id.to_string()[..8],
                         match r.loser_class {
-                            engramma_core::cell::conflicts::ActorClass::Human => "umano",
-                            engramma_core::cell::conflicts::ActorClass::Agent => "agente",
+                            engramma_core::cell::conflicts::ActorClass::Human => "human",
+                            engramma_core::cell::conflicts::ActorClass::Agent => "agent",
                         },
                         r.loser_actor,
                         r.loser_at,
                         if r.visible {
                             ""
                         } else {
-                            "  (in attesa: oltre il tetto di tre)"
+                            "  (waiting: over the cap of three)"
                         }
                     );
-                    println!("  originale {}", &r.original_id.to_string()[..8]);
+                    println!("  original {}", &r.original_id.to_string()[..8]);
                 }
             }
             Ok(())
@@ -3005,7 +2998,7 @@ fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliE
                 .map_err(|e| CliError::internal(e.to_string()))?;
             let d = cell.conflict(&full).map_err(|e| match e {
                 CellError::NoteNotFound(_) => {
-                    CliError::not_found(format!("{full} non è una copia di conflitto aperta"))
+                    CliError::not_found(format!("{full} is not an open conflict copy"))
                 }
                 other => CliError::internal(other.to_string()),
             })?;
@@ -3015,32 +3008,32 @@ fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliE
                     "conflict": conflict_detail_json(&d),
                 }));
             } else {
-                println!("copia {}  contro l'originale {}", d.copy_id, d.original_id);
+                println!("copy {}  against the original {}", d.copy_id, d.original_id);
                 println!(
                     "  {}  {}  {}",
                     match d.loser_class {
-                        engramma_core::cell::conflicts::ActorClass::Human => "umano",
-                        engramma_core::cell::conflicts::ActorClass::Agent => "agente",
+                        engramma_core::cell::conflicts::ActorClass::Human => "human",
+                        engramma_core::cell::conflicts::ActorClass::Agent => "agent",
                     },
                     d.loser_actor,
                     d.loser_at
                 );
                 if d.quarantined {
-                    println!("  in quarantena (si legge qui, non con get)");
+                    println!("  in quarantine (read it here, not with get)");
                 }
-                println!("--- l'originale ---");
-                println!("{}", d.original_body.as_deref().unwrap_or("(assente)"));
+                println!("--- the original ---");
+                println!("{}", d.original_body.as_deref().unwrap_or("(absent)"));
                 println!(
-                    "--- alla biforcazione{} ---",
+                    "--- at the fork{} ---",
                     if d.fork_body.is_none() {
-                        " (sotto il taglio)"
+                        " (below the cut)"
                     } else {
                         ""
                     }
                 );
                 println!("{}", d.fork_body.as_deref().unwrap_or(""));
-                println!("--- la copia ---");
-                println!("{}", d.copy_body.as_deref().unwrap_or("(assente)"));
+                println!("--- the copy ---");
+                println!("{}", d.copy_body.as_deref().unwrap_or("(absent)"));
             }
             Ok(())
         }
@@ -3058,7 +3051,7 @@ fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliE
                 "merged" => engramma_core::ResolveKeep::Merged,
                 other => {
                     return Err(CliError::usage(format!(
-                        "`--keep` vale original | copy | merged, non `{other}`"
+                        "`--keep` takes original | copy | merged, not `{other}`"
                     )));
                 }
             };
@@ -3070,12 +3063,12 @@ fn run_conflicts(cli: &Cli, action: &Option<ConflictsAction>) -> Result<(), CliE
                 .resolve_conflict(&id, keep, body.as_deref(), "user@cli")
                 .map_err(|e| match e {
                     engramma_core::CellError::NoteNotFound(_) => {
-                        CliError::usage("non è una copia di conflitto".to_string())
+                        CliError::usage("not a conflict copy".to_string())
                     }
                     engramma_core::CellError::Conflict(m) => CliError::usage(m),
                     other => CliError::internal(other.to_string()),
                 })?;
-            report_ok(cli, "conflitto risolto", &original.to_string());
+            report_ok(cli, "conflict resolved", &original.to_string());
             Ok(())
         }
     }
@@ -3137,12 +3130,12 @@ fn run_proposals(
                 print_json(&serde_json::json!({ "cell": cli.cell, "proposals": arr }));
             } else {
                 if rows.is_empty() {
-                    println!("coda vuota");
+                    println!("the queue is empty");
                 }
                 for r in &rows {
                     let marker = match r.state {
                         engramma_core::cell::proposals::ProposalState::Pending
-                        | engramma_core::cell::proposals::ProposalState::Reverted => "[in coda]",
+                        | engramma_core::cell::proposals::ProposalState::Reverted => "[queued]",
                         _ => "",
                     };
                     println!(
@@ -3153,18 +3146,16 @@ fn run_proposals(
                         r.note.display_title()
                     );
                     if let Some(reason) = &r.reason {
-                        println!("      motivo: {reason}");
+                        println!("      reason: {reason}");
                     }
                     if let engramma_core::cell::proposals::ProposalMode::Supersede(t) = &r.mode {
-                        println!("      rettifica di {}", engramma_core::id::id8(t));
+                        println!("      correction of {}", engramma_core::id::id8(t));
                     }
                     if r.auto_failed {
-                        println!(
-                            "      revisione automatica fallita: riprova con `proposals review`"
-                        );
+                        println!("      automatic review failed: retry with `proposals review`");
                     }
                     if let (Some(who), Some(at)) = (&r.decided_by, &r.decided_at) {
-                        println!("      decisa da {who} il {at}");
+                        println!("      decided by {who} at {at}");
                     }
                 }
             }
@@ -3176,7 +3167,7 @@ fn run_proposals(
                 .proposals(&engramma_core::cell::proposals::ProposalsFilter::default())?
                 .into_iter()
                 .find(|r| r.id == id)
-                .ok_or_else(|| CliError::not_found(format!("proposta {id}")))?;
+                .ok_or_else(|| CliError::not_found(format!("proposal {id}")))?;
             if cli.json {
                 print_json(&proposal_json(&row));
             } else {
@@ -3187,16 +3178,16 @@ fn run_proposals(
                         .map_err(|e| CliError::internal(e.to_string()))?
                 );
                 println!();
-                println!("proposta da {} il {}", row.proposer, row.proposed_at);
+                println!("proposed by {} at {}", row.proposer, row.proposed_at);
                 if let Some(c) = &row.client {
-                    println!("client dichiarato: {c}");
+                    println!("declared client: {c}");
                 }
                 if let Some(r) = &row.reason {
-                    println!("motivo: {r}");
+                    println!("reason: {r}");
                 }
                 if let (Some(who), Some(at)) = (&row.decided_by, &row.decided_at) {
                     println!(
-                        "decisa da {who} il {at}: {}",
+                        "decided by {who} at {at}: {}",
                         row.decision_reason.clone().unwrap_or_default()
                     );
                 }
@@ -3241,7 +3232,7 @@ fn run_proposals(
                 &id,
                 &engramma_core::cell::proposals::DecisionInput {
                     action: engramma_core::cell::proposals::DecisionAction::Accept { edited },
-                    reason: Some("accettata dalla CLI".into()),
+                    reason: Some("accepted from the CLI".into()),
                     review: None,
                 },
                 "user@cli",
@@ -3270,13 +3261,13 @@ fn run_proposals(
                 }
                 print_json(&v);
             } else {
-                report_ok(cli, "accettata", &id.to_string());
+                report_ok(cli, "accepted", &id.to_string());
                 match embedded {
                     Some((done, remaining)) => {
-                        println!("incorporate: {done} (in attesa: {remaining})");
+                        println!("embedded: {done} (pending: {remaining})");
                     }
                     None if !no_embed => {
-                        println!("vettori in attesa: la nota si incorpora con `engramma embed`");
+                        println!("vectors pending: the note is embedded by `engramma embed`");
                     }
                     None => {}
                 }
@@ -3294,7 +3285,7 @@ fn run_proposals(
                 },
                 "user@cli",
             )?;
-            report_ok(cli, "rifiutata (lapide)", &id.to_string());
+            report_ok(cli, "rejected (tombstone)", &id.to_string());
             Ok(())
         }
         Some(ProposalsAction::Review) => {
@@ -3324,11 +3315,11 @@ fn run_proposals(
                 print_json(&v);
             } else {
                 match decided {
-                    0 => println!("nulla da ritentare (o niente da decidere per il revisore)"),
-                    n => println!("ritentate e decise: {n}"),
+                    0 => println!("nothing to retry (or nothing for the reviewer to decide)"),
+                    n => println!("retried and decided: {n}"),
                 }
                 if let Some((done, remaining)) = embedded {
-                    println!("incorporate: {done} (in attesa: {remaining})");
+                    println!("embedded: {done} (pending: {remaining})");
                 }
             }
             Ok(())
@@ -3385,27 +3376,27 @@ fn run_decisions(
         print_json(&serde_json::json!({ "cell": cli.cell, "decisions": arr }));
     } else {
         if rows.is_empty() {
-            println!("nessuna decisione");
+            println!("no decisions");
         }
         for r in &rows {
             println!(
                 "{}  {}  {}  {}",
                 engramma_core::id::id8(&r.op_id),
                 if r.decision == "accept" {
-                    "accetta"
+                    "accept"
                 } else {
-                    "rifiuta"
+                    "reject"
                 },
                 r.actor,
                 r.decided_at
             );
-            println!("      proposta {}", engramma_core::id::id8(&r.proposal));
+            println!("      proposal {}", engramma_core::id::id8(&r.proposal));
             if let Some(reason) = &r.reason {
-                println!("      perché: {reason}");
+                println!("      why: {reason}");
             }
             if let Some(review) = &r.review {
                 println!(
-                    "      revisore {} modello {} confidenza {} prompt {}",
+                    "      reviewer {} model {} confidence {} prompt {}",
                     review["name"].as_str().unwrap_or("?"),
                     review["model"].as_str().unwrap_or("?"),
                     review["confidence"],
@@ -3413,7 +3404,7 @@ fn run_decisions(
                 );
             }
             if r.reverted_by.is_some() {
-                println!("      annullata");
+                println!("      reverted");
             }
         }
     }
@@ -3483,20 +3474,23 @@ fn run_revert(
             } else {
                 match preview {
                     P::Revertable { proposal } => println!(
-                        "annullerei: proposta di nuovo in coda: {}",
+                        "would revert: the proposal goes back to the queue: {}",
                         id8_or(&proposal)
                     ),
                     P::Purged { .. } => {
-                        println!("annullerei nel registro, ma il contenuto era purgato: non torna");
+                        println!(
+                            "would revert in the registry, but the content was purged: \
+                             it does not come back"
+                        );
                     }
-                    P::AlreadyReverted => println!("già annullata: niente da fare"),
-                    P::Conflict(what) => println!("non annullerei: {what}"),
+                    P::AlreadyReverted => println!("already reverted: nothing to do"),
+                    P::Conflict(what) => println!("would not revert: {what}"),
                 }
             }
             return Ok(());
         }
         let outcome = cell
-            .revert_decision(&full, "annullata dalla CLI", "user@cli")
+            .revert_decision(&full, "reverted from the CLI", "user@cli")
             .map_err(CliError::from)?;
         if cli.json {
             print_json(&serde_json::json!({
@@ -3512,12 +3506,12 @@ fn run_revert(
                 engramma_core::cell::proposals::RevertOutcome::Reverted { proposal, .. } => {
                     report_ok(
                         cli,
-                        "annullata: proposta di nuovo in coda",
+                        "reverted: the proposal goes back to the queue",
                         &id8_or(&proposal),
                     );
                 }
                 engramma_core::cell::proposals::RevertOutcome::Purged { .. } => {
-                    println!("annullata, ma il contenuto era purgato: non torna");
+                    println!("reverted, but the content was purged: it does not come back");
                 }
             }
         }
@@ -3539,13 +3533,13 @@ fn run_revert(
         .map_err(CliError::from)?;
     // the human preview stays out of --json (the JSON answers carry it all)
     if !cli.json {
-        println!("annullerò {} decisioni:", report.reverted);
-        println!("  conflitti: {} (non toccati)", report.conflicts.len());
+        println!("would revert {} decisions:", report.reverted);
+        println!("  conflicts: {} (left alone)", report.conflicts.len());
         for c in &report.conflicts {
             println!("    {c}");
         }
         println!(
-            "  purgate: {} (annullate nel registro, il contenuto non torna)",
+            "  purged: {} (reverted in the registry, the content does not come back)",
             report.purged
         );
     }
@@ -3562,7 +3556,7 @@ fn run_revert(
     }
     if !yes {
         if !cli.json {
-            print!("procedo? [y/N] ");
+            print!("proceed? [y/N] ");
         }
         use std::io::Write as _;
         std::io::stdout().flush().ok();
@@ -3574,7 +3568,7 @@ fn run_revert(
             if cli.json {
                 print_json(&serde_json::json!({ "aborted": true }));
             } else {
-                println!("annullato");
+                println!("aborted");
             }
             return Ok(());
         }
@@ -3590,7 +3584,7 @@ fn run_revert(
         }));
     } else {
         println!(
-            "annullate {}, conflitti {}, purgate {}",
+            "reverted {}, conflicts {}, purged {}",
             report.reverted,
             report.conflicts.len(),
             report.purged
@@ -3652,7 +3646,7 @@ fn run_policy(cli: &Cli, action: &PolicyAction) -> Result<(), CliError> {
                 println!(
                     "kinds: {}",
                     if policy.kinds.is_empty() {
-                        "tutti".into()
+                        "all".into()
                     } else {
                         policy
                             .kinds
@@ -3690,7 +3684,7 @@ fn run_policy(cli: &Cli, action: &PolicyAction) -> Result<(), CliError> {
             if cli.json {
                 print_json(&doc);
             } else {
-                println!("politica aggiornata");
+                println!("policy updated");
             }
             Ok(())
         }
@@ -3772,15 +3766,13 @@ fn run_history(cli: &Cli, cell: &Cell, id: &Ulid, diff: bool) -> Result<(), CliE
 
     if let Some(r) = &proposal {
         println!(
-            "proposta da {} il {} — {}",
+            "proposed by {} at {} — {}",
             r.proposer,
             r.proposed_at,
-            r.reason
-                .clone()
-                .unwrap_or_else(|| "senza motivo dichiarato".into())
+            r.reason.clone().unwrap_or_else(|| "no reason given".into())
         );
         if let (Some(who), Some(at)) = (&r.decided_by, &r.decided_at) {
-            println!("decisa da {who} il {at}");
+            println!("decided by {who} at {at}");
         }
     }
     if diff {
@@ -3803,7 +3795,7 @@ fn run_history(cli: &Cli, cell: &Cell, id: &Ulid, diff: bool) -> Result<(), CliE
             }
             prev = Some(v);
             if i + 1 == hist.len() && v.note.body != current.body {
-                println!("v{} → ora  (stato attuale)", v.version);
+                println!("v{} → now  (current state)", v.version);
                 for line in line_diff(&v.note.body, &current.body) {
                     println!("  {line}");
                 }
@@ -3885,14 +3877,14 @@ fn devices_run(cli: &Cli, action: &DevicesAction) -> Result<(), CliError> {
                 .map_err(|e| CliError::internal(e.to_string()))?
                 .len();
             if n == 0 {
-                reg.create_first(&dk, "portatile")
+                reg.create_first(&dk, "laptop")
                     .map_err(|e| CliError::internal(e.to_string()))?;
             }
             if cli.json {
                 print_json(&serde_json::json!({ "device": short_id(&dk.device_id()) }));
             } else {
                 println!(
-                    "dispositivo {} (elenco: {} vivi)",
+                    "device {} (list: {} live)",
                     short_id(&dk.device_id()),
                     n.max(1)
                 );
@@ -3980,7 +3972,7 @@ fn sync_run(cli: &Cli, action: &SyncAction) -> Result<(), CliError> {
                 if cli.json {
                     print_json(&serde_json::json!({ "cells": [] }));
                 } else {
-                    println!("nessuna cella condivisa da qui");
+                    println!("no cell is shared from here");
                 }
                 return Ok(());
             }
@@ -4027,14 +4019,14 @@ fn sync_run(cli: &Cli, action: &SyncAction) -> Result<(), CliError> {
                 }
                 print_json(&v);
             } else {
-                println!("dispositivi {devices}");
+                println!("devices {devices}");
                 for c in &cells {
                     let head = engramma_sync::protocol::SyncedCell::head_seq(c);
                     let frontier = c.cell().stable_frontier().unwrap_or(0);
                     let epoch = c.current_epoch().unwrap_or(0);
                     println!(
-                        "cella «{}»: testa {head}, frontiera stabile {frontier}, \
-                         in attesa {}, epoca {epoch}",
+                        "cell \"{}\": head {head}, stable frontier {frontier}, \
+                         pending {}, epoch {epoch}",
                         engramma_sync::serve::cell_name(&r, c.sync_id()).unwrap_or_default(),
                         (head - frontier).max(0)
                     );
@@ -4080,7 +4072,7 @@ fn sync_run(cli: &Cli, action: &SyncAction) -> Result<(), CliError> {
                     }
                 }
                 if !any {
-                    println!("nessuna copia di conflitto");
+                    println!("no conflict copies");
                 }
             }
             Ok(())

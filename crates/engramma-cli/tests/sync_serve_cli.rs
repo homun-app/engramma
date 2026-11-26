@@ -1367,7 +1367,7 @@ impl ServedPair {
         );
         remember_all(
             &b.root,
-            &device_of(&b.root, "portatile"),
+            &device_of(&b.root, "laptop"),
             &node_of(&va),
             &addrs_of(&va),
         );

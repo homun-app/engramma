@@ -1476,8 +1476,7 @@ fn share_cell(root: &Path, cell: &str) -> SResult<ShareView> {
     let reg = DeviceRegistry::open(root).map_err(ServiceError::io)?;
     if reg.live_members().map_err(ServiceError::io)?.is_empty() {
         // the first device creates the list by itself
-        reg.create_first(&dk, "portatile")
-            .map_err(ServiceError::io)?;
+        reg.create_first(&dk, "laptop").map_err(ServiceError::io)?;
     }
     // arm the signer FIRST: the adopt itself must be signed
     c.set_signer(Arc::new(crate::arrival::DeviceSigner::new(&dk)))
