@@ -47,9 +47,9 @@ pub enum VaultError {
     Format(#[from] engramma_core::FormatError),
     /// Too many files would vanish: nothing was deleted.
     #[error(
-        "la riconciliazione vorrebbe cancellare {would_delete} file su {known} \
-         (soglia: {MASS_DELETE_FILES} file o il {pct:.0}% delle note): \
-         cartella smontata o spostata? --allow-deletions per procedere"
+        "the reconciliation would delete {would_delete} of {known} files \
+         (the floor: {MASS_DELETE_FILES} files or the {pct:.0}% of the notes): \
+         folder unmounted or moved? --allow-deletions to go on"
     )]
     MassDelete {
         /// Files that would be deleted.
@@ -62,7 +62,7 @@ pub enum VaultError {
     /// The view's folder is not there (v0.4, P0.1): unmounted, renamed
     /// away, permissions. A purge reports it pending only when this view
     /// still holds bytes of a note.
-    #[error("la vista {root} non è raggiungibile")]
+    #[error("view {root} is unreachable")]
     Unreachable {
         /// The folder that was not there.
         root: String,
@@ -647,8 +647,8 @@ impl Vault {
                     if !registered.contains_key(rel) {
                         self.cell.vault_conflict_put(view_id, rel, None)?;
                         report.warnings.push(format!(
-                            "{rel}: copia .conflitto orfana (il suo file base non è \
-                             legato a nessuna nota), lasciata stare"
+                            "{rel}: orphan .conflitto copy (its base file is bound to no \
+                             note), left alone"
                         ));
                     }
                 }
@@ -680,7 +680,7 @@ impl Vault {
         };
         let Ok(note_id) = Ulid::from_string(&header_id) else {
             report.errors.push(format!(
-                "{}: l'id nell'intestazione non è un ULID",
+                "{}: the id in the frontmatter is not a ULID",
                 file.path
             ));
             return Ok(());
@@ -703,7 +703,7 @@ impl Vault {
         let mut file_note = parsed.note;
         if file_note.id != note_id {
             report.errors.push(format!(
-                "{}: l'id dell'intestazione ({header_id}) non concorda con la nota ({})",
+                "{}: the id in the frontmatter ({header_id}) does not agree with the note ({})",
                 file.path, file_note.id
             ));
             return Ok(());
@@ -725,7 +725,7 @@ impl Vault {
                 report.deleted.push(file.path.clone());
             } else {
                 report.warnings.push(format!(
-                    "{}: la nota {header_id} non è in questa cella, file lasciato stare",
+                    "{}: the note {header_id} is not in this cell, file left alone",
                     file.path
                 ));
             }
@@ -743,7 +743,7 @@ impl Vault {
         {
             if scanned_paths.contains(old.path.as_str()) {
                 report.warnings.push(format!(
-                    "{}: seconda copia della nota {} ({} è quella legata), lasciata stare",
+                    "{}: a second copy of the note {} ({} is the bound one), left alone",
                     file.path,
                     engramma_core::id::id8(&note_id),
                     old.path
@@ -759,7 +759,7 @@ impl Vault {
         if file_note.confidence == Confidence::External && file_note.status == Status::Active {
             file_note.status = Status::Quarantined;
             report.warnings.push(format!(
-                "{}: una nota external nasce in quarantena (`confirm` la promuove)",
+                "{}: an external note is born in quarantine (`confirm` promotes it)",
                 file.path
             ));
         }
@@ -774,8 +774,8 @@ impl Vault {
                 && file_note.status == Status::Quarantined)
         {
             report.warnings.push(format!(
-                "{}: il file non può cambiare lo stato della nota ({}): \
-                 resta {} — `setStatus`/`confirm`/`delete` in the cell",
+                "{}: the file cannot change the note's status ({}): \
+                 it stays {} — `setStatus`/`confirm`/`delete` in the cell",
                 file.path,
                 file_note.status.as_str(),
                 live_note.status.as_str(),
@@ -911,7 +911,7 @@ impl Vault {
         };
         if note.id != Ulid::nil() {
             report.warnings.push(format!(
-                "{}: intestazione valida senza campo id visibile, uso {}",
+                "{}: a valid frontmatter with no visible id field, using {}",
                 file.path, note.id
             ));
         } else {
@@ -1095,10 +1095,10 @@ pub fn purge_everywhere(
                             view_id: Some(view.view_id.clone()),
                             root: view.root.clone(),
                             reason: format!(
-                                "la vista {} ({short}) non è raggiungibile e la cella vi lega \
-                                 ancora file o copie della nota: `engramma vault sync {}` per \
-                                 finire, o `engramma vault unbind {}` per sganciarla \
-                                 (i file restano)",
+                                "the view {} ({short}) is unreachable and the cell still binds \
+                                 files or copies of the note to it: `engramma vault sync {}` to \
+                                 finish, or `engramma vault unbind {}` to detach it \
+                                 (the files stay)",
                                 view.root, view.root, view.root,
                             ),
                         });
@@ -1107,7 +1107,7 @@ pub fn purge_everywhere(
                         problems.push(ViewProblem {
                             view_id: Some(view.view_id.clone()),
                             root: view.root.clone(),
-                            reason: format!("vista {}: {e}", view.root),
+                            reason: format!("view {}: {e}", view.root),
                         });
                     }
                 }
@@ -1118,7 +1118,7 @@ pub fn purge_everywhere(
             problems.push(ViewProblem {
                 view_id: None,
                 root: String::new(),
-                reason: format!("viste non leggibili: {e}"),
+                reason: format!("views unreadable: {e}"),
             });
         }
     }
@@ -1190,9 +1190,9 @@ pub fn drop_cell_everywhere(cell: &Cell) -> Result<DropReport, VaultError> {
                             view_id: Some(view.view_id.clone()),
                             root,
                             reason: format!(
-                                "la vista {} non è raggiungibile e la cella vi lega ancora \
-                                 file o copie delle sue note: i file restano lì finché la \
-                                 cartella non torna (il contenuto è cancellabile a mano)",
+                                "the view {} is unreachable and the cell still binds files or \
+                                 copies of its notes to it: the files stay there until the \
+                                 folder comes back (the content can be deleted by hand)",
                                 view.root,
                             ),
                         });
@@ -1201,7 +1201,7 @@ pub fn drop_cell_everywhere(cell: &Cell) -> Result<DropReport, VaultError> {
                         report.problems.push(ViewProblem {
                             view_id: Some(view.view_id.clone()),
                             root: view.root.clone(),
-                            reason: format!("vista {}: {e}", view.root),
+                            reason: format!("view {}: {e}", view.root),
                         });
                     }
                 }
@@ -1212,7 +1212,7 @@ pub fn drop_cell_everywhere(cell: &Cell) -> Result<DropReport, VaultError> {
             report.problems.push(ViewProblem {
                 view_id: None,
                 root: String::new(),
-                reason: format!("viste non leggibili: {e}"),
+                reason: format!("views unreadable: {e}"),
             });
         }
     }

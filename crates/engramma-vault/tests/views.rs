@@ -380,7 +380,7 @@ fn orphan_conflict_copy_is_warned_once_and_stays() {
         first
             .warnings
             .iter()
-            .any(|w| w.contains(orphan) && w.contains("orfana")),
+            .any(|w| w.contains(orphan) && w.contains("orphan")),
         "the orphan is listed, once: {first:?}"
     );
     assert!(

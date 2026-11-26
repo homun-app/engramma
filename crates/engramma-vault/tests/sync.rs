@@ -326,7 +326,7 @@ fn file_cannot_promote_an_external_note() {
         .replace("updated_at:", "x-zz: 1\nupdated_at:");
     std::fs::write(&f, edited).unwrap(/* t */);
     let r = vault.sync_once(false).unwrap(/* test-only */);
-    assert!(r.warnings.iter().any(|w| w.contains("quarantena")), "{r:?}");
+    assert!(r.warnings.iter().any(|w| w.contains("quarantine")), "{r:?}");
     assert_eq!(
         vault.cell().get(&n.id).unwrap(/* t */).status,
         Status::Quarantined,
