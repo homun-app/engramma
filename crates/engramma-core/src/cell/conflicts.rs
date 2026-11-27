@@ -406,7 +406,7 @@ struct PlannedCopy {
 }
 
 /// One raw scan row: `(op_id, hlc, actor, kind, base, content_hash,
-/// payload body)`.
+/// payload body, signing device)`.
 type ScanRow = (
     String,
     String,
@@ -415,6 +415,7 @@ type ScanRow = (
     Option<String>,
     String,
     Option<String>,
+    Option<String>,
 );
 
 /// Read every operation of the note — above the compaction cut AND
@@ -422,7 +423,7 @@ type ScanRow = (
 /// the graph asks of them) — in total order.
 fn scan(tx: &Transaction<'_>, original: &Ulid) -> Result<Vec<NoteOpRow>, CellError> {
     let mut stmt = tx.prepare(
-        "SELECT o.op_id, o.hlc, o.actor, o.kind, o.base, o.content_hash, p.body
+        "SELECT o.op_id, o.hlc, o.actor, o.kind, o.base, o.content_hash, p.body, o.device
          FROM ops o
          JOIN op_objects oo ON oo.op_id = o.op_id
          LEFT JOIN op_payloads p ON p.op_id = o.op_id
@@ -439,6 +440,7 @@ fn scan(tx: &Transaction<'_>, original: &Ulid) -> Result<Vec<NoteOpRow>, CellErr
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
+                r.get(7)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -450,60 +452,81 @@ fn scan(tx: &Transaction<'_>, original: &Ulid) -> Result<Vec<NoteOpRow>, CellErr
         .collect();
     let mapped = raw
         .into_iter()
-        .map(|(op_id, hlc, actor, kind, base, hash, body_json)| {
-            let op_id = Ulid::from_string(&op_id)
-                .map_err(|_| CellError::Db(format!("bad op id {op_id}")))?;
-            let kind = OpKind::parse(&kind)?;
-            // v0.6.11 (K2's hunt, seed 16743842670308237750): a body
-            // write is EVERY write that sets the note's body — the birth
-            // by `put`, `propose` or `supersede` (the new note's body
-            // rides the supersede's own payload) included, exactly as
-            // the reference of DESIGN § 4.3 collects them. The scan kept
-            // only put and patch, and a note born by supersede arrived
-            // at its conflict derivation WITHOUT its birth: the ancestry
-            // and the fork started at the first patch, and the witness
-            // missed what the reference saw (engine no, reference yes).
-            // Rare before K1 — a supersede-born note whose old side was
-            // purged did not materialize at all under the whole-operation
-            // dominance — and common now: the new note lives
-            let body = body_json
-                .filter(|_| {
-                    matches!(
-                        kind,
-                        OpKind::PutNote | OpKind::PatchNote | OpKind::Propose | OpKind::Supersede
-                    )
+        .enumerate()
+        .map(
+            |(i, (op_id, hlc, actor, kind, base, hash, body_json, device))| {
+                let op_id = Ulid::from_string(&op_id)
+                    .map_err(|_| CellError::Db(format!("bad op id {op_id}")))?;
+                let kind = OpKind::parse(&kind)?;
+                // v0.6.11 (K2's hunt, seed 16743842670308237750): a body
+                // write is EVERY write that sets the note's body — the birth
+                // by `put`, `propose` or `supersede` (the new note's body
+                // rides the supersede's own payload) included, exactly as
+                // the reference of DESIGN § 4.3 collects them. The scan kept
+                // only put and patch, and a note born by supersede arrived
+                // at its conflict derivation WITHOUT its birth: the ancestry
+                // and the fork started at the first patch, and the witness
+                // missed what the reference saw (engine no, reference yes).
+                // Rare before K1 — a supersede-born note whose old side was
+                // purged did not materialize at all under the whole-operation
+                // dominance — and common now: the new note lives
+                let body = body_json
+                    .filter(|_| {
+                        matches!(
+                            kind,
+                            OpKind::PutNote
+                                | OpKind::PatchNote
+                                | OpKind::Propose
+                                | OpKind::Supersede
+                        )
+                    })
+                    .and_then(|b| {
+                        // a supersede sits in BOTH its notes' scans (it is an
+                        // operation of the old one and the new one): the body
+                        // it carries is the birth of the NEW note alone —
+                        // the old side sees the closing, never this body
+                        // (the reference's own guard, `note.id == original`)
+                        if kind == OpKind::Supersede
+                            && serde_json::from_str::<serde_json::Value>(b.as_str())
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("note").and_then(|n| n.get("id")).and_then(|i| {
+                                        i.as_str().map(|id| id != original.to_string())
+                                    })
+                                })
+                                .unwrap_or(true)
+                        {
+                            return None;
+                        }
+                        body_facts(&kind, b.as_str())
+                    });
+                // v0.6.20: a write without `base` is a root only when it can
+                // be concurrent — a SIGNED one, which came from another device
+                // (the same import on two machines). An UNSIGNED one was
+                // written on this copy, and a local writer of v0.6 always
+                // names its base when the note exists: base-less and unsigned
+                // past the note's first operation means written before v0.6,
+                // and those operations are sequential by declaration
+                // (migration v15). Its parent is the operation before it in
+                // the total order. Without this, every rewrite of a pre-sync
+                // cell was a root: a conflict copy, the human hand winning
+                // back over a newer agent body (Homun's hook of v0.6.19).
+                let parent = match &base {
+                    Some(b) => by_hash.get(b).copied(),
+                    None if device.is_none() && i > 0 => Some(i - 1),
+                    None => None,
+                };
+                Ok(NoteOpRow {
+                    hash,
+                    op_id,
+                    hlc,
+                    actor,
+                    kind,
+                    parent,
+                    body,
                 })
-                .and_then(|b| {
-                    // a supersede sits in BOTH its notes' scans (it is an
-                    // operation of the old one and the new one): the body
-                    // it carries is the birth of the NEW note alone —
-                    // the old side sees the closing, never this body
-                    // (the reference's own guard, `note.id == original`)
-                    if kind == OpKind::Supersede
-                        && serde_json::from_str::<serde_json::Value>(b.as_str())
-                            .ok()
-                            .and_then(|v| {
-                                v.get("note")
-                                    .and_then(|n| n.get("id"))
-                                    .and_then(|i| i.as_str().map(|id| id != original.to_string()))
-                            })
-                            .unwrap_or(true)
-                    {
-                        return None;
-                    }
-                    body_facts(&kind, b.as_str())
-                });
-            let parent = base.as_ref().and_then(|b| by_hash.get(b).copied());
-            Ok(NoteOpRow {
-                hash,
-                op_id,
-                hlc,
-                actor,
-                kind,
-                parent,
-                body,
-            })
-        })
+            },
+        )
         .collect::<Result<Vec<_>, CellError>>()?;
     Ok(mapped)
 }
