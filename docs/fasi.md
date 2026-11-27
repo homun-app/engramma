@@ -38,3 +38,16 @@ leggere. Le regole:
    perde dati, oppure lascia uno stato che `verify` non vede. Tutti gli
    altri si dichiarano in `open-defects.txt`, con chi li raggiunge e
    cosa succede, e la fase va avanti.
+7. **La pulizia del disco a fine fase** (v0.6.19). Ogni fase lascia in
+   `target/` i binari di tutte le sue build: circa 25 GB in due giorni,
+   perché cargo non toglie mai quelli vecchi. A fine fase, **sempre con
+   la cartella esplicita** (una shell con `CARGO_TARGET_DIR` nell'ambiente
+   pulirebbe un'altra cartella):
+   ```sh
+   CARGO_TARGET_DIR="$PWD/target" cargo sweep --maxsize 15GB .
+   rm -rf "$TMPDIR/engramma-cli-plain" "$TMPDIR/engramma-cli-relay"
+   ```
+   Il primo comando tiene i 15 GB più recenti, così la build dopo non
+   riparte da zero. Il secondo toglie le cartelle di build di
+   `relay_cli.rs`, che il test ricrea. Nel REPORT vanno `df -h /` e
+   `du -sh target`, prima e dopo.
