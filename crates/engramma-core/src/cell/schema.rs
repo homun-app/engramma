@@ -1455,6 +1455,17 @@ fn migrate_log_v15(tx: &rusqlite::Transaction<'_>) -> Result<(), crate::error::C
         })?;
         mapped.collect::<Result<Vec<_>, _>>()?
     };
+    // v0.6.20: the era this migration declares sequential, written down
+    // where the conflict derivation can read it — LOCAL bookkeeping (like
+    // `meta.hlc`), never replicated: a copy that receives this history
+    // reads the same era from its `adopt` instead.
+    if !rows.is_empty() {
+        tx.execute(
+            "INSERT OR IGNORE INTO meta (key, value)
+             SELECT 'pre_v06_seq', CAST(MAX(seq) AS TEXT) FROM ops",
+            [],
+        )?;
+    }
     for r in &rows {
         let op_id = ulid::Ulid::from_string(&r.op_id)
             .map_err(|_| CellError::Invalid(format!("bad op_id `{}`", r.op_id)))?;

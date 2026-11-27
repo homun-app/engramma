@@ -445,6 +445,17 @@ fn scan(tx: &Transaction<'_>, original: &Ulid) -> Result<Vec<NoteOpRow>, CellErr
         })?
         .collect::<Result<Vec<_>, _>>()?;
     drop(stmt);
+    // v0.6.20: does this copy hold an UNSIGNED ERA — a history written
+    // before v0.6 (the v15 migration marks it) or adopted under a root
+    // (the sharing device's pre-sync log)? Only there is an unsigned
+    // operation known to be one device's sequence; a cell born in v0.6
+    // has none, and its base-less writes stay roots, whoever ingested
+    // them.
+    let unsigned_era: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM meta WHERE key IN ('pre_v06_seq', 'adopted_root'))",
+        [],
+        |r| r.get(0),
+    )?;
     let by_hash: HashMap<String, usize> = raw
         .iter()
         .enumerate()
@@ -500,20 +511,19 @@ fn scan(tx: &Transaction<'_>, original: &Ulid) -> Result<Vec<NoteOpRow>, CellErr
                         }
                         body_facts(&kind, b.as_str())
                     });
-                // v0.6.20: a write without `base` is a root only when it can
-                // be concurrent — a SIGNED one, which came from another device
-                // (the same import on two machines). An UNSIGNED one was
-                // written on this copy, and a local writer of v0.6 always
-                // names its base when the note exists: base-less and unsigned
-                // past the note's first operation means written before v0.6,
-                // and those operations are sequential by declaration
-                // (migration v15). Its parent is the operation before it in
-                // the total order. Without this, every rewrite of a pre-sync
-                // cell was a root: a conflict copy, the human hand winning
-                // back over a newer agent body (Homun's hook of v0.6.19).
+                // v0.6.20: a write without `base` is a root (the same import on
+                // two machines) — except in an UNSIGNED ERA (`unsigned_era`): a log
+                // written before v0.6, or adopted from one device's pre-sync log,
+                // is that device's sequence, as the v15 migration declared, and a
+                // local writer of v0.6 always names its base when the note exists.
+                // There an unsigned base-less write past the note's first
+                // operation leans on the one before it in the total order. Without
+                // this, every rewrite of a pre-sync cell was a root: a conflict
+                // copy, the human hand winning back over a newer agent body
+                // (Homun's hook of v0.6.19).
                 let parent = match &base {
                     Some(b) => by_hash.get(b).copied(),
-                    None if device.is_none() && i > 0 => Some(i - 1),
+                    None if unsigned_era && device.is_none() && i > 0 => Some(i - 1),
                     None => None,
                 };
                 Ok(NoteOpRow {

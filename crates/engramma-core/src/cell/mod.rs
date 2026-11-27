@@ -846,6 +846,27 @@ fn upgrade_snapshot_digests(conn: &mut Connection, cell_path: &Path) -> Result<(
     Ok(())
 }
 
+/// v0.6.20: copy the UNSIGNED-ERA mark of a cell (`meta.pre_v06_seq`, left
+/// by the v15 migration of a pre-v0.6 log) into a connection that rebuilds
+/// its state from the log — the mark is local bookkeeping, not an
+/// operation, and the conflict derivation reads it.
+fn seed_unsigned_era(from: &Connection, into: &Connection) -> Result<(), CellError> {
+    let mark: Option<String> = from
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'pre_v06_seq'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(mark) = mark {
+        into.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('pre_v06_seq', ?1)",
+            [mark],
+        )?;
+    }
+    Ok(())
+}
+
 fn configure(conn: &Connection) -> Result<(), CellError> {
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -2709,6 +2730,7 @@ impl Cell {
         configure(&rebuild)?;
         let tx = rebuild.transaction()?;
         schema::migrate(&tx)?;
+        seed_unsigned_era(&inner.conn, &tx)?;
         for op in ops::read_ops(&inner.conn)? {
             ops::store_op(&tx, &op)?;
         }
@@ -4153,6 +4175,12 @@ impl Cell {
                 schema::migrate(&tx)?;
                 tx.commit()?;
             }
+        }
+        // v0.6.20: the replay derives the conflicts as the live copy does,
+        // so it reads the same UNSIGNED ERA: the pre-v0.6 mark the v15
+        // migration left in this copy's `meta` (local, never an operation)
+        if !chain_only {
+            seed_unsigned_era(&audit, &rebuild_conn)?;
         }
         // v0.6.14 (N1.2): **the threshold.** Every operation whose payload
         // the CUT removed sits at or below the registered cut: a cut that
