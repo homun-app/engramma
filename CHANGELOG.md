@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.20-beta.1] - 2026-11-27
+
+For the beta developers — one fix to the engine: a cell written before
+0.6 opens with its history intact. The schema, the MCP contract and the
+binding's API do not change.
+
+### Fixed
+
+- **A cell written before 0.6 no longer turns its rewrites into
+  conflict copies.** The operations of a pre-0.6 log carry no `base`: the
+  conflict derivation read each of them as a root, concurrent with the
+  others, so every rewrite of a note became a conflict copy — and the
+  human hand won back over a newer agent body (a note the user wrote and
+  an assistant rewrote went back to the user's old text, the rewrite in
+  quarantine). In a log written before 0.6 — marked by its migration, or
+  adopted from one device's pre-sync log — an unsigned operation without
+  `base` past the note's first one is now chained to the operation before
+  it, as the v15 migration always declared. Everywhere else a base-less
+  write stays a root. The golden cell `v043.sqlite`, written by the 0.4.3 engine, pins
+  it. Found by Homun's hook of 0.6.19, before any release of it.
+
+### Known issues
+
+- A pre-0.6 cell that a 0.6.16–0.6.19 engine already opened keeps the
+  wrong derived state (the copies, the old body): the log is right, and
+  `engramma verify` now reports the difference instead of passing. Open a
+  copy of the cell taken before that engine touched it. No Homun release
+  shipped a 0.6 engine.
+- `engramma search` without an embedding model prints `source:` empty
+  and `validity: always → now` for the hits found by words (`explain`
+  carries no source and no validity there); the note's own fields are
+  right.
+
 ## [0.6.19-beta.1] - 2026-11-27
 
 For the beta developers — everything a user, a client or a developer

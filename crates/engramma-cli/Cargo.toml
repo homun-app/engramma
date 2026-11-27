@@ -16,7 +16,7 @@ engramma-embed.workspace = true
 engramma-core.workspace = true
 engramma-sync.workspace = true
 engramma-vault.workspace = true
-engramma-mcp = { path = "../engramma-mcp", version = "0.6.19-beta.1" }
+engramma-mcp = { path = "../engramma-mcp", version = "0.6.20-beta.1" }
 clap.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
