@@ -3,6 +3,95 @@
 Una pagina per fase (docs/fasi.md). La storia fino alla v0.6.14, fase per
 fase, sta in [docs/storia/REPORT-fino-alla-v0.6.14.md](docs/storia/REPORT-fino-alla-v0.6.14.md).
 
+## v0.6.20 — la storia di prima della v0.6 migra come una sequenza
+
+Data: 2026-11-27. Base: `main` @ `0ffe315` (la `0.6.19-beta.1` più la
+regola della pulizia). Esce come `0.6.20-beta.1`. Una correzione sola,
+fatta dal revisore: il difetto l'ha trovato la sessione di Homun
+agganciando la 0.6.19, prima di qualsiasi rilascio di Homun.
+
+### Il difetto
+
+Una cella scritta dal motore della v0.4.3 (schema 12: nessuna `base`,
+nessuna firma), aperta dal motore di oggi, faceva nascere una **copia di
+conflitto per ogni riscrittura**. La derivazione dei conflitti
+(`conflicts.rs`, v0.6.4) legge una scrittura senza `base` come una
+**radice**: tutte le riscritture di una nota pre-v0.6 erano radici,
+concorrenti fra loro. E la regola «vince la mano umana» rimetteva il corpo
+vecchio dell'utente sopra quello più nuovo del bot, con la riscrittura del
+bot in quarantena. La migrazione v15 dice «sequential by declaration», ma
+nessun codice lo faceva valere. Nessuna cella d'oro aveva una storia
+pre-v0.6 con riscritture: le celle d'oro partono dalla v0.6.8.
+
+### La correzione, in due passi
+
+**Il primo passo** (`26b8e4f`) diceva: una scrittura senza `base` e
+**senza firma** è stata scritta su questa copia, e quindi è pre-v0.6. In
+produzione è vero: il gate della sync (`engramma-sync/src/arrival.rs`)
+accetta un'operazione senza firma solo sotto un `adopt`, cioè la storia di
+un dispositivo solo. Ma il core da solo non lo impone, e **la caccia l'ha
+preso**: `no_body_text_is_lost`, seme `3828773795759282483`, «device 0
+LOST the body …». Il banco di convergenza fa viaggiare tra dispositivi
+creazioni concorrenti senza firma, e la regola le legava: un corpo
+spariva. Verde su `0ffe315` e su `fase-v0.6.17`, quindi nato dalla
+correzione.
+
+**Il secondo passo** (`d2f98a5`) rende la regola esplicita nel
+core. La catena senza firma vale solo in un'**era senza firma
+dichiarata**:
+- la migrazione v15, quando migra una storia pre-v0.6, scrive in `meta`
+  la chiave locale `pre_v06_seq`;
+- su una copia che riceve con la sync, vale l'`adopt`, che copre proprio
+  quelle operazioni;
+- i rigiochi di `verify` e dell'oracolo di ricostruzione copiano il segno
+  (senza, `verify` ricavava di nuovo le copie e falliva sulla cella
+  migrata giusta).
+
+Una cella nata nella v0.6 non ha era senza firma: le sue scritture senza
+`base` restano radici, chiunque le abbia ingerite. Lo schema non cambia,
+e l'identità delle operazioni non si tocca (riscrivere le `base` avrebbe
+cambiato i `content_hash`).
+
+**La cella d'oro `v043.sqlite`**, scritta davvero dal motore del tag
+`fase-v0.4.3` (`examples/make_golden_cell_v043.rs`, da un worktree del
+tag, dati sintetici): utente e bot riscrivono le stesse note, con patch,
+put e una patch del solo header. `tests/migration_v043.rs` è rosso senza
+la correzione («sequential rewrites are not conflicts: [ConflictInfo …
+homun:bot-01 … quarantined: true …]») e verde con: nessuna copia, ogni
+nota tiene l'ultima scrittura, `verify` passa, e anche una scrittura nuova
+sopra la storia migrata non fa nascere copie.
+
+**Una cella già aperta da un motore 0.6.x** tiene lo stato derivato
+sbagliato. Provato col binario di `3fb62c7`, che ha la derivazione della
+0.6.19: aprendo `v043.sqlite`, `conflicts` mostra tre copie e la nota 1
+dice «Torino». Il motore nuovo la apre, e `verify` **fallisce**
+(«replay=false», Milano contro Torino): il registro è giusto, e il
+difetto non è più muto. Nessuna riparazione automatica, perché nessuna
+release di Homun ha distribuito un motore 0.6.x: le release sono tutte
+bloccate su `fase-v0.4.3` (verificato dalla sessione di Homun, compresa
+la cartella dati vera). Il caso resta nel CHANGELOG, tra i Known issues.
+
+### Le prove
+
+Suite del workspace col seme del CI, sulla correzione finale: **verde,
+89 binari, 727 test, 0 caduti** (12 ignorati). `fmt` e `clippy` puliti.
+La caccia (`CACCIABASE=0ffe315`, budget di default,
+`target/caccia/20261127-135604`, 99 minuti): **0 rossi**, verdi le 30
+proprietà, le 16 toccate fra 1 452 e 20 003 casi, la suite a 2 048 casi
+verde. Le quattro della convergenza comprese, e `no_body_text_is_lost`,
+che aveva preso il primo passo. Contratto JS e SHA:
+in «La build sul tag».
+
+### Per Homun
+
+Agganciare `0.6.20-beta.1` (gli SHA in cima a `per-homun.md`), rifare le
+celle di prova dalla cella d'oro v0.4.3, e l'`it.fails` di
+`migrazione-v043.test.ts` diventa verde.
+
+### La build sul tag
+
+{{SHA}}
+
 ## v0.6.19 — la CLI parla inglese
 
 Data: 2026-11-27. Base: `main` @ `a5a61f2` (la `0.6.18-beta.1`). Esce come
