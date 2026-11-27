@@ -90,7 +90,13 @@ celle di prova dalla cella d'oro v0.4.3, e l'`it.fails` di
 
 ### La build sul tag
 
-{{SHA}}
+Il tag `fase-v0.6.20`, annotato e solo locale, punta al commit della
+REPORT. `scripts/build-sha.sh` col repo sul tag (costruisce su
+`327857e`): `engramma.darwin-arm64.node` 51 257 272 B, SHA256
+`6c6ae78a…77c363b9`; `index.js` 36 463 B, `5c6b9b6a…e1782485`;
+`index.d.ts` 32 673 B, `b1807110…9996b9a`, identico alla v0.6.19.
+Contratto JS sull'addon del tag: **67 pass**. Cambiano il `.node` (il
+motore e la versione) e `index.js` (la versione); l'API del binding no.
 
 ## v0.6.19 — la CLI parla inglese
 
