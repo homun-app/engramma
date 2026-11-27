@@ -18,7 +18,7 @@ not change.
   keys, same enumerated values, same exit codes; the OAuth `error` codes
   and the binding's `e.code` are the same too. Only **prose fields**
   change language:
-  - `decisions[].reason` and `proposals[].reason`, for the decisions to
+  - `decisions[].reason` and `proposals[].decision_reason`, for the decisions to
     come: `accepted from the CLI`, `reverted from the CLI`, `accepted
     from the review page`, `reverted from the review page`, `bulk
     revert`, `confirmed from the client's form` when the MCP form
@@ -32,8 +32,8 @@ not change.
   - `engramma verify`: `declared_corners` and `mismatch`.
   - `engramma search`: `explain.graph.off` and `explain.via`.
   - `engramma consolidate`: `detail`.
-  - Sync: `why_not`, `relay_warning`, and the `reason` of the operations
-    that could not leave (`engramma sync status`).
+  - Sync: `why_not`, `relay_warning`, and the `why` of the operations
+    that could not leave (`unsent_events[].why`, `engramma sync status`).
   - `vault sync --json` and `import --json`: `warnings` and `errors`.
   - `engramma oauth log`: `detail`; and the `error_description` of every
     OAuth answer.
@@ -84,6 +84,15 @@ not change.
   `oauth.db`, which is not an error code.
 - The sync service told a refused SAS by the word «rifiutata» inside the
   message: it is a typed variant now, whatever language the words speak.
+- **Reverting a reject no longer reopens its target.** A reject never
+  touched the target, but its revert restored the target as the decision
+  had seen it — overwriting what came later. Two corrections P1 and P2 of
+  a quarantined note T: P1 accepted, P2 rejected, P1 purged (T back in
+  quarantine), then `engramma revert` of P2's reject left T `superseded`
+  with no decision — out of the quarantine, and silent to `verify`.
+  Reachable from the CLI since 0.6.18-beta.1; the same root closes the
+  two-device form declared since 0.6.14. Reverts already written replay
+  as they were.
 
 ### Known issues
 

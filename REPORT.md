@@ -9,8 +9,8 @@ Data: 2026-11-27. Base: `main` @ `a5a61f2` (la `0.6.18-beta.1`). Esce come
 `0.6.19-beta.1`. Tema: tutto quello che un utente, un client o uno
 sviluppatore legge è in inglese — la CLI, la pagina di revisione, il server
 MCP e le pagine OAuth, la prosa del core, i rifiuti di sync e di vault, gli
-errori del binding Node. Il motore non cambia e non ci sono misure
-(docs/fasi.md). Tre tappe col revisore in mezzo: l'inventario e il cancello,
+errori del binding Node. Il motore cambia in un punto solo, il revert di
+un rifiuto (qui sotto, «La caccia»); niente misure (docs/fasi.md). Tre tappe col revisore in mezzo: l'inventario e il cancello,
 la traduzione, la chiusura. I codici restano identici: `e.code`, gli exit
 code, le chiavi e i valori enumerati del JSON, i codici OAuth.
 
@@ -47,8 +47,8 @@ sbagliata contava doppio, e il verde ora dice quante ne ha lette.
 - La pagina: `lang="en"`, le route inglesi, le vecchie GET in 308, le POST
   e i campi solo rinominati; i dati di prova in inglese; le tre promesse
   nel cancello; i tre testi che il cancello non vede, a mano.
-- **`via` è un valore enumerato del contratto** (`sync run --json`, `sync
-  status --json`, `via?: string` del binding), non prosa: la traduzione
+- **`via` è un valore enumerato del contratto** (`sync run --json` e
+  `via?: string` del binding), non prosa: la traduzione
   l'aveva fatto diventare `direct`. Ora il JSON e il binding tengono
   `"diretta"` per sempre, la riga per umani dice `direct`, e due test lo
   fissano (nella CLI e in `unsent.rs`). Il CHANGELOG non lo nomina: non
@@ -77,8 +77,8 @@ sbagliata contava doppio, e il verde ora dice quante ne ha lette.
 ### Le prove
 
 Suite del workspace col seme del CI (`PROPTEST_RNG_SEED=20261124`):
-**verde — 88 binari, 724 test, 0 caduti** (13 ignorati, tra cui il difetto
-dichiarato della v0.6.14); in essa il cancello verde (132 superfici) e
+**verde — 88 binari, 726 test, 0 caduti** (12 ignorati: il difetto a due
+dispositivi della v0.6.14 non lo è più); in essa il cancello verde (132 superfici) e
 `golden_cell` verde. Contratto JS del binding, sull'addon ricostruito:
 **67 pass, 0 falliti**. `cargo fmt --all --check` e `cargo clippy
 --all-targets --locked -- -D warnings` puliti.
@@ -132,31 +132,53 @@ dichiarato** (CHANGELOG, Known issues): `explain.source` esce vuoto nella
 ricerca senza modello — la riga `source:` qui sopra — mentre `note.source`
 vale `user`. C'era già nella beta; la causa nel core non è stata cercata.
 
-### La caccia
+### La caccia, e il difetto del revert corretto
 
 `scripts/caccia.sh`, `CACCIABASE=a5a61f2`, budget di default
 (`target/caccia/20261126-211001`, 86 minuti): 30 proprietà, 16 toccate,
-**29 verdi** (da 1 434 a 20 029 casi). Tre rossi, tutti e tre smistati con
-i tre passi di `docs/caccia.md` e **tutti e tre già sul tag
-`fase-v0.6.18`** (`scripts/seme-sul-tag.sh`, motore verificato), in
-`quarantine_exits_only_by_decision` — la proprietà che ha già due difetti
-dichiarati dalla v0.6.14 e cade circa una volta ogni 2 000–4 000 casi:
+**29 verdi**. Tre rossi, tutti in `quarantine_exits_only_by_decision`.
+Lo smistamento di GLM li diceva «già sul tag `fase-v0.6.18`», ed era vero
+ma non bastava: **il confronto giusto è con il tag dove il codice era
+verde l'ultima volta**. Rifatto dal revisore con `seme-sul-tag.sh`:
 
-- `5883740581019706580`, dalla proprietà (2 321 casi): «[due/finale] la
-  decisione annullata … non basta» — la famiglia dichiarata; la suite a
-  2 048, nella stessa corsa, è caduta rigiocando questo seme.
-- `4586480981517075520`, dalla suite rifatta: «[singolo] la nota … è
-  `superseded` senza una decisione che la spieghi» — terza forma, riga
-  nuova.
-- `2220529349810690032`, dalla terza corsa della suite (`--no-fail-fast`,
-  tutta giudicata: 394 verdi, 9 ignorati): «state differs around» — la
-  famiglia del taglio.
+| Seme | `fase-v0.6.17` | Verdetto |
+|---|---|---|
+| `5883740581019706580` | cade | la famiglia a due dispositivi della v0.6.14 |
+| `4586480981517075520` | **verde** | **nato con la v0.6.18**: verde su `389c44c`, rosso su `875d51e` (`StaleTarget`) |
+| `2220529349810690032` | verde | la famiglia del taglio: cade anche senza la correzione qui sotto, solo dopo una compattazione (dietro l'interruttore sperimentale) |
 
-I tre semi sono in `open-defects.txt`, fuori dalle regressioni. Due
-correzioni agli strumenti: il limite della suite viene solo da una suite
-verde (F3), e `seme-sul-tag.sh` toglie il `CARGO_TARGET_DIR` dell'ambiente
-(un primo verdetto, valido per i due controlli, era stato preso con la
-build finita nella cache condivisa: rifatto).
+**La causa** (`4586…`, una cella): P1 e P2 correggono T in quarantena;
+P1 accettata (T `superseded`), P2 rifiutata — la decisione fotografa T
+`superseded`; P1 purgata, e la purga riapre T in quarantena; il revert
+del rifiuto di P2 rimette T com'era nella foto: **`superseded` senza
+decisione, fuori dalla quarantena**, e `verify` muto. Il revert non vede
+la purga (è archiviata sotto P1); `StaleTarget` ha solo aperto la strada
+su una cella sola, raggiungibile dalla CLI della beta.
+
+**La correzione** (`7bb1e87`, `classify_revert`): un rifiuto non tocca mai
+il bersaglio, quindi il suo revert non lo riapre — `restore_target` vale
+solo per un'accettazione. I revert già scritti si rigiocano come sono
+(un `restore_target` nullo era già gestito): lo schema non cambia. Test
+rosso prima: `the_revert_of_a_reject_leaves_the_target_as_it_is` («left:
+Superseded, right: Active»). **Chiude anche il difetto dichiarato della
+v0.6.14 a due dispositivi**: `1835111131785192683`,
+`2472647288214113510`, `5883740581019706580` e `4586480981517075520`
+sono casi fissi in `the_revert_family_seeds_stay_green`; le due righe
+escono da `open-defects.txt`, dove resta solo la famiglia del taglio (con
+`2220…`). La caccia sulle 7 proprietà di `proposals.rs` dopo la
+correzione (`CACCIABASE=0c11ba1`, `target/caccia/20261127-002632`):
+**sei verdi** (da 4 145 a 20 003 casi); `quarantine_exits_only_by_decision`
+rossa col seme `10124808415445337785` (6 239 casi, e la suite a 2 048 lo
+rigioca): «state differs around: tag … note_tags», la famiglia del taglio
+— cade su `0c11ba1`, `fase-v0.6.18`, `fase-v0.6.17` e `fase-v0.6.16`,
+quindi precede la fase e non viene dalla correzione: dichiarato nella sua
+riga.
+
+Due correzioni agli strumenti: il limite della suite viene solo da una
+suite verde (F3), e `seme-sul-tag.sh` toglie il `CARGO_TARGET_DIR`
+dell'ambiente (un primo verdetto era stato preso con la build finita
+nella cache condivisa: rifatto). In `docs/caccia.md` la regola nuova del
+secondo passo.
 
 ### Per il revisore: la sequenza del rilascio
 

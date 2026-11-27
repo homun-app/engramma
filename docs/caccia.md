@@ -91,6 +91,15 @@ spetta alla fase che lo trova: la fa la fase che lo chiude.
    `frozen_prefix_body`, `quarantine_exits_body`): per le altre lo script
    lo dice (esce 3).
 
+   **Quale tag (v0.6.19).** «Cade anche sul tag della fase prima» non
+   basta a dire «c'era già»: quella fase può averlo introdotto lei. Se il
+   seme cade sul tag precedente, si prova anche su quello **prima
+   dell'ultima fase che ha toccato i moduli della proprietà**
+   (`properties.txt`), e sulla release pubblica precedente. Nella
+   v0.6.19 tre semi cadevano su `fase-v0.6.18`; uno era verde su
+   `fase-v0.6.17`: la v0.6.18 aveva aperto la strada, e il difetto
+   andava corretto, non dichiarato.
+
    **La cartella di build non si condivide con l'albero principale, e lo
    script controlla il motore.** Due alberi diversi nella stessa
    `CARGO_TARGET_DIR` danno manufatti con lo stesso nome, e cargo giudica
