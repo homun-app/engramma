@@ -207,13 +207,14 @@ commento in testa al file: «the CLI prints Italian labels today».
 ### La build sul tag
 
 Il tag `fase-v0.6.19`, annotato e solo locale, punta al commit della
-REPORT. `scripts/build-sha.sh` col repo sul tag (costruisce su `71c3053`):
-`engramma.darwin-arm64.node` 51 259 032 B, SHA256 `0bc4ccbb…6f2dcb`;
-`index.js` 36 463 B, `586f717f…8aa3a56`; `index.d.ts` 32 673 B,
-`b1807110…9996b9a`. Rispetto alla build della v0.6.18 cambiano tutti e
-tre: il `.node` per i messaggi e la versione, `index.js` per la versione
-(stessa misura), `index.d.ts` per i commenti del binding. L'API e i codici
-di errore del binding non cambiano.
+REPORT. `scripts/build-sha.sh` col repo sul tag (costruisce su `58d63a3`,
+dopo la correzione del revert): `engramma.darwin-arm64.node` 51 258 856 B,
+SHA256 `217dc5c5…cc411c26`; `index.js` 36 463 B, `586f717f…8aa3a56`;
+`index.d.ts` 32 673 B, `b1807110…9996b9a`. Contratto JS sull'addon del tag:
+67 pass. Rispetto alla v0.6.18 cambiano tutti e tre: il `.node` per i
+messaggi, la versione e il revert, `index.js` per la versione (stessa
+misura), `index.d.ts` per i commenti del binding. L'API e i codici di
+errore del binding non cambiano.
 
 ## v0.6.18 — la revisione mantiene le promesse
 
